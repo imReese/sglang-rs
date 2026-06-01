@@ -16,6 +16,14 @@ pub struct ServerArgs {
     pub grpc_mode: bool,
     pub served_model_name: Option<String>,
     pub tokenizer_path: Option<String>,
+    pub disaggregation_mode: String,
+    pub disaggregation_transfer_backend: String,
+    pub disaggregation_bootstrap_port: u16,
+    pub disaggregation_ib_device: Option<String>,
+    pub disaggregation_decode_enable_radix_cache: bool,
+    pub disaggregation_decode_enable_offload_kvcache: bool,
+    pub num_reserved_decode_tokens: usize,
+    pub disaggregation_decode_polling_interval: usize,
     pub extra_args: Vec<String>,
 }
 
@@ -107,6 +115,41 @@ impl ArgParser {
                 "--tokenizer-path" => {
                     self.parsed.tokenizer_path = Some(self.take_value("--tokenizer-path")?);
                 }
+                "--disaggregation-mode" => {
+                    self.parsed.disaggregation_mode = self.take_value("--disaggregation-mode")?;
+                }
+                "--disaggregation-transfer-backend" => {
+                    self.parsed.disaggregation_transfer_backend =
+                        self.take_value("--disaggregation-transfer-backend")?;
+                }
+                "--disaggregation-bootstrap-port" => {
+                    let value = self.take_value("--disaggregation-bootstrap-port")?;
+                    self.parsed.disaggregation_bootstrap_port = value
+                        .parse::<u16>()
+                        .map_err(|_| CliParseError::InvalidPort(value))?;
+                }
+                "--disaggregation-ib-device" => {
+                    self.parsed.disaggregation_ib_device =
+                        Some(self.take_value("--disaggregation-ib-device")?);
+                }
+                "--disaggregation-decode-enable-radix-cache" => {
+                    self.parsed.disaggregation_decode_enable_radix_cache = true;
+                }
+                "--disaggregation-decode-enable-offload-kvcache" => {
+                    self.parsed.disaggregation_decode_enable_offload_kvcache = true;
+                }
+                "--num-reserved-decode-tokens" => {
+                    self.parsed.num_reserved_decode_tokens = parse_usize(
+                        "--num-reserved-decode-tokens",
+                        self.take_value("--num-reserved-decode-tokens")?,
+                    )?;
+                }
+                "--disaggregation-decode-polling-interval" => {
+                    self.parsed.disaggregation_decode_polling_interval = parse_usize(
+                        "--disaggregation-decode-polling-interval",
+                        self.take_value("--disaggregation-decode-polling-interval")?,
+                    )?;
+                }
                 _ => self.preserve_unknown(arg),
             }
         }
@@ -125,6 +168,20 @@ impl ArgParser {
             grpc_mode: self.parsed.grpc_mode,
             served_model_name: self.parsed.served_model_name.clone(),
             tokenizer_path: self.parsed.tokenizer_path.clone(),
+            disaggregation_mode: self.parsed.disaggregation_mode.clone(),
+            disaggregation_transfer_backend: self.parsed.disaggregation_transfer_backend.clone(),
+            disaggregation_bootstrap_port: self.parsed.disaggregation_bootstrap_port,
+            disaggregation_ib_device: self.parsed.disaggregation_ib_device.clone(),
+            disaggregation_decode_enable_radix_cache: self
+                .parsed
+                .disaggregation_decode_enable_radix_cache,
+            disaggregation_decode_enable_offload_kvcache: self
+                .parsed
+                .disaggregation_decode_enable_offload_kvcache,
+            num_reserved_decode_tokens: self.parsed.num_reserved_decode_tokens,
+            disaggregation_decode_polling_interval: self
+                .parsed
+                .disaggregation_decode_polling_interval,
             extra_args: self.parsed.extra_args.clone(),
         })
     }
@@ -176,6 +233,14 @@ struct PartialServerArgs {
     grpc_mode: bool,
     served_model_name: Option<String>,
     tokenizer_path: Option<String>,
+    disaggregation_mode: String,
+    disaggregation_transfer_backend: String,
+    disaggregation_bootstrap_port: u16,
+    disaggregation_ib_device: Option<String>,
+    disaggregation_decode_enable_radix_cache: bool,
+    disaggregation_decode_enable_offload_kvcache: bool,
+    num_reserved_decode_tokens: usize,
+    disaggregation_decode_polling_interval: usize,
     extra_args: Vec<String>,
 }
 
@@ -190,6 +255,14 @@ impl Default for PartialServerArgs {
             grpc_mode: false,
             served_model_name: None,
             tokenizer_path: None,
+            disaggregation_mode: "null".to_string(),
+            disaggregation_transfer_backend: "mooncake".to_string(),
+            disaggregation_bootstrap_port: 8998,
+            disaggregation_ib_device: None,
+            disaggregation_decode_enable_radix_cache: false,
+            disaggregation_decode_enable_offload_kvcache: false,
+            num_reserved_decode_tokens: 512,
+            disaggregation_decode_polling_interval: 1,
             extra_args: Vec::new(),
         }
     }

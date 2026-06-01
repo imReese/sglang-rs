@@ -3,7 +3,7 @@ use std::fmt;
 use crate::scheduler::{ScheduledOutput, ScheduledRequest, Scheduler, SchedulerError};
 use crate::tokenizer::{Tokenizer, TokenizerError};
 use crate::types::{GenerateOutput, GenerateRequest, TokenGenerateOutput, TokenGenerateRequest};
-use crate::worker::ModelWorker;
+use crate::worker::WorkerExecutor;
 
 #[derive(Debug)]
 pub enum RuntimeError {
@@ -59,7 +59,7 @@ impl<T, W> Engine<T, W> {
 impl<T, W> Engine<T, W>
 where
     T: Tokenizer,
-    W: ModelWorker,
+    W: WorkerExecutor,
 {
     pub fn generate(&mut self, request: GenerateRequest) -> Result<GenerateOutput, RuntimeError> {
         let input_ids = self.tokenizer.encode(&request.prompt);

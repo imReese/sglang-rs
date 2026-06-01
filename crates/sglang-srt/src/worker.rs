@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::scheduler::{ScheduleBatch, ScheduledOutput};
+use crate::scheduler::{ForwardMode, ScheduleBatch, ScheduledOutput};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GeneratedToken {
@@ -96,4 +96,58 @@ impl std::error::Error for WorkerOutputError {}
 
 pub trait ModelWorker {
     fn generate_batch(&mut self, batch: &ScheduleBatch) -> BatchGeneratedTokens;
+}
+
+pub trait WorkerExecutor {
+    fn execute_batch(&mut self, batch: &ScheduleBatch) -> BatchGeneratedTokens;
+}
+
+impl<W> WorkerExecutor for W
+where
+    W: ModelWorker,
+{
+    fn execute_batch(&mut self, batch: &ScheduleBatch) -> BatchGeneratedTokens {
+        self.generate_batch(batch)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PdModelWorkers<P, D> {
+    prefill: P,
+    decode: D,
+}
+
+impl<P, D> PdModelWorkers<P, D> {
+    pub fn new(prefill: P, decode: D) -> Self {
+        Self { prefill, decode }
+    }
+
+    pub fn prefill(&self) -> &P {
+        &self.prefill
+    }
+
+    pub fn prefill_mut(&mut self) -> &mut P {
+        &mut self.prefill
+    }
+
+    pub fn decode(&self) -> &D {
+        &self.decode
+    }
+
+    pub fn decode_mut(&mut self) -> &mut D {
+        &mut self.decode
+    }
+}
+
+impl<P, D> WorkerExecutor for PdModelWorkers<P, D>
+where
+    P: ModelWorker,
+    D: ModelWorker,
+{
+    fn execute_batch(&mut self, batch: &ScheduleBatch) -> BatchGeneratedTokens {
+        match batch.forward_mode() {
+            ForwardMode::Prefill => self.prefill.generate_batch(batch),
+            ForwardMode::Decode => self.decode.generate_batch(batch),
+        }
+    }
 }

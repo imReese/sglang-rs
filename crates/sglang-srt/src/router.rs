@@ -5,7 +5,7 @@ use crate::cli::ServerArgs;
 use crate::engine::{Engine, RuntimeError};
 use crate::tokenizer::Tokenizer;
 use crate::types::{RequestId, SamplingParams, TokenGenerateOutput, TokenGenerateRequest};
-use crate::worker::ModelWorker;
+use crate::worker::WorkerExecutor;
 
 pub const DEFAULT_MAX_NEW_TOKENS: usize = 128;
 
@@ -224,7 +224,7 @@ impl<T, W> RouterRuntime<T, W> {
 impl<T, W> RouterRuntime<T, W>
 where
     T: Tokenizer,
-    W: ModelWorker,
+    W: WorkerExecutor,
 {
     pub fn generate(
         &mut self,

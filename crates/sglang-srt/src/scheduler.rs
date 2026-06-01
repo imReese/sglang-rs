@@ -5,7 +5,7 @@ use crate::cache::{
     CacheAllocationError, CachePageAllocator, CachePageId, PrefixMatch, RadixCache,
 };
 use crate::types::{RequestId, SamplingParams};
-use crate::worker::{GeneratedToken, ModelWorker};
+use crate::worker::{GeneratedToken, WorkerExecutor};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequestStage {
@@ -371,7 +371,7 @@ impl<W> Scheduler<W> {
 
 impl<W> Scheduler<W>
 where
-    W: ModelWorker,
+    W: WorkerExecutor,
 {
     pub fn dispatch_prefill_batch(
         &mut self,
@@ -402,7 +402,7 @@ where
         &mut self,
         batch: ScheduleBatch,
     ) -> Result<Vec<ScheduledOutput>, SchedulerError> {
-        let generated = self.worker.generate_batch(&batch);
+        let generated = self.worker.execute_batch(&batch);
         let forward_mode = batch.forward_mode();
         let requests = batch.into_requests();
         let tokens = generated.into_tokens();

@@ -79,3 +79,37 @@ fn parse_model_metadata_args_used_by_router_registration() {
     assert_eq!(parsed.tokenizer_path.as_deref(), Some("hf-tokenizer"));
     assert!(parsed.extra_args.is_empty());
 }
+
+#[test]
+fn parse_pd_disaggregation_args_matches_sglang_server_args() {
+    let parsed = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--disaggregation-mode",
+        "prefill",
+        "--disaggregation-transfer-backend",
+        "mooncake",
+        "--disaggregation-bootstrap-port",
+        "8999",
+        "--disaggregation-ib-device",
+        "mlx5_0",
+        "--disaggregation-decode-enable-radix-cache",
+        "--disaggregation-decode-enable-offload-kvcache",
+        "--num-reserved-decode-tokens",
+        "1024",
+        "--disaggregation-decode-polling-interval",
+        "2",
+    ])
+    .expect("pd args should parse");
+
+    assert_eq!(parsed.disaggregation_mode, "prefill");
+    assert_eq!(parsed.disaggregation_transfer_backend, "mooncake");
+    assert_eq!(parsed.disaggregation_bootstrap_port, 8999);
+    assert_eq!(parsed.disaggregation_ib_device.as_deref(), Some("mlx5_0"));
+    assert!(parsed.disaggregation_decode_enable_radix_cache);
+    assert!(parsed.disaggregation_decode_enable_offload_kvcache);
+    assert_eq!(parsed.num_reserved_decode_tokens, 1024);
+    assert_eq!(parsed.disaggregation_decode_polling_interval, 2);
+    assert!(parsed.extra_args.is_empty());
+}

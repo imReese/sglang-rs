@@ -13,9 +13,10 @@ This repository currently contains the first `sglang-srt` runtime crate:
 
 - `cli`: `sglang serve`-style argument parsing for `--model-path`/`--model`,
   `--host`, `--port`, `--tp-size`, `--dp-size`, `--grpc-mode`,
-  `--served-model-name`, and `--tokenizer-path`, with unknown server args
-  preserved for incremental upstream compatibility. The crate builds both
-  `sglang` and `sglang-rs` binaries so the upstream command shape works.
+  `--served-model-name`, `--tokenizer-path`, and the upstream PD
+  disaggregation flags, with unknown server args preserved for incremental
+  upstream compatibility. The crate builds both `sglang` and `sglang-rs`
+  binaries so the upstream command shape works.
 - `engine`: text and tokenized request lifecycle glue that drives prefill and
   decode until completion, with a token stream path that preserves incremental
   prefill/decode outputs for router streaming.
@@ -30,19 +31,26 @@ This repository currently contains the first `sglang-srt` runtime crate:
   uncached-token budgeted prefill batching, decode requeueing,
   `max_new_tokens` stopping, prefix-cache application, and KV cache page
   allocation for uncached prefill tokens. Successful prefill dispatches publish
-  allocated pages back into RadixCache for future prefix reuse.
+  allocated pages back into RadixCache for future prefix reuse. The dispatch
+  path can run in local PD mode by routing prefill and decode batches to
+  separate worker executors, matching the split execution boundary used by
+  SGLang disaggregation.
 - `model_executor`: prepared model-worker batches with flattened input ids,
   positions, sequence lengths, request offsets, and prefix cache pages for the
   future CUDA/model executor boundary.
 - `cache`: RadixCache-style token-prefix matching plus a finite KV cache page
   allocator for page assignment/reuse and safe full reset when no decode request
   is active.
-- `worker`: batch model worker trait that will become the CUDA/model executor boundary.
+- `worker`: batch model worker trait that will become the CUDA/model executor
+  boundary, plus a `PdModelWorkers` wrapper that sends prefill batches to a
+  prefill worker and decode batches to a decode worker.
 - `types`: generation request and response types.
 
 The implementation is intentionally small while the architecture is being
 carved out. The current worker is test-driven and mockable; CUDA integration is
-not implemented yet.
+not implemented yet. PD support currently covers the scheduler/router execution
+split; network bootstrap metadata and KV transfer are still future integration
+work.
 
 ## Development
 
