@@ -154,6 +154,12 @@ impl RouterHealthCheckResponse {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouterFlushCacheResponse {
+    pub success: bool,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouterGetModelInfoResponse {
     pub model_path: String,
     pub tokenizer_path: String,
@@ -280,6 +286,20 @@ where
         }
 
         Ok(responses)
+    }
+
+    pub fn flush_cache(&mut self) -> RouterFlushCacheResponse {
+        if self.engine.flush_cache() {
+            RouterFlushCacheResponse {
+                success: true,
+                message: "cache flushed".to_string(),
+            }
+        } else {
+            RouterFlushCacheResponse {
+                success: false,
+                message: String::new(),
+            }
+        }
     }
 }
 

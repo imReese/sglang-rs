@@ -50,6 +50,10 @@ impl<T, W> Engine<T, W> {
     pub fn scheduler(&self) -> &Scheduler<W> {
         &self.scheduler
     }
+
+    pub fn flush_cache(&mut self) -> bool {
+        self.scheduler.flush_cache()
+    }
 }
 
 impl<T, W> Engine<T, W>

@@ -91,6 +91,21 @@ fn insert_rejects_page_sequences_that_do_not_match_token_count() {
 }
 
 #[test]
+fn clear_removes_cached_prefix_matches() {
+    let mut cache = RadixCache::default();
+    cache
+        .insert(&[1, 2], &[CachePageId::from(10), CachePageId::from(11)])
+        .expect("insert should succeed");
+
+    cache.clear();
+
+    let matched = cache.match_prefix(&[1, 2, 3]);
+    assert_eq!(matched.matched_token_count, 0);
+    assert!(matched.cache_pages.is_empty());
+    assert_eq!(matched.remaining_input_ids, vec![1, 2, 3]);
+}
+
+#[test]
 fn scheduler_applies_radix_cache_match_before_dispatching_to_worker() {
     let mut cache = RadixCache::default();
     cache

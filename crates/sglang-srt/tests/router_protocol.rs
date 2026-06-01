@@ -1,12 +1,13 @@
+use sglang_srt::cache::{CachePageAllocator, RadixCache};
 use sglang_srt::cli::ServerArgs;
 use sglang_srt::engine::Engine;
 use sglang_srt::router::{
-    DEFAULT_MAX_NEW_TOKENS, RouterGenerateComplete, RouterGenerateRequest, RouterGenerateResponse,
-    RouterGenerateResponseBody, RouterGenerateStreamChunk, RouterGetModelInfoResponse,
-    RouterHealthCheckResponse, RouterProtocolError, RouterRuntime, RouterSamplingParams,
-    RouterTokenizedInput,
+    DEFAULT_MAX_NEW_TOKENS, RouterFlushCacheResponse, RouterGenerateComplete,
+    RouterGenerateRequest, RouterGenerateResponse, RouterGenerateResponseBody,
+    RouterGenerateStreamChunk, RouterGetModelInfoResponse, RouterHealthCheckResponse,
+    RouterProtocolError, RouterRuntime, RouterSamplingParams, RouterTokenizedInput,
 };
-use sglang_srt::scheduler::{ScheduleBatch, Scheduler};
+use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::tokenizer::ByteTokenizer;
 use sglang_srt::types::{RequestId, SamplingParams, TokenGenerateOutput};
 use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
@@ -28,6 +29,16 @@ impl ModelWorker for RouterEchoWorker {
 #[derive(Default)]
 struct TwoStepRouterWorker {
     seen_modes: Vec<sglang_srt::scheduler::ForwardMode>,
+}
+
+#[derive(Default)]
+struct AlwaysUnfinishedRouterWorker;
+
+impl ModelWorker for AlwaysUnfinishedRouterWorker {
+    fn generate_batch(&mut self, batch: &ScheduleBatch) -> BatchGeneratedTokens {
+        BatchGeneratedTokens::from_batch(batch, vec![GeneratedToken::unfinished(vec![42])])
+            .expect("output shape should match batch")
+    }
 }
 
 impl ModelWorker for TwoStepRouterWorker {
@@ -284,5 +295,82 @@ fn router_runtime_streams_prefill_chunks_and_final_complete_response() {
             sglang_srt::scheduler::ForwardMode::Prefill,
             sglang_srt::scheduler::ForwardMode::Decode,
         ]
+    );
+}
+
+#[test]
+fn router_runtime_flush_cache_calls_scheduler_and_reports_success() {
+    let tokenizer = ByteTokenizer::default();
+    let scheduler = Scheduler::with_cache_resources(
+        RouterEchoWorker::default(),
+        RadixCache::default(),
+        CachePageAllocator::new(4),
+    );
+    let engine = Engine::new(tokenizer, scheduler);
+    let mut runtime = RouterRuntime::new(engine);
+
+    runtime
+        .generate(RouterGenerateRequest {
+            request_id: "flush-seed".to_string(),
+            tokenized: Some(RouterTokenizedInput {
+                original_text: String::new(),
+                input_ids: vec![1, 2],
+            }),
+            sampling_params: Some(RouterSamplingParams {
+                max_new_tokens: Some(2),
+            }),
+            stream: false,
+            data_parallel_rank: 0,
+            trace_headers: Default::default(),
+        })
+        .expect("seed request should execute");
+
+    assert_eq!(
+        runtime.engine().scheduler().available_cache_pages(),
+        Some(2)
+    );
+
+    let response = runtime.flush_cache();
+
+    assert_eq!(
+        response,
+        RouterFlushCacheResponse {
+            success: true,
+            message: "cache flushed".to_string(),
+        }
+    );
+    assert_eq!(
+        runtime.engine().scheduler().available_cache_pages(),
+        Some(4)
+    );
+}
+
+#[test]
+fn router_runtime_flush_cache_reports_failure_when_decode_requests_are_active() {
+    let tokenizer = ByteTokenizer::default();
+    let mut scheduler = Scheduler::with_cache_resources(
+        AlwaysUnfinishedRouterWorker,
+        RadixCache::default(),
+        CachePageAllocator::new(4),
+    );
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("active"),
+        vec![1, 2],
+        SamplingParams { max_new_tokens: 2 },
+    ));
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should dispatch");
+
+    let engine = Engine::new(tokenizer, scheduler);
+    let mut runtime = RouterRuntime::new(engine);
+
+    let response = runtime.flush_cache();
+
+    assert!(!response.success);
+    assert!(response.message.is_empty());
+    assert_eq!(
+        runtime.engine().scheduler().available_cache_pages(),
+        Some(2)
     );
 }

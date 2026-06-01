@@ -57,3 +57,22 @@ fn allocator_reuses_released_pages_before_never_allocated_pages() {
         ]
     );
 }
+
+#[test]
+fn allocator_reset_restores_all_pages_in_page_order() {
+    let mut allocator = CachePageAllocator::new(4);
+    let _allocated = allocator.allocate(3).expect("allocation should succeed");
+
+    allocator.reset();
+
+    assert_eq!(allocator.available_pages(), 4);
+    assert_eq!(
+        allocator.allocate(4).expect("allocation should succeed"),
+        vec![
+            CachePageId::from(0),
+            CachePageId::from(1),
+            CachePageId::from(2),
+            CachePageId::from(3),
+        ]
+    );
+}

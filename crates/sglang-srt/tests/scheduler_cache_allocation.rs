@@ -21,6 +21,23 @@ impl ModelWorker for NoopWorker {
     }
 }
 
+#[derive(Default)]
+struct UnfinishedWorker;
+
+impl ModelWorker for UnfinishedWorker {
+    fn generate_batch(&mut self, batch: &ScheduleBatch) -> BatchGeneratedTokens {
+        BatchGeneratedTokens::from_batch(
+            batch,
+            batch
+                .requests()
+                .iter()
+                .map(|_| GeneratedToken::unfinished(vec![0]))
+                .collect(),
+        )
+        .expect("output shape should match batch")
+    }
+}
+
 #[test]
 fn prefill_batch_allocates_cache_pages_for_uncached_tokens() {
     let mut scheduler = Scheduler::with_cache_resources(
@@ -160,6 +177,76 @@ fn allocation_failure_rolls_back_pages_and_preserves_queue_order_for_partial_bat
         batch.requests()[0].allocated_cache_pages(),
         &[CachePageId::from(0), CachePageId::from(1)]
     );
+}
+
+#[test]
+fn flush_cache_clears_prefix_matches_and_restores_allocator_when_no_decode_is_active() {
+    let mut scheduler = Scheduler::with_cache_resources(
+        NoopWorker,
+        RadixCache::default(),
+        CachePageAllocator::new(4),
+    );
+    enqueue_request(&mut scheduler, "req-a", &[1, 2]);
+
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should dispatch");
+    assert_eq!(scheduler.available_cache_pages(), Some(2));
+
+    assert!(scheduler.flush_cache());
+
+    assert_eq!(scheduler.available_cache_pages(), Some(4));
+    enqueue_request(&mut scheduler, "req-b", &[1, 2, 3]);
+    let batch = scheduler
+        .next_prefill_batch(1)
+        .expect("batch should be available");
+
+    assert!(batch.requests()[0].prefix_cache_pages().is_empty());
+    assert_eq!(batch.requests()[0].uncached_input_ids(), &[1, 2, 3]);
+    assert_eq!(
+        batch.requests()[0].allocated_cache_pages(),
+        &[
+            CachePageId::from(0),
+            CachePageId::from(1),
+            CachePageId::from(2)
+        ]
+    );
+}
+
+#[test]
+fn flush_cache_rejects_when_decode_requests_are_active() {
+    let mut scheduler = Scheduler::with_cache_resources(
+        UnfinishedWorker,
+        RadixCache::default(),
+        CachePageAllocator::new(4),
+    );
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("req-active"),
+        vec![1, 2],
+        SamplingParams { max_new_tokens: 2 },
+    ));
+
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should dispatch");
+
+    assert_eq!(scheduler.decode_queue_depth(), 1);
+    assert!(!scheduler.flush_cache());
+    assert_eq!(scheduler.available_cache_pages(), Some(2));
+}
+
+#[test]
+fn flush_cache_rejects_when_waiting_requests_are_queued() {
+    let mut scheduler = Scheduler::with_cache_resources(
+        NoopWorker,
+        RadixCache::default(),
+        CachePageAllocator::new(4),
+    );
+    enqueue_request(&mut scheduler, "req-waiting", &[1, 2]);
+
+    assert!(!scheduler.flush_cache());
+    assert_eq!(scheduler.waiting_queue_depth(), 1);
+    assert_eq!(scheduler.available_cache_pages(), Some(4));
 }
 
 fn enqueue_request<W>(scheduler: &mut Scheduler<W>, request_id: &str, input_ids: &[u32]) {

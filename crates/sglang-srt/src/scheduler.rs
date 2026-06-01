@@ -242,6 +242,19 @@ impl<W> Scheduler<W> {
         &self.worker
     }
 
+    pub fn flush_cache(&mut self) -> bool {
+        if !self.waiting_queue.is_empty() || !self.decode_queue.is_empty() {
+            return false;
+        }
+
+        self.prefix_cache.clear();
+        if let Some(allocator) = self.cache_page_allocator.as_mut() {
+            allocator.reset();
+        }
+
+        true
+    }
+
     pub fn next_prefill_batch(
         &mut self,
         max_batch_size: usize,

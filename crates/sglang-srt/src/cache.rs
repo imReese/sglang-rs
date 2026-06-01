@@ -64,12 +64,14 @@ impl std::error::Error for CacheAllocationError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CachePageAllocator {
+    page_count: usize,
     free_pages: VecDeque<CachePageId>,
 }
 
 impl CachePageAllocator {
     pub fn new(page_count: usize) -> Self {
         Self {
+            page_count,
             free_pages: (0..page_count).map(CachePageId::from).collect(),
         }
     }
@@ -99,6 +101,10 @@ impl CachePageAllocator {
             self.free_pages.push_front(*cache_page);
         }
     }
+
+    pub fn reset(&mut self) {
+        self.free_pages = (0..self.page_count).map(CachePageId::from).collect();
+    }
 }
 
 #[derive(Default)]
@@ -107,6 +113,10 @@ pub struct RadixCache {
 }
 
 impl RadixCache {
+    pub fn clear(&mut self) {
+        self.root = RadixNode::default();
+    }
+
     pub fn insert(
         &mut self,
         input_ids: &[u32],
