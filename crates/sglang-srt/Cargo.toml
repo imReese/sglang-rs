@@ -1,0 +1,10 @@
+[package]
+name = "sglang-srt"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "sglang_srt"
+path = "src/lib.rs"

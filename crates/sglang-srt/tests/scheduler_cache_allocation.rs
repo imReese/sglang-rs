@@ -1,0 +1,171 @@
+use sglang_srt::cache::{CacheAllocationError, CachePageAllocator, CachePageId, RadixCache};
+use sglang_srt::model_executor::ModelWorkerBatch;
+use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler, SchedulerError};
+use sglang_srt::types::{RequestId, SamplingParams};
+use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
+
+#[derive(Default)]
+struct NoopWorker;
+
+impl ModelWorker for NoopWorker {
+    fn generate_batch(&mut self, batch: &ScheduleBatch) -> BatchGeneratedTokens {
+        BatchGeneratedTokens::from_batch(
+            batch,
+            batch
+                .requests()
+                .iter()
+                .map(|_| GeneratedToken::finished(vec![0]))
+                .collect(),
+        )
+        .expect("output shape should match batch")
+    }
+}
+
+#[test]
+fn prefill_batch_allocates_cache_pages_for_uncached_tokens() {
+    let mut scheduler = Scheduler::with_cache_resources(
+        NoopWorker,
+        RadixCache::default(),
+        CachePageAllocator::new(4),
+    );
+    enqueue_request(&mut scheduler, "req-a", &[1, 2]);
+    enqueue_request(&mut scheduler, "req-b", &[3]);
+
+    let batch = scheduler
+        .next_prefill_batch(2)
+        .expect("batch should be available");
+
+    assert_eq!(
+        batch.requests()[0].allocated_cache_pages(),
+        &[CachePageId::from(0), CachePageId::from(1)]
+    );
+    assert_eq!(
+        batch.requests()[1].allocated_cache_pages(),
+        &[CachePageId::from(2)]
+    );
+    assert_eq!(scheduler.available_cache_pages(), Some(1));
+}
+
+#[test]
+fn model_worker_batch_exposes_flattened_output_cache_pages_for_prefill() {
+    let mut scheduler = Scheduler::with_cache_resources(
+        NoopWorker,
+        RadixCache::default(),
+        CachePageAllocator::new(4),
+    );
+    enqueue_request(&mut scheduler, "req-a", &[1, 2]);
+    enqueue_request(&mut scheduler, "req-b", &[3]);
+
+    let batch = scheduler
+        .next_prefill_batch(2)
+        .expect("batch should be available");
+    let worker_batch = ModelWorkerBatch::from_schedule_batch(&batch);
+
+    assert_eq!(
+        worker_batch.out_cache_pages(),
+        &[
+            CachePageId::from(0),
+            CachePageId::from(1),
+            CachePageId::from(2)
+        ]
+    );
+}
+
+#[test]
+fn successful_prefill_dispatch_publishes_allocated_pages_to_radix_cache_for_future_prefix_hits() {
+    let mut scheduler = Scheduler::with_cache_resources(
+        NoopWorker,
+        RadixCache::default(),
+        CachePageAllocator::new(8),
+    );
+    enqueue_request(&mut scheduler, "req-a", &[1, 2, 3]);
+
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should dispatch");
+
+    enqueue_request(&mut scheduler, "req-b", &[1, 2, 3, 4]);
+    let batch = scheduler
+        .next_prefill_batch(1)
+        .expect("batch should be available");
+
+    assert_eq!(
+        batch.requests()[0].prefix_cache_pages(),
+        &[
+            CachePageId::from(0),
+            CachePageId::from(1),
+            CachePageId::from(2)
+        ]
+    );
+    assert_eq!(batch.requests()[0].uncached_input_ids(), &[4]);
+    assert_eq!(
+        batch.requests()[0].allocated_cache_pages(),
+        &[CachePageId::from(3)]
+    );
+}
+
+#[test]
+fn allocation_failure_leaves_request_queued_and_pages_available() {
+    let mut scheduler = Scheduler::with_cache_resources(
+        NoopWorker,
+        RadixCache::default(),
+        CachePageAllocator::new(2),
+    );
+    enqueue_request(&mut scheduler, "req-too-large", &[1, 2, 3]);
+
+    let result = scheduler.next_prefill_batch(1);
+
+    assert_eq!(
+        result,
+        Err(SchedulerError::CacheAllocation(
+            CacheAllocationError::OutOfPages {
+                requested: 3,
+                available: 2
+            }
+        ))
+    );
+    assert_eq!(scheduler.waiting_queue_depth(), 1);
+    assert_eq!(scheduler.available_cache_pages(), Some(2));
+}
+
+#[test]
+fn allocation_failure_rolls_back_pages_and_preserves_queue_order_for_partial_batch() {
+    let mut scheduler = Scheduler::with_cache_resources(
+        NoopWorker,
+        RadixCache::default(),
+        CachePageAllocator::new(3),
+    );
+    enqueue_request(&mut scheduler, "req-a", &[1, 2]);
+    enqueue_request(&mut scheduler, "req-b", &[3, 4]);
+
+    let result = scheduler.next_prefill_batch(2);
+
+    assert_eq!(
+        result,
+        Err(SchedulerError::CacheAllocation(
+            CacheAllocationError::OutOfPages {
+                requested: 2,
+                available: 1
+            }
+        ))
+    );
+    assert_eq!(scheduler.waiting_queue_depth(), 2);
+    assert_eq!(scheduler.available_cache_pages(), Some(3));
+
+    let batch = scheduler
+        .next_prefill_batch_with_token_budget(1, usize::MAX)
+        .expect("first request should still be queued first");
+    assert_eq!(batch.requests()[0].request_id(), &RequestId::from("req-a"));
+    assert_eq!(
+        batch.requests()[0].allocated_cache_pages(),
+        &[CachePageId::from(0), CachePageId::from(1)]
+    );
+}
+
+fn enqueue_request<W>(scheduler: &mut Scheduler<W>, request_id: &str, input_ids: &[u32]) {
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from(request_id),
+        input_ids.to_vec(),
+        SamplingParams { max_new_tokens: 1 },
+    ));
+}
