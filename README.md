@@ -29,6 +29,9 @@ This repository currently contains the first `sglang-srt` runtime crate:
   worker execution, and exposes a flush-cache control operation for gateway
   control-plane calls.
 - `tokenizer`: tokenizer trait plus a temporary byte tokenizer for tests.
+- `transfer`: PD disaggregation mode/backend normalization, including
+  SGLang-compatible `mooncake_tcp` handling, plus the initial Mooncake
+  transfer-engine ABI boundary for memory registration and batch transfer.
 - `scheduler`: waiting queue, prefill/decode batch formation, request stages,
   uncached-token budgeted prefill batching, decode requeueing,
   `max_new_tokens` stopping, prefix-cache application, and KV cache page

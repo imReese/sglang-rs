@@ -5,5 +5,6 @@ pub mod model_executor;
 pub mod router;
 pub mod scheduler;
 pub mod tokenizer;
+pub mod transfer;
 pub mod types;
 pub mod worker;
