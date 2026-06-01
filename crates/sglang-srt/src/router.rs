@@ -2,7 +2,10 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::cli::ServerArgs;
+use crate::engine::{Engine, RuntimeError};
+use crate::tokenizer::Tokenizer;
 use crate::types::{RequestId, SamplingParams, TokenGenerateOutput, TokenGenerateRequest};
+use crate::worker::ModelWorker;
 
 pub const DEFAULT_MAX_NEW_TOKENS: usize = 128;
 
@@ -198,6 +201,44 @@ impl RouterGetModelInfoResponse {
     }
 }
 
+pub struct RouterRuntime<T, W> {
+    engine: Engine<T, W>,
+}
+
+impl<T, W> RouterRuntime<T, W> {
+    pub fn new(engine: Engine<T, W>) -> Self {
+        Self { engine }
+    }
+
+    pub fn engine(&self) -> &Engine<T, W> {
+        &self.engine
+    }
+}
+
+impl<T, W> RouterRuntime<T, W>
+where
+    T: Tokenizer,
+    W: ModelWorker,
+{
+    pub fn generate(
+        &mut self,
+        request: RouterGenerateRequest,
+    ) -> Result<RouterGenerateResponse, RouterRuntimeError> {
+        let prompt_tokens = request
+            .tokenized
+            .as_ref()
+            .map(|tokenized| tokenized.input_ids.len() as i32)
+            .unwrap_or(0);
+        let token_request = request.try_into_token_generate_request()?;
+        let output = self.engine.generate_tokens(token_request)?;
+
+        Ok(RouterGenerateResponse::from_token_generate_output(
+            output,
+            prompt_tokens,
+        ))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RouterProtocolError {
     MissingRequestId,
@@ -218,3 +259,32 @@ impl fmt::Display for RouterProtocolError {
 }
 
 impl std::error::Error for RouterProtocolError {}
+
+#[derive(Debug)]
+pub enum RouterRuntimeError {
+    Protocol(RouterProtocolError),
+    Runtime(RuntimeError),
+}
+
+impl fmt::Display for RouterRuntimeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Protocol(error) => write!(formatter, "router protocol error: {error}"),
+            Self::Runtime(error) => write!(formatter, "router runtime error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for RouterRuntimeError {}
+
+impl From<RouterProtocolError> for RouterRuntimeError {
+    fn from(value: RouterProtocolError) -> Self {
+        Self::Protocol(value)
+    }
+}
+
+impl From<RuntimeError> for RouterRuntimeError {
+    fn from(value: RuntimeError) -> Self {
+        Self::Runtime(value)
+    }
+}
