@@ -17,12 +17,13 @@ This repository currently contains the first `sglang-srt` runtime crate:
   preserved for incremental upstream compatibility. The crate builds both
   `sglang` and `sglang-rs` binaries so the upstream command shape works.
 - `engine`: text and tokenized request lifecycle glue that drives prefill and
-  decode until completion.
+  decode until completion, with a token stream path that preserves incremental
+  prefill/decode outputs for router streaming.
 - `router`: SGLang gateway/router protocol boundary types for tokenized
   `Generate` requests/responses using the current `tokenized.input_ids: u32`
   and `chunk`/`complete` stream shape, plus health and model-info responses used
   during worker registration. `RouterRuntime` adapts these requests into the
-  engine's tokenized generation path.
+  engine's tokenized generation and streaming paths.
 - `tokenizer`: tokenizer trait plus a temporary byte tokenizer for tests.
 - `scheduler`: waiting queue, prefill/decode batch formation, request stages,
   uncached-token budgeted prefill batching, decode requeueing,

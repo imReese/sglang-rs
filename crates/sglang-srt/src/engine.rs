@@ -91,26 +91,62 @@ where
         })
     }
 
+    pub fn generate_token_stream(
+        &mut self,
+        request: TokenGenerateRequest,
+    ) -> Result<Vec<TokenGenerateOutput>, RuntimeError> {
+        let outputs = self.generate_scheduled_stream(ScheduledRequest::new(
+            request.request_id,
+            request.input_ids,
+            request.sampling,
+        ))?;
+
+        Ok(outputs
+            .into_iter()
+            .map(|output| TokenGenerateOutput {
+                request_id: output.request_id,
+                output_ids: output.token_ids,
+                finished: output.finished,
+            })
+            .collect())
+    }
+
     fn generate_scheduled(
         &mut self,
         request: ScheduledRequest,
     ) -> Result<ScheduledOutput, RuntimeError> {
+        let outputs = self.generate_scheduled_stream(request)?;
+        let mut output_ids = Vec::new();
+        let mut final_output = None;
+
+        for output in outputs {
+            output_ids.extend_from_slice(&output.token_ids);
+            final_output = Some(output);
+        }
+
+        let final_output = final_output.ok_or(SchedulerError::EmptyQueue)?;
+
+        Ok(ScheduledOutput {
+            request_id: final_output.request_id,
+            token_ids: output_ids,
+            finished: final_output.finished,
+        })
+    }
+
+    fn generate_scheduled_stream(
+        &mut self,
+        request: ScheduledRequest,
+    ) -> Result<Vec<ScheduledOutput>, RuntimeError> {
         self.scheduler.enqueue(request);
         let mut scheduled_output = self.scheduler.dispatch_next()?;
-        let request_id = scheduled_output.request_id.clone();
-        let mut output_ids = Vec::new();
-        output_ids.extend_from_slice(&scheduled_output.token_ids);
+        let mut outputs = vec![scheduled_output.clone()];
 
         while !scheduled_output.finished {
             scheduled_output = self.next_decode_output()?;
-            output_ids.extend_from_slice(&scheduled_output.token_ids);
+            outputs.push(scheduled_output.clone());
         }
 
-        Ok(ScheduledOutput {
-            request_id,
-            token_ids: output_ids,
-            finished: scheduled_output.finished,
-        })
+        Ok(outputs)
     }
 
     fn next_decode_output(&mut self) -> Result<ScheduledOutput, RuntimeError> {

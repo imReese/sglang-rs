@@ -237,6 +237,50 @@ where
             prompt_tokens,
         ))
     }
+
+    pub fn generate_stream(
+        &mut self,
+        request: RouterGenerateRequest,
+    ) -> Result<Vec<RouterGenerateResponse>, RouterRuntimeError> {
+        let prompt_tokens = request
+            .tokenized
+            .as_ref()
+            .map(|tokenized| tokenized.input_ids.len() as i32)
+            .unwrap_or(0);
+        let token_request = request.try_into_token_generate_request()?;
+        let outputs = self.engine.generate_token_stream(token_request)?;
+        let mut output_ids = Vec::new();
+        let mut responses = Vec::with_capacity(outputs.len());
+
+        for output in outputs {
+            let request_id = output.request_id.as_str().to_string();
+            output_ids.extend_from_slice(&output.output_ids);
+            let completion_tokens = output_ids.len() as i32;
+
+            let body = if output.finished {
+                RouterGenerateResponseBody::Complete(RouterGenerateComplete {
+                    output_ids: output_ids.clone(),
+                    finish_reason: "stop".to_string(),
+                    prompt_tokens,
+                    completion_tokens,
+                    cached_tokens: 0,
+                    index: 0,
+                })
+            } else {
+                RouterGenerateResponseBody::Chunk(RouterGenerateStreamChunk {
+                    token_ids: output.output_ids,
+                    prompt_tokens,
+                    completion_tokens,
+                    cached_tokens: 0,
+                    index: 0,
+                })
+            };
+
+            responses.push(RouterGenerateResponse { request_id, body });
+        }
+
+        Ok(responses)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

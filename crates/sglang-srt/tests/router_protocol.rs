@@ -25,6 +25,24 @@ impl ModelWorker for RouterEchoWorker {
     }
 }
 
+#[derive(Default)]
+struct TwoStepRouterWorker {
+    seen_modes: Vec<sglang_srt::scheduler::ForwardMode>,
+}
+
+impl ModelWorker for TwoStepRouterWorker {
+    fn generate_batch(&mut self, batch: &ScheduleBatch) -> BatchGeneratedTokens {
+        self.seen_modes.push(batch.forward_mode());
+        let token = match batch.forward_mode() {
+            sglang_srt::scheduler::ForwardMode::Prefill => GeneratedToken::unfinished(vec![42]),
+            sglang_srt::scheduler::ForwardMode::Decode => GeneratedToken::finished(vec![43]),
+        };
+
+        BatchGeneratedTokens::from_batch(batch, vec![token])
+            .expect("output shape should match batch")
+    }
+}
+
 #[test]
 fn router_generate_request_maps_to_tokenized_engine_request() {
     let request = RouterGenerateRequest {
@@ -208,5 +226,63 @@ fn router_runtime_executes_generate_request_through_engine() {
     assert_eq!(
         runtime.engine().scheduler().worker().seen_input_ids,
         vec![9, 8, 7]
+    );
+}
+
+#[test]
+fn router_runtime_streams_prefill_chunks_and_final_complete_response() {
+    let tokenizer = ByteTokenizer::default();
+    let scheduler = Scheduler::new(TwoStepRouterWorker::default());
+    let engine = Engine::new(tokenizer, scheduler);
+    let mut runtime = RouterRuntime::new(engine);
+
+    let responses = runtime
+        .generate_stream(RouterGenerateRequest {
+            request_id: "router-stream".to_string(),
+            tokenized: Some(RouterTokenizedInput {
+                original_text: String::new(),
+                input_ids: vec![1, 2, 3],
+            }),
+            sampling_params: Some(RouterSamplingParams {
+                max_new_tokens: Some(2),
+            }),
+            stream: true,
+            data_parallel_rank: 0,
+            trace_headers: Default::default(),
+        })
+        .expect("router stream should execute");
+
+    assert_eq!(
+        responses,
+        vec![
+            RouterGenerateResponse {
+                request_id: "router-stream".to_string(),
+                body: RouterGenerateResponseBody::Chunk(RouterGenerateStreamChunk {
+                    token_ids: vec![42],
+                    prompt_tokens: 3,
+                    completion_tokens: 1,
+                    cached_tokens: 0,
+                    index: 0,
+                }),
+            },
+            RouterGenerateResponse {
+                request_id: "router-stream".to_string(),
+                body: RouterGenerateResponseBody::Complete(RouterGenerateComplete {
+                    output_ids: vec![42, 43],
+                    finish_reason: "stop".to_string(),
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                    cached_tokens: 0,
+                    index: 0,
+                }),
+            },
+        ]
+    );
+    assert_eq!(
+        runtime.engine().scheduler().worker().seen_modes,
+        vec![
+            sglang_srt::scheduler::ForwardMode::Prefill,
+            sglang_srt::scheduler::ForwardMode::Decode,
+        ]
     );
 }
