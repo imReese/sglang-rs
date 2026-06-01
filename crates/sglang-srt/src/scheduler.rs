@@ -4,7 +4,7 @@ use std::fmt;
 use crate::cache::{
     CacheAllocationError, CachePageAllocator, CachePageId, PrefixMatch, RadixCache,
 };
-use crate::types::{DisaggregatedParams, RequestId, SamplingParams};
+use crate::types::{DisaggregatedParams, FAKE_BOOTSTRAP_HOST, RequestId, SamplingParams};
 use crate::worker::{GeneratedToken, WorkerExecutor};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,6 +83,12 @@ impl ScheduledRequest {
 
     pub fn disaggregated_params(&self) -> Option<&DisaggregatedParams> {
         self.disaggregated_params.as_ref()
+    }
+
+    pub fn skips_radix_cache_insert(&self) -> bool {
+        self.disaggregated_params
+            .as_ref()
+            .is_some_and(|params| params.bootstrap_host == FAKE_BOOTSTRAP_HOST)
     }
 
     pub fn stage(&self) -> RequestStage {
@@ -445,7 +451,7 @@ where
     }
 
     fn publish_prefill_cache_pages(&mut self, request: &ScheduledRequest) {
-        if request.allocated_cache_pages().is_empty() {
+        if request.allocated_cache_pages().is_empty() || request.skips_radix_cache_insert() {
             return;
         }
 

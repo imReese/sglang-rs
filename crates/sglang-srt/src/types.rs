@@ -18,6 +18,8 @@ pub struct SamplingParams {
     pub max_new_tokens: usize,
 }
 
+pub const FAKE_BOOTSTRAP_HOST: &str = "2.2.2.2";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DisaggregatedParams {
     pub bootstrap_host: String,

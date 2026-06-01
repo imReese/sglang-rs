@@ -1,7 +1,7 @@
 use sglang_srt::cache::{CacheAllocationError, CachePageAllocator, CachePageId, RadixCache};
 use sglang_srt::model_executor::ModelWorkerBatch;
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler, SchedulerError};
-use sglang_srt::types::{RequestId, SamplingParams};
+use sglang_srt::types::{DisaggregatedParams, FAKE_BOOTSTRAP_HOST, RequestId, SamplingParams};
 use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
 
 #[derive(Default)]
@@ -119,6 +119,39 @@ fn successful_prefill_dispatch_publishes_allocated_pages_to_radix_cache_for_futu
         batch.requests()[0].allocated_cache_pages(),
         &[CachePageId::from(3)]
     );
+}
+
+#[test]
+fn fake_bootstrap_prefill_dispatch_does_not_publish_pages_to_radix_cache() {
+    let mut scheduler = Scheduler::with_cache_resources(
+        NoopWorker,
+        RadixCache::default(),
+        CachePageAllocator::new(8),
+    );
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("req-fake-bootstrap"),
+            vec![1, 2, 3],
+            SamplingParams { max_new_tokens: 1 },
+        )
+        .with_disaggregated_params(Some(DisaggregatedParams {
+            bootstrap_host: FAKE_BOOTSTRAP_HOST.to_string(),
+            bootstrap_port: 8998,
+            bootstrap_room: 0,
+        })),
+    );
+
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("fake bootstrap prefill should dispatch");
+
+    enqueue_request(&mut scheduler, "req-normal", &[1, 2, 3, 4]);
+    let batch = scheduler
+        .next_prefill_batch(1)
+        .expect("batch should be available");
+
+    assert!(batch.requests()[0].prefix_cache_pages().is_empty());
+    assert_eq!(batch.requests()[0].uncached_input_ids(), &[1, 2, 3, 4]);
 }
 
 #[test]

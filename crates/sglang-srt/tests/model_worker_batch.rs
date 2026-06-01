@@ -1,7 +1,7 @@
 use sglang_srt::cache::{CachePageId, RadixCache};
 use sglang_srt::model_executor::ModelWorkerBatch;
 use sglang_srt::scheduler::{ForwardMode, ScheduleBatch, ScheduledRequest, Scheduler};
-use sglang_srt::types::{DisaggregatedParams, RequestId, SamplingParams};
+use sglang_srt::types::{DisaggregatedParams, FAKE_BOOTSTRAP_HOST, RequestId, SamplingParams};
 use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
 
 #[derive(Default)]
@@ -167,6 +167,22 @@ fn model_worker_batch_exposes_pd_bootstrap_metadata() {
             bootstrap_room: 123,
         })]
     );
+}
+
+#[test]
+fn scheduled_request_detects_fake_bootstrap_radix_cache_skip() {
+    let request = ScheduledRequest::new(
+        RequestId::from("fake-bootstrap"),
+        vec![1, 2, 3],
+        SamplingParams { max_new_tokens: 1 },
+    )
+    .with_disaggregated_params(Some(DisaggregatedParams {
+        bootstrap_host: FAKE_BOOTSTRAP_HOST.to_string(),
+        bootstrap_port: 8998,
+        bootstrap_room: 0,
+    }));
+
+    assert!(request.skips_radix_cache_insert());
 }
 
 fn enqueue_request<W>(scheduler: &mut Scheduler<W>, request_id: &str, input_ids: &[u32]) {
