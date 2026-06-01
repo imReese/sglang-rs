@@ -2,10 +2,11 @@ use sglang_srt::cache::{CachePageAllocator, RadixCache};
 use sglang_srt::cli::ServerArgs;
 use sglang_srt::engine::Engine;
 use sglang_srt::router::{
-    DEFAULT_MAX_NEW_TOKENS, RouterFlushCacheResponse, RouterGenerateComplete,
-    RouterGenerateRequest, RouterGenerateResponse, RouterGenerateResponseBody,
-    RouterGenerateStreamChunk, RouterGetModelInfoResponse, RouterHealthCheckResponse,
-    RouterProtocolError, RouterRuntime, RouterSamplingParams, RouterTokenizedInput,
+    DEFAULT_MAX_NEW_TOKENS, RouterDisaggregatedParams, RouterFlushCacheResponse,
+    RouterGenerateComplete, RouterGenerateRequest, RouterGenerateResponse,
+    RouterGenerateResponseBody, RouterGenerateStreamChunk, RouterGetModelInfoResponse,
+    RouterHealthCheckResponse, RouterProtocolError, RouterRuntime, RouterSamplingParams,
+    RouterTokenizedInput,
 };
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::tokenizer::ByteTokenizer;
@@ -65,6 +66,7 @@ fn router_generate_request_maps_to_tokenized_engine_request() {
         sampling_params: Some(RouterSamplingParams {
             max_new_tokens: Some(7),
         }),
+        disaggregated_params: None,
         stream: true,
         data_parallel_rank: 2,
         trace_headers: [("traceparent".to_string(), "00-abc".to_string())].into(),
@@ -77,6 +79,40 @@ fn router_generate_request_maps_to_tokenized_engine_request() {
     assert_eq!(token_request.request_id, RequestId::from("router-rid"));
     assert_eq!(token_request.input_ids, vec![101, 202, 303]);
     assert_eq!(token_request.sampling, SamplingParams { max_new_tokens: 7 });
+    assert!(token_request.disaggregated_params.is_none());
+}
+
+#[test]
+fn router_generate_request_preserves_disaggregated_params_for_pd() {
+    let request = RouterGenerateRequest {
+        request_id: "router-pd".to_string(),
+        tokenized: Some(RouterTokenizedInput {
+            original_text: String::new(),
+            input_ids: vec![101, 202],
+        }),
+        sampling_params: None,
+        disaggregated_params: Some(RouterDisaggregatedParams {
+            bootstrap_host: "10.0.0.7".to_string(),
+            bootstrap_port: 8998,
+            bootstrap_room: 123,
+        }),
+        stream: true,
+        data_parallel_rank: 0,
+        trace_headers: Default::default(),
+    };
+
+    let token_request = request
+        .try_into_token_generate_request()
+        .expect("router request should map");
+
+    assert_eq!(
+        token_request.disaggregated_params,
+        Some(sglang_srt::types::DisaggregatedParams {
+            bootstrap_host: "10.0.0.7".to_string(),
+            bootstrap_port: 8998,
+            bootstrap_room: 123,
+        })
+    );
 }
 
 #[test]
@@ -88,6 +124,7 @@ fn router_sampling_params_default_to_sglang_max_new_tokens() {
             input_ids: vec![1],
         }),
         sampling_params: None,
+        disaggregated_params: None,
         stream: false,
         data_parallel_rank: 0,
         trace_headers: Default::default(),
@@ -111,6 +148,7 @@ fn router_generate_request_rejects_missing_tokenized_input() {
         request_id: "missing-tokenized".to_string(),
         tokenized: None,
         sampling_params: None,
+        disaggregated_params: None,
         stream: false,
         data_parallel_rank: 0,
         trace_headers: Default::default(),
@@ -216,6 +254,7 @@ fn router_runtime_executes_generate_request_through_engine() {
             sampling_params: Some(RouterSamplingParams {
                 max_new_tokens: Some(2),
             }),
+            disaggregated_params: None,
             stream: true,
             data_parallel_rank: 0,
             trace_headers: Default::default(),
@@ -257,6 +296,7 @@ fn router_runtime_streams_prefill_chunks_and_final_complete_response() {
             sampling_params: Some(RouterSamplingParams {
                 max_new_tokens: Some(2),
             }),
+            disaggregated_params: None,
             stream: true,
             data_parallel_rank: 0,
             trace_headers: Default::default(),
@@ -319,6 +359,7 @@ fn router_runtime_flush_cache_calls_scheduler_and_reports_success() {
             sampling_params: Some(RouterSamplingParams {
                 max_new_tokens: Some(2),
             }),
+            disaggregated_params: None,
             stream: false,
             data_parallel_rank: 0,
             trace_headers: Default::default(),

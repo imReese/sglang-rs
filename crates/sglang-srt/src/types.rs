@@ -19,6 +19,13 @@ pub struct SamplingParams {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisaggregatedParams {
+    pub bootstrap_host: String,
+    pub bootstrap_port: u16,
+    pub bootstrap_room: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GenerateRequest {
     pub request_id: RequestId,
     pub prompt: String,
@@ -37,6 +44,7 @@ pub struct TokenGenerateRequest {
     pub request_id: RequestId,
     pub input_ids: Vec<u32>,
     pub sampling: SamplingParams,
+    pub disaggregated_params: Option<DisaggregatedParams>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

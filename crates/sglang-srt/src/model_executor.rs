@@ -1,6 +1,6 @@
 use crate::cache::CachePageId;
 use crate::scheduler::{ForwardMode, ScheduleBatch, ScheduledRequest};
-use crate::types::RequestId;
+use crate::types::{DisaggregatedParams, RequestId};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelWorkerBatch {
@@ -12,6 +12,7 @@ pub struct ModelWorkerBatch {
     request_offsets: Vec<usize>,
     prefix_cache_pages: Vec<Vec<CachePageId>>,
     out_cache_pages: Vec<CachePageId>,
+    disaggregated_params: Vec<Option<DisaggregatedParams>>,
 }
 
 impl ModelWorkerBatch {
@@ -25,6 +26,7 @@ impl ModelWorkerBatch {
             request_offsets: Vec::with_capacity(batch.batch_size()),
             prefix_cache_pages: Vec::with_capacity(batch.batch_size()),
             out_cache_pages: Vec::new(),
+            disaggregated_params: Vec::with_capacity(batch.batch_size()),
         };
 
         for request in batch.requests() {
@@ -66,11 +68,17 @@ impl ModelWorkerBatch {
         &self.out_cache_pages
     }
 
+    pub fn disaggregated_params(&self) -> &[Option<DisaggregatedParams>] {
+        &self.disaggregated_params
+    }
+
     fn push_request(&mut self, forward_mode: ForwardMode, request: &ScheduledRequest) {
         self.request_ids.push(request.request_id().clone());
         self.request_offsets.push(self.input_ids.len());
         self.prefix_cache_pages
             .push(request.prefix_cache_pages().to_vec());
+        self.disaggregated_params
+            .push(request.disaggregated_params().cloned());
 
         match forward_mode {
             ForwardMode::Prefill => self.push_prefill_request(request),

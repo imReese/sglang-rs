@@ -4,7 +4,9 @@ use std::fmt;
 use crate::cli::ServerArgs;
 use crate::engine::{Engine, RuntimeError};
 use crate::tokenizer::Tokenizer;
-use crate::types::{RequestId, SamplingParams, TokenGenerateOutput, TokenGenerateRequest};
+use crate::types::{
+    DisaggregatedParams, RequestId, SamplingParams, TokenGenerateOutput, TokenGenerateRequest,
+};
 use crate::worker::WorkerExecutor;
 
 pub const DEFAULT_MAX_NEW_TOKENS: usize = 128;
@@ -34,11 +36,29 @@ pub struct RouterTokenizedInput {
     pub input_ids: Vec<u32>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouterDisaggregatedParams {
+    pub bootstrap_host: String,
+    pub bootstrap_port: u16,
+    pub bootstrap_room: i32,
+}
+
+impl From<RouterDisaggregatedParams> for DisaggregatedParams {
+    fn from(value: RouterDisaggregatedParams) -> Self {
+        Self {
+            bootstrap_host: value.bootstrap_host,
+            bootstrap_port: value.bootstrap_port,
+            bootstrap_room: value.bootstrap_room,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RouterGenerateRequest {
     pub request_id: String,
     pub tokenized: Option<RouterTokenizedInput>,
     pub sampling_params: Option<RouterSamplingParams>,
+    pub disaggregated_params: Option<RouterDisaggregatedParams>,
     pub stream: bool,
     pub data_parallel_rank: i32,
     pub trace_headers: BTreeMap<String, String>,
@@ -64,6 +84,7 @@ impl RouterGenerateRequest {
             request_id: RequestId::from(self.request_id.as_str()),
             input_ids: tokenized.input_ids,
             sampling,
+            disaggregated_params: self.disaggregated_params.map(Into::into),
         })
     }
 }

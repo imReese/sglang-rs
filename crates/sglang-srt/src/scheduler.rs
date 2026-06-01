@@ -4,7 +4,7 @@ use std::fmt;
 use crate::cache::{
     CacheAllocationError, CachePageAllocator, CachePageId, PrefixMatch, RadixCache,
 };
-use crate::types::{RequestId, SamplingParams};
+use crate::types::{DisaggregatedParams, RequestId, SamplingParams};
 use crate::worker::{GeneratedToken, WorkerExecutor};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,6 +29,7 @@ pub struct ScheduledRequest {
     output_ids: Vec<u32>,
     allocated_cache_pages: Vec<CachePageId>,
     sampling: SamplingParams,
+    disaggregated_params: Option<DisaggregatedParams>,
     prefix_match: PrefixMatch,
     stage: RequestStage,
 }
@@ -42,6 +43,7 @@ impl ScheduledRequest {
             output_ids: Vec::new(),
             allocated_cache_pages: Vec::new(),
             sampling,
+            disaggregated_params: None,
             prefix_match: PrefixMatch {
                 matched_token_count: 0,
                 cache_pages: Vec::new(),
@@ -49,6 +51,14 @@ impl ScheduledRequest {
             },
             stage: RequestStage::PrefillWaiting,
         }
+    }
+
+    pub fn with_disaggregated_params(
+        mut self,
+        disaggregated_params: Option<DisaggregatedParams>,
+    ) -> Self {
+        self.disaggregated_params = disaggregated_params;
+        self
     }
 
     pub fn request_id(&self) -> &RequestId {
@@ -69,6 +79,10 @@ impl ScheduledRequest {
 
     pub fn sampling(&self) -> &SamplingParams {
         &self.sampling
+    }
+
+    pub fn disaggregated_params(&self) -> Option<&DisaggregatedParams> {
+        self.disaggregated_params.as_ref()
     }
 
     pub fn stage(&self) -> RequestStage {

@@ -24,8 +24,10 @@ This repository currently contains the first `sglang-srt` runtime crate:
   `Generate` requests/responses using the current `tokenized.input_ids: u32`
   and `chunk`/`complete` stream shape, plus health and model-info responses used
   during worker registration. `RouterRuntime` adapts these requests into the
-  engine's tokenized generation and streaming paths, and exposes a flush-cache
-  control operation for gateway control-plane calls.
+  engine's tokenized generation and streaming paths, preserves PD bootstrap
+  metadata (`bootstrap_host`, `bootstrap_port`, `bootstrap_room`) for downstream
+  worker execution, and exposes a flush-cache control operation for gateway
+  control-plane calls.
 - `tokenizer`: tokenizer trait plus a temporary byte tokenizer for tests.
 - `scheduler`: waiting queue, prefill/decode batch formation, request stages,
   uncached-token budgeted prefill batching, decode requeueing,
@@ -37,7 +39,9 @@ This repository currently contains the first `sglang-srt` runtime crate:
   SGLang disaggregation.
 - `model_executor`: prepared model-worker batches with flattened input ids,
   positions, sequence lengths, request offsets, and prefix cache pages for the
-  future CUDA/model executor boundary.
+  future CUDA/model executor boundary. PD bootstrap metadata is carried per
+  request so the later KV transfer implementation has the same context that
+  SGLang attaches to disaggregated requests.
 - `cache`: RadixCache-style token-prefix matching plus a finite KV cache page
   allocator for page assignment/reuse and safe full reset when no decode request
   is active.

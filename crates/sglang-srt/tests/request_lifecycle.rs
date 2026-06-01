@@ -102,6 +102,7 @@ fn tokenized_generation_request_bypasses_tokenizer_for_router_generate_rpc() {
             request_id: RequestId::from("router-req"),
             input_ids: vec![11, 22, 33],
             sampling: SamplingParams { max_new_tokens: 2 },
+            disaggregated_params: None,
         })
         .expect("token request should run");
 

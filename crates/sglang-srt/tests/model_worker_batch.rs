@@ -1,7 +1,7 @@
 use sglang_srt::cache::{CachePageId, RadixCache};
 use sglang_srt::model_executor::ModelWorkerBatch;
 use sglang_srt::scheduler::{ForwardMode, ScheduleBatch, ScheduledRequest, Scheduler};
-use sglang_srt::types::{RequestId, SamplingParams};
+use sglang_srt::types::{DisaggregatedParams, RequestId, SamplingParams};
 use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
 
 #[derive(Default)]
@@ -137,6 +137,36 @@ fn worker_can_prepare_model_worker_batch_from_scheduler_dispatch() {
     );
     assert_eq!(worker_batch.input_ids(), &[1, 2, 3]);
     assert_eq!(worker_batch.request_offsets(), &[0, 2]);
+}
+
+#[test]
+fn model_worker_batch_exposes_pd_bootstrap_metadata() {
+    let request = ScheduledRequest::new(
+        RequestId::from("pd-bootstrap"),
+        vec![1, 2, 3],
+        SamplingParams { max_new_tokens: 2 },
+    )
+    .with_disaggregated_params(Some(DisaggregatedParams {
+        bootstrap_host: "10.0.0.7".to_string(),
+        bootstrap_port: 8998,
+        bootstrap_room: 123,
+    }));
+    let mut scheduler = Scheduler::new(NoopWorker);
+    scheduler.enqueue(request);
+
+    let batch = scheduler
+        .next_prefill_batch(1)
+        .expect("prefill batch should be created");
+    let worker_batch = ModelWorkerBatch::from_schedule_batch(&batch);
+
+    assert_eq!(
+        worker_batch.disaggregated_params(),
+        &[Some(DisaggregatedParams {
+            bootstrap_host: "10.0.0.7".to_string(),
+            bootstrap_port: 8998,
+            bootstrap_room: 123,
+        })]
+    );
 }
 
 fn enqueue_request<W>(scheduler: &mut Scheduler<W>, request_id: &str, input_ids: &[u32]) {

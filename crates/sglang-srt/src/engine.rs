@@ -82,11 +82,10 @@ where
         &mut self,
         request: TokenGenerateRequest,
     ) -> Result<TokenGenerateOutput, RuntimeError> {
-        let output = self.generate_scheduled(ScheduledRequest::new(
-            request.request_id,
-            request.input_ids,
-            request.sampling,
-        ))?;
+        let output = self.generate_scheduled(
+            ScheduledRequest::new(request.request_id, request.input_ids, request.sampling)
+                .with_disaggregated_params(request.disaggregated_params),
+        )?;
 
         Ok(TokenGenerateOutput {
             request_id: output.request_id,
@@ -99,11 +98,10 @@ where
         &mut self,
         request: TokenGenerateRequest,
     ) -> Result<Vec<TokenGenerateOutput>, RuntimeError> {
-        let outputs = self.generate_scheduled_stream(ScheduledRequest::new(
-            request.request_id,
-            request.input_ids,
-            request.sampling,
-        ))?;
+        let outputs = self.generate_scheduled_stream(
+            ScheduledRequest::new(request.request_id, request.input_ids, request.sampling)
+                .with_disaggregated_params(request.disaggregated_params),
+        )?;
 
         Ok(outputs
             .into_iter()
