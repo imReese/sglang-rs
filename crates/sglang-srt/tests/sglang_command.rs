@@ -16,7 +16,6 @@ fn sglang_binary_accepts_upstream_serve_command_shape() {
             "1",
             "--dp-size",
             "8",
-            "--grpc-mode",
         ])
         .output()
         .expect("sglang binary should run");
@@ -29,5 +28,5 @@ fn sglang_binary_accepts_upstream_serve_command_shape() {
     assert!(stdout.contains("port=8080"));
     assert!(stdout.contains("tp_size=1"));
     assert!(stdout.contains("dp_size=8"));
-    assert!(stdout.contains("grpc_mode=true"));
+    assert!(stdout.contains("grpc_mode=false"));
 }

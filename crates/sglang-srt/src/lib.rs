@@ -6,6 +6,7 @@ pub mod model_executor;
 pub mod proto;
 pub mod router;
 pub mod scheduler;
+pub mod server;
 pub mod tokenizer;
 pub mod transfer;
 pub mod types;
