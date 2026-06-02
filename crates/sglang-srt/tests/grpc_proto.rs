@@ -5,7 +5,9 @@ use tonic::{Code, Request};
 use sglang_srt::cache::{CachePageAllocator, RadixCache};
 use sglang_srt::cli::ServerArgs;
 use sglang_srt::engine::Engine;
-use sglang_srt::grpc::{GrpcRouterService, router_protocol_error_to_status};
+use sglang_srt::grpc::{
+    GrpcRouterService, SGLANG_RUNTIME_FILE_DESCRIPTOR_SET, router_protocol_error_to_status,
+};
 use sglang_srt::proto::sglang::runtime::v1::generate_response::Body;
 use sglang_srt::proto::sglang::runtime::v1::sglang_service_server::SglangService;
 use sglang_srt::proto::sglang::runtime::v1::{
@@ -76,6 +78,20 @@ fn generated_proto_generate_request_round_trips_with_prost() {
             .trace_headers
             .get("traceparent"),
         Some(&"00-abc".to_string())
+    );
+}
+
+#[test]
+fn grpc_reflection_descriptor_registers_runtime_service() {
+    let reflection_service = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(SGLANG_RUNTIME_FILE_DESCRIPTOR_SET)
+        .build_v1();
+
+    assert!(reflection_service.is_ok());
+    assert!(
+        SGLANG_RUNTIME_FILE_DESCRIPTOR_SET
+            .windows(b"SglangService".len())
+            .any(|window| window == b"SglangService")
     );
 }
 

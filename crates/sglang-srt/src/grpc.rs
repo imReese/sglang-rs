@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
@@ -7,7 +9,9 @@ use tonic::{Code, Request, Response, Status};
 use crate::cli::ServerArgs;
 use crate::engine::Engine;
 use crate::proto::sglang::runtime::v1::generate_response::Body as ProtoGenerateResponseBody;
-use crate::proto::sglang::runtime::v1::sglang_service_server::SglangService;
+use crate::proto::sglang::runtime::v1::sglang_service_server::{
+    SglangService, SglangServiceServer,
+};
 use crate::proto::sglang::runtime::v1::{
     AbortRequest, ClassifyRequest, ClassifyResponse, ContinueGenerationRequest, ControlResponse,
     DetokenizeRequest, DetokenizeResponse, EmbedRequest, EmbedResponse, FlushCacheRequest,
@@ -39,9 +43,42 @@ type OpenAiJsonResponseStream = Pin<
     Box<dyn tonic::codegen::tokio_stream::Stream<Item = Result<OpenAiJsonResponse, Status>> + Send>,
 >;
 
+pub const SGLANG_RUNTIME_FILE_DESCRIPTOR_SET: &[u8] =
+    tonic::include_file_descriptor_set!("sglang_runtime_descriptor");
+
+#[derive(Clone)]
 pub struct GrpcRouterService<T, W> {
     runtime: Arc<Mutex<RouterRuntime<T, W>>>,
     model_info: Option<RouterGetModelInfoResponse>,
+}
+
+#[derive(Debug)]
+pub enum GrpcServeError {
+    Reflection(tonic_reflection::server::Error),
+    Transport(tonic::transport::Error),
+}
+
+impl fmt::Display for GrpcServeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Reflection(error) => write!(formatter, "gRPC reflection error: {error}"),
+            Self::Transport(error) => write!(formatter, "gRPC transport error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for GrpcServeError {}
+
+impl From<tonic_reflection::server::Error> for GrpcServeError {
+    fn from(value: tonic_reflection::server::Error) -> Self {
+        Self::Reflection(value)
+    }
+}
+
+impl From<tonic::transport::Error> for GrpcServeError {
+    fn from(value: tonic::transport::Error) -> Self {
+        Self::Transport(value)
+    }
 }
 
 impl<T, W> GrpcRouterService<T, W> {
@@ -101,6 +138,39 @@ pub fn router_protocol_error_to_status(error: RouterProtocolError) -> Status {
         router_status_code_to_grpc_code(error.status_code()),
         error.to_string(),
     )
+}
+
+pub async fn serve_grpc_router<T, W>(
+    addr: SocketAddr,
+    service: GrpcRouterService<T, W>,
+    enable_reflection: bool,
+) -> Result<(), GrpcServeError>
+where
+    T: Tokenizer + Send + 'static,
+    W: WorkerExecutor + Send + 'static,
+{
+    let sglang_service = SglangServiceServer::new(service);
+
+    if enable_reflection {
+        let reflection_service = tonic_reflection::server::Builder::configure()
+            .register_encoded_file_descriptor_set(SGLANG_RUNTIME_FILE_DESCRIPTOR_SET)
+            .build_v1()?;
+
+        tonic::transport::Server::builder()
+            .add_service(sglang_service)
+            .add_service(reflection_service)
+            .serve(addr)
+            .await?;
+
+        return Ok(());
+    }
+
+    tonic::transport::Server::builder()
+        .add_service(sglang_service)
+        .serve(addr)
+        .await?;
+
+    Ok(())
 }
 
 fn router_runtime_error_to_status(error: RouterRuntimeError) -> Status {

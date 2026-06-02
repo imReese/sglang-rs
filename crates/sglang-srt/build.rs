@@ -15,9 +15,12 @@ fn compile_proto() {
         .expect("crate lives under workspace/crates/sglang-srt");
     let proto_root = workspace_root.join("proto");
     let sglang_proto = proto_root.join("sglang/runtime/v1/sglang.proto");
+    let descriptor_path = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set"))
+        .join("sglang_runtime_descriptor.bin");
 
     println!("cargo:rerun-if-changed={}", sglang_proto.display());
     tonic_prost_build::configure()
+        .file_descriptor_set_path(descriptor_path)
         .compile_protos(&[sglang_proto], &[proto_root])
         .expect("sglang runtime proto should compile");
 }
