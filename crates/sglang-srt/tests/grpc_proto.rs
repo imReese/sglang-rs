@@ -9,7 +9,7 @@ use sglang_srt::proto::sglang::runtime::v1::generate_response::Body;
 use sglang_srt::proto::sglang::runtime::v1::sglang_service_server::SglangService;
 use sglang_srt::proto::sglang::runtime::v1::{
     DetokenizeRequest, FlushCacheRequest, GenerateRequest, GetLoadRequest, RequestOptions,
-    SamplingParams, TokenizeRequest,
+    SamplingParams, TextGenerateRequest, TokenizeRequest,
 };
 use sglang_srt::router::{RouterProtocolError, RouterRuntime};
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
@@ -166,6 +166,73 @@ async fn grpc_generate_streams_router_runtime_outputs() {
 }
 
 #[tokio::test]
+async fn grpc_text_generate_tokenizes_prompt_and_streams_decoded_text() {
+    let service = GrpcRouterService::from_engine(Engine::new(
+        ByteTokenizer,
+        Scheduler::new(GrpcTwoStepWorker),
+    ));
+
+    let mut stream = service
+        .text_generate(Request::new(TextGenerateRequest {
+            text: "Hello".to_string(),
+            sampling_params: Some(SamplingParams {
+                max_new_tokens: Some(2),
+                ..Default::default()
+            }),
+            options: Some(RequestOptions {
+                request_id: Some("grpc-text".to_string()),
+                stream: true,
+                data_parallel_rank: 0,
+                trace_headers: Default::default(),
+            }),
+            disaggregated_params: None,
+        }))
+        .await
+        .expect("grpc text generate should execute")
+        .into_inner();
+
+    let first = stream
+        .next()
+        .await
+        .expect("first response")
+        .expect("first response ok");
+    let second = stream
+        .next()
+        .await
+        .expect("second response")
+        .expect("second response ok");
+
+    assert_eq!(
+        first.body,
+        Some(Body::Chunk(
+            sglang_srt::proto::sglang::runtime::v1::GenerateStreamChunk {
+                token_ids: vec![42],
+                text: "*".to_string(),
+                prompt_tokens: 5,
+                completion_tokens: 1,
+                cached_tokens: 0,
+                index: 0,
+            }
+        ))
+    );
+    assert_eq!(
+        second.body,
+        Some(Body::Complete(
+            sglang_srt::proto::sglang::runtime::v1::GenerateComplete {
+                output_ids: vec![42, 43],
+                text: "*+".to_string(),
+                finish_reason: "stop".to_string(),
+                prompt_tokens: 5,
+                completion_tokens: 2,
+                cached_tokens: 0,
+                index: 0,
+            }
+        ))
+    );
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
 async fn grpc_generate_maps_router_protocol_errors_to_status() {
     let service = GrpcRouterService::from_engine(Engine::new(
         ByteTokenizer,
@@ -188,6 +255,30 @@ async fn grpc_generate_maps_router_protocol_errors_to_status() {
 
     assert_eq!(error.code(), Code::InvalidArgument);
     assert!(error.message().contains("empty router tokenized input"));
+}
+
+#[tokio::test]
+async fn grpc_text_generate_maps_empty_text_to_invalid_argument() {
+    let service = GrpcRouterService::from_engine(Engine::new(
+        ByteTokenizer,
+        Scheduler::new(GrpcTwoStepWorker),
+    ));
+
+    let error = match service
+        .text_generate(Request::new(TextGenerateRequest {
+            text: String::new(),
+            sampling_params: None,
+            options: None,
+            disaggregated_params: None,
+        }))
+        .await
+    {
+        Ok(_) => panic!("empty text should be rejected"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert!(error.message().contains("empty router text input"));
 }
 
 #[tokio::test]

@@ -238,6 +238,17 @@ impl RouterGenerateRequest {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RouterTextGenerateRequest {
+    pub request_id: String,
+    pub text: String,
+    pub sampling_params: Option<RouterSamplingParams>,
+    pub disaggregated_params: Option<RouterDisaggregatedParams>,
+    pub stream: bool,
+    pub data_parallel_rank: i32,
+    pub trace_headers: BTreeMap<String, String>,
+}
+
 fn next_router_request_id() -> String {
     let sequence = ROUTER_REQUEST_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let timestamp_nanos = SystemTime::now()
@@ -294,6 +305,7 @@ impl RouterGenerateResponse {
         let body = if output.finished {
             RouterGenerateResponseBody::Complete(RouterGenerateComplete {
                 output_ids: output.output_ids,
+                text: String::new(),
                 finish_reason: "stop".to_string(),
                 prompt_tokens,
                 completion_tokens,
@@ -303,6 +315,7 @@ impl RouterGenerateResponse {
         } else {
             RouterGenerateResponseBody::Chunk(RouterGenerateStreamChunk {
                 token_ids: output.output_ids,
+                text: String::new(),
                 prompt_tokens,
                 completion_tokens,
                 cached_tokens: 0,
@@ -330,6 +343,7 @@ impl Default for RouterGenerateResponseBody {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RouterGenerateStreamChunk {
     pub token_ids: Vec<u32>,
+    pub text: String,
     pub prompt_tokens: i32,
     pub completion_tokens: i32,
     pub cached_tokens: i32,
@@ -339,6 +353,7 @@ pub struct RouterGenerateStreamChunk {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RouterGenerateComplete {
     pub output_ids: Vec<u32>,
+    pub text: String,
     pub finish_reason: String,
     pub prompt_tokens: i32,
     pub completion_tokens: i32,
@@ -530,6 +545,7 @@ where
             let body = if output.finished {
                 RouterGenerateResponseBody::Complete(RouterGenerateComplete {
                     output_ids: output_ids.clone(),
+                    text: String::new(),
                     finish_reason: "stop".to_string(),
                     prompt_tokens,
                     completion_tokens,
@@ -539,6 +555,7 @@ where
             } else {
                 RouterGenerateResponseBody::Chunk(RouterGenerateStreamChunk {
                     token_ids: output.output_ids,
+                    text: String::new(),
                     prompt_tokens,
                     completion_tokens,
                     cached_tokens: 0,
@@ -550,6 +567,58 @@ where
         }
 
         Ok(responses)
+    }
+
+    pub fn generate_text_stream(
+        &mut self,
+        request: RouterTextGenerateRequest,
+    ) -> Result<Vec<RouterGenerateResponse>, RouterRuntimeError> {
+        if request.text.is_empty() {
+            return Err(RouterProtocolError::EmptyTextInput.into());
+        }
+
+        let input_ids = self.engine.tokenize(&request.text);
+        let mut responses = self.generate_stream(RouterGenerateRequest {
+            request_id: request.request_id,
+            tokenized: Some(RouterTokenizedInput {
+                original_text: request.text,
+                input_ids,
+            }),
+            sampling_params: request.sampling_params,
+            disaggregated_params: request.disaggregated_params,
+            stream: request.stream,
+            data_parallel_rank: request.data_parallel_rank,
+            trace_headers: request.trace_headers,
+        })?;
+
+        for response in &mut responses {
+            self.fill_generate_response_text(response)?;
+        }
+
+        Ok(responses)
+    }
+
+    fn fill_generate_response_text(
+        &self,
+        response: &mut RouterGenerateResponse,
+    ) -> Result<(), RouterRuntimeError> {
+        match &mut response.body {
+            RouterGenerateResponseBody::Chunk(chunk) => {
+                chunk.text = self
+                    .engine
+                    .detokenize(&chunk.token_ids)
+                    .map_err(RuntimeError::from)?;
+            }
+            RouterGenerateResponseBody::Complete(complete) => {
+                complete.text = self
+                    .engine
+                    .detokenize(&complete.output_ids)
+                    .map_err(RuntimeError::from)?;
+            }
+            RouterGenerateResponseBody::Error(_) => {}
+        }
+
+        Ok(())
     }
 
     pub fn flush_cache(&mut self) -> RouterFlushCacheResponse {
@@ -572,6 +641,7 @@ pub enum RouterProtocolError {
     MissingRequestId,
     MissingTokenizedInput,
     EmptyTokenizedInput,
+    EmptyTextInput,
     InvalidIntegerSamplingParam {
         field: &'static str,
         value: i32,
@@ -606,6 +676,7 @@ impl RouterProtocolError {
             Self::MissingRequestId
             | Self::MissingTokenizedInput
             | Self::EmptyTokenizedInput
+            | Self::EmptyTextInput
             | Self::InvalidIntegerSamplingParam { .. }
             | Self::InvalidFloatSamplingParam { .. } => RouterStatusCode::InvalidArgument,
             Self::InputTooLong { .. } | Self::ContextOverflow { .. } => {
@@ -621,6 +692,7 @@ impl fmt::Display for RouterProtocolError {
             Self::MissingRequestId => formatter.write_str("missing router request id"),
             Self::MissingTokenizedInput => formatter.write_str("missing router tokenized input"),
             Self::EmptyTokenizedInput => formatter.write_str("empty router tokenized input"),
+            Self::EmptyTextInput => formatter.write_str("empty router text input"),
             Self::InvalidIntegerSamplingParam {
                 field,
                 value,

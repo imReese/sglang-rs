@@ -6,7 +6,7 @@ use sglang_srt::router::{
     RouterGenerateComplete, RouterGenerateRequest, RouterGenerateResponse,
     RouterGenerateResponseBody, RouterGenerateStreamChunk, RouterGetModelInfoResponse,
     RouterHealthCheckResponse, RouterProtocolError, RouterRuntime, RouterSamplingParams,
-    RouterStatusCode, RouterTokenizedInput, RouterValidationConfig,
+    RouterStatusCode, RouterTextGenerateRequest, RouterTokenizedInput, RouterValidationConfig,
 };
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::tokenizer::ByteTokenizer;
@@ -446,6 +446,7 @@ fn tokenized_engine_output_maps_to_router_generate_stream_chunk() {
         response.body,
         RouterGenerateResponseBody::Chunk(RouterGenerateStreamChunk {
             token_ids: vec![7, 8, 9],
+            text: String::new(),
             prompt_tokens: 5,
             completion_tokens: 3,
             cached_tokens: 0,
@@ -468,6 +469,7 @@ fn tokenized_engine_finished_output_maps_to_router_generate_complete() {
         response.body,
         RouterGenerateResponseBody::Complete(RouterGenerateComplete {
             output_ids: vec![7, 8, 9],
+            text: String::new(),
             finish_reason: "stop".to_string(),
             prompt_tokens: 5,
             completion_tokens: 3,
@@ -537,6 +539,7 @@ fn router_runtime_executes_generate_request_through_engine() {
         response.body,
         RouterGenerateResponseBody::Complete(RouterGenerateComplete {
             output_ids: vec![42, 43],
+            text: String::new(),
             finish_reason: "stop".to_string(),
             prompt_tokens: 3,
             completion_tokens: 2,
@@ -631,6 +634,7 @@ fn router_runtime_streams_prefill_chunks_and_final_complete_response() {
                 request_id: "router-stream".to_string(),
                 body: RouterGenerateResponseBody::Chunk(RouterGenerateStreamChunk {
                     token_ids: vec![42],
+                    text: String::new(),
                     prompt_tokens: 3,
                     completion_tokens: 1,
                     cached_tokens: 0,
@@ -641,6 +645,7 @@ fn router_runtime_streams_prefill_chunks_and_final_complete_response() {
                 request_id: "router-stream".to_string(),
                 body: RouterGenerateResponseBody::Complete(RouterGenerateComplete {
                     output_ids: vec![42, 43],
+                    text: String::new(),
                     finish_reason: "stop".to_string(),
                     prompt_tokens: 3,
                     completion_tokens: 2,
@@ -656,6 +661,82 @@ fn router_runtime_streams_prefill_chunks_and_final_complete_response() {
             sglang_srt::scheduler::ForwardMode::Prefill,
             sglang_srt::scheduler::ForwardMode::Decode,
         ]
+    );
+}
+
+#[test]
+fn router_runtime_text_generate_tokenizes_prompt_and_decodes_output_text() {
+    let tokenizer = ByteTokenizer::default();
+    let scheduler = Scheduler::new(RouterEchoWorker::default());
+    let engine = Engine::new(tokenizer, scheduler);
+    let mut runtime = RouterRuntime::new(engine);
+
+    let responses = runtime
+        .generate_text_stream(RouterTextGenerateRequest {
+            request_id: "router-text".to_string(),
+            text: "abc".to_string(),
+            sampling_params: Some(RouterSamplingParams {
+                max_new_tokens: Some(2),
+                ..Default::default()
+            }),
+            disaggregated_params: None,
+            stream: true,
+            data_parallel_rank: 0,
+            trace_headers: Default::default(),
+        })
+        .expect("text request should execute");
+
+    assert_eq!(
+        responses,
+        vec![RouterGenerateResponse {
+            request_id: "router-text".to_string(),
+            body: RouterGenerateResponseBody::Complete(RouterGenerateComplete {
+                output_ids: vec![42, 43],
+                text: "*+".to_string(),
+                finish_reason: "stop".to_string(),
+                prompt_tokens: 3,
+                completion_tokens: 2,
+                cached_tokens: 0,
+                index: 0,
+            }),
+        }]
+    );
+    assert_eq!(
+        runtime.engine().scheduler().worker().seen_input_ids,
+        vec![97, 98, 99]
+    );
+}
+
+#[test]
+fn router_runtime_text_generate_rejects_empty_text_before_dispatch() {
+    let tokenizer = ByteTokenizer::default();
+    let scheduler = Scheduler::new(RouterEchoWorker::default());
+    let engine = Engine::new(tokenizer, scheduler);
+    let mut runtime = RouterRuntime::new(engine);
+
+    let error = runtime
+        .generate_text_stream(RouterTextGenerateRequest {
+            request_id: "router-empty-text".to_string(),
+            text: String::new(),
+            sampling_params: None,
+            disaggregated_params: None,
+            stream: true,
+            data_parallel_rank: 0,
+            trace_headers: Default::default(),
+        })
+        .expect_err("empty text should be rejected");
+
+    assert!(matches!(
+        error,
+        sglang_srt::router::RouterRuntimeError::Protocol(RouterProtocolError::EmptyTextInput)
+    ));
+    assert!(
+        runtime
+            .engine()
+            .scheduler()
+            .worker()
+            .seen_input_ids
+            .is_empty()
     );
 }
 

@@ -23,6 +23,7 @@ use crate::router::{
     RouterDisaggregatedParams, RouterGenerateComplete, RouterGenerateError, RouterGenerateRequest,
     RouterGenerateResponse, RouterGenerateResponseBody, RouterGenerateStreamChunk,
     RouterProtocolError, RouterRuntime, RouterRuntimeError, RouterSamplingParams, RouterStatusCode,
+    RouterTextGenerateRequest,
 };
 use crate::tokenizer::Tokenizer;
 use crate::worker::WorkerExecutor;
@@ -98,9 +99,23 @@ where
 
     async fn text_generate(
         &self,
-        _request: Request<TextGenerateRequest>,
+        request: Request<TextGenerateRequest>,
     ) -> Result<Response<Self::TextGenerateStream>, Status> {
-        Err(unimplemented_rpc("TextGenerate"))
+        let request = proto_text_generate_request_to_router_request(request.into_inner())?;
+        let responses = self
+            .runtime
+            .lock()
+            .map_err(|_| Status::internal("router runtime mutex poisoned"))?
+            .generate_text_stream(request)
+            .map_err(router_runtime_error_to_status)?
+            .into_iter()
+            .map(router_generate_response_to_proto_response)
+            .map(Ok)
+            .collect::<Vec<_>>();
+
+        Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
+            responses,
+        ))))
     }
 
     async fn generate(
@@ -356,6 +371,28 @@ fn proto_generate_request_to_router_request(
     })
 }
 
+fn proto_text_generate_request_to_router_request(
+    request: TextGenerateRequest,
+) -> Result<RouterTextGenerateRequest, Status> {
+    let options = request.options.unwrap_or_default();
+
+    Ok(RouterTextGenerateRequest {
+        request_id: options.request_id.unwrap_or_default(),
+        text: request.text,
+        sampling_params: request.sampling_params.map(proto_sampling_params_to_router),
+        disaggregated_params: request
+            .disaggregated_params
+            .map(proto_disaggregated_params_to_router)
+            .transpose()?,
+        stream: options.stream,
+        data_parallel_rank: options.data_parallel_rank,
+        trace_headers: options
+            .trace_headers
+            .into_iter()
+            .collect::<BTreeMap<_, _>>(),
+    })
+}
+
 fn proto_sampling_params_to_router(params: ProtoSamplingParams) -> RouterSamplingParams {
     RouterSamplingParams {
         max_new_tokens: params.max_new_tokens,
@@ -410,7 +447,7 @@ fn router_generate_response_to_proto_response(
 fn router_chunk_to_proto(chunk: RouterGenerateStreamChunk) -> ProtoGenerateStreamChunk {
     ProtoGenerateStreamChunk {
         token_ids: chunk.token_ids,
-        text: String::new(),
+        text: chunk.text,
         prompt_tokens: chunk.prompt_tokens,
         completion_tokens: chunk.completion_tokens,
         cached_tokens: chunk.cached_tokens,
@@ -421,7 +458,7 @@ fn router_chunk_to_proto(chunk: RouterGenerateStreamChunk) -> ProtoGenerateStrea
 fn router_complete_to_proto(complete: RouterGenerateComplete) -> ProtoGenerateComplete {
     ProtoGenerateComplete {
         output_ids: complete.output_ids,
-        text: String::new(),
+        text: complete.text,
         finish_reason: complete.finish_reason,
         prompt_tokens: complete.prompt_tokens,
         completion_tokens: complete.completion_tokens,

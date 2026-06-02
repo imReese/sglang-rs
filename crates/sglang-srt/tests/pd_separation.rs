@@ -121,6 +121,7 @@ fn router_runtime_streams_pd_worker_outputs_from_prefill_then_decode() {
                 request_id: "router-pd".to_string(),
                 body: RouterGenerateResponseBody::Chunk(RouterGenerateStreamChunk {
                     token_ids: vec![11],
+                    text: String::new(),
                     prompt_tokens: 3,
                     completion_tokens: 1,
                     cached_tokens: 0,
@@ -131,6 +132,7 @@ fn router_runtime_streams_pd_worker_outputs_from_prefill_then_decode() {
                 request_id: "router-pd".to_string(),
                 body: RouterGenerateResponseBody::Complete(RouterGenerateComplete {
                     output_ids: vec![11, 12],
+                    text: String::new(),
                     finish_reason: "stop".to_string(),
                     prompt_tokens: 3,
                     completion_tokens: 2,
