@@ -38,9 +38,11 @@ This repository currently contains the first `sglang-srt` runtime crate:
   validates token budgets before scheduler dispatch, maps protocol errors to
   router status classes for the future gRPC bridge, and exposes a flush-cache
   control operation for gateway control-plane calls.
-- `grpc`: gRPC boundary helpers, including router protocol-error conversion to
-  `tonic::Status` so generated service implementations can return canonical
-  gRPC status codes without duplicating error mapping logic.
+- `grpc`: gRPC boundary helpers and the initial `GrpcRouterService` adapter for
+  the generated Tonic service trait. It wires tokenized `Generate`,
+  `HealthCheck`, and `FlushCache` into `RouterRuntime`, converts router
+  protocol errors to canonical `tonic::Status` codes, and leaves unsupported
+  RPCs as explicit `UNIMPLEMENTED` responses while the runtime surface grows.
 - `tokenizer`: tokenizer trait plus a temporary byte tokenizer for tests.
 - `transfer`: PD disaggregation mode/backend normalization, including
   SGLang-compatible `mooncake_tcp` handling, plus the initial Mooncake
