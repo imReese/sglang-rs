@@ -59,6 +59,19 @@ impl<T, W> Engine<T, W> {
 impl<T, W> Engine<T, W>
 where
     T: Tokenizer,
+{
+    pub fn tokenize(&self, text: &str) -> Vec<u32> {
+        self.tokenizer.encode(text)
+    }
+
+    pub fn detokenize(&self, token_ids: &[u32]) -> Result<String, TokenizerError> {
+        self.tokenizer.decode(token_ids)
+    }
+}
+
+impl<T, W> Engine<T, W>
+where
+    T: Tokenizer,
     W: WorkerExecutor,
 {
     pub fn generate(&mut self, request: GenerateRequest) -> Result<GenerateOutput, RuntimeError> {

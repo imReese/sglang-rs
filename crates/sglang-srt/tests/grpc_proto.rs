@@ -8,7 +8,8 @@ use sglang_srt::grpc::{GrpcRouterService, router_protocol_error_to_status};
 use sglang_srt::proto::sglang::runtime::v1::generate_response::Body;
 use sglang_srt::proto::sglang::runtime::v1::sglang_service_server::SglangService;
 use sglang_srt::proto::sglang::runtime::v1::{
-    FlushCacheRequest, GenerateRequest, GetLoadRequest, RequestOptions, SamplingParams,
+    DetokenizeRequest, FlushCacheRequest, GenerateRequest, GetLoadRequest, RequestOptions,
+    SamplingParams, TokenizeRequest,
 };
 use sglang_srt::router::{RouterProtocolError, RouterRuntime};
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
@@ -187,6 +188,64 @@ async fn grpc_generate_maps_router_protocol_errors_to_status() {
 
     assert_eq!(error.code(), Code::InvalidArgument);
     assert!(error.message().contains("empty router tokenized input"));
+}
+
+#[tokio::test]
+async fn grpc_tokenize_uses_router_tokenizer() {
+    let service = GrpcRouterService::from_engine(Engine::new(
+        ByteTokenizer,
+        Scheduler::new(GrpcTwoStepWorker),
+    ));
+
+    let response = service
+        .tokenize(Request::new(TokenizeRequest {
+            text: "Hello".to_string(),
+            add_special_tokens: true,
+        }))
+        .await
+        .expect("tokenize should execute")
+        .into_inner();
+
+    assert_eq!(response.token_ids, vec![72, 101, 108, 108, 111]);
+    assert_eq!(response.count, 5);
+}
+
+#[tokio::test]
+async fn grpc_detokenize_uses_router_tokenizer() {
+    let service = GrpcRouterService::from_engine(Engine::new(
+        ByteTokenizer,
+        Scheduler::new(GrpcTwoStepWorker),
+    ));
+
+    let response = service
+        .detokenize(Request::new(DetokenizeRequest {
+            token_ids: vec![72, 101, 108, 108, 111],
+            skip_special_tokens: true,
+        }))
+        .await
+        .expect("detokenize should execute")
+        .into_inner();
+
+    assert_eq!(response.text, "Hello");
+}
+
+#[tokio::test]
+async fn grpc_detokenize_maps_tokenizer_errors_to_invalid_argument() {
+    let service = GrpcRouterService::from_engine(Engine::new(
+        ByteTokenizer,
+        Scheduler::new(GrpcTwoStepWorker),
+    ));
+
+    let error = service
+        .detokenize(Request::new(DetokenizeRequest {
+            token_ids: vec![u32::from(u8::MAX) + 1],
+            skip_special_tokens: false,
+        }))
+        .await
+        .expect_err("invalid token ids should be rejected");
+
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert!(error.message().contains("not valid UTF-8"));
 }
 
 #[tokio::test]

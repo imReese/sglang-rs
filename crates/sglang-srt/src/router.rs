@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cli::ServerArgs;
 use crate::engine::{Engine, RuntimeError};
-use crate::tokenizer::Tokenizer;
+use crate::tokenizer::{Tokenizer, TokenizerError};
 use crate::types::{
     DisaggregatedParams, RequestId, SamplingParams, TokenGenerateOutput, TokenGenerateRequest,
 };
@@ -380,6 +380,16 @@ pub struct RouterLoadResponse {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouterTokenizeResponse {
+    pub token_ids: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouterDetokenizeResponse {
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouterGetModelInfoResponse {
     pub model_path: String,
     pub tokenizer_path: String,
@@ -458,6 +468,26 @@ impl<T, W> RouterRuntime<T, W> {
             decode_queue_depth: scheduler.decode_queue_depth(),
             available_cache_pages: scheduler.available_cache_pages(),
         }
+    }
+}
+
+impl<T, W> RouterRuntime<T, W>
+where
+    T: Tokenizer,
+{
+    pub fn tokenize(&self, text: &str) -> RouterTokenizeResponse {
+        RouterTokenizeResponse {
+            token_ids: self.engine.tokenize(text),
+        }
+    }
+
+    pub fn detokenize(
+        &self,
+        token_ids: &[u32],
+    ) -> Result<RouterDetokenizeResponse, TokenizerError> {
+        Ok(RouterDetokenizeResponse {
+            text: self.engine.detokenize(token_ids)?,
+        })
     }
 }
 

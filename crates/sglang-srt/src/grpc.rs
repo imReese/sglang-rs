@@ -147,16 +147,36 @@ where
 
     async fn tokenize(
         &self,
-        _request: Request<TokenizeRequest>,
+        request: Request<TokenizeRequest>,
     ) -> Result<Response<TokenizeResponse>, Status> {
-        Err(unimplemented_rpc("Tokenize"))
+        let request = request.into_inner();
+        let response = self
+            .runtime
+            .lock()
+            .map_err(|_| Status::internal("router runtime mutex poisoned"))?
+            .tokenize(&request.text);
+
+        Ok(Response::new(TokenizeResponse {
+            count: usize_to_u32(response.token_ids.len())?,
+            token_ids: response.token_ids,
+        }))
     }
 
     async fn detokenize(
         &self,
-        _request: Request<DetokenizeRequest>,
+        request: Request<DetokenizeRequest>,
     ) -> Result<Response<DetokenizeResponse>, Status> {
-        Err(unimplemented_rpc("Detokenize"))
+        let request = request.into_inner();
+        let response = self
+            .runtime
+            .lock()
+            .map_err(|_| Status::internal("router runtime mutex poisoned"))?
+            .detokenize(&request.token_ids)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+
+        Ok(Response::new(DetokenizeResponse {
+            text: response.text,
+        }))
     }
 
     async fn health_check(
