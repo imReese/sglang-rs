@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::future::{Future, pending};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -149,6 +150,20 @@ where
     T: Tokenizer + Send + 'static,
     W: WorkerExecutor + Send + 'static,
 {
+    serve_grpc_router_with_shutdown(addr, service, enable_reflection, pending()).await
+}
+
+pub async fn serve_grpc_router_with_shutdown<T, W, F>(
+    addr: SocketAddr,
+    service: GrpcRouterService<T, W>,
+    enable_reflection: bool,
+    shutdown: F,
+) -> Result<(), GrpcServeError>
+where
+    T: Tokenizer + Send + 'static,
+    W: WorkerExecutor + Send + 'static,
+    F: Future<Output = ()> + Send + 'static,
+{
     let sglang_service = SglangServiceServer::new(service);
 
     if enable_reflection {
@@ -159,7 +174,7 @@ where
         tonic::transport::Server::builder()
             .add_service(sglang_service)
             .add_service(reflection_service)
-            .serve(addr)
+            .serve_with_shutdown(addr, shutdown)
             .await?;
 
         return Ok(());
@@ -167,7 +182,7 @@ where
 
     tonic::transport::Server::builder()
         .add_service(sglang_service)
-        .serve(addr)
+        .serve_with_shutdown(addr, shutdown)
         .await?;
 
     Ok(())
