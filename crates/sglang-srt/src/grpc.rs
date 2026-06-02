@@ -370,9 +370,19 @@ where
 
     async fn abort(
         &self,
-        _request: Request<AbortRequest>,
+        request: Request<AbortRequest>,
     ) -> Result<Response<ControlResponse>, Status> {
-        Err(unimplemented_rpc("Abort"))
+        let response = self
+            .runtime
+            .lock()
+            .map_err(|_| Status::internal("router runtime mutex poisoned"))?
+            .abort_request(&request.into_inner().request_id)
+            .map_err(router_protocol_error_to_status)?;
+
+        Ok(Response::new(ControlResponse {
+            success: response.success,
+            message: response.message,
+        }))
     }
 
     async fn flush_cache(

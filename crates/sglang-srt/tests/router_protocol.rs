@@ -676,6 +676,41 @@ fn router_runtime_pause_generation_rejects_valid_requests_before_dispatch() {
 }
 
 #[test]
+fn router_runtime_abort_request_removes_queued_request() {
+    let tokenizer = ByteTokenizer::default();
+    let mut scheduler = Scheduler::new(RouterEchoWorker::default());
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("abort-me"),
+        vec![1, 2, 3],
+        SamplingParams { max_new_tokens: 1 },
+    ));
+    let engine = Engine::new(tokenizer, scheduler);
+    let mut runtime = RouterRuntime::new(engine);
+
+    let response = runtime
+        .abort_request("abort-me")
+        .expect("abort request id should be valid");
+
+    assert!(response.success);
+    assert_eq!(response.message, "request aborted");
+    assert_eq!(runtime.load().waiting_queue_depth, 0);
+
+    let missing = runtime
+        .abort_request("missing")
+        .expect("missing request id should still be valid");
+
+    assert!(!missing.success);
+    assert_eq!(missing.message, "request not found");
+
+    let error = runtime
+        .abort_request("")
+        .expect_err("empty request id should be rejected");
+
+    assert_eq!(error, RouterProtocolError::MissingRequestId);
+    assert_eq!(error.status_code(), RouterStatusCode::InvalidArgument);
+}
+
+#[test]
 fn router_runtime_streams_prefill_chunks_and_final_complete_response() {
     let tokenizer = ByteTokenizer::default();
     let scheduler = Scheduler::new(TwoStepRouterWorker::default());

@@ -266,6 +266,14 @@ impl<W> Scheduler<W> {
             .map(CachePageAllocator::available_pages)
     }
 
+    pub fn abort_request(&mut self, request_id: &RequestId) -> bool {
+        if remove_request_from_queue(&mut self.waiting_queue, request_id) {
+            return true;
+        }
+
+        remove_request_from_queue(&mut self.decode_queue, request_id)
+    }
+
     pub fn worker(&self) -> &W {
         &self.worker
     }
@@ -494,4 +502,18 @@ fn scheduled_output(
         token_ids: generated.token_ids().to_vec(),
         finished,
     }
+}
+
+fn remove_request_from_queue(
+    queue: &mut VecDeque<ScheduledRequest>,
+    request_id: &RequestId,
+) -> bool {
+    let Some(index) = queue
+        .iter()
+        .position(|request| request.request_id() == request_id)
+    else {
+        return false;
+    };
+
+    queue.remove(index).is_some()
 }

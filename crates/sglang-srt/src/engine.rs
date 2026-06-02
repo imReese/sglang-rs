@@ -2,7 +2,9 @@ use std::fmt;
 
 use crate::scheduler::{ScheduledOutput, ScheduledRequest, Scheduler, SchedulerError};
 use crate::tokenizer::{Tokenizer, TokenizerError};
-use crate::types::{GenerateOutput, GenerateRequest, TokenGenerateOutput, TokenGenerateRequest};
+use crate::types::{
+    GenerateOutput, GenerateRequest, RequestId, TokenGenerateOutput, TokenGenerateRequest,
+};
 use crate::worker::WorkerExecutor;
 
 #[derive(Debug)]
@@ -53,6 +55,10 @@ impl<T, W> Engine<T, W> {
 
     pub fn flush_cache(&mut self) -> bool {
         self.scheduler.flush_cache()
+    }
+
+    pub fn abort_request(&mut self, request_id: &RequestId) -> bool {
+        self.scheduler.abort_request(request_id)
     }
 }
 

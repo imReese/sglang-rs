@@ -511,6 +511,27 @@ impl<T, W> RouterRuntime<T, W> {
         }
     }
 
+    pub fn abort_request(
+        &mut self,
+        request_id: &str,
+    ) -> Result<RouterControlResponse, RouterProtocolError> {
+        if request_id.is_empty() {
+            return Err(RouterProtocolError::MissingRequestId);
+        }
+
+        if self.engine.abort_request(&RequestId::from(request_id)) {
+            return Ok(RouterControlResponse {
+                success: true,
+                message: "request aborted".to_string(),
+            });
+        }
+
+        Ok(RouterControlResponse {
+            success: false,
+            message: "request not found".to_string(),
+        })
+    }
+
     fn ensure_generation_ready(&self) -> Result<(), RouterProtocolError> {
         if self.generation_paused {
             return Err(RouterProtocolError::GenerationPaused);

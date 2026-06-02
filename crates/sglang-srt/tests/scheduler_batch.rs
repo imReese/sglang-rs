@@ -47,6 +47,22 @@ impl ModelWorker for RecordingBatchWorker {
     }
 }
 
+struct UnfinishedWorker;
+
+impl ModelWorker for UnfinishedWorker {
+    fn generate_batch(&mut self, batch: &ScheduleBatch) -> BatchGeneratedTokens {
+        BatchGeneratedTokens::from_batch(
+            batch,
+            batch
+                .requests()
+                .iter()
+                .map(|_| GeneratedToken::unfinished(vec![42]))
+                .collect(),
+        )
+        .expect("output shape should match batch")
+    }
+}
+
 #[test]
 fn next_prefill_batch_applies_batch_limit_and_preserves_queue_order() {
     let mut scheduler = Scheduler::new(NoopWorker);
@@ -148,6 +164,43 @@ fn next_prefill_batch_with_token_budget_includes_first_oversized_request_to_avoi
     assert_eq!(batch.total_uncached_tokens(), 5);
     assert_eq!(batch.requests()[0].request_id(), &RequestId::from("req-a"));
     assert_eq!(scheduler.waiting_queue_depth(), 1);
+}
+
+#[test]
+fn abort_request_removes_waiting_request_by_id() {
+    let mut scheduler = Scheduler::new(NoopWorker);
+    enqueue_request(&mut scheduler, "req-a", &[1]);
+    enqueue_request(&mut scheduler, "req-b", &[2]);
+    enqueue_request(&mut scheduler, "req-c", &[3]);
+
+    assert!(scheduler.abort_request(&RequestId::from("req-b")));
+    assert_eq!(scheduler.waiting_queue_depth(), 2);
+    assert!(!scheduler.abort_request(&RequestId::from("missing")));
+
+    let batch = scheduler
+        .next_prefill_batch(8)
+        .expect("remaining requests should batch");
+
+    assert_eq!(batch.requests()[0].request_id(), &RequestId::from("req-a"));
+    assert_eq!(batch.requests()[1].request_id(), &RequestId::from("req-c"));
+}
+
+#[test]
+fn abort_request_removes_decode_request_by_id() {
+    let mut scheduler = Scheduler::new(UnfinishedWorker);
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("decode-a"),
+        vec![1],
+        SamplingParams { max_new_tokens: 2 },
+    ));
+
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should leave request in decode queue");
+
+    assert_eq!(scheduler.decode_queue_depth(), 1);
+    assert!(scheduler.abort_request(&RequestId::from("decode-a")));
+    assert_eq!(scheduler.decode_queue_depth(), 0);
 }
 
 #[test]

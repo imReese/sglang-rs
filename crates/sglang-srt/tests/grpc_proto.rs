@@ -11,7 +11,7 @@ use sglang_srt::grpc::{
 use sglang_srt::proto::sglang::runtime::v1::generate_response::Body;
 use sglang_srt::proto::sglang::runtime::v1::sglang_service_server::SglangService;
 use sglang_srt::proto::sglang::runtime::v1::{
-    ContinueGenerationRequest, DetokenizeRequest, FlushCacheRequest, GenerateRequest,
+    AbortRequest, ContinueGenerationRequest, DetokenizeRequest, FlushCacheRequest, GenerateRequest,
     GetLoadRequest, GetModelInfoRequest, GetServerInfoRequest, ListModelsRequest,
     PauseGenerationRequest, RequestOptions, SamplingParams, TextGenerateRequest, TokenizeRequest,
 };
@@ -545,6 +545,66 @@ async fn grpc_flush_cache_calls_router_runtime() {
 
     assert!(response.success);
     assert_eq!(response.message, "cache flushed");
+}
+
+#[tokio::test]
+async fn grpc_abort_removes_queued_request() {
+    let mut scheduler = Scheduler::new(GrpcTwoStepWorker);
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("grpc-abort"),
+        vec![1, 2, 3],
+        RuntimeSamplingParams { max_new_tokens: 1 },
+    ));
+    let runtime = RouterRuntime::new(Engine::new(ByteTokenizer, scheduler));
+    let service = GrpcRouterService::new(runtime);
+
+    let response = service
+        .abort(Request::new(AbortRequest {
+            request_id: "grpc-abort".to_string(),
+        }))
+        .await
+        .expect("abort should execute")
+        .into_inner();
+
+    assert!(response.success);
+    assert_eq!(response.message, "request aborted");
+
+    let load = service
+        .get_load(Request::new(GetLoadRequest {}))
+        .await
+        .expect("load should execute")
+        .into_inner();
+
+    assert_eq!(load.waiting_queue_depth, 0);
+
+    let missing = service
+        .abort(Request::new(AbortRequest {
+            request_id: "missing".to_string(),
+        }))
+        .await
+        .expect("abort for missing request should execute")
+        .into_inner();
+
+    assert!(!missing.success);
+    assert_eq!(missing.message, "request not found");
+}
+
+#[tokio::test]
+async fn grpc_abort_rejects_empty_request_id() {
+    let service = GrpcRouterService::from_engine(Engine::new(
+        ByteTokenizer,
+        Scheduler::new(GrpcTwoStepWorker),
+    ));
+
+    let error = service
+        .abort(Request::new(AbortRequest {
+            request_id: String::new(),
+        }))
+        .await
+        .expect_err("empty request id should be rejected");
+
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert!(error.message().contains("missing router request id"));
 }
 
 #[tokio::test]
