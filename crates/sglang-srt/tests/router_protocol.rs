@@ -6,7 +6,7 @@ use sglang_srt::router::{
     RouterGenerateComplete, RouterGenerateRequest, RouterGenerateResponse,
     RouterGenerateResponseBody, RouterGenerateStreamChunk, RouterGetModelInfoResponse,
     RouterHealthCheckResponse, RouterProtocolError, RouterRuntime, RouterSamplingParams,
-    RouterTokenizedInput,
+    RouterStatusCode, RouterTokenizedInput, RouterValidationConfig,
 };
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::tokenizer::ByteTokenizer;
@@ -65,6 +65,7 @@ fn router_generate_request_maps_to_tokenized_engine_request() {
         }),
         sampling_params: Some(RouterSamplingParams {
             max_new_tokens: Some(7),
+            ..Default::default()
         }),
         disaggregated_params: None,
         stream: true,
@@ -80,6 +81,49 @@ fn router_generate_request_maps_to_tokenized_engine_request() {
     assert_eq!(token_request.input_ids, vec![101, 202, 303]);
     assert_eq!(token_request.sampling, SamplingParams { max_new_tokens: 7 });
     assert!(token_request.disaggregated_params.is_none());
+}
+
+#[test]
+fn router_generate_request_generates_request_id_when_missing() {
+    let first = RouterGenerateRequest {
+        request_id: String::new(),
+        tokenized: Some(RouterTokenizedInput {
+            original_text: String::new(),
+            input_ids: vec![101],
+        }),
+        sampling_params: Some(RouterSamplingParams {
+            max_new_tokens: Some(1),
+            ..Default::default()
+        }),
+        disaggregated_params: None,
+        stream: false,
+        data_parallel_rank: 0,
+        trace_headers: Default::default(),
+    }
+    .try_into_token_generate_request()
+    .expect("router should generate a request id");
+
+    let second = RouterGenerateRequest {
+        request_id: String::new(),
+        tokenized: Some(RouterTokenizedInput {
+            original_text: String::new(),
+            input_ids: vec![202],
+        }),
+        sampling_params: Some(RouterSamplingParams {
+            max_new_tokens: Some(1),
+            ..Default::default()
+        }),
+        disaggregated_params: None,
+        stream: false,
+        data_parallel_rank: 0,
+        trace_headers: Default::default(),
+    }
+    .try_into_token_generate_request()
+    .expect("router should generate a request id");
+
+    assert!(first.request_id.as_str().starts_with("sglang-rs-"));
+    assert!(second.request_id.as_str().starts_with("sglang-rs-"));
+    assert_ne!(first.request_id, second.request_id);
 }
 
 #[test]
@@ -159,6 +203,232 @@ fn router_generate_request_rejects_missing_tokenized_input() {
         .expect_err("missing tokenized input should be rejected");
 
     assert_eq!(error, RouterProtocolError::MissingTokenizedInput);
+}
+
+#[test]
+fn router_generate_request_rejects_empty_tokenized_input() {
+    let request = RouterGenerateRequest {
+        request_id: "empty-tokenized".to_string(),
+        tokenized: Some(RouterTokenizedInput {
+            original_text: String::new(),
+            input_ids: Vec::new(),
+        }),
+        sampling_params: None,
+        disaggregated_params: None,
+        stream: false,
+        data_parallel_rank: 0,
+        trace_headers: Default::default(),
+    };
+
+    let error = request
+        .try_into_token_generate_request()
+        .expect_err("empty tokenized input should be rejected");
+
+    assert_eq!(error, RouterProtocolError::EmptyTokenizedInput);
+    assert_eq!(error.status_code(), RouterStatusCode::InvalidArgument);
+}
+
+#[test]
+fn router_generate_request_rejects_non_positive_max_new_tokens() {
+    let request = RouterGenerateRequest {
+        request_id: "bad-sampling".to_string(),
+        tokenized: Some(RouterTokenizedInput {
+            original_text: String::new(),
+            input_ids: vec![1],
+        }),
+        sampling_params: Some(RouterSamplingParams {
+            max_new_tokens: Some(0),
+            ..Default::default()
+        }),
+        disaggregated_params: None,
+        stream: false,
+        data_parallel_rank: 0,
+        trace_headers: Default::default(),
+    };
+
+    let error = request
+        .try_into_token_generate_request()
+        .expect_err("zero max_new_tokens should be rejected");
+
+    assert_eq!(
+        error,
+        RouterProtocolError::InvalidIntegerSamplingParam {
+            field: "max_new_tokens",
+            value: 0,
+            expected: "positive",
+        }
+    );
+    assert_eq!(error.status_code(), RouterStatusCode::InvalidArgument);
+}
+
+#[test]
+fn router_generate_request_accepts_valid_extended_sampling_params() {
+    let request = RouterGenerateRequest {
+        request_id: "extended-sampling".to_string(),
+        tokenized: Some(RouterTokenizedInput {
+            original_text: String::new(),
+            input_ids: vec![1],
+        }),
+        sampling_params: Some(RouterSamplingParams {
+            max_new_tokens: Some(8),
+            temperature: Some(0.7),
+            top_p: Some(0.95),
+            top_k: Some(40),
+            min_p: Some(0.0),
+            frequency_penalty: Some(0.0),
+            presence_penalty: Some(0.0),
+            repetition_penalty: Some(1.0),
+            n: Some(1),
+            best_of: Some(1),
+        }),
+        disaggregated_params: None,
+        stream: false,
+        data_parallel_rank: 0,
+        trace_headers: Default::default(),
+    };
+
+    let token_request = request
+        .try_into_token_generate_request()
+        .expect("valid extended sampling params should map");
+
+    assert_eq!(token_request.sampling, SamplingParams { max_new_tokens: 8 });
+}
+
+#[test]
+fn router_generate_request_rejects_invalid_float_sampling_params() {
+    let request = RouterGenerateRequest {
+        request_id: "bad-top-p".to_string(),
+        tokenized: Some(RouterTokenizedInput {
+            original_text: String::new(),
+            input_ids: vec![1],
+        }),
+        sampling_params: Some(RouterSamplingParams {
+            top_p: Some(1.1),
+            ..Default::default()
+        }),
+        disaggregated_params: None,
+        stream: false,
+        data_parallel_rank: 0,
+        trace_headers: Default::default(),
+    };
+
+    let error = request
+        .try_into_token_generate_request()
+        .expect_err("top_p outside [0, 1] should be rejected");
+
+    assert_eq!(
+        error,
+        RouterProtocolError::InvalidFloatSamplingParam {
+            field: "top_p",
+            value: 1.1,
+            expected: "finite and in [0, 1]",
+        }
+    );
+    assert_eq!(error.status_code(), RouterStatusCode::InvalidArgument);
+}
+
+#[test]
+fn router_generate_request_rejects_invalid_integer_sampling_params() {
+    let request = RouterGenerateRequest {
+        request_id: "bad-n".to_string(),
+        tokenized: Some(RouterTokenizedInput {
+            original_text: String::new(),
+            input_ids: vec![1],
+        }),
+        sampling_params: Some(RouterSamplingParams {
+            n: Some(0),
+            ..Default::default()
+        }),
+        disaggregated_params: None,
+        stream: false,
+        data_parallel_rank: 0,
+        trace_headers: Default::default(),
+    };
+
+    let error = request
+        .try_into_token_generate_request()
+        .expect_err("n must be positive");
+
+    assert_eq!(
+        error,
+        RouterProtocolError::InvalidIntegerSamplingParam {
+            field: "n",
+            value: 0,
+            expected: "positive",
+        }
+    );
+    assert_eq!(error.status_code(), RouterStatusCode::InvalidArgument);
+}
+
+#[test]
+fn router_generate_request_rejects_input_over_model_request_limit() {
+    let request = RouterGenerateRequest {
+        request_id: "too-long".to_string(),
+        tokenized: Some(RouterTokenizedInput {
+            original_text: String::new(),
+            input_ids: vec![1, 2, 3],
+        }),
+        sampling_params: Some(RouterSamplingParams {
+            max_new_tokens: Some(1),
+            ..Default::default()
+        }),
+        disaggregated_params: None,
+        stream: false,
+        data_parallel_rank: 0,
+        trace_headers: Default::default(),
+    };
+
+    let error = request
+        .try_into_token_generate_request_with_config(RouterValidationConfig {
+            max_context_tokens: None,
+            max_request_input_tokens: Some(2),
+        })
+        .expect_err("input over model request limit should be rejected");
+
+    assert_eq!(
+        error,
+        RouterProtocolError::InputTooLong {
+            input_tokens: 3,
+            max_request_input_tokens: 2,
+        }
+    );
+    assert_eq!(error.status_code(), RouterStatusCode::ResourceExhausted);
+}
+
+#[test]
+fn router_generate_request_rejects_context_overflow() {
+    let request = RouterGenerateRequest {
+        request_id: "context-overflow".to_string(),
+        tokenized: Some(RouterTokenizedInput {
+            original_text: String::new(),
+            input_ids: vec![1, 2, 3],
+        }),
+        sampling_params: Some(RouterSamplingParams {
+            max_new_tokens: Some(4),
+            ..Default::default()
+        }),
+        disaggregated_params: None,
+        stream: false,
+        data_parallel_rank: 0,
+        trace_headers: Default::default(),
+    };
+
+    let error = request
+        .try_into_token_generate_request_with_config(RouterValidationConfig {
+            max_context_tokens: Some(6),
+            max_request_input_tokens: None,
+        })
+        .expect_err("input plus output budget over context should be rejected");
+
+    assert_eq!(
+        error,
+        RouterProtocolError::ContextOverflow {
+            input_tokens: 3,
+            max_new_tokens: 4,
+            max_context_tokens: 6,
+        }
+    );
+    assert_eq!(error.status_code(), RouterStatusCode::ResourceExhausted);
 }
 
 #[test]
@@ -253,6 +523,7 @@ fn router_runtime_executes_generate_request_through_engine() {
             }),
             sampling_params: Some(RouterSamplingParams {
                 max_new_tokens: Some(2),
+                ..Default::default()
             }),
             disaggregated_params: None,
             stream: true,
@@ -280,6 +551,55 @@ fn router_runtime_executes_generate_request_through_engine() {
 }
 
 #[test]
+fn router_runtime_rejects_invalid_request_before_engine_dispatch() {
+    let tokenizer = ByteTokenizer::default();
+    let scheduler = Scheduler::new(RouterEchoWorker::default());
+    let engine = Engine::new(tokenizer, scheduler);
+    let mut runtime = RouterRuntime::with_validation_config(
+        engine,
+        RouterValidationConfig {
+            max_context_tokens: Some(4),
+            max_request_input_tokens: None,
+        },
+    );
+
+    let error = runtime
+        .generate(RouterGenerateRequest {
+            request_id: "runtime-reject".to_string(),
+            tokenized: Some(RouterTokenizedInput {
+                original_text: String::new(),
+                input_ids: vec![1, 2, 3],
+            }),
+            sampling_params: Some(RouterSamplingParams {
+                max_new_tokens: Some(2),
+                ..Default::default()
+            }),
+            disaggregated_params: None,
+            stream: false,
+            data_parallel_rank: 0,
+            trace_headers: Default::default(),
+        })
+        .expect_err("context overflow should be rejected by router runtime");
+
+    assert!(matches!(
+        error,
+        sglang_srt::router::RouterRuntimeError::Protocol(RouterProtocolError::ContextOverflow {
+            input_tokens: 3,
+            max_new_tokens: 2,
+            max_context_tokens: 4,
+        })
+    ));
+    assert!(
+        runtime
+            .engine()
+            .scheduler()
+            .worker()
+            .seen_input_ids
+            .is_empty()
+    );
+}
+
+#[test]
 fn router_runtime_streams_prefill_chunks_and_final_complete_response() {
     let tokenizer = ByteTokenizer::default();
     let scheduler = Scheduler::new(TwoStepRouterWorker::default());
@@ -295,6 +615,7 @@ fn router_runtime_streams_prefill_chunks_and_final_complete_response() {
             }),
             sampling_params: Some(RouterSamplingParams {
                 max_new_tokens: Some(2),
+                ..Default::default()
             }),
             disaggregated_params: None,
             stream: true,
@@ -358,6 +679,7 @@ fn router_runtime_flush_cache_calls_scheduler_and_reports_success() {
             }),
             sampling_params: Some(RouterSamplingParams {
                 max_new_tokens: Some(2),
+                ..Default::default()
             }),
             disaggregated_params: None,
             stream: false,

@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cli::ServerArgs;
 use crate::engine::{Engine, RuntimeError};
@@ -10,17 +12,47 @@ use crate::types::{
 use crate::worker::WorkerExecutor;
 
 pub const DEFAULT_MAX_NEW_TOKENS: usize = 128;
+static ROUTER_REQUEST_ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RouterValidationConfig {
+    pub max_context_tokens: Option<usize>,
+    pub max_request_input_tokens: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct RouterSamplingParams {
     pub max_new_tokens: Option<i32>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<i32>,
+    pub min_p: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub repetition_penalty: Option<f32>,
+    pub n: Option<i32>,
+    pub best_of: Option<i32>,
 }
 
 impl RouterSamplingParams {
     fn into_sampling_params(self) -> Result<SamplingParams, RouterProtocolError> {
+        validate_optional_non_negative_float("temperature", self.temperature)?;
+        validate_optional_unit_float("top_p", self.top_p)?;
+        validate_optional_unit_float("min_p", self.min_p)?;
+        validate_optional_non_negative_float("frequency_penalty", self.frequency_penalty)?;
+        validate_optional_non_negative_float("presence_penalty", self.presence_penalty)?;
+        validate_optional_positive_float("repetition_penalty", self.repetition_penalty)?;
+        validate_optional_non_negative_i32("top_k", self.top_k)?;
+        validate_optional_positive_i32("n", self.n)?;
+        validate_optional_positive_i32("best_of", self.best_of)?;
+
         let max_new_tokens = match self.max_new_tokens {
-            Some(value) if value < 0 => {
-                return Err(RouterProtocolError::InvalidMaxNewTokens(value));
+            Some(value) if value <= 0 => {
+                return Err(RouterProtocolError::InvalidIntegerSamplingParam {
+                    field: "max_new_tokens",
+                    value,
+                    expected: "positive",
+                });
             }
             Some(value) => value as usize,
             None => DEFAULT_MAX_NEW_TOKENS,
@@ -53,7 +85,97 @@ impl From<RouterDisaggregatedParams> for DisaggregatedParams {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+fn validate_optional_non_negative_float(
+    field: &'static str,
+    value: Option<f32>,
+) -> Result<(), RouterProtocolError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if !value.is_finite() || value < 0.0 {
+        return Err(RouterProtocolError::InvalidFloatSamplingParam {
+            field,
+            value,
+            expected: "finite and non-negative",
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_optional_positive_float(
+    field: &'static str,
+    value: Option<f32>,
+) -> Result<(), RouterProtocolError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if !value.is_finite() || value <= 0.0 {
+        return Err(RouterProtocolError::InvalidFloatSamplingParam {
+            field,
+            value,
+            expected: "finite and positive",
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_optional_unit_float(
+    field: &'static str,
+    value: Option<f32>,
+) -> Result<(), RouterProtocolError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return Err(RouterProtocolError::InvalidFloatSamplingParam {
+            field,
+            value,
+            expected: "finite and in [0, 1]",
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_optional_non_negative_i32(
+    field: &'static str,
+    value: Option<i32>,
+) -> Result<(), RouterProtocolError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value < 0 {
+        return Err(RouterProtocolError::InvalidIntegerSamplingParam {
+            field,
+            value,
+            expected: "non-negative",
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_optional_positive_i32(
+    field: &'static str,
+    value: Option<i32>,
+) -> Result<(), RouterProtocolError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value <= 0 {
+        return Err(RouterProtocolError::InvalidIntegerSamplingParam {
+            field,
+            value,
+            expected: "positive",
+        });
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct RouterGenerateRequest {
     pub request_id: String,
     pub tokenized: Option<RouterTokenizedInput>,
@@ -68,25 +190,95 @@ impl RouterGenerateRequest {
     pub fn try_into_token_generate_request(
         self,
     ) -> Result<TokenGenerateRequest, RouterProtocolError> {
-        if self.request_id.is_empty() {
-            return Err(RouterProtocolError::MissingRequestId);
-        }
+        self.try_into_token_generate_request_with_config(RouterValidationConfig::default())
+    }
+
+    pub fn try_into_token_generate_request_with_config(
+        self,
+        validation_config: RouterValidationConfig,
+    ) -> Result<TokenGenerateRequest, RouterProtocolError> {
+        Ok(self
+            .try_into_validated_token_request(validation_config)?
+            .request)
+    }
+
+    fn try_into_validated_token_request(
+        self,
+        validation_config: RouterValidationConfig,
+    ) -> Result<ValidatedTokenGenerateRequest, RouterProtocolError> {
+        let request_id = if self.request_id.is_empty() {
+            next_router_request_id()
+        } else {
+            self.request_id
+        };
         let tokenized = self
             .tokenized
             .ok_or(RouterProtocolError::MissingTokenizedInput)?;
+        let input_tokens = tokenized.input_ids.len();
+        if input_tokens == 0 {
+            return Err(RouterProtocolError::EmptyTokenizedInput);
+        }
 
         let sampling = self
             .sampling_params
             .unwrap_or_default()
             .into_sampling_params()?;
 
-        Ok(TokenGenerateRequest {
-            request_id: RequestId::from(self.request_id.as_str()),
-            input_ids: tokenized.input_ids,
-            sampling,
-            disaggregated_params: self.disaggregated_params.map(Into::into),
+        validate_token_budget(input_tokens, sampling.max_new_tokens, validation_config)?;
+
+        Ok(ValidatedTokenGenerateRequest {
+            prompt_tokens: input_tokens,
+            request: TokenGenerateRequest {
+                request_id: RequestId::from(request_id.as_str()),
+                input_ids: tokenized.input_ids,
+                sampling,
+                disaggregated_params: self.disaggregated_params.map(Into::into),
+            },
         })
     }
+}
+
+fn next_router_request_id() -> String {
+    let sequence = ROUTER_REQUEST_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let timestamp_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+
+    format!("sglang-rs-{timestamp_nanos:x}-{sequence:x}")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ValidatedTokenGenerateRequest {
+    prompt_tokens: usize,
+    request: TokenGenerateRequest,
+}
+
+fn validate_token_budget(
+    input_tokens: usize,
+    max_new_tokens: usize,
+    validation_config: RouterValidationConfig,
+) -> Result<(), RouterProtocolError> {
+    if let Some(max_request_input_tokens) = validation_config.max_request_input_tokens {
+        if input_tokens > max_request_input_tokens {
+            return Err(RouterProtocolError::InputTooLong {
+                input_tokens,
+                max_request_input_tokens,
+            });
+        }
+    }
+
+    if let Some(max_context_tokens) = validation_config.max_context_tokens {
+        if input_tokens.saturating_add(max_new_tokens) > max_context_tokens {
+            return Err(RouterProtocolError::ContextOverflow {
+                input_tokens,
+                max_new_tokens,
+                max_context_tokens,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -230,11 +422,22 @@ impl RouterGetModelInfoResponse {
 
 pub struct RouterRuntime<T, W> {
     engine: Engine<T, W>,
+    validation_config: RouterValidationConfig,
 }
 
 impl<T, W> RouterRuntime<T, W> {
     pub fn new(engine: Engine<T, W>) -> Self {
-        Self { engine }
+        Self::with_validation_config(engine, RouterValidationConfig::default())
+    }
+
+    pub fn with_validation_config(
+        engine: Engine<T, W>,
+        validation_config: RouterValidationConfig,
+    ) -> Self {
+        Self {
+            engine,
+            validation_config,
+        }
     }
 
     pub fn engine(&self) -> &Engine<T, W> {
@@ -251,13 +454,9 @@ where
         &mut self,
         request: RouterGenerateRequest,
     ) -> Result<RouterGenerateResponse, RouterRuntimeError> {
-        let prompt_tokens = request
-            .tokenized
-            .as_ref()
-            .map(|tokenized| tokenized.input_ids.len() as i32)
-            .unwrap_or(0);
-        let token_request = request.try_into_token_generate_request()?;
-        let output = self.engine.generate_tokens(token_request)?;
+        let validated_request = request.try_into_validated_token_request(self.validation_config)?;
+        let prompt_tokens = validated_request.prompt_tokens as i32;
+        let output = self.engine.generate_tokens(validated_request.request)?;
 
         Ok(RouterGenerateResponse::from_token_generate_output(
             output,
@@ -269,13 +468,11 @@ where
         &mut self,
         request: RouterGenerateRequest,
     ) -> Result<Vec<RouterGenerateResponse>, RouterRuntimeError> {
-        let prompt_tokens = request
-            .tokenized
-            .as_ref()
-            .map(|tokenized| tokenized.input_ids.len() as i32)
-            .unwrap_or(0);
-        let token_request = request.try_into_token_generate_request()?;
-        let outputs = self.engine.generate_token_stream(token_request)?;
+        let validated_request = request.try_into_validated_token_request(self.validation_config)?;
+        let prompt_tokens = validated_request.prompt_tokens as i32;
+        let outputs = self
+            .engine
+            .generate_token_stream(validated_request.request)?;
         let mut output_ids = Vec::new();
         let mut responses = Vec::with_capacity(outputs.len());
 
@@ -324,11 +521,52 @@ where
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum RouterProtocolError {
     MissingRequestId,
     MissingTokenizedInput,
-    InvalidMaxNewTokens(i32),
+    EmptyTokenizedInput,
+    InvalidIntegerSamplingParam {
+        field: &'static str,
+        value: i32,
+        expected: &'static str,
+    },
+    InvalidFloatSamplingParam {
+        field: &'static str,
+        value: f32,
+        expected: &'static str,
+    },
+    InputTooLong {
+        input_tokens: usize,
+        max_request_input_tokens: usize,
+    },
+    ContextOverflow {
+        input_tokens: usize,
+        max_new_tokens: usize,
+        max_context_tokens: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RouterStatusCode {
+    InvalidArgument,
+    ResourceExhausted,
+    FailedPrecondition,
+}
+
+impl RouterProtocolError {
+    pub fn status_code(&self) -> RouterStatusCode {
+        match self {
+            Self::MissingRequestId
+            | Self::MissingTokenizedInput
+            | Self::EmptyTokenizedInput
+            | Self::InvalidIntegerSamplingParam { .. }
+            | Self::InvalidFloatSamplingParam { .. } => RouterStatusCode::InvalidArgument,
+            Self::InputTooLong { .. } | Self::ContextOverflow { .. } => {
+                RouterStatusCode::ResourceExhausted
+            }
+        }
+    }
 }
 
 impl fmt::Display for RouterProtocolError {
@@ -336,8 +574,45 @@ impl fmt::Display for RouterProtocolError {
         match self {
             Self::MissingRequestId => formatter.write_str("missing router request id"),
             Self::MissingTokenizedInput => formatter.write_str("missing router tokenized input"),
-            Self::InvalidMaxNewTokens(value) => {
-                write!(formatter, "invalid router max_new_tokens: {value}")
+            Self::EmptyTokenizedInput => formatter.write_str("empty router tokenized input"),
+            Self::InvalidIntegerSamplingParam {
+                field,
+                value,
+                expected,
+            } => {
+                write!(
+                    formatter,
+                    "router sampling param {field} must be {expected}: {value}"
+                )
+            }
+            Self::InvalidFloatSamplingParam {
+                field,
+                value,
+                expected,
+            } => {
+                write!(
+                    formatter,
+                    "router sampling param {field} must be {expected}: {value}"
+                )
+            }
+            Self::InputTooLong {
+                input_tokens,
+                max_request_input_tokens,
+            } => {
+                write!(
+                    formatter,
+                    "router input token count {input_tokens} exceeds max request input token limit {max_request_input_tokens}"
+                )
+            }
+            Self::ContextOverflow {
+                input_tokens,
+                max_new_tokens,
+                max_context_tokens,
+            } => {
+                write!(
+                    formatter,
+                    "router input token count {input_tokens} plus max_new_tokens {max_new_tokens} exceeds context token limit {max_context_tokens}"
+                )
             }
         }
     }

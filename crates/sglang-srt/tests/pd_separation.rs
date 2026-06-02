@@ -105,6 +105,7 @@ fn router_runtime_streams_pd_worker_outputs_from_prefill_then_decode() {
             }),
             sampling_params: Some(RouterSamplingParams {
                 max_new_tokens: Some(2),
+                ..Default::default()
             }),
             disaggregated_params: None,
             stream: true,

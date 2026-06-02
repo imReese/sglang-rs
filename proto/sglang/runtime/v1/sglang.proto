@@ -1,0 +1,258 @@
+syntax = "proto3";
+
+package sglang.runtime.v1;
+
+service SglangService {
+  rpc TextGenerate(TextGenerateRequest) returns (stream GenerateResponse);
+  rpc Generate(GenerateRequest) returns (stream GenerateResponse);
+  rpc TextEmbed(TextEmbedRequest) returns (EmbedResponse);
+  rpc Embed(EmbedRequest) returns (EmbedResponse);
+  rpc Classify(ClassifyRequest) returns (ClassifyResponse);
+  rpc Tokenize(TokenizeRequest) returns (TokenizeResponse);
+  rpc Detokenize(DetokenizeRequest) returns (DetokenizeResponse);
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+  rpc GetModelInfo(GetModelInfoRequest) returns (ModelInfoResponse);
+  rpc GetServerInfo(GetServerInfoRequest) returns (ServerInfoResponse);
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+  rpc GetLoad(GetLoadRequest) returns (LoadResponse);
+  rpc Abort(AbortRequest) returns (ControlResponse);
+  rpc FlushCache(FlushCacheRequest) returns (ControlResponse);
+  rpc PauseGeneration(PauseGenerationRequest) returns (ControlResponse);
+  rpc ContinueGeneration(ContinueGenerationRequest) returns (ControlResponse);
+  rpc ChatComplete(OpenAIJsonRequest) returns (stream OpenAIJsonResponse);
+  rpc Complete(OpenAIJsonRequest) returns (stream OpenAIJsonResponse);
+  rpc OpenAIEmbed(OpenAIJsonRequest) returns (OpenAIJsonResponse);
+  rpc OpenAIClassify(OpenAIJsonRequest) returns (OpenAIJsonResponse);
+  rpc Score(OpenAIJsonRequest) returns (OpenAIJsonResponse);
+  rpc Rerank(OpenAIJsonRequest) returns (OpenAIJsonResponse);
+  rpc StartProfile(StartProfileRequest) returns (ControlResponse);
+  rpc StopProfile(StopProfileRequest) returns (ControlResponse);
+  rpc UpdateWeightsFromDisk(UpdateWeightsFromDiskRequest) returns (ControlResponse);
+}
+
+message SamplingParams {
+  optional int32 max_new_tokens = 1;
+  optional float temperature = 2;
+  optional float top_p = 3;
+  optional int32 top_k = 4;
+  optional float min_p = 5;
+  optional float frequency_penalty = 6;
+  optional float presence_penalty = 7;
+  optional float repetition_penalty = 8;
+  optional int32 stop_token_id = 9;
+  repeated string stop = 10;
+  optional int32 n = 11;
+  optional int32 best_of = 12;
+  optional int64 seed = 13;
+}
+
+message DisaggregatedParams {
+  string bootstrap_host = 1;
+  uint32 bootstrap_port = 2;
+  int32 bootstrap_room = 3;
+}
+
+message RequestOptions {
+  optional string request_id = 1;
+  bool stream = 2;
+  int32 data_parallel_rank = 3;
+  map<string, string> trace_headers = 4;
+}
+
+message TextGenerateRequest {
+  string text = 1;
+  SamplingParams sampling_params = 2;
+  RequestOptions options = 3;
+  DisaggregatedParams disaggregated_params = 4;
+}
+
+message GenerateRequest {
+  repeated uint32 input_ids = 1;
+  string original_text = 2;
+  SamplingParams sampling_params = 3;
+  RequestOptions options = 4;
+  DisaggregatedParams disaggregated_params = 5;
+}
+
+message GenerateResponse {
+  string request_id = 1;
+  oneof body {
+    GenerateStreamChunk chunk = 2;
+    GenerateComplete complete = 3;
+    GenerateError error = 4;
+  }
+}
+
+message GenerateStreamChunk {
+  repeated uint32 token_ids = 1;
+  string text = 2;
+  int32 prompt_tokens = 3;
+  int32 completion_tokens = 4;
+  int32 cached_tokens = 5;
+  uint32 index = 6;
+}
+
+message GenerateComplete {
+  repeated uint32 output_ids = 1;
+  string text = 2;
+  string finish_reason = 3;
+  int32 prompt_tokens = 4;
+  int32 completion_tokens = 5;
+  int32 cached_tokens = 6;
+  uint32 index = 7;
+}
+
+message GenerateError {
+  string message = 1;
+  string code = 2;
+}
+
+message TextEmbedRequest {
+  repeated string texts = 1;
+  RequestOptions options = 2;
+}
+
+message EmbedRequest {
+  repeated TokenizedInput inputs = 1;
+  RequestOptions options = 2;
+}
+
+message TokenizedInput {
+  string original_text = 1;
+  repeated uint32 input_ids = 2;
+}
+
+message EmbedResponse {
+  repeated Embedding embeddings = 1;
+  Usage usage = 2;
+}
+
+message Embedding {
+  repeated float values = 1;
+  uint32 index = 2;
+}
+
+message ClassifyRequest {
+  repeated TokenizedInput inputs = 1;
+  repeated string labels = 2;
+  RequestOptions options = 3;
+}
+
+message ClassifyResponse {
+  repeated Classification classifications = 1;
+  Usage usage = 2;
+}
+
+message Classification {
+  string label = 1;
+  float score = 2;
+  uint32 index = 3;
+}
+
+message TokenizeRequest {
+  string text = 1;
+  bool add_special_tokens = 2;
+}
+
+message TokenizeResponse {
+  repeated uint32 token_ids = 1;
+  uint32 count = 2;
+}
+
+message DetokenizeRequest {
+  repeated uint32 token_ids = 1;
+  bool skip_special_tokens = 2;
+}
+
+message DetokenizeResponse {
+  string text = 1;
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool healthy = 1;
+  string message = 2;
+}
+
+message GetModelInfoRequest {}
+
+message ModelInfoResponse {
+  string model_path = 1;
+  string tokenizer_path = 2;
+  bool is_generation = 3;
+  string preferred_sampling_params_json = 4;
+  string weight_version = 5;
+  string served_model_name = 6;
+  int32 max_context_length = 7;
+  int32 vocab_size = 8;
+  bool supports_vision = 9;
+  string model_type = 10;
+  repeated int32 eos_token_ids = 11;
+  int32 pad_token_id = 12;
+  int32 bos_token_id = 13;
+  int32 max_request_input_length = 14;
+}
+
+message GetServerInfoRequest {}
+
+message ServerInfoResponse {
+  string version = 1;
+  string runtime = 2;
+  map<string, string> attributes = 3;
+}
+
+message ListModelsRequest {}
+
+message ListModelsResponse {
+  repeated ModelInfoResponse models = 1;
+}
+
+message GetLoadRequest {}
+
+message LoadResponse {
+  uint32 waiting_queue_depth = 1;
+  uint32 decode_queue_depth = 2;
+  optional uint32 available_cache_pages = 3;
+}
+
+message AbortRequest {
+  string request_id = 1;
+}
+
+message FlushCacheRequest {}
+
+message PauseGenerationRequest {}
+
+message ContinueGenerationRequest {}
+
+message ControlResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message OpenAIJsonRequest {
+  bytes json = 1;
+  RequestOptions options = 2;
+}
+
+message OpenAIJsonResponse {
+  bytes json = 1;
+}
+
+message StartProfileRequest {
+  optional string output_dir = 1;
+}
+
+message StopProfileRequest {}
+
+message UpdateWeightsFromDiskRequest {
+  string model_path = 1;
+  optional string load_format = 2;
+}
+
+message Usage {
+  int32 prompt_tokens = 1;
+  int32 completion_tokens = 2;
+  int32 total_tokens = 3;
+}
