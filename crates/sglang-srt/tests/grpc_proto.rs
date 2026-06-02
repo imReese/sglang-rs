@@ -2,16 +2,18 @@ use prost::Message;
 use tonic::codegen::tokio_stream::StreamExt;
 use tonic::{Code, Request};
 
+use sglang_srt::cache::{CachePageAllocator, RadixCache};
 use sglang_srt::engine::Engine;
 use sglang_srt::grpc::{GrpcRouterService, router_protocol_error_to_status};
 use sglang_srt::proto::sglang::runtime::v1::generate_response::Body;
 use sglang_srt::proto::sglang::runtime::v1::sglang_service_server::SglangService;
 use sglang_srt::proto::sglang::runtime::v1::{
-    FlushCacheRequest, GenerateRequest, RequestOptions, SamplingParams,
+    FlushCacheRequest, GenerateRequest, GetLoadRequest, RequestOptions, SamplingParams,
 };
-use sglang_srt::router::RouterProtocolError;
-use sglang_srt::scheduler::{ScheduleBatch, Scheduler};
+use sglang_srt::router::{RouterProtocolError, RouterRuntime};
+use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::tokenizer::ByteTokenizer;
+use sglang_srt::types::{RequestId, SamplingParams as RuntimeSamplingParams};
 use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
 
 #[derive(Default)]
@@ -185,6 +187,32 @@ async fn grpc_generate_maps_router_protocol_errors_to_status() {
 
     assert_eq!(error.code(), Code::InvalidArgument);
     assert!(error.message().contains("empty router tokenized input"));
+}
+
+#[tokio::test]
+async fn grpc_get_load_reports_scheduler_metrics() {
+    let mut scheduler = Scheduler::with_cache_resources(
+        GrpcTwoStepWorker,
+        RadixCache::default(),
+        CachePageAllocator::new(4),
+    );
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("load-waiting"),
+        vec![1, 2, 3],
+        RuntimeSamplingParams { max_new_tokens: 1 },
+    ));
+    let runtime = RouterRuntime::new(Engine::new(ByteTokenizer, scheduler));
+    let service = GrpcRouterService::new(runtime);
+
+    let response = service
+        .get_load(Request::new(GetLoadRequest {}))
+        .await
+        .expect("get load should execute")
+        .into_inner();
+
+    assert_eq!(response.waiting_queue_depth, 1);
+    assert_eq!(response.decode_queue_depth, 0);
+    assert_eq!(response.available_cache_pages, Some(4));
 }
 
 #[tokio::test]

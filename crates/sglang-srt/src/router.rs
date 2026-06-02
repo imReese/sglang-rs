@@ -373,6 +373,13 @@ pub struct RouterFlushCacheResponse {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouterLoadResponse {
+    pub waiting_queue_depth: usize,
+    pub decode_queue_depth: usize,
+    pub available_cache_pages: Option<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouterGetModelInfoResponse {
     pub model_path: String,
     pub tokenizer_path: String,
@@ -442,6 +449,15 @@ impl<T, W> RouterRuntime<T, W> {
 
     pub fn engine(&self) -> &Engine<T, W> {
         &self.engine
+    }
+
+    pub fn load(&self) -> RouterLoadResponse {
+        let scheduler = self.engine.scheduler();
+        RouterLoadResponse {
+            waiting_queue_depth: scheduler.waiting_queue_depth(),
+            decode_queue_depth: scheduler.decode_queue_depth(),
+            available_cache_pages: scheduler.available_cache_pages(),
+        }
     }
 }
 

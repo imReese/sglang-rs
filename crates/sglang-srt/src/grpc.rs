@@ -194,7 +194,20 @@ where
         &self,
         _request: Request<GetLoadRequest>,
     ) -> Result<Response<LoadResponse>, Status> {
-        Err(unimplemented_rpc("GetLoad"))
+        let response = self
+            .runtime
+            .lock()
+            .map_err(|_| Status::internal("router runtime mutex poisoned"))?
+            .load();
+
+        Ok(Response::new(LoadResponse {
+            waiting_queue_depth: usize_to_u32(response.waiting_queue_depth)?,
+            decode_queue_depth: usize_to_u32(response.decode_queue_depth)?,
+            available_cache_pages: response
+                .available_cache_pages
+                .map(usize_to_u32)
+                .transpose()?,
+        }))
     }
 
     async fn abort(
@@ -402,4 +415,8 @@ fn router_error_to_proto(error: RouterGenerateError) -> ProtoGenerateError {
         message: error.message,
         code: String::new(),
     }
+}
+
+fn usize_to_u32(value: usize) -> Result<u32, Status> {
+    u32::try_from(value).map_err(|_| Status::internal("load metric overflowed uint32"))
 }
