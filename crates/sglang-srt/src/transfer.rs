@@ -1,7 +1,17 @@
-use std::ffi::{c_char, c_int, c_void};
+#[cfg(feature = "mooncake-link")]
+use std::ffi::CString;
+use std::ffi::{NulError, c_char, c_int, c_void};
 use std::fmt;
 
 use crate::cli::ServerArgs;
+
+#[cfg(feature = "mooncake-link")]
+#[link(name = "transfer_engine", kind = "static")]
+unsafe extern "C" {}
+
+#[cfg(feature = "mooncake-link")]
+#[link(name = "mooncake_common", kind = "static")]
+unsafe extern "C" {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DisaggregationMode {
@@ -136,6 +146,57 @@ impl fmt::Display for PdConfigError {
 
 impl std::error::Error for PdConfigError {}
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum MooncakeError {
+    InteriorNul,
+    EngineCreateFailed,
+    TransportInstallFailed(String),
+    RegisterMemoryFailed(i32),
+    UnregisterMemoryFailed(i32),
+    OpenSegmentFailed(String),
+    SubmitTransferFailed(i32),
+    StatusQueryFailed(i32),
+    FreeBatchFailed(i32),
+}
+
+impl From<NulError> for MooncakeError {
+    fn from(_: NulError) -> Self {
+        Self::InteriorNul
+    }
+}
+
+impl fmt::Display for MooncakeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InteriorNul => formatter.write_str("mooncake string contains interior nul byte"),
+            Self::EngineCreateFailed => {
+                formatter.write_str("mooncake transfer engine create failed")
+            }
+            Self::TransportInstallFailed(protocol) => {
+                write!(formatter, "mooncake transport install failed: {protocol}")
+            }
+            Self::RegisterMemoryFailed(code) => {
+                write!(formatter, "mooncake memory register failed: {code}")
+            }
+            Self::UnregisterMemoryFailed(code) => {
+                write!(formatter, "mooncake memory unregister failed: {code}")
+            }
+            Self::OpenSegmentFailed(segment) => {
+                write!(formatter, "mooncake open segment failed: {segment}")
+            }
+            Self::SubmitTransferFailed(code) => {
+                write!(formatter, "mooncake transfer submit failed: {code}")
+            }
+            Self::StatusQueryFailed(code) => {
+                write!(formatter, "mooncake status query failed: {code}")
+            }
+            Self::FreeBatchFailed(code) => write!(formatter, "mooncake free batch failed: {code}"),
+        }
+    }
+}
+
+impl std::error::Error for MooncakeError {}
+
 pub const MOONCAKE_P2P_HANDSHAKE_METADATA: &str = "P2PHANDSHAKE";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -220,6 +281,134 @@ pub type MooncakeTransferEngineHandle = *mut c_void;
 pub type MooncakeTransportHandle = *mut c_void;
 pub type MooncakeSegmentId = i32;
 pub type MooncakeBatchId = u64;
+
+#[cfg(feature = "mooncake-link")]
+pub struct LinkedMooncakeTransferEngine {
+    handle: MooncakeTransferEngineHandle,
+}
+
+#[cfg(feature = "mooncake-link")]
+impl LinkedMooncakeTransferEngine {
+    pub fn new(config: &MooncakeTransferEngineConfig) -> Result<Self, MooncakeError> {
+        let metadata = CString::new(config.metadata_server.as_str())?;
+        let local_server = CString::new(config.hostname.as_str())?;
+        let host = CString::new(config.hostname.as_str())?;
+
+        let handle = unsafe {
+            createTransferEngine(
+                metadata.as_ptr(),
+                local_server.as_ptr(),
+                host.as_ptr(),
+                0,
+                1,
+            )
+        };
+        if handle.is_null() {
+            return Err(MooncakeError::EngineCreateFailed);
+        }
+
+        let engine = Self { handle };
+        engine.install_transport(config.protocol.as_str())?;
+        Ok(engine)
+    }
+
+    pub fn handle(&self) -> MooncakeTransferEngineHandle {
+        self.handle
+    }
+
+    pub fn install_transport(&self, protocol: &str) -> Result<(), MooncakeError> {
+        let protocol_c = CString::new(protocol)?;
+        let transport =
+            unsafe { installTransport(self.handle, protocol_c.as_ptr(), std::ptr::null_mut()) };
+        if transport.is_null() {
+            return Err(MooncakeError::TransportInstallFailed(protocol.to_string()));
+        }
+        Ok(())
+    }
+
+    pub fn register_memory_batch(
+        &self,
+        buffers: &mut [MooncakeBufferEntry],
+        location: &str,
+    ) -> Result<(), MooncakeError> {
+        let location_c = CString::new(location)?;
+        let code = unsafe {
+            registerLocalMemoryBatch(
+                self.handle,
+                buffers.as_mut_ptr(),
+                buffers.len(),
+                location_c.as_ptr(),
+            )
+        };
+        if code != 0 {
+            return Err(MooncakeError::RegisterMemoryFailed(code));
+        }
+        Ok(())
+    }
+
+    pub fn unregister_memory_batch(&self, addrs: &mut [*mut c_void]) -> Result<(), MooncakeError> {
+        let code =
+            unsafe { unregisterLocalMemoryBatch(self.handle, addrs.as_mut_ptr(), addrs.len()) };
+        if code != 0 {
+            return Err(MooncakeError::UnregisterMemoryFailed(code));
+        }
+        Ok(())
+    }
+
+    pub fn open_segment(&self, segment: &str) -> Result<MooncakeSegmentId, MooncakeError> {
+        let segment_c = CString::new(segment)?;
+        let segment_id = unsafe { openSegment(self.handle, segment_c.as_ptr()) };
+        if segment_id < 0 {
+            return Err(MooncakeError::OpenSegmentFailed(segment.to_string()));
+        }
+        Ok(segment_id)
+    }
+
+    pub fn submit_transfer(
+        &self,
+        requests: &mut [MooncakeTransferRequest],
+    ) -> Result<MooncakeBatchId, MooncakeError> {
+        let batch_id = unsafe { allocateBatchID(self.handle, requests.len()) };
+        let code =
+            unsafe { submitTransfer(self.handle, batch_id, requests.as_mut_ptr(), requests.len()) };
+        if code != 0 {
+            let _ = unsafe { freeBatchID(self.handle, batch_id) };
+            return Err(MooncakeError::SubmitTransferFailed(code));
+        }
+        Ok(batch_id)
+    }
+
+    pub fn transfer_status(
+        &self,
+        batch_id: MooncakeBatchId,
+        task_id: usize,
+    ) -> Result<MooncakeTransferStatus, MooncakeError> {
+        let mut status = MooncakeTransferStatus {
+            status: MooncakeTransferStatusCode::Waiting as c_int,
+            transferred_bytes: 0,
+        };
+        let code = unsafe { getTransferStatus(self.handle, batch_id, task_id, &mut status) };
+        if code != 0 {
+            return Err(MooncakeError::StatusQueryFailed(code));
+        }
+        Ok(status)
+    }
+
+    pub fn free_batch(&self, batch_id: MooncakeBatchId) -> Result<(), MooncakeError> {
+        let code = unsafe { freeBatchID(self.handle, batch_id) };
+        if code != 0 {
+            return Err(MooncakeError::FreeBatchFailed(code));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "mooncake-link")]
+impl Drop for LinkedMooncakeTransferEngine {
+    fn drop(&mut self) {
+        unsafe { destroyTransferEngine(self.handle) };
+    }
+}
 
 unsafe extern "C" {
     pub fn createTransferEngine(

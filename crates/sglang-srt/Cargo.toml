@@ -8,3 +8,7 @@ repository.workspace = true
 [lib]
 name = "sglang_srt"
 path = "src/lib.rs"
+
+[features]
+default = []
+mooncake-link = []

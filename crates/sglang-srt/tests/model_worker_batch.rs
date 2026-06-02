@@ -1,5 +1,5 @@
 use sglang_srt::cache::{CachePageId, RadixCache};
-use sglang_srt::model_executor::ModelWorkerBatch;
+use sglang_srt::model_executor::{ForwardModel, ModelForwardOutput, ModelRunner, ModelWorkerBatch};
 use sglang_srt::scheduler::{ForwardMode, ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::types::{DisaggregatedParams, FAKE_BOOTSTRAP_HOST, RequestId, SamplingParams};
 use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
@@ -183,6 +183,98 @@ fn scheduled_request_detects_fake_bootstrap_radix_cache_skip() {
     }));
 
     assert!(request.skips_radix_cache_insert());
+}
+
+#[derive(Default)]
+struct RecordingForwardModel {
+    seen_input_ids: Vec<u32>,
+    seen_positions: Vec<usize>,
+    seen_forward_modes: Vec<ForwardMode>,
+}
+
+impl ForwardModel for RecordingForwardModel {
+    fn forward(&mut self, batch: &ModelWorkerBatch) -> ModelForwardOutput {
+        self.seen_input_ids = batch.input_ids().to_vec();
+        self.seen_positions = batch.positions().to_vec();
+        self.seen_forward_modes.push(batch.forward_mode());
+
+        ModelForwardOutput::new(vec![vec![0.1, 9.0, 0.2], vec![0.0, 0.5, 8.0]])
+            .expect("logits should be rectangular")
+    }
+}
+
+#[test]
+fn model_runner_calls_forward_and_returns_argmax_tokens() {
+    let mut scheduler = Scheduler::new(ModelRunner::new(RecordingForwardModel::default()));
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("req-a"),
+        vec![10, 11],
+        SamplingParams { max_new_tokens: 1 },
+    ));
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("req-b"),
+        vec![20],
+        SamplingParams { max_new_tokens: 1 },
+    ));
+
+    let outputs = scheduler
+        .dispatch_prefill_batch(2)
+        .expect("prefill should dispatch through model runner");
+
+    assert_eq!(outputs[0].token_ids, vec![1]);
+    assert_eq!(outputs[1].token_ids, vec![2]);
+    assert!(outputs.iter().all(|output| output.finished));
+    assert_eq!(scheduler.worker().model().seen_input_ids, vec![10, 11, 20]);
+    assert_eq!(scheduler.worker().model().seen_positions, vec![0, 1, 0]);
+    assert_eq!(
+        scheduler.worker().model().seen_forward_modes,
+        vec![ForwardMode::Prefill]
+    );
+}
+
+#[derive(Default)]
+struct TwoStepForwardModel {
+    seen_forward_modes: Vec<ForwardMode>,
+}
+
+impl ForwardModel for TwoStepForwardModel {
+    fn forward(&mut self, batch: &ModelWorkerBatch) -> ModelForwardOutput {
+        self.seen_forward_modes.push(batch.forward_mode());
+        match batch.forward_mode() {
+            ForwardMode::Prefill => {
+                ModelForwardOutput::new(vec![vec![0.0, 4.0, 0.1]]).expect("valid logits")
+            }
+            ForwardMode::Decode => {
+                ModelForwardOutput::new(vec![vec![0.0, 0.1, 4.0]]).expect("valid logits")
+            }
+        }
+    }
+}
+
+#[test]
+fn model_runner_requeues_decode_until_scheduler_reaches_max_new_tokens() {
+    let mut scheduler = Scheduler::new(ModelRunner::new(TwoStepForwardModel::default()));
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("runner-decode"),
+        vec![10, 11],
+        SamplingParams { max_new_tokens: 2 },
+    ));
+
+    let prefill_outputs = scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should dispatch through model runner");
+    let decode_outputs = scheduler
+        .dispatch_decode_batch(1)
+        .expect("decode should dispatch through model runner");
+
+    assert_eq!(prefill_outputs[0].token_ids, vec![1]);
+    assert!(!prefill_outputs[0].finished);
+    assert_eq!(decode_outputs[0].token_ids, vec![2]);
+    assert!(decode_outputs[0].finished);
+    assert_eq!(
+        scheduler.worker().model().seen_forward_modes,
+        vec![ForwardMode::Prefill, ForwardMode::Decode]
+    );
 }
 
 fn enqueue_request<W>(scheduler: &mut Scheduler<W>, request_id: &str, input_ids: &[u32]) {

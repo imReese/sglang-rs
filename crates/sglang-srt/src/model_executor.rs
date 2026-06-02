@@ -1,6 +1,7 @@
 use crate::cache::CachePageId;
 use crate::scheduler::{ForwardMode, ScheduleBatch, ScheduledRequest};
 use crate::types::{DisaggregatedParams, RequestId};
+use crate::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelWorkerBatch {
@@ -106,5 +107,106 @@ impl ModelWorkerBatch {
             .push(request.input_ids().len() + request.output_ids().len() - 1);
         self.sequence_lengths
             .push(request.input_ids().len() + request.output_ids().len());
+    }
+}
+
+pub trait ForwardModel {
+    fn forward(&mut self, batch: &ModelWorkerBatch) -> ModelForwardOutput;
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelForwardOutput {
+    logits: Vec<Vec<f32>>,
+}
+
+impl ModelForwardOutput {
+    pub fn new(logits: Vec<Vec<f32>>) -> Result<Self, ModelForwardError> {
+        let Some(first_row) = logits.first() else {
+            return Ok(Self { logits });
+        };
+        let vocab_size = first_row.len();
+        if vocab_size == 0 {
+            return Err(ModelForwardError::EmptyVocabulary);
+        }
+        if logits.iter().any(|row| row.len() != vocab_size) {
+            return Err(ModelForwardError::RaggedLogits);
+        }
+
+        Ok(Self { logits })
+    }
+
+    pub fn logits(&self) -> &[Vec<f32>] {
+        &self.logits
+    }
+
+    fn into_argmax_tokens(self) -> Result<Vec<u32>, ModelForwardError> {
+        self.logits
+            .into_iter()
+            .map(|row| {
+                row.iter()
+                    .enumerate()
+                    .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                    .map(|(index, _)| index as u32)
+                    .ok_or(ModelForwardError::EmptyVocabulary)
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ModelForwardError {
+    EmptyVocabulary,
+    RaggedLogits,
+    BatchSizeMismatch {
+        request_count: usize,
+        output_count: usize,
+    },
+}
+
+pub struct ModelRunner<M> {
+    model: M,
+}
+
+impl<M> ModelRunner<M> {
+    pub fn new(model: M) -> Self {
+        Self { model }
+    }
+
+    pub fn model(&self) -> &M {
+        &self.model
+    }
+
+    pub fn model_mut(&mut self) -> &mut M {
+        &mut self.model
+    }
+}
+
+impl<M> ModelWorker for ModelRunner<M>
+where
+    M: ForwardModel,
+{
+    fn generate_batch(&mut self, batch: &ScheduleBatch) -> BatchGeneratedTokens {
+        let worker_batch = ModelWorkerBatch::from_schedule_batch(batch);
+        let forward_output = self.model.forward(&worker_batch);
+        let token_ids = forward_output
+            .into_argmax_tokens()
+            .expect("model forward logits must contain one non-empty row per request");
+
+        if token_ids.len() != batch.batch_size() {
+            panic!(
+                "model forward output count ({}) must match request count ({})",
+                token_ids.len(),
+                batch.batch_size()
+            );
+        }
+
+        BatchGeneratedTokens::from_batch(
+            batch,
+            token_ids
+                .into_iter()
+                .map(|token_id| GeneratedToken::unfinished(vec![token_id]))
+                .collect(),
+        )
+        .expect("runner output shape should match batch")
     }
 }

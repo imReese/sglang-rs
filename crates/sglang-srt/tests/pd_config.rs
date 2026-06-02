@@ -4,6 +4,9 @@ use sglang_srt::transfer::{
     MooncakeTransferStatusCode, PdConfig, PdConfigError, TransferBackend,
 };
 
+#[cfg(feature = "mooncake-link")]
+use sglang_srt::transfer::{LinkedMooncakeTransferEngine, MooncakeError};
+
 #[test]
 fn pd_config_defaults_to_unified_mooncake_backend() {
     let args =
@@ -115,4 +118,14 @@ fn mooncake_ffi_enums_match_upstream_c_and_sglang_poll_values() {
     assert_eq!(KvPoll::WaitingForInput as u8, 2);
     assert_eq!(KvPoll::Transferring as u8, 3);
     assert_eq!(KvPoll::Success as u8, 4);
+}
+
+#[cfg(feature = "mooncake-link")]
+#[test]
+fn linked_mooncake_engine_constructor_is_available_under_feature() {
+    let constructor: fn(
+        &MooncakeTransferEngineConfig,
+    ) -> Result<LinkedMooncakeTransferEngine, MooncakeError> = LinkedMooncakeTransferEngine::new;
+
+    let _ = constructor;
 }
