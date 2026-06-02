@@ -2,6 +2,27 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
+    compile_proto();
+    configure_mooncake_link();
+}
+
+fn compile_proto() {
+    let manifest_dir =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set"));
+    let workspace_root = manifest_dir
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("crate lives under workspace/crates/sglang-srt");
+    let proto_root = workspace_root.join("proto");
+    let sglang_proto = proto_root.join("sglang/runtime/v1/sglang.proto");
+
+    println!("cargo:rerun-if-changed={}", sglang_proto.display());
+    tonic_prost_build::configure()
+        .compile_protos(&[sglang_proto], &[proto_root])
+        .expect("sglang runtime proto should compile");
+}
+
+fn configure_mooncake_link() {
     println!("cargo:rerun-if-env-changed=MOONCAKE_HOME");
     println!("cargo:rerun-if-env-changed=MOONCAKE_BUILD_DIR");
 

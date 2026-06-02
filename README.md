@@ -15,8 +15,10 @@ This repository currently contains the first `sglang-srt` runtime crate:
   native Rust gRPC path in the community roadmap, including typed
   text/tokenized generation, embedding, classification, tokenization,
   health/model/load/control-plane RPCs, OpenAI-compatible JSON pass-through
-  RPCs, and admin operations. The root `buf.yaml` enables future proto lint and
-  breaking-change checks once Buf is available in CI.
+  RPCs, and admin operations. The crate build script compiles this contract
+  into Tonic/prost Rust types exposed through `sglang_srt::proto`; the root
+  `buf.yaml` enables future proto lint and breaking-change checks once Buf is
+  available in CI.
 - `cli`: `sglang serve`-style argument parsing for `--model-path`/`--model`,
   `--host`, `--port`, `--tp-size`, `--dp-size`, `--grpc-mode`,
   `--served-model-name`, `--tokenizer-path`, and the upstream PD
@@ -36,6 +38,9 @@ This repository currently contains the first `sglang-srt` runtime crate:
   validates token budgets before scheduler dispatch, maps protocol errors to
   router status classes for the future gRPC bridge, and exposes a flush-cache
   control operation for gateway control-plane calls.
+- `grpc`: gRPC boundary helpers, including router protocol-error conversion to
+  `tonic::Status` so generated service implementations can return canonical
+  gRPC status codes without duplicating error mapping logic.
 - `tokenizer`: tokenizer trait plus a temporary byte tokenizer for tests.
 - `transfer`: PD disaggregation mode/backend normalization, including
   SGLang-compatible `mooncake_tcp` handling, plus the initial Mooncake

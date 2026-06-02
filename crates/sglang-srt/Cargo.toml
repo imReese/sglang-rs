@@ -12,3 +12,11 @@ path = "src/lib.rs"
 [features]
 default = []
 mooncake-link = []
+
+[dependencies]
+prost = "0.14.3"
+tonic = "0.14.6"
+tonic-prost = "0.14.6"
+
+[build-dependencies]
+tonic-prost-build = "0.14.6"

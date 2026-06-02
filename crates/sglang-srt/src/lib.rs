@@ -1,7 +1,9 @@
 pub mod cache;
 pub mod cli;
 pub mod engine;
+pub mod grpc;
 pub mod model_executor;
+pub mod proto;
 pub mod router;
 pub mod scheduler;
 pub mod tokenizer;
