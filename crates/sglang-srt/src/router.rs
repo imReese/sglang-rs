@@ -390,6 +390,12 @@ pub struct RouterFlushCacheResponse {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouterControlResponse {
+    pub success: bool,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouterLoadResponse {
     pub waiting_queue_depth: usize,
     pub decode_queue_depth: usize,
@@ -457,6 +463,7 @@ impl RouterGetModelInfoResponse {
 pub struct RouterRuntime<T, W> {
     engine: Engine<T, W>,
     validation_config: RouterValidationConfig,
+    generation_paused: bool,
 }
 
 impl<T, W> RouterRuntime<T, W> {
@@ -471,6 +478,7 @@ impl<T, W> RouterRuntime<T, W> {
         Self {
             engine,
             validation_config,
+            generation_paused: false,
         }
     }
 
@@ -485,6 +493,30 @@ impl<T, W> RouterRuntime<T, W> {
             decode_queue_depth: scheduler.decode_queue_depth(),
             available_cache_pages: scheduler.available_cache_pages(),
         }
+    }
+
+    pub fn pause_generation(&mut self) -> RouterControlResponse {
+        self.generation_paused = true;
+        RouterControlResponse {
+            success: true,
+            message: "generation paused".to_string(),
+        }
+    }
+
+    pub fn continue_generation(&mut self) -> RouterControlResponse {
+        self.generation_paused = false;
+        RouterControlResponse {
+            success: true,
+            message: "generation continued".to_string(),
+        }
+    }
+
+    fn ensure_generation_ready(&self) -> Result<(), RouterProtocolError> {
+        if self.generation_paused {
+            return Err(RouterProtocolError::GenerationPaused);
+        }
+
+        Ok(())
     }
 }
 
@@ -518,6 +550,7 @@ where
         request: RouterGenerateRequest,
     ) -> Result<RouterGenerateResponse, RouterRuntimeError> {
         let validated_request = request.try_into_validated_token_request(self.validation_config)?;
+        self.ensure_generation_ready()?;
         let prompt_tokens = validated_request.prompt_tokens as i32;
         let output = self.engine.generate_tokens(validated_request.request)?;
 
@@ -532,6 +565,7 @@ where
         request: RouterGenerateRequest,
     ) -> Result<Vec<RouterGenerateResponse>, RouterRuntimeError> {
         let validated_request = request.try_into_validated_token_request(self.validation_config)?;
+        self.ensure_generation_ready()?;
         let prompt_tokens = validated_request.prompt_tokens as i32;
         let stream = validated_request.stream;
         let outputs = self
@@ -651,6 +685,7 @@ pub enum RouterProtocolError {
     MissingTokenizedInput,
     EmptyTokenizedInput,
     EmptyTextInput,
+    GenerationPaused,
     InvalidIntegerSamplingParam {
         field: &'static str,
         value: i32,
@@ -691,6 +726,7 @@ impl RouterProtocolError {
             Self::InputTooLong { .. } | Self::ContextOverflow { .. } => {
                 RouterStatusCode::ResourceExhausted
             }
+            Self::GenerationPaused => RouterStatusCode::FailedPrecondition,
         }
     }
 }
@@ -702,6 +738,7 @@ impl fmt::Display for RouterProtocolError {
             Self::MissingTokenizedInput => formatter.write_str("missing router tokenized input"),
             Self::EmptyTokenizedInput => formatter.write_str("empty router tokenized input"),
             Self::EmptyTextInput => formatter.write_str("empty router text input"),
+            Self::GenerationPaused => formatter.write_str("router generation is paused"),
             Self::InvalidIntegerSamplingParam {
                 field,
                 value,

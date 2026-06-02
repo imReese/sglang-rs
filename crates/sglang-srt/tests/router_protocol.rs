@@ -603,6 +603,79 @@ fn router_runtime_rejects_invalid_request_before_engine_dispatch() {
 }
 
 #[test]
+fn router_runtime_pause_generation_rejects_valid_requests_before_dispatch() {
+    let tokenizer = ByteTokenizer::default();
+    let scheduler = Scheduler::new(RouterEchoWorker::default());
+    let engine = Engine::new(tokenizer, scheduler);
+    let mut runtime = RouterRuntime::new(engine);
+
+    let pause_response = runtime.pause_generation();
+
+    assert!(pause_response.success);
+    assert_eq!(pause_response.message, "generation paused");
+
+    let error = runtime
+        .generate(RouterGenerateRequest {
+            request_id: "paused".to_string(),
+            tokenized: Some(RouterTokenizedInput {
+                original_text: String::new(),
+                input_ids: vec![1, 2, 3],
+            }),
+            sampling_params: Some(RouterSamplingParams {
+                max_new_tokens: Some(2),
+                ..Default::default()
+            }),
+            disaggregated_params: None,
+            stream: false,
+            data_parallel_rank: 0,
+            trace_headers: Default::default(),
+        })
+        .expect_err("paused runtime should reject generation before dispatch");
+
+    assert!(matches!(
+        error,
+        sglang_srt::router::RouterRuntimeError::Protocol(RouterProtocolError::GenerationPaused)
+    ));
+    assert!(
+        runtime
+            .engine()
+            .scheduler()
+            .worker()
+            .seen_input_ids
+            .is_empty()
+    );
+
+    let continue_response = runtime.continue_generation();
+
+    assert!(continue_response.success);
+    assert_eq!(continue_response.message, "generation continued");
+
+    let response = runtime
+        .generate(RouterGenerateRequest {
+            request_id: "continued".to_string(),
+            tokenized: Some(RouterTokenizedInput {
+                original_text: String::new(),
+                input_ids: vec![9, 8, 7],
+            }),
+            sampling_params: Some(RouterSamplingParams {
+                max_new_tokens: Some(2),
+                ..Default::default()
+            }),
+            disaggregated_params: None,
+            stream: false,
+            data_parallel_rank: 0,
+            trace_headers: Default::default(),
+        })
+        .expect("continued runtime should dispatch generation");
+
+    assert_eq!(response.request_id, "continued");
+    assert_eq!(
+        runtime.engine().scheduler().worker().seen_input_ids,
+        vec![9, 8, 7]
+    );
+}
+
+#[test]
 fn router_runtime_streams_prefill_chunks_and_final_complete_response() {
     let tokenizer = ByteTokenizer::default();
     let scheduler = Scheduler::new(TwoStepRouterWorker::default());

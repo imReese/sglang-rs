@@ -11,9 +11,9 @@ use sglang_srt::grpc::{
 use sglang_srt::proto::sglang::runtime::v1::generate_response::Body;
 use sglang_srt::proto::sglang::runtime::v1::sglang_service_server::SglangService;
 use sglang_srt::proto::sglang::runtime::v1::{
-    DetokenizeRequest, FlushCacheRequest, GenerateRequest, GetLoadRequest, GetModelInfoRequest,
-    GetServerInfoRequest, ListModelsRequest, RequestOptions, SamplingParams, TextGenerateRequest,
-    TokenizeRequest,
+    ContinueGenerationRequest, DetokenizeRequest, FlushCacheRequest, GenerateRequest,
+    GetLoadRequest, GetModelInfoRequest, GetServerInfoRequest, ListModelsRequest,
+    PauseGenerationRequest, RequestOptions, SamplingParams, TextGenerateRequest, TokenizeRequest,
 };
 use sglang_srt::router::{RouterProtocolError, RouterRuntime};
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
@@ -545,4 +545,85 @@ async fn grpc_flush_cache_calls_router_runtime() {
 
     assert!(response.success);
     assert_eq!(response.message, "cache flushed");
+}
+
+#[tokio::test]
+async fn grpc_pause_generation_rejects_generate_until_continued() {
+    let service = GrpcRouterService::from_engine(Engine::new(
+        ByteTokenizer,
+        Scheduler::new(GrpcTwoStepWorker),
+    ));
+
+    let pause_response = service
+        .pause_generation(Request::new(PauseGenerationRequest {}))
+        .await
+        .expect("pause generation should execute")
+        .into_inner();
+
+    assert!(pause_response.success);
+    assert_eq!(pause_response.message, "generation paused");
+
+    let paused_error = match service
+        .generate(Request::new(GenerateRequest {
+            input_ids: vec![1, 2, 3],
+            original_text: String::new(),
+            sampling_params: Some(SamplingParams {
+                max_new_tokens: Some(2),
+                ..Default::default()
+            }),
+            options: Some(RequestOptions {
+                request_id: Some("grpc-paused".to_string()),
+                stream: false,
+                data_parallel_rank: 0,
+                trace_headers: Default::default(),
+            }),
+            disaggregated_params: None,
+        }))
+        .await
+    {
+        Ok(_) => panic!("paused generation should be rejected"),
+        Err(error) => error,
+    };
+
+    assert_eq!(paused_error.code(), Code::FailedPrecondition);
+    assert!(paused_error.message().contains("generation is paused"));
+
+    let continue_response = service
+        .continue_generation(Request::new(ContinueGenerationRequest {}))
+        .await
+        .expect("continue generation should execute")
+        .into_inner();
+
+    assert!(continue_response.success);
+    assert_eq!(continue_response.message, "generation continued");
+
+    let mut stream = service
+        .generate(Request::new(GenerateRequest {
+            input_ids: vec![1, 2, 3],
+            original_text: String::new(),
+            sampling_params: Some(SamplingParams {
+                max_new_tokens: Some(2),
+                ..Default::default()
+            }),
+            options: Some(RequestOptions {
+                request_id: Some("grpc-continued".to_string()),
+                stream: false,
+                data_parallel_rank: 0,
+                trace_headers: Default::default(),
+            }),
+            disaggregated_params: None,
+        }))
+        .await
+        .expect("continued generation should execute")
+        .into_inner();
+
+    let response = stream
+        .next()
+        .await
+        .expect("complete response")
+        .expect("complete response ok");
+
+    assert_eq!(response.request_id, "grpc-continued");
+    assert!(matches!(response.body, Some(Body::Complete(_))));
+    assert!(stream.next().await.is_none());
 }

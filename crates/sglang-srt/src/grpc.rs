@@ -395,14 +395,32 @@ where
         &self,
         _request: Request<PauseGenerationRequest>,
     ) -> Result<Response<ControlResponse>, Status> {
-        Err(unimplemented_rpc("PauseGeneration"))
+        let response = self
+            .runtime
+            .lock()
+            .map_err(|_| Status::internal("router runtime mutex poisoned"))?
+            .pause_generation();
+
+        Ok(Response::new(ControlResponse {
+            success: response.success,
+            message: response.message,
+        }))
     }
 
     async fn continue_generation(
         &self,
         _request: Request<ContinueGenerationRequest>,
     ) -> Result<Response<ControlResponse>, Status> {
-        Err(unimplemented_rpc("ContinueGeneration"))
+        let response = self
+            .runtime
+            .lock()
+            .map_err(|_| Status::internal("router runtime mutex poisoned"))?
+            .continue_generation();
+
+        Ok(Response::new(ControlResponse {
+            success: response.success,
+            message: response.message,
+        }))
     }
 
     async fn chat_complete(
