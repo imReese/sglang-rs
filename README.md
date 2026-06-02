@@ -7,6 +7,55 @@ The goal is to move Python-heavy runtime work into Rust: request lifecycle
 management, scheduling, prefix-cache matching, tokenization/detokenization
 boundaries, and eventually the bridge into the existing CUDA kernels.
 
+## Project Layout
+
+This repository is organized as an independent Rust workspace rather than a
+mirror of the upstream SGLang source tree. The Rust crates live under
+`crates/`, shared protocol contracts live under `proto/`, and non-Rust runtime
+surfaces will get their own top-level directories as they become real
+integration targets.
+
+The intended long-term layout is:
+
+```text
+sglang-rs/
+  Cargo.toml
+  Cargo.lock
+  rust-toolchain.toml
+
+  proto/
+    sglang/runtime/v1/
+      sglang.proto
+
+  crates/
+    sglang-srt/        # Current runtime crate: router, scheduler, engine, gRPC
+    sglang-core/       # Future shared config/types/errors crate if boundaries grow
+    sglang-cuda/       # Future Rust FFI wrapper around CUDA/C++ kernels
+    sglang-python/     # Future PyO3 extension crate for Python integration
+
+  cuda/                # Future CUDA/C++ kernels and headers
+    include/
+    src/
+
+  python/              # Future pure Python package, CLI glue, and Python tests
+    sglang_rs/
+    tests/
+
+  docs/                # Future architecture notes and design docs
+```
+
+`crates/` is the conventional Rust workspace location for packages. Each
+subdirectory is a Rust crate with its own `Cargo.toml`; crates are split only
+when the boundary is useful. For now, `crates/sglang-srt` remains the main crate
+so runtime work can move quickly without premature crate churn.
+
+CUDA and Python code should not be folded into the current crate by default.
+CUDA kernels belong under `cuda/`, with a Rust wrapper crate such as
+`crates/sglang-cuda` handling build/link/FFI. Python code belongs under
+`python/`, while a PyO3 extension crate belongs under `crates/sglang-python`.
+The shared `proto/` directory stays at the workspace root because it is a
+cross-language contract.
+
 ## Current Scope
 
 This repository currently contains the first `sglang-srt` runtime crate:
