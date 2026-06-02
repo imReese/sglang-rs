@@ -2,7 +2,10 @@ use sglang_srt::cache::{CacheAllocationError, CachePageAllocator, CachePageId, R
 use sglang_srt::model_executor::ModelWorkerBatch;
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler, SchedulerError};
 use sglang_srt::types::{DisaggregatedParams, FAKE_BOOTSTRAP_HOST, RequestId, SamplingParams};
-use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
+use sglang_srt::worker::{
+    BatchGeneratedTokens, FallibleModelWorker, GeneratedToken, ModelWorker, WorkerExecutionError,
+    WorkerOutputError,
+};
 
 #[derive(Default)]
 struct NoopWorker;
@@ -35,6 +38,22 @@ impl ModelWorker for UnfinishedWorker {
                 .collect(),
         )
         .expect("output shape should match batch")
+    }
+}
+
+#[derive(Default)]
+struct FailingWorker;
+
+impl FallibleModelWorker for FailingWorker {
+    fn try_generate_batch(
+        &mut self,
+        batch: &ScheduleBatch,
+    ) -> Result<BatchGeneratedTokens, WorkerExecutionError> {
+        Err(WorkerOutputError::BatchSizeMismatch {
+            request_count: batch.batch_size(),
+            output_count: 0,
+        }
+        .into())
     }
 }
 
@@ -152,6 +171,26 @@ fn fake_bootstrap_prefill_dispatch_does_not_publish_pages_to_radix_cache() {
 
     assert!(batch.requests()[0].prefix_cache_pages().is_empty());
     assert_eq!(batch.requests()[0].uncached_input_ids(), &[1, 2, 3, 4]);
+}
+
+#[test]
+fn worker_failure_releases_prefill_cache_pages() {
+    let mut scheduler = Scheduler::with_cache_resources(
+        FailingWorker,
+        RadixCache::default(),
+        CachePageAllocator::new(3),
+    );
+    enqueue_request(&mut scheduler, "req-fail", &[1, 2]);
+
+    let error = scheduler
+        .dispatch_prefill_batch(1)
+        .expect_err("worker failure should be returned");
+
+    assert_eq!(
+        error.to_string(),
+        "worker execution error: worker output error: batch output count (0) must match request count (1)"
+    );
+    assert_eq!(scheduler.available_cache_pages(), Some(3));
 }
 
 #[test]

@@ -438,7 +438,13 @@ where
         &mut self,
         batch: ScheduleBatch,
     ) -> Result<Vec<ScheduledOutput>, SchedulerError> {
-        let generated = self.worker.execute_batch(&batch)?;
+        let generated = match self.worker.execute_batch(&batch) {
+            Ok(generated) => generated,
+            Err(error) => {
+                self.release_failed_batch_cache_pages(&batch);
+                return Err(error.into());
+            }
+        };
         let forward_mode = batch.forward_mode();
         let requests = batch.into_requests();
         let tokens = generated.into_tokens();
@@ -464,6 +470,20 @@ where
         }
 
         Ok(outputs)
+    }
+
+    fn release_failed_batch_cache_pages(&mut self, batch: &ScheduleBatch) {
+        if batch.forward_mode() != ForwardMode::Prefill {
+            return;
+        }
+
+        let Some(allocator) = self.cache_page_allocator.as_mut() else {
+            return;
+        };
+
+        for request in batch.requests() {
+            allocator.release(request.allocated_cache_pages());
+        }
     }
 
     fn publish_prefill_cache_pages(&mut self, request: &ScheduledRequest) {
