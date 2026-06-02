@@ -3,13 +3,15 @@ use tonic::codegen::tokio_stream::StreamExt;
 use tonic::{Code, Request};
 
 use sglang_srt::cache::{CachePageAllocator, RadixCache};
+use sglang_srt::cli::ServerArgs;
 use sglang_srt::engine::Engine;
 use sglang_srt::grpc::{GrpcRouterService, router_protocol_error_to_status};
 use sglang_srt::proto::sglang::runtime::v1::generate_response::Body;
 use sglang_srt::proto::sglang::runtime::v1::sglang_service_server::SglangService;
 use sglang_srt::proto::sglang::runtime::v1::{
-    DetokenizeRequest, FlushCacheRequest, GenerateRequest, GetLoadRequest, RequestOptions,
-    SamplingParams, TextGenerateRequest, TokenizeRequest,
+    DetokenizeRequest, FlushCacheRequest, GenerateRequest, GetLoadRequest, GetModelInfoRequest,
+    GetServerInfoRequest, ListModelsRequest, RequestOptions, SamplingParams, TextGenerateRequest,
+    TokenizeRequest,
 };
 use sglang_srt::router::{RouterProtocolError, RouterRuntime};
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
@@ -337,6 +339,102 @@ async fn grpc_detokenize_maps_tokenizer_errors_to_invalid_argument() {
 
     assert_eq!(error.code(), Code::InvalidArgument);
     assert!(error.message().contains("not valid UTF-8"));
+}
+
+#[tokio::test]
+async fn grpc_get_model_info_reports_configured_server_args() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "meta-llama/Llama-3.1-8B-Instruct",
+        "--served-model-name",
+        "llama3",
+        "--tokenizer-path",
+        "hf-tokenizer",
+    ])
+    .expect("server args should parse");
+    let runtime = RouterRuntime::new(Engine::new(
+        ByteTokenizer,
+        Scheduler::new(GrpcTwoStepWorker),
+    ));
+    let service = GrpcRouterService::with_server_args(runtime, &args);
+
+    let response = service
+        .get_model_info(Request::new(GetModelInfoRequest {}))
+        .await
+        .expect("model info should execute")
+        .into_inner();
+
+    assert_eq!(response.model_path, "meta-llama/Llama-3.1-8B-Instruct");
+    assert_eq!(response.tokenizer_path, "hf-tokenizer");
+    assert_eq!(response.served_model_name, "llama3");
+    assert!(response.is_generation);
+    assert_eq!(response.preferred_sampling_params_json, "{}");
+}
+
+#[tokio::test]
+async fn grpc_list_models_returns_configured_model_info() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "Qwen/Qwen3-4B",
+        "--served-model-name",
+        "qwen3",
+    ])
+    .expect("server args should parse");
+    let runtime = RouterRuntime::new(Engine::new(
+        ByteTokenizer,
+        Scheduler::new(GrpcTwoStepWorker),
+    ));
+    let service = GrpcRouterService::with_server_args(runtime, &args);
+
+    let response = service
+        .list_models(Request::new(ListModelsRequest {}))
+        .await
+        .expect("list models should execute")
+        .into_inner();
+
+    assert_eq!(response.models.len(), 1);
+    assert_eq!(response.models[0].model_path, "Qwen/Qwen3-4B");
+    assert_eq!(response.models[0].tokenizer_path, "Qwen/Qwen3-4B");
+    assert_eq!(response.models[0].served_model_name, "qwen3");
+}
+
+#[tokio::test]
+async fn grpc_model_info_requires_configured_metadata() {
+    let service = GrpcRouterService::from_engine(Engine::new(
+        ByteTokenizer,
+        Scheduler::new(GrpcTwoStepWorker),
+    ));
+
+    let error = service
+        .get_model_info(Request::new(GetModelInfoRequest {}))
+        .await
+        .expect_err("model info should require configured metadata");
+
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(error.message().contains("model info is not configured"));
+}
+
+#[tokio::test]
+async fn grpc_get_server_info_reports_rust_runtime() {
+    let service = GrpcRouterService::from_engine(Engine::new(
+        ByteTokenizer,
+        Scheduler::new(GrpcTwoStepWorker),
+    ));
+
+    let response = service
+        .get_server_info(Request::new(GetServerInfoRequest {}))
+        .await
+        .expect("server info should execute")
+        .into_inner();
+
+    assert_eq!(response.version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(response.runtime, "sglang-rs");
+    assert_eq!(
+        response.attributes.get("transport"),
+        Some(&"tonic-grpc".to_string())
+    );
 }
 
 #[tokio::test]

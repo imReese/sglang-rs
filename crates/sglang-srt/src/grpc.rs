@@ -1,9 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use tonic::{Code, Request, Response, Status};
 
+use crate::cli::ServerArgs;
 use crate::engine::Engine;
 use crate::proto::sglang::runtime::v1::generate_response::Body as ProtoGenerateResponseBody;
 use crate::proto::sglang::runtime::v1::sglang_service_server::SglangService;
@@ -22,8 +23,8 @@ use crate::proto::sglang::runtime::v1::{
 use crate::router::{
     RouterDisaggregatedParams, RouterGenerateComplete, RouterGenerateError, RouterGenerateRequest,
     RouterGenerateResponse, RouterGenerateResponseBody, RouterGenerateStreamChunk,
-    RouterProtocolError, RouterRuntime, RouterRuntimeError, RouterSamplingParams, RouterStatusCode,
-    RouterTextGenerateRequest,
+    RouterGetModelInfoResponse, RouterProtocolError, RouterRuntime, RouterRuntimeError,
+    RouterSamplingParams, RouterStatusCode, RouterTextGenerateRequest,
 };
 use crate::tokenizer::Tokenizer;
 use crate::worker::WorkerExecutor;
@@ -40,21 +41,50 @@ type OpenAiJsonResponseStream = Pin<
 
 pub struct GrpcRouterService<T, W> {
     runtime: Arc<Mutex<RouterRuntime<T, W>>>,
+    model_info: Option<RouterGetModelInfoResponse>,
 }
 
 impl<T, W> GrpcRouterService<T, W> {
     pub fn new(runtime: RouterRuntime<T, W>) -> Self {
         Self {
             runtime: Arc::new(Mutex::new(runtime)),
+            model_info: None,
         }
+    }
+
+    pub fn with_model_info(
+        runtime: RouterRuntime<T, W>,
+        model_info: RouterGetModelInfoResponse,
+    ) -> Self {
+        Self {
+            runtime: Arc::new(Mutex::new(runtime)),
+            model_info: Some(model_info),
+        }
+    }
+
+    pub fn with_server_args(runtime: RouterRuntime<T, W>, args: &ServerArgs) -> Self {
+        Self::with_model_info(runtime, RouterGetModelInfoResponse::from_server_args(args))
     }
 
     pub fn from_engine(engine: Engine<T, W>) -> Self {
         Self::new(RouterRuntime::new(engine))
     }
 
+    pub fn from_engine_with_model_info(
+        engine: Engine<T, W>,
+        model_info: RouterGetModelInfoResponse,
+    ) -> Self {
+        Self::with_model_info(RouterRuntime::new(engine), model_info)
+    }
+
     pub fn runtime(&self) -> &Arc<Mutex<RouterRuntime<T, W>>> {
         &self.runtime
+    }
+
+    fn model_info(&self) -> Result<RouterGetModelInfoResponse, Status> {
+        self.model_info
+            .clone()
+            .ok_or_else(|| Status::failed_precondition("model info is not configured"))
     }
 }
 
@@ -208,21 +238,29 @@ where
         &self,
         _request: Request<GetModelInfoRequest>,
     ) -> Result<Response<ModelInfoResponse>, Status> {
-        Err(unimplemented_rpc("GetModelInfo"))
+        Ok(Response::new(router_model_info_to_proto_response(
+            self.model_info()?,
+        )))
     }
 
     async fn get_server_info(
         &self,
         _request: Request<GetServerInfoRequest>,
     ) -> Result<Response<ServerInfoResponse>, Status> {
-        Err(unimplemented_rpc("GetServerInfo"))
+        Ok(Response::new(ServerInfoResponse {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            runtime: "sglang-rs".to_string(),
+            attributes: HashMap::from([("transport".to_string(), "tonic-grpc".to_string())]),
+        }))
     }
 
     async fn list_models(
         &self,
         _request: Request<ListModelsRequest>,
     ) -> Result<Response<ListModelsResponse>, Status> {
-        Err(unimplemented_rpc("ListModels"))
+        Ok(Response::new(ListModelsResponse {
+            models: vec![router_model_info_to_proto_response(self.model_info()?)],
+        }))
     }
 
     async fn get_load(
@@ -471,6 +509,27 @@ fn router_error_to_proto(error: RouterGenerateError) -> ProtoGenerateError {
     ProtoGenerateError {
         message: error.message,
         code: String::new(),
+    }
+}
+
+fn router_model_info_to_proto_response(
+    model_info: RouterGetModelInfoResponse,
+) -> ModelInfoResponse {
+    ModelInfoResponse {
+        model_path: model_info.model_path,
+        tokenizer_path: model_info.tokenizer_path,
+        is_generation: model_info.is_generation,
+        preferred_sampling_params_json: model_info.preferred_sampling_params,
+        weight_version: model_info.weight_version,
+        served_model_name: model_info.served_model_name,
+        max_context_length: model_info.max_context_length,
+        vocab_size: model_info.vocab_size,
+        supports_vision: model_info.supports_vision,
+        model_type: model_info.model_type,
+        eos_token_ids: model_info.eos_token_ids,
+        pad_token_id: model_info.pad_token_id,
+        bos_token_id: model_info.bos_token_id,
+        max_request_input_length: model_info.max_req_input_len,
     }
 }
 
