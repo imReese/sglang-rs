@@ -665,6 +665,55 @@ fn router_runtime_streams_prefill_chunks_and_final_complete_response() {
 }
 
 #[test]
+fn router_runtime_non_stream_generate_returns_only_final_complete_response() {
+    let tokenizer = ByteTokenizer::default();
+    let scheduler = Scheduler::new(TwoStepRouterWorker::default());
+    let engine = Engine::new(tokenizer, scheduler);
+    let mut runtime = RouterRuntime::new(engine);
+
+    let responses = runtime
+        .generate_stream(RouterGenerateRequest {
+            request_id: "router-non-stream".to_string(),
+            tokenized: Some(RouterTokenizedInput {
+                original_text: String::new(),
+                input_ids: vec![1, 2, 3],
+            }),
+            sampling_params: Some(RouterSamplingParams {
+                max_new_tokens: Some(2),
+                ..Default::default()
+            }),
+            disaggregated_params: None,
+            stream: false,
+            data_parallel_rank: 0,
+            trace_headers: Default::default(),
+        })
+        .expect("router non-stream request should execute");
+
+    assert_eq!(
+        responses,
+        vec![RouterGenerateResponse {
+            request_id: "router-non-stream".to_string(),
+            body: RouterGenerateResponseBody::Complete(RouterGenerateComplete {
+                output_ids: vec![42, 43],
+                text: String::new(),
+                finish_reason: "stop".to_string(),
+                prompt_tokens: 3,
+                completion_tokens: 2,
+                cached_tokens: 0,
+                index: 0,
+            }),
+        }]
+    );
+    assert_eq!(
+        runtime.engine().scheduler().worker().seen_modes,
+        vec![
+            sglang_srt::scheduler::ForwardMode::Prefill,
+            sglang_srt::scheduler::ForwardMode::Decode,
+        ]
+    );
+}
+
+#[test]
 fn router_runtime_text_generate_tokenizes_prompt_and_decodes_output_text() {
     let tokenizer = ByteTokenizer::default();
     let scheduler = Scheduler::new(RouterEchoWorker::default());

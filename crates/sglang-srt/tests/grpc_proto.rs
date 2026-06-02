@@ -184,6 +184,57 @@ async fn grpc_generate_streams_router_runtime_outputs() {
 }
 
 #[tokio::test]
+async fn grpc_generate_non_stream_returns_only_complete_response() {
+    let service = GrpcRouterService::from_engine(Engine::new(
+        ByteTokenizer,
+        Scheduler::new(GrpcTwoStepWorker),
+    ));
+
+    let mut stream = service
+        .generate(Request::new(GenerateRequest {
+            input_ids: vec![1, 2, 3],
+            original_text: String::new(),
+            sampling_params: Some(SamplingParams {
+                max_new_tokens: Some(2),
+                ..Default::default()
+            }),
+            options: Some(RequestOptions {
+                request_id: Some("grpc-non-stream".to_string()),
+                stream: false,
+                data_parallel_rank: 0,
+                trace_headers: Default::default(),
+            }),
+            disaggregated_params: None,
+        }))
+        .await
+        .expect("grpc generate should execute")
+        .into_inner();
+
+    let response = stream
+        .next()
+        .await
+        .expect("complete response")
+        .expect("complete response ok");
+
+    assert_eq!(response.request_id, "grpc-non-stream");
+    assert_eq!(
+        response.body,
+        Some(Body::Complete(
+            sglang_srt::proto::sglang::runtime::v1::GenerateComplete {
+                output_ids: vec![42, 43],
+                text: String::new(),
+                finish_reason: "stop".to_string(),
+                prompt_tokens: 3,
+                completion_tokens: 2,
+                cached_tokens: 0,
+                index: 0,
+            }
+        ))
+    );
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
 async fn grpc_text_generate_tokenizes_prompt_and_streams_decoded_text() {
     let service = GrpcRouterService::from_engine(Engine::new(
         ByteTokenizer,

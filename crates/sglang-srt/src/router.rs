@@ -228,6 +228,7 @@ impl RouterGenerateRequest {
 
         Ok(ValidatedTokenGenerateRequest {
             prompt_tokens: input_tokens,
+            stream: self.stream,
             request: TokenGenerateRequest {
                 request_id: RequestId::from(request_id.as_str()),
                 input_ids: tokenized.input_ids,
@@ -262,6 +263,7 @@ fn next_router_request_id() -> String {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ValidatedTokenGenerateRequest {
     prompt_tokens: usize,
+    stream: bool,
     request: TokenGenerateRequest,
 }
 
@@ -531,6 +533,7 @@ where
     ) -> Result<Vec<RouterGenerateResponse>, RouterRuntimeError> {
         let validated_request = request.try_into_validated_token_request(self.validation_config)?;
         let prompt_tokens = validated_request.prompt_tokens as i32;
+        let stream = validated_request.stream;
         let outputs = self
             .engine
             .generate_token_stream(validated_request.request)?;
@@ -564,6 +567,12 @@ where
             };
 
             responses.push(RouterGenerateResponse { request_id, body });
+        }
+
+        if !stream {
+            responses.retain(|response| {
+                matches!(response.body, RouterGenerateResponseBody::Complete(_))
+            });
         }
 
         Ok(responses)
