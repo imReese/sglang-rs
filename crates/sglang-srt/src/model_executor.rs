@@ -1,7 +1,11 @@
 use crate::cache::CachePageId;
 use crate::scheduler::{ForwardMode, ScheduleBatch, ScheduledRequest};
 use crate::types::{DisaggregatedParams, RequestId};
-use crate::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
+use std::fmt;
+
+use crate::worker::{
+    BatchGeneratedTokens, FallibleModelWorker, GeneratedToken, WorkerExecutionError,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelWorkerBatch {
@@ -163,6 +167,26 @@ pub enum ModelForwardError {
     },
 }
 
+impl fmt::Display for ModelForwardError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyVocabulary => {
+                formatter.write_str("model forward output has empty vocabulary")
+            }
+            Self::RaggedLogits => formatter.write_str("model forward output logits are ragged"),
+            Self::BatchSizeMismatch {
+                request_count,
+                output_count,
+            } => write!(
+                formatter,
+                "model forward output count ({output_count}) must match request count ({request_count})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ModelForwardError {}
+
 pub struct ModelRunner<M> {
     model: M,
 }
@@ -181,32 +205,36 @@ impl<M> ModelRunner<M> {
     }
 }
 
-impl<M> ModelWorker for ModelRunner<M>
+impl<M> FallibleModelWorker for ModelRunner<M>
 where
     M: ForwardModel,
 {
-    fn generate_batch(&mut self, batch: &ScheduleBatch) -> BatchGeneratedTokens {
+    fn try_generate_batch(
+        &mut self,
+        batch: &ScheduleBatch,
+    ) -> Result<BatchGeneratedTokens, WorkerExecutionError> {
         let worker_batch = ModelWorkerBatch::from_schedule_batch(batch);
         let forward_output = self.model.forward(&worker_batch);
         let token_ids = forward_output
             .into_argmax_tokens()
-            .expect("model forward logits must contain one non-empty row per request");
+            .map_err(|error| WorkerExecutionError::Runtime(error.to_string()))?;
 
         if token_ids.len() != batch.batch_size() {
-            panic!(
-                "model forward output count ({}) must match request count ({})",
-                token_ids.len(),
-                batch.batch_size()
-            );
+            return Err(WorkerExecutionError::Runtime(
+                ModelForwardError::BatchSizeMismatch {
+                    request_count: batch.batch_size(),
+                    output_count: token_ids.len(),
+                }
+                .to_string(),
+            ));
         }
 
-        BatchGeneratedTokens::from_batch(
+        Ok(BatchGeneratedTokens::from_batch(
             batch,
             token_ids
                 .into_iter()
                 .map(|token_id| GeneratedToken::unfinished(vec![token_id]))
                 .collect(),
-        )
-        .expect("runner output shape should match batch")
+        )?)
     }
 }

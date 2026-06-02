@@ -5,7 +5,7 @@ use crate::cache::{
     CacheAllocationError, CachePageAllocator, CachePageId, PrefixMatch, RadixCache,
 };
 use crate::types::{DisaggregatedParams, FAKE_BOOTSTRAP_HOST, RequestId, SamplingParams};
-use crate::worker::{GeneratedToken, WorkerExecutor};
+use crate::worker::{GeneratedToken, WorkerExecutionError, WorkerExecutor};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequestStage {
@@ -132,6 +132,7 @@ impl ScheduledRequest {
 pub enum SchedulerError {
     EmptyQueue,
     CacheAllocation(CacheAllocationError),
+    Worker(WorkerExecutionError),
 }
 
 impl fmt::Display for SchedulerError {
@@ -139,6 +140,7 @@ impl fmt::Display for SchedulerError {
         match self {
             Self::EmptyQueue => formatter.write_str("scheduler queue is empty"),
             Self::CacheAllocation(error) => write!(formatter, "cache allocation error: {error}"),
+            Self::Worker(error) => write!(formatter, "worker execution error: {error}"),
         }
     }
 }
@@ -148,6 +150,12 @@ impl std::error::Error for SchedulerError {}
 impl From<CacheAllocationError> for SchedulerError {
     fn from(value: CacheAllocationError) -> Self {
         Self::CacheAllocation(value)
+    }
+}
+
+impl From<WorkerExecutionError> for SchedulerError {
+    fn from(value: WorkerExecutionError) -> Self {
+        Self::Worker(value)
     }
 }
 
@@ -422,7 +430,7 @@ where
         &mut self,
         batch: ScheduleBatch,
     ) -> Result<Vec<ScheduledOutput>, SchedulerError> {
-        let generated = self.worker.execute_batch(&batch);
+        let generated = self.worker.execute_batch(&batch)?;
         let forward_mode = batch.forward_mode();
         let requests = batch.into_requests();
         let tokens = generated.into_tokens();

@@ -94,20 +94,68 @@ impl fmt::Display for WorkerOutputError {
 
 impl std::error::Error for WorkerOutputError {}
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum WorkerExecutionError {
+    Output(WorkerOutputError),
+    Runtime(String),
+}
+
+impl fmt::Display for WorkerExecutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Output(error) => write!(formatter, "worker output error: {error}"),
+            Self::Runtime(error) => write!(formatter, "worker runtime error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for WorkerExecutionError {}
+
+impl From<WorkerOutputError> for WorkerExecutionError {
+    fn from(value: WorkerOutputError) -> Self {
+        Self::Output(value)
+    }
+}
+
 pub trait ModelWorker {
     fn generate_batch(&mut self, batch: &ScheduleBatch) -> BatchGeneratedTokens;
 }
 
+pub trait FallibleModelWorker {
+    fn try_generate_batch(
+        &mut self,
+        batch: &ScheduleBatch,
+    ) -> Result<BatchGeneratedTokens, WorkerExecutionError>;
+}
+
 pub trait WorkerExecutor {
-    fn execute_batch(&mut self, batch: &ScheduleBatch) -> BatchGeneratedTokens;
+    fn execute_batch(
+        &mut self,
+        batch: &ScheduleBatch,
+    ) -> Result<BatchGeneratedTokens, WorkerExecutionError>;
+}
+
+impl<W> FallibleModelWorker for W
+where
+    W: ModelWorker,
+{
+    fn try_generate_batch(
+        &mut self,
+        batch: &ScheduleBatch,
+    ) -> Result<BatchGeneratedTokens, WorkerExecutionError> {
+        Ok(self.generate_batch(batch))
+    }
 }
 
 impl<W> WorkerExecutor for W
 where
-    W: ModelWorker,
+    W: FallibleModelWorker,
 {
-    fn execute_batch(&mut self, batch: &ScheduleBatch) -> BatchGeneratedTokens {
-        self.generate_batch(batch)
+    fn execute_batch(
+        &mut self,
+        batch: &ScheduleBatch,
+    ) -> Result<BatchGeneratedTokens, WorkerExecutionError> {
+        self.try_generate_batch(batch)
     }
 }
 
@@ -139,15 +187,18 @@ impl<P, D> PdModelWorkers<P, D> {
     }
 }
 
-impl<P, D> WorkerExecutor for PdModelWorkers<P, D>
+impl<P, D> FallibleModelWorker for PdModelWorkers<P, D>
 where
-    P: ModelWorker,
-    D: ModelWorker,
+    P: FallibleModelWorker,
+    D: FallibleModelWorker,
 {
-    fn execute_batch(&mut self, batch: &ScheduleBatch) -> BatchGeneratedTokens {
+    fn try_generate_batch(
+        &mut self,
+        batch: &ScheduleBatch,
+    ) -> Result<BatchGeneratedTokens, WorkerExecutionError> {
         match batch.forward_mode() {
-            ForwardMode::Prefill => self.prefill.generate_batch(batch),
-            ForwardMode::Decode => self.decode.generate_batch(batch),
+            ForwardMode::Prefill => self.prefill.try_generate_batch(batch),
+            ForwardMode::Decode => self.decode.try_generate_batch(batch),
         }
     }
 }

@@ -1,6 +1,8 @@
 use sglang_srt::cache::{CachePageId, RadixCache};
 use sglang_srt::model_executor::{ForwardModel, ModelForwardOutput, ModelRunner, ModelWorkerBatch};
-use sglang_srt::scheduler::{ForwardMode, ScheduleBatch, ScheduledRequest, Scheduler};
+use sglang_srt::scheduler::{
+    ForwardMode, ScheduleBatch, ScheduledRequest, Scheduler, SchedulerError,
+};
 use sglang_srt::types::{DisaggregatedParams, FAKE_BOOTSTRAP_HOST, RequestId, SamplingParams};
 use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
 
@@ -274,6 +276,36 @@ fn model_runner_requeues_decode_until_scheduler_reaches_max_new_tokens() {
     assert_eq!(
         scheduler.worker().model().seen_forward_modes,
         vec![ForwardMode::Prefill, ForwardMode::Decode]
+    );
+}
+
+#[derive(Default)]
+struct EmptyForwardModel;
+
+impl ForwardModel for EmptyForwardModel {
+    fn forward(&mut self, _batch: &ModelWorkerBatch) -> ModelForwardOutput {
+        ModelForwardOutput::new(Vec::new()).expect("empty batch logits are constructible")
+    }
+}
+
+#[test]
+fn model_runner_returns_forward_errors_without_panicking() {
+    let mut scheduler = Scheduler::new(ModelRunner::new(EmptyForwardModel));
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("runner-error"),
+        vec![10, 11],
+        SamplingParams { max_new_tokens: 1 },
+    ));
+
+    let error = scheduler
+        .dispatch_prefill_batch(1)
+        .expect_err("empty model output should become a scheduler error");
+
+    assert!(matches!(error, SchedulerError::Worker(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("model forward output count (0) must match request count (1)")
     );
 }
 
