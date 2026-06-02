@@ -4,23 +4,29 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use crate::cli::ServerArgs;
 use crate::engine::Engine;
 use crate::grpc::{GrpcRouterService, GrpcServeError, serve_grpc_router};
+use crate::model_executor::{ForwardModel, ModelForwardOutput, ModelRunner, ModelWorkerBatch};
 use crate::router::RouterRuntime;
-use crate::scheduler::{ScheduleBatch, Scheduler};
+use crate::scheduler::Scheduler;
 use crate::tokenizer::ByteTokenizer;
-use crate::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
 
 #[derive(Clone, Debug, Default)]
-pub struct BootstrapModelWorker;
+pub struct BootstrapForwardModel;
 
-impl ModelWorker for BootstrapModelWorker {
-    fn generate_batch(&mut self, batch: &ScheduleBatch) -> BatchGeneratedTokens {
-        let token = GeneratedToken::finished(vec![b' ' as u32]);
-        BatchGeneratedTokens::from_batch(batch, vec![token; batch.batch_size()])
-            .expect("bootstrap worker output shape should match batch")
+impl ForwardModel for BootstrapForwardModel {
+    fn forward(&mut self, batch: &ModelWorkerBatch) -> ModelForwardOutput {
+        let mut logits = Vec::with_capacity(batch.request_ids().len());
+        for _ in batch.request_ids() {
+            let mut row = vec![0.0; (b' ' as usize) + 1];
+            row[b' ' as usize] = 1.0;
+            logits.push(row);
+        }
+
+        ModelForwardOutput::new(logits).expect("bootstrap logits should be rectangular")
     }
 }
 
-pub type BootstrapGrpcRouterService = GrpcRouterService<ByteTokenizer, BootstrapModelWorker>;
+pub type BootstrapGrpcRouterService =
+    GrpcRouterService<ByteTokenizer, ModelRunner<BootstrapForwardModel>>;
 
 #[derive(Debug)]
 pub enum ServerLaunchError {
@@ -65,7 +71,7 @@ pub fn grpc_listen_addr(args: &ServerArgs) -> Result<SocketAddr, ServerLaunchErr
 }
 
 pub fn build_bootstrap_grpc_router_service(args: &ServerArgs) -> BootstrapGrpcRouterService {
-    let scheduler = Scheduler::new(BootstrapModelWorker);
+    let scheduler = Scheduler::new(ModelRunner::new(BootstrapForwardModel));
     let engine = Engine::new(ByteTokenizer, scheduler);
     let runtime = RouterRuntime::new(engine);
     GrpcRouterService::with_server_args(runtime, args)
