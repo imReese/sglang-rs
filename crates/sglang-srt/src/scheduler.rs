@@ -30,6 +30,7 @@ pub struct ScheduledRequest {
     allocated_cache_pages: Vec<CachePageId>,
     sampling: SamplingParams,
     disaggregated_params: Option<DisaggregatedParams>,
+    data_parallel_rank: i32,
     prefix_match: PrefixMatch,
     stage: RequestStage,
 }
@@ -44,6 +45,7 @@ impl ScheduledRequest {
             allocated_cache_pages: Vec::new(),
             sampling,
             disaggregated_params: None,
+            data_parallel_rank: 0,
             prefix_match: PrefixMatch {
                 matched_token_count: 0,
                 cache_pages: Vec::new(),
@@ -58,6 +60,11 @@ impl ScheduledRequest {
         disaggregated_params: Option<DisaggregatedParams>,
     ) -> Self {
         self.disaggregated_params = disaggregated_params;
+        self
+    }
+
+    pub fn with_data_parallel_rank(mut self, data_parallel_rank: i32) -> Self {
+        self.data_parallel_rank = data_parallel_rank;
         self
     }
 
@@ -83,6 +90,10 @@ impl ScheduledRequest {
 
     pub fn disaggregated_params(&self) -> Option<&DisaggregatedParams> {
         self.disaggregated_params.as_ref()
+    }
+
+    pub fn data_parallel_rank(&self) -> i32 {
+        self.data_parallel_rank
     }
 
     pub fn skips_radix_cache_insert(&self) -> bool {

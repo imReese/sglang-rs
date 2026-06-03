@@ -47,6 +47,7 @@ pub struct TokenGenerateRequest {
     pub input_ids: Vec<u32>,
     pub sampling: SamplingParams,
     pub disaggregated_params: Option<DisaggregatedParams>,
+    pub data_parallel_rank: i32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

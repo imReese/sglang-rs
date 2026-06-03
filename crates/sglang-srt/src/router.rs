@@ -234,6 +234,7 @@ impl RouterGenerateRequest {
                 input_ids: tokenized.input_ids,
                 sampling,
                 disaggregated_params: self.disaggregated_params.map(Into::into),
+                data_parallel_rank: self.data_parallel_rank,
             },
         })
     }

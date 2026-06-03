@@ -172,6 +172,25 @@ fn model_worker_batch_exposes_pd_bootstrap_metadata() {
 }
 
 #[test]
+fn model_worker_batch_exposes_data_parallel_rank_for_pd_bootstrap() {
+    let request = ScheduledRequest::new(
+        RequestId::from("pd-dp-rank"),
+        vec![1, 2, 3],
+        SamplingParams { max_new_tokens: 1 },
+    )
+    .with_data_parallel_rank(7);
+    let mut scheduler = Scheduler::new(NoopWorker);
+    scheduler.enqueue(request);
+
+    let batch = scheduler
+        .next_prefill_batch(1)
+        .expect("prefill batch should be created");
+    let worker_batch = ModelWorkerBatch::from_schedule_batch(&batch);
+
+    assert_eq!(worker_batch.data_parallel_ranks(), &[7]);
+}
+
+#[test]
 fn scheduled_request_detects_fake_bootstrap_radix_cache_skip() {
     let request = ScheduledRequest::new(
         RequestId::from("fake-bootstrap"),

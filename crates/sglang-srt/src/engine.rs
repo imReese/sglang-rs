@@ -103,7 +103,8 @@ where
     ) -> Result<TokenGenerateOutput, RuntimeError> {
         let output = self.generate_scheduled(
             ScheduledRequest::new(request.request_id, request.input_ids, request.sampling)
-                .with_disaggregated_params(request.disaggregated_params),
+                .with_disaggregated_params(request.disaggregated_params)
+                .with_data_parallel_rank(request.data_parallel_rank),
         )?;
 
         Ok(TokenGenerateOutput {
@@ -119,7 +120,8 @@ where
     ) -> Result<Vec<TokenGenerateOutput>, RuntimeError> {
         let outputs = self.generate_scheduled_stream(
             ScheduledRequest::new(request.request_id, request.input_ids, request.sampling)
-                .with_disaggregated_params(request.disaggregated_params),
+                .with_disaggregated_params(request.disaggregated_params)
+                .with_data_parallel_rank(request.data_parallel_rank),
         )?;
 
         Ok(outputs

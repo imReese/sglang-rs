@@ -80,6 +80,7 @@ fn router_generate_request_maps_to_tokenized_engine_request() {
     assert_eq!(token_request.request_id, RequestId::from("router-rid"));
     assert_eq!(token_request.input_ids, vec![101, 202, 303]);
     assert_eq!(token_request.sampling, SamplingParams { max_new_tokens: 7 });
+    assert_eq!(token_request.data_parallel_rank, 2);
     assert!(token_request.disaggregated_params.is_none());
 }
 

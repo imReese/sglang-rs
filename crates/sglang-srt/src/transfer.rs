@@ -1,9 +1,11 @@
+use std::collections::BTreeMap;
 #[cfg(feature = "mooncake-link")]
 use std::ffi::CString;
 use std::ffi::{NulError, c_char, c_int, c_void};
 use std::fmt;
 
 use crate::cli::ServerArgs;
+use crate::types::{DisaggregatedParams, RequestId};
 
 #[cfg(feature = "mooncake-link")]
 #[link(name = "transfer_engine", kind = "static")]
@@ -232,6 +234,123 @@ pub enum KvPoll {
     WaitingForInput = 2,
     Transferring = 3,
     Success = 4,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecodeBootstrapSession {
+    request_id: RequestId,
+    disaggregated_params: DisaggregatedParams,
+    data_parallel_rank: i32,
+    status: KvPoll,
+}
+
+impl DecodeBootstrapSession {
+    pub fn new(
+        request_id: RequestId,
+        disaggregated_params: DisaggregatedParams,
+        data_parallel_rank: i32,
+    ) -> Self {
+        Self {
+            request_id,
+            disaggregated_params,
+            data_parallel_rank,
+            status: KvPoll::Bootstrapping,
+        }
+    }
+
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub fn disaggregated_params(&self) -> &DisaggregatedParams {
+        &self.disaggregated_params
+    }
+
+    pub fn data_parallel_rank(&self) -> i32 {
+        self.data_parallel_rank
+    }
+
+    pub fn status(&self) -> KvPoll {
+        self.status
+    }
+
+    fn set_status(&mut self, status: KvPoll) {
+        self.status = status;
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum DecodeBootstrapRegistryError {
+    DuplicateBootstrapRoom(i32),
+    MissingBootstrapRoom(i32),
+}
+
+impl fmt::Display for DecodeBootstrapRegistryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateBootstrapRoom(room) => {
+                write!(formatter, "duplicate decode bootstrap room: {room}")
+            }
+            Self::MissingBootstrapRoom(room) => {
+                write!(formatter, "missing decode bootstrap room: {room}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DecodeBootstrapRegistryError {}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DecodeBootstrapRegistry {
+    sessions_by_room: BTreeMap<i32, DecodeBootstrapSession>,
+}
+
+impl DecodeBootstrapRegistry {
+    pub fn register(
+        &mut self,
+        session: DecodeBootstrapSession,
+    ) -> Result<(), DecodeBootstrapRegistryError> {
+        let room = session.disaggregated_params.bootstrap_room;
+        if self.sessions_by_room.contains_key(&room) {
+            return Err(DecodeBootstrapRegistryError::DuplicateBootstrapRoom(room));
+        }
+
+        self.sessions_by_room.insert(room, session);
+        Ok(())
+    }
+
+    pub fn get(&self, bootstrap_room: i32) -> Option<&DecodeBootstrapSession> {
+        self.sessions_by_room.get(&bootstrap_room)
+    }
+
+    pub fn query_data_parallel_rank(&self, bootstrap_room: i32) -> Option<i32> {
+        self.get(bootstrap_room)
+            .map(DecodeBootstrapSession::data_parallel_rank)
+    }
+
+    pub fn update_status(
+        &mut self,
+        bootstrap_room: i32,
+        status: KvPoll,
+    ) -> Result<(), DecodeBootstrapRegistryError> {
+        let session = self.sessions_by_room.get_mut(&bootstrap_room).ok_or(
+            DecodeBootstrapRegistryError::MissingBootstrapRoom(bootstrap_room),
+        )?;
+        session.set_status(status);
+        Ok(())
+    }
+
+    pub fn remove(&mut self, bootstrap_room: i32) -> Option<DecodeBootstrapSession> {
+        self.sessions_by_room.remove(&bootstrap_room)
+    }
+
+    pub fn len(&self) -> usize {
+        self.sessions_by_room.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sessions_by_room.is_empty()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

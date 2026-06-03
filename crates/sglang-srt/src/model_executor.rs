@@ -18,6 +18,7 @@ pub struct ModelWorkerBatch {
     prefix_cache_pages: Vec<Vec<CachePageId>>,
     out_cache_pages: Vec<CachePageId>,
     disaggregated_params: Vec<Option<DisaggregatedParams>>,
+    data_parallel_ranks: Vec<i32>,
 }
 
 impl ModelWorkerBatch {
@@ -32,6 +33,7 @@ impl ModelWorkerBatch {
             prefix_cache_pages: Vec::with_capacity(batch.batch_size()),
             out_cache_pages: Vec::new(),
             disaggregated_params: Vec::with_capacity(batch.batch_size()),
+            data_parallel_ranks: Vec::with_capacity(batch.batch_size()),
         };
 
         for request in batch.requests() {
@@ -77,6 +79,10 @@ impl ModelWorkerBatch {
         &self.disaggregated_params
     }
 
+    pub fn data_parallel_ranks(&self) -> &[i32] {
+        &self.data_parallel_ranks
+    }
+
     fn push_request(&mut self, forward_mode: ForwardMode, request: &ScheduledRequest) {
         self.request_ids.push(request.request_id().clone());
         self.request_offsets.push(self.input_ids.len());
@@ -84,6 +90,7 @@ impl ModelWorkerBatch {
             .push(request.prefix_cache_pages().to_vec());
         self.disaggregated_params
             .push(request.disaggregated_params().cloned());
+        self.data_parallel_ranks.push(request.data_parallel_rank());
 
         match forward_mode {
             ForwardMode::Prefill => self.push_prefill_request(request),
