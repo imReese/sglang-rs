@@ -117,6 +117,22 @@ impl KvCacheDtype {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KvCacheModelLayout {
+    pub num_layers: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+}
+
+impl KvCacheModelLayout {
+    pub fn elements_per_token(&self) -> Option<usize> {
+        self.num_layers
+            .checked_mul(2)
+            .and_then(|value| value.checked_mul(self.kv_heads))
+            .and_then(|value| value.checked_mul(self.head_dim))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PdConfig {
     pub mode: DisaggregationMode,
@@ -188,6 +204,7 @@ pub enum PdConfigError {
     InvalidTransferBackend(String),
     InvalidKvCacheDtype(String),
     KvCacheDtypeRequiresModelMetadata(KvCacheDtype),
+    KvCacheLayoutOverflow,
     FakePrefillUnsupported,
 }
 
@@ -211,6 +228,9 @@ impl fmt::Display for PdConfigError {
                     formatter,
                     "kv cache dtype requires model metadata for byte width: {dtype:?}"
                 )
+            }
+            Self::KvCacheLayoutOverflow => {
+                formatter.write_str("kv cache layout byte size overflow")
             }
             Self::FakePrefillUnsupported => {
                 formatter.write_str("prefill server does not support fake transfer backend")
@@ -955,13 +975,37 @@ impl MooncakeKvCacheLayout {
         let bytes_per_element = config.kv_cache_dtype.bytes_per_element().ok_or(
             PdConfigError::KvCacheDtypeRequiresModelMetadata(config.kv_cache_dtype),
         )?;
+        let token_size_bytes = kv_elements_per_token
+            .checked_mul(bytes_per_element)
+            .ok_or(PdConfigError::KvCacheLayoutOverflow)?;
+        let page_size_bytes = config
+            .page_size
+            .checked_mul(token_size_bytes)
+            .ok_or(PdConfigError::KvCacheLayoutOverflow)?;
 
-        Ok(Self::from_pd_config(
+        Ok(Self {
             source_base_addr,
-            kv_elements_per_token * bytes_per_element,
+            page_size_bytes,
+            target_base_offset,
+        })
+    }
+
+    pub fn from_pd_config_model_layout(
+        source_base_addr: usize,
+        target_base_offset: u64,
+        config: &PdConfig,
+        model_layout: &KvCacheModelLayout,
+    ) -> Result<Self, PdConfigError> {
+        let kv_elements_per_token = model_layout
+            .elements_per_token()
+            .ok_or(PdConfigError::KvCacheLayoutOverflow)?;
+
+        Self::from_pd_config_kv_elements(
+            source_base_addr,
+            kv_elements_per_token,
             target_base_offset,
             config,
-        ))
+        )
     }
 }
 
