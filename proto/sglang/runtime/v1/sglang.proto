@@ -192,6 +192,10 @@ message ModelInfoResponse {
   int32 pad_token_id = 12;
   int32 bos_token_id = 13;
   int32 max_request_input_length = 14;
+  int32 routed_expert_expected_group_count = 15;
+  int32 routed_expert_actual_group_count = 16;
+  int32 routed_expert_expected_weight_count = 17;
+  int32 routed_expert_actual_weight_count = 18;
 }
 
 message GetServerInfoRequest {}

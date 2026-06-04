@@ -510,6 +510,10 @@ fn router_model_info_uses_sglang_server_args_for_worker_registration() {
     assert!(response.is_generation);
     assert_eq!(response.served_model_name, "llama3");
     assert_eq!(response.preferred_sampling_params, "{}");
+    assert_eq!(response.routed_expert_expected_group_count, 0);
+    assert_eq!(response.routed_expert_actual_group_count, 0);
+    assert_eq!(response.routed_expert_expected_weight_count, 0);
+    assert_eq!(response.routed_expert_actual_weight_count, 0);
 }
 
 #[test]

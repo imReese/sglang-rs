@@ -102,6 +102,65 @@ async fn bootstrap_grpc_router_service_reports_local_model_config_metadata() {
 }
 
 #[tokio::test]
+async fn bootstrap_grpc_router_service_reports_local_moe_checkpoint_coverage() {
+    let model_dir = temp_model_dir("server-moe-checkpoint-coverage");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "model_type": "deepseek_v4",
+  "num_hidden_layers": 1,
+  "n_routed_experts": 1,
+  "first_k_dense_replace": 0,
+  "moe_layer_freq": 1
+}"#,
+    )
+    .expect("config should be written");
+    fs::write(
+        model_dir.join("model.safetensors.index.json"),
+        r#"{
+  "weight_map": {
+    "model.layers.0.ffn.experts.0.w1.weight": "model.safetensors",
+    "model.layers.0.ffn.experts.0.w2.weight": "model.safetensors",
+    "model.layers.0.ffn.experts.0.w3.weight": "model.safetensors"
+  }
+}"#,
+    )
+    .expect("index should be written");
+    write_safetensors_file(
+        &model_dir.join("model.safetensors"),
+        &[
+            ("model.layers.0.ffn.experts.0.w1.weight", "U8", &[1], [0, 1]),
+            ("model.layers.0.ffn.experts.0.w2.weight", "U8", &[1], [1, 2]),
+            ("model.layers.0.ffn.experts.0.w3.weight", "U8", &[1], [2, 3]),
+        ],
+        &[1, 2, 3],
+    )
+    .expect("shard should be written");
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_dir.to_str().expect("temp model dir should be utf-8"),
+        "--grpc-mode",
+    ])
+    .expect("args should parse");
+    let service = build_bootstrap_grpc_router_service(&args);
+
+    let response = service
+        .get_model_info(Request::new(GetModelInfoRequest {}))
+        .await
+        .expect("model info should execute")
+        .into_inner();
+
+    assert_eq!(response.routed_expert_expected_group_count, 1);
+    assert_eq!(response.routed_expert_actual_group_count, 1);
+    assert_eq!(response.routed_expert_expected_weight_count, 3);
+    assert_eq!(response.routed_expert_actual_weight_count, 3);
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[tokio::test]
 async fn bootstrap_grpc_router_service_generates_through_model_runner() {
     let args = ServerArgs::parse_from(["serve", "--model-path", "dummy", "--grpc-mode"])
         .expect("args should parse");

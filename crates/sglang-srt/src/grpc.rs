@@ -651,6 +651,10 @@ fn router_model_info_to_proto_response(
         pad_token_id: model_info.pad_token_id,
         bos_token_id: model_info.bos_token_id,
         max_request_input_length: model_info.max_req_input_len,
+        routed_expert_expected_group_count: model_info.routed_expert_expected_group_count,
+        routed_expert_actual_group_count: model_info.routed_expert_actual_group_count,
+        routed_expert_expected_weight_count: model_info.routed_expert_expected_weight_count,
+        routed_expert_actual_weight_count: model_info.routed_expert_actual_weight_count,
     }
 }
 

@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cli::ServerArgs;
 use crate::engine::{Engine, RuntimeError};
-use crate::model_artifacts::HfModelConfig;
+use crate::model_artifacts::{HfModelConfig, LocalModelArtifacts, RoutedExpertCheckpointCoverage};
 use crate::scheduler::SchedulerError;
 use crate::tokenizer::{Tokenizer, TokenizerError};
 use crate::types::{
@@ -442,6 +442,10 @@ pub struct RouterGetModelInfoResponse {
     pub pad_token_id: i32,
     pub bos_token_id: i32,
     pub max_req_input_len: i32,
+    pub routed_expert_expected_group_count: i32,
+    pub routed_expert_actual_group_count: i32,
+    pub routed_expert_expected_weight_count: i32,
+    pub routed_expert_actual_weight_count: i32,
 }
 
 impl RouterGetModelInfoResponse {
@@ -470,10 +474,19 @@ impl RouterGetModelInfoResponse {
             pad_token_id: 0,
             bos_token_id: 0,
             max_req_input_len: 0,
+            routed_expert_expected_group_count: 0,
+            routed_expert_actual_group_count: 0,
+            routed_expert_expected_weight_count: 0,
+            routed_expert_actual_weight_count: 0,
         };
 
         if let Ok(config) = HfModelConfig::from_model_path(&args.model_path) {
             response.apply_model_config(config);
+        }
+        if let Ok(artifacts) = LocalModelArtifacts::from_model_path(&args.model_path) {
+            if let Ok(coverage) = artifacts.validate_routed_expert_checkpoint_coverage() {
+                response.apply_routed_expert_checkpoint_coverage(coverage);
+            }
         }
 
         response
@@ -489,6 +502,24 @@ impl RouterGetModelInfoResponse {
         if let Some(max_context_length) = config.max_position_embeddings.and_then(usize_to_i32) {
             self.max_context_length = max_context_length;
             self.max_req_input_len = max_context_length;
+        }
+    }
+
+    fn apply_routed_expert_checkpoint_coverage(
+        &mut self,
+        coverage: RoutedExpertCheckpointCoverage,
+    ) {
+        if let Some(value) = usize_to_i32(coverage.expected_group_count) {
+            self.routed_expert_expected_group_count = value;
+        }
+        if let Some(value) = usize_to_i32(coverage.actual_group_count) {
+            self.routed_expert_actual_group_count = value;
+        }
+        if let Some(value) = usize_to_i32(coverage.expected_weight_count) {
+            self.routed_expert_expected_weight_count = value;
+        }
+        if let Some(value) = usize_to_i32(coverage.actual_weight_count) {
+            self.routed_expert_actual_weight_count = value;
         }
     }
 }
