@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cli::ServerArgs;
 use crate::engine::{Engine, RuntimeError};
+use crate::model_artifacts::HfModelConfig;
 use crate::scheduler::SchedulerError;
 use crate::tokenizer::{Tokenizer, TokenizerError};
 use crate::types::{
@@ -296,6 +297,10 @@ fn validate_token_budget(
     Ok(())
 }
 
+fn usize_to_i32(value: usize) -> Option<i32> {
+    i32::try_from(value).ok()
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RouterGenerateResponse {
     pub request_id: String,
@@ -450,7 +455,7 @@ impl RouterGetModelInfoResponse {
             .clone()
             .unwrap_or_else(|| args.model_path.clone());
 
-        Self {
+        let mut response = Self {
             model_path: args.model_path.clone(),
             tokenizer_path,
             is_generation: true,
@@ -465,6 +470,25 @@ impl RouterGetModelInfoResponse {
             pad_token_id: 0,
             bos_token_id: 0,
             max_req_input_len: 0,
+        };
+
+        if let Ok(config) = HfModelConfig::from_model_path(&args.model_path) {
+            response.apply_model_config(config);
+        }
+
+        response
+    }
+
+    fn apply_model_config(&mut self, config: HfModelConfig) {
+        if let Some(model_type) = config.model_type {
+            self.model_type = model_type;
+        }
+        if let Some(vocab_size) = config.vocab_size.and_then(usize_to_i32) {
+            self.vocab_size = vocab_size;
+        }
+        if let Some(max_context_length) = config.max_position_embeddings.and_then(usize_to_i32) {
+            self.max_context_length = max_context_length;
+            self.max_req_input_len = max_context_length;
         }
     }
 }

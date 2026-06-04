@@ -69,6 +69,38 @@ async fn bootstrap_grpc_router_service_carries_model_metadata() {
 }
 
 #[tokio::test]
+async fn bootstrap_grpc_router_service_reports_local_model_config_metadata() {
+    let model_dir = temp_model_dir("server-model-config");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        deepseek_v4_model_config_json(),
+    )
+    .expect("config should be written");
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_dir.to_str().expect("temp model dir should be utf-8"),
+        "--grpc-mode",
+    ])
+    .expect("args should parse");
+    let service = build_bootstrap_grpc_router_service(&args);
+
+    let response = service
+        .get_model_info(Request::new(GetModelInfoRequest {}))
+        .await
+        .expect("model info should execute")
+        .into_inner();
+
+    assert_eq!(response.model_type, "deepseek_v4");
+    assert_eq!(response.vocab_size, 129_280);
+    assert_eq!(response.max_context_length, 163_840);
+    assert_eq!(response.max_request_input_length, 163_840);
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[tokio::test]
 async fn bootstrap_grpc_router_service_generates_through_model_runner() {
     let args = ServerArgs::parse_from(["serve", "--model-path", "dummy", "--grpc-mode"])
         .expect("args should parse");
@@ -476,6 +508,15 @@ fn word_level_tokenizer_json() -> &'static str {
     },
     "unk_token": "[UNK]"
   }
+}"#
+}
+
+fn deepseek_v4_model_config_json() -> &'static str {
+    r#"{
+  "model_type": "deepseek_v4",
+  "vocab_size": 129280,
+  "max_position_embeddings": 163840,
+  "num_hidden_layers": 43
 }"#
 }
 
