@@ -325,6 +325,36 @@ pub struct SafetensorsTensorSpan {
 }
 
 impl SafetensorsTensorSpan {
+    pub fn fnv1a64_checksum(&self) -> Result<u64, ModelArtifactError> {
+        let mut file =
+            fs::File::open(&self.path).map_err(|error| ModelArtifactError::ReadWeightShard {
+                path: self.path.clone(),
+                message: error.to_string(),
+            })?;
+        file.seek(SeekFrom::Start(self.absolute_byte_offset))
+            .map_err(|error| ModelArtifactError::ReadWeightShard {
+                path: self.path.clone(),
+                message: error.to_string(),
+            })?;
+
+        let mut remaining = self.byte_len;
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut checksum = FNV1A64_OFFSET_BASIS;
+        while remaining > 0 {
+            let read_len = remaining.min(buffer.len());
+            file.read_exact(&mut buffer[..read_len]).map_err(|error| {
+                ModelArtifactError::ReadWeightShard {
+                    path: self.path.clone(),
+                    message: error.to_string(),
+                }
+            })?;
+            checksum = fnv1a64_update(checksum, &buffer[..read_len]);
+            remaining -= read_len;
+        }
+
+        Ok(checksum)
+    }
+
     pub fn read(&self) -> Result<Option<SafetensorsTensorData>, ModelArtifactError> {
         let mut file =
             fs::File::open(&self.path).map_err(|error| ModelArtifactError::ReadWeightShard {
@@ -801,6 +831,17 @@ fn safetensors_dtype_byte_width(dtype: &str) -> Option<usize> {
         "I64" | "U64" | "F64" => Some(8),
         _ => None,
     }
+}
+
+const FNV1A64_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV1A64_PRIME: u64 = 0x100000001b3;
+
+fn fnv1a64_update(mut checksum: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        checksum ^= u64::from(*byte);
+        checksum = checksum.wrapping_mul(FNV1A64_PRIME);
+    }
+    checksum
 }
 
 fn is_routed_expert_weight(tensor_name: &str) -> bool {

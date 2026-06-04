@@ -303,6 +303,50 @@ fn safetensors_manifest_reads_indexed_tensor_payload_bytes() {
 }
 
 #[test]
+fn safetensors_tensor_span_computes_checksum_over_payload_slice() {
+    let model_dir = temp_model_dir("tensor-span-checksum");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(model_dir.join("config.json"), deepseek_v4_config_json())
+        .expect("config should be written");
+    fs::write(
+        model_dir.join("model.safetensors.index.json"),
+        safetensors_index_json(),
+    )
+    .expect("index should be written");
+    write_safetensors_file(
+        &model_dir.join("model-00001-of-00002.safetensors"),
+        &[("model.layers.0.ffn.experts.3.w1.weight", "U8", &[5], [1, 6])],
+        &[99, 1, 2, 3, 4, 5, 88],
+    )
+    .expect("first shard should be written");
+    write_safetensors_header(
+        &model_dir.join("model-00002-of-00002.safetensors"),
+        &[(
+            "model.layers.0.self_attn.q_b_proj.weight",
+            "BF16",
+            &[128, 128],
+            [0, 32768],
+        )],
+    )
+    .expect("second shard should be written");
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("local artifacts should load");
+    let span = artifacts
+        .safetensors()
+        .tensor_span("model.layers.0.ffn.experts.3.w1.weight")
+        .expect("indexed tensor span should read")
+        .expect("indexed tensor should exist");
+
+    assert_eq!(
+        span.fnv1a64_checksum()
+            .expect("span checksum should stream payload"),
+        fnv1a64(&[1, 2, 3, 4, 5])
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
 fn safetensors_manifest_rejects_tensor_payload_length_mismatching_shape_and_dtype() {
     let model_dir = temp_model_dir("tensor-payload-bad-shape-len");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");
@@ -608,4 +652,10 @@ fn temp_model_dir(name: &str) -> PathBuf {
         "sglang-rs-model-artifacts-{name}-{}",
         std::process::id()
     ))
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
 }
