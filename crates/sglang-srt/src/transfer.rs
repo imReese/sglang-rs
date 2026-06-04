@@ -1191,16 +1191,27 @@ where
         let submitted_transfers = self.submitted_transfers.clone();
         let mut summary = MooncakeTransferPollSummary::default();
         let mut pending_transfers = Vec::new();
+        let mut first_error = None;
 
         for transfer in submitted_transfers {
-            match poll_mooncake_submitted_batch(registry, &mut self.submitter, &transfer)? {
-                MooncakePolledBatchState::Completed => {
+            match poll_mooncake_submitted_batch(registry, &mut self.submitter, &transfer) {
+                Err(error) => {
+                    let release_error = self
+                        .submitter
+                        .free_batch(transfer.batch_id())
+                        .map_err(|error| KvCacheTransferError::Runtime(error.to_string()));
+                    first_error = Some(match release_error {
+                        Ok(()) => error,
+                        Err(release_error) => release_error,
+                    });
+                }
+                Ok(MooncakePolledBatchState::Completed) => {
                     self.submitter
                         .free_batch(transfer.batch_id())
                         .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
                     summary.completed_batches += 1;
                 }
-                MooncakePolledBatchState::Pending => {
+                Ok(MooncakePolledBatchState::Pending) => {
                     pending_transfers.push(transfer);
                     summary.pending_batches += 1;
                 }
@@ -1213,6 +1224,10 @@ where
             .iter()
             .map(MooncakeSubmittedBatch::batch_id)
             .collect();
+
+        if let Some(error) = first_error {
+            return Err(error);
+        }
 
         Ok(summary)
     }
@@ -1256,7 +1271,6 @@ where
         self.poll_submitted_transfers(registry)
     }
 }
-
 #[cfg(feature = "mooncake-link")]
 pub struct LinkedMooncakeTransferEngine {
     handle: MooncakeTransferEngineHandle,

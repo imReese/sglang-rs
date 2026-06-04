@@ -998,6 +998,42 @@ fn mooncake_executor_keeps_pending_submitted_transfers_after_poll() {
 }
 
 #[test]
+fn mooncake_executor_clears_failed_submitted_transfers_after_poll_error() {
+    let transfer_plan =
+        transfer_plan_for_request("pd-mooncake-failed-cleanup", &[65, 66], None, 30);
+    let mut registry = registry_with_session("pd-mooncake-failed-cleanup", 30);
+    let mut executor = MooncakeKvCacheTransferExecutor::new(
+        RecordingMooncakeBackend::failed(),
+        MooncakeKvCacheLayout {
+            source_base_addr: 0x2300,
+            page_size_bytes: 128,
+            target_base_offset: 0x9300,
+        },
+        MooncakeTransferTarget { target_id: 8 },
+    );
+    execute_kv_cache_transfer_plan(&mut registry, &mut executor, &transfer_plan)
+        .expect("mooncake executor should submit");
+
+    let error = executor
+        .poll_submitted_transfers(&mut registry)
+        .expect_err("failed transfer should return polling error");
+
+    assert_eq!(
+        error,
+        KvCacheTransferError::Runtime(
+            "Mooncake transfer batch 300 task 0 failed with status 6".to_string()
+        )
+    );
+    assert!(executor.submitted_transfers().is_empty());
+    assert!(executor.submitted_batches().is_empty());
+    assert_eq!(executor.submitter().freed_batches, vec![300]);
+    assert_eq!(
+        registry.get(30).expect("session should remain").status(),
+        KvPoll::Failed
+    );
+}
+
+#[test]
 fn mooncake_executor_maps_request_build_errors_to_transfer_runtime_errors() {
     let transfer_plan = transfer_plan_for_request("pd-bad-layout", &[70], None, 10);
     let mut registry = registry_with_session("pd-bad-layout", 10);
@@ -1222,6 +1258,14 @@ impl RecordingMooncakeBackend {
         Self {
             submitted_requests: Vec::new(),
             statuses: vec![MooncakeTransferStatusCode::Pending],
+            freed_batches: Vec::new(),
+        }
+    }
+
+    fn failed() -> Self {
+        Self {
+            submitted_requests: Vec::new(),
+            statuses: vec![MooncakeTransferStatusCode::Failed],
             freed_batches: Vec::new(),
         }
     }
