@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use sglang_srt::model_artifacts::{
-    LocalModelArtifacts, ModelArtifactError, SafetensorsCheckpointFingerprintEntry,
+    HfModelConfig, LocalModelArtifacts, ModelArtifactError, SafetensorsCheckpointFingerprintEntry,
     SafetensorsRoutedExpertProjection, SafetensorsRoutedExpertWeightGroup,
     SafetensorsRoutedExpertWeightSpan, SafetensorsTensorData, SafetensorsTensorMetadata,
     SafetensorsTensorSpan,
@@ -51,6 +51,31 @@ fn local_model_artifacts_loads_deepseek_v4_config_and_indexed_safetensors() {
     assert_eq!(artifacts.config().vocab_size, Some(129_280));
     assert_eq!(artifacts.config().max_position_embeddings, Some(163_840));
     assert_eq!(artifacts.config().num_hidden_layers, Some(43));
+    assert_eq!(artifacts.config().hidden_size, Some(7168));
+    assert_eq!(artifacts.config().intermediate_size, Some(18_432));
+    assert_eq!(artifacts.config().moe_intermediate_size, Some(2048));
+    assert_eq!(artifacts.config().n_routed_experts, Some(256));
+    assert_eq!(artifacts.config().n_shared_experts, Some(1));
+    assert_eq!(artifacts.config().num_experts_per_tok, Some(8));
+    assert_eq!(artifacts.config().first_k_dense_replace, Some(3));
+    assert_eq!(artifacts.config().moe_layer_freq, Some(2));
+    assert_eq!(
+        artifacts.config().moe_layer_ids(),
+        vec![
+            4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42
+        ]
+    );
+    assert!(!artifacts.config().is_moe_layer(3));
+    assert!(artifacts.config().is_moe_layer(4));
+    assert!(!artifacts.config().is_moe_layer(43));
+    assert_eq!(
+        artifacts.config().expected_routed_expert_group_count(),
+        Some(20 * 256)
+    );
+    assert_eq!(
+        artifacts.config().expected_routed_expert_weight_count(),
+        Some(20 * 256 * 3)
+    );
     assert_eq!(
         artifacts.safetensors().tensor_names(),
         &[
@@ -91,6 +116,36 @@ fn local_model_artifacts_loads_deepseek_v4_config_and_indexed_safetensors() {
             .expect("routed expert dtype probe should read header"),
         Some("F8_E4M3".to_string())
     );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn hf_model_config_treats_null_optional_moe_fields_as_absent() {
+    let model_dir = temp_model_dir("null-optional-moe-config");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "model_type": "deepseek_v4",
+  "num_hidden_layers": 4,
+  "n_routed_experts": null,
+  "n_shared_experts": null,
+  "num_experts_per_tok": null,
+  "moe_intermediate_size": null
+}"#,
+    )
+    .expect("config should be written");
+
+    let config = HfModelConfig::from_model_path(&model_dir)
+        .expect("null optional MoE fields should parse as absent");
+
+    assert_eq!(config.n_routed_experts, None);
+    assert_eq!(config.n_shared_experts, None);
+    assert_eq!(config.num_experts_per_tok, None);
+    assert_eq!(config.moe_intermediate_size, None);
+    assert!(!config.is_moe_layer(0));
+    assert_eq!(config.expected_routed_expert_group_count(), None);
 
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
@@ -1047,6 +1102,14 @@ fn deepseek_v4_config_json() -> &'static str {
   "vocab_size": 129280,
   "max_position_embeddings": 163840,
   "num_hidden_layers": 43,
+  "hidden_size": 7168,
+  "intermediate_size": 18432,
+  "moe_intermediate_size": 2048,
+  "n_routed_experts": 256,
+  "n_shared_experts": 1,
+  "num_experts_per_tok": 8,
+  "first_k_dense_replace": 3,
+  "moe_layer_freq": 2,
   "num_key_value_heads": 1,
   "qk_nope_head_dim": 448,
   "qk_rope_head_dim": 64,

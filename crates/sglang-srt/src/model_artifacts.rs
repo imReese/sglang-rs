@@ -50,6 +50,14 @@ pub struct HfModelConfig {
     pub vocab_size: Option<usize>,
     pub max_position_embeddings: Option<usize>,
     pub num_hidden_layers: Option<usize>,
+    pub hidden_size: Option<usize>,
+    pub intermediate_size: Option<usize>,
+    pub moe_intermediate_size: Option<usize>,
+    pub n_routed_experts: Option<usize>,
+    pub n_shared_experts: Option<usize>,
+    pub num_experts_per_tok: Option<usize>,
+    pub first_k_dense_replace: Option<usize>,
+    pub moe_layer_freq: Option<usize>,
 }
 
 impl HfModelConfig {
@@ -77,7 +85,48 @@ impl HfModelConfig {
                 &config_path,
             )?,
             num_hidden_layers: read_usize_field(&value, "num_hidden_layers", &config_path)?,
+            hidden_size: read_usize_field(&value, "hidden_size", &config_path)?,
+            intermediate_size: read_usize_field(&value, "intermediate_size", &config_path)?,
+            moe_intermediate_size: read_usize_field(&value, "moe_intermediate_size", &config_path)?,
+            n_routed_experts: read_usize_field(&value, "n_routed_experts", &config_path)?,
+            n_shared_experts: read_usize_field(&value, "n_shared_experts", &config_path)?,
+            num_experts_per_tok: read_usize_field(&value, "num_experts_per_tok", &config_path)?,
+            first_k_dense_replace: read_usize_field(&value, "first_k_dense_replace", &config_path)?,
+            moe_layer_freq: read_usize_field(&value, "moe_layer_freq", &config_path)?,
         })
+    }
+
+    pub fn is_moe_layer(&self, layer_id: usize) -> bool {
+        let Some(num_hidden_layers) = self.num_hidden_layers else {
+            return false;
+        };
+        if layer_id >= num_hidden_layers || self.n_routed_experts.is_none() {
+            return false;
+        }
+
+        let first_k_dense_replace = self.first_k_dense_replace.unwrap_or(0);
+        let moe_layer_freq = self.moe_layer_freq.unwrap_or(1);
+        moe_layer_freq > 0 && layer_id >= first_k_dense_replace && layer_id % moe_layer_freq == 0
+    }
+
+    pub fn moe_layer_ids(&self) -> Vec<usize> {
+        let Some(num_hidden_layers) = self.num_hidden_layers else {
+            return Vec::new();
+        };
+
+        (0..num_hidden_layers)
+            .filter(|layer_id| self.is_moe_layer(*layer_id))
+            .collect()
+    }
+
+    pub fn expected_routed_expert_group_count(&self) -> Option<usize> {
+        self.moe_layer_ids()
+            .len()
+            .checked_mul(self.n_routed_experts?)
+    }
+
+    pub fn expected_routed_expert_weight_count(&self) -> Option<usize> {
+        self.expected_routed_expert_group_count()?.checked_mul(3)
     }
 }
 
@@ -903,6 +952,9 @@ fn read_usize_field(
     let Some(raw) = value.get(field) else {
         return Ok(None);
     };
+    if raw.is_null() {
+        return Ok(None);
+    }
     let Some(value) = raw.as_u64() else {
         return Err(ModelArtifactError::InvalidModelConfig {
             path: config_path.to_path_buf(),
