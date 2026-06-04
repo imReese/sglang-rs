@@ -1,6 +1,7 @@
 use std::fmt;
 use std::net::{SocketAddr, ToSocketAddrs};
 
+use crate::cache::{CachePageAllocator, RadixCache};
 use crate::cli::ServerArgs;
 use crate::engine::Engine;
 use crate::grpc::{GrpcRouterService, GrpcServeError, serve_grpc_router};
@@ -8,6 +9,7 @@ use crate::model_executor::{ForwardModel, ModelForwardOutput, ModelRunner, Model
 use crate::router::RouterRuntime;
 use crate::scheduler::Scheduler;
 use crate::tokenizer::ByteTokenizer;
+use crate::transfer::{DecodeBootstrapRegistry, KvCacheTransferExecutor, KvTransferModelWorker};
 
 #[derive(Clone, Debug, Default)]
 pub struct BootstrapForwardModel;
@@ -27,6 +29,8 @@ impl ForwardModel for BootstrapForwardModel {
 
 pub type BootstrapGrpcRouterService =
     GrpcRouterService<ByteTokenizer, ModelRunner<BootstrapForwardModel>>;
+pub type BootstrapPdGrpcRouterService<E> =
+    GrpcRouterService<ByteTokenizer, KvTransferModelWorker<ModelRunner<BootstrapForwardModel>, E>>;
 
 #[derive(Debug)]
 pub enum ServerLaunchError {
@@ -75,6 +79,30 @@ pub fn build_bootstrap_grpc_router_service(args: &ServerArgs) -> BootstrapGrpcRo
     let engine = Engine::new(ByteTokenizer, scheduler);
     let runtime = RouterRuntime::new(engine);
     GrpcRouterService::with_server_args(runtime, args)
+}
+
+pub fn build_bootstrap_pd_grpc_router_service<E>(
+    args: &ServerArgs,
+    registry: DecodeBootstrapRegistry,
+    transfer_executor: E,
+) -> BootstrapPdGrpcRouterService<E>
+where
+    E: KvCacheTransferExecutor,
+{
+    let worker = KvTransferModelWorker::new(
+        ModelRunner::new(BootstrapForwardModel),
+        registry,
+        transfer_executor,
+    );
+    let scheduler = Scheduler::with_cache_resources(
+        worker,
+        RadixCache::default(),
+        CachePageAllocator::new(args.num_reserved_decode_tokens),
+    );
+    let engine = Engine::new(ByteTokenizer, scheduler);
+    let runtime = RouterRuntime::new(engine);
+    GrpcRouterService::with_server_args(runtime, args)
+        .with_max_transfer_polls(args.disaggregation_decode_polling_interval)
 }
 
 pub async fn launch_grpc_server(args: ServerArgs) -> Result<(), ServerLaunchError> {

@@ -6,7 +6,16 @@ use sglang_srt::proto::sglang::runtime::v1::sglang_service_server::SglangService
 use sglang_srt::proto::sglang::runtime::v1::{
     GetModelInfoRequest, RequestOptions, SamplingParams, TextGenerateRequest,
 };
-use sglang_srt::server::{build_bootstrap_grpc_router_service, grpc_listen_addr};
+use sglang_srt::server::{
+    build_bootstrap_grpc_router_service, build_bootstrap_pd_grpc_router_service, grpc_listen_addr,
+};
+use sglang_srt::transfer::{
+    DecodeBootstrapRegistry, DecodeBootstrapSession, MooncakeBatchId, MooncakeError,
+    MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeTransferRequest,
+    MooncakeTransferStatus, MooncakeTransferStatusCode, MooncakeTransferStatusReader,
+    MooncakeTransferSubmitter, MooncakeTransferTarget,
+};
+use sglang_srt::types::{DisaggregatedParams, RequestId};
 
 #[test]
 fn grpc_listen_addr_uses_server_host_and_port() {
@@ -104,4 +113,140 @@ async fn bootstrap_grpc_router_service_generates_through_model_runner() {
             .await
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn bootstrap_pd_grpc_router_service_polls_transfer_before_decode() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--grpc-mode",
+        "--disaggregation-mode",
+        "decode",
+        "--disaggregation-decode-polling-interval",
+        "1",
+        "--num-reserved-decode-tokens",
+        "8",
+    ])
+    .expect("args should parse");
+    let registry = bootstrap_registry_with_session("bootstrap-pd", 41);
+    let transfer_executor = MooncakeKvCacheTransferExecutor::new(
+        RecordingMooncakeBackend::completed(),
+        MooncakeKvCacheLayout {
+            source_base_addr: 0x3000,
+            page_size_bytes: 64,
+            target_base_offset: 0,
+        },
+        MooncakeTransferTarget { target_id: 17 },
+    );
+    let service = build_bootstrap_pd_grpc_router_service(&args, registry, transfer_executor);
+
+    let mut stream = service
+        .text_generate(Request::new(TextGenerateRequest {
+            text: "hi".to_string(),
+            sampling_params: Some(SamplingParams {
+                max_new_tokens: Some(2),
+                ..Default::default()
+            }),
+            options: Some(RequestOptions {
+                request_id: Some("bootstrap-pd".to_string()),
+                stream: true,
+                data_parallel_rank: 0,
+                trace_headers: Default::default(),
+            }),
+            disaggregated_params: Some(
+                sglang_srt::proto::sglang::runtime::v1::DisaggregatedParams {
+                    bootstrap_host: "10.0.0.9".to_string(),
+                    bootstrap_port: 8998,
+                    bootstrap_room: 41,
+                },
+            ),
+        }))
+        .await
+        .expect("PD bootstrap service should poll transfer and generate")
+        .into_inner();
+
+    let first = tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
+        .await
+        .expect("first response")
+        .expect("first response should be ok");
+    let second = tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
+        .await
+        .expect("second response")
+        .expect("second response should be ok");
+
+    assert_eq!(first.request_id, "bootstrap-pd");
+    assert!(matches!(first.body, Some(Body::Chunk(_))));
+    assert_eq!(second.request_id, "bootstrap-pd");
+    assert!(matches!(second.body, Some(Body::Complete(_))));
+    assert!(
+        tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
+            .await
+            .is_none()
+    );
+}
+
+#[derive(Default)]
+struct RecordingMooncakeBackend {
+    submitted_batches: usize,
+    statuses: Vec<MooncakeTransferStatusCode>,
+}
+
+impl RecordingMooncakeBackend {
+    fn completed() -> Self {
+        Self {
+            submitted_batches: 0,
+            statuses: vec![MooncakeTransferStatusCode::Completed],
+        }
+    }
+}
+
+impl MooncakeTransferSubmitter for RecordingMooncakeBackend {
+    fn submit_transfer(
+        &mut self,
+        requests: &mut [MooncakeTransferRequest],
+    ) -> Result<MooncakeBatchId, MooncakeError> {
+        assert!(!requests.is_empty());
+        self.submitted_batches += 1;
+        Ok(700 + self.submitted_batches as MooncakeBatchId - 1)
+    }
+}
+
+impl MooncakeTransferStatusReader for RecordingMooncakeBackend {
+    fn transfer_status(
+        &mut self,
+        _batch_id: MooncakeBatchId,
+        task_id: usize,
+    ) -> Result<MooncakeTransferStatus, MooncakeError> {
+        let status = self
+            .statuses
+            .get(task_id)
+            .or_else(|| self.statuses.last())
+            .copied()
+            .expect("recording Mooncake backend needs at least one status");
+        Ok(MooncakeTransferStatus {
+            status: status as i32,
+            transferred_bytes: 0,
+        })
+    }
+}
+
+fn bootstrap_registry_with_session(
+    request_id: &str,
+    bootstrap_room: i32,
+) -> DecodeBootstrapRegistry {
+    let mut registry = DecodeBootstrapRegistry::default();
+    registry
+        .register(DecodeBootstrapSession::new(
+            RequestId::from(request_id),
+            DisaggregatedParams {
+                bootstrap_host: "10.0.0.9".to_string(),
+                bootstrap_port: 8998,
+                bootstrap_room,
+            },
+            0,
+        ))
+        .expect("session should register");
+    registry
 }

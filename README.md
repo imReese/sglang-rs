@@ -92,6 +92,11 @@ This repository currently contains the first `sglang-srt` runtime crate:
   `HealthCheck`, and `FlushCache` into `RouterRuntime`, converts router
   protocol errors to canonical `tonic::Status` codes, and leaves unsupported
   RPCs as explicit `UNIMPLEMENTED` responses while the runtime surface grows.
+- `server`: bootstrap helpers for launching the Rust gRPC router service from
+  parsed `ServerArgs`, including model metadata propagation and an injectable PD
+  service builder that wraps the bootstrap model runner with
+  `KvTransferModelWorker`, a finite decode KV page pool, and bounded transfer
+  polling.
 - `tokenizer`: tokenizer trait plus a temporary byte tokenizer for tests.
 - `transfer`: PD disaggregation mode/backend normalization, including
   SGLang-compatible `mooncake_tcp` handling, decode bootstrap session tracking,
