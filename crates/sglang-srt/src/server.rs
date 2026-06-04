@@ -8,7 +8,7 @@ use crate::grpc::{GrpcRouterService, GrpcServeError, serve_grpc_router};
 use crate::model_executor::{ForwardModel, ModelForwardOutput, ModelRunner, ModelWorkerBatch};
 use crate::router::RouterRuntime;
 use crate::scheduler::Scheduler;
-use crate::tokenizer::ByteTokenizer;
+use crate::tokenizer::{RuntimeTokenizer, TokenizerError};
 use crate::transfer::{
     DecodeBootstrapRegistry, DisaggregationMode, FakeKvCacheTransferExecutor,
     KvCacheTransferExecutor, KvTransferModelWorker, PdConfig, PdConfigError, TransferBackend,
@@ -31,9 +31,11 @@ impl ForwardModel for BootstrapForwardModel {
 }
 
 pub type BootstrapGrpcRouterService =
-    GrpcRouterService<ByteTokenizer, ModelRunner<BootstrapForwardModel>>;
-pub type BootstrapPdGrpcRouterService<E> =
-    GrpcRouterService<ByteTokenizer, KvTransferModelWorker<ModelRunner<BootstrapForwardModel>, E>>;
+    GrpcRouterService<RuntimeTokenizer, ModelRunner<BootstrapForwardModel>>;
+pub type BootstrapPdGrpcRouterService<E> = GrpcRouterService<
+    RuntimeTokenizer,
+    KvTransferModelWorker<ModelRunner<BootstrapForwardModel>, E>,
+>;
 pub type BootstrapFakePdGrpcRouterService =
     BootstrapPdGrpcRouterService<FakeKvCacheTransferExecutor>;
 
@@ -49,6 +51,7 @@ pub enum ServerLaunchError {
         mode: DisaggregationMode,
         transfer_backend: TransferBackend,
     },
+    Tokenizer(TokenizerError),
     Grpc(GrpcServeError),
 }
 
@@ -76,6 +79,7 @@ impl PartialEq for ServerLaunchError {
                     transfer_backend: right_backend,
                 },
             ) => left_mode == right_mode && left_backend == right_backend,
+            (Self::Tokenizer(left), Self::Tokenizer(right)) => left == right,
             _ => false,
         }
     }
@@ -98,6 +102,7 @@ impl fmt::Display for ServerLaunchError {
                 formatter,
                 "bootstrap server does not support PD runtime mode {mode:?} with backend {transfer_backend:?}"
             ),
+            Self::Tokenizer(error) => write!(formatter, "tokenizer error: {error}"),
             Self::Grpc(error) => write!(formatter, "{error}"),
         }
     }
@@ -117,6 +122,12 @@ impl From<PdConfigError> for ServerLaunchError {
     }
 }
 
+impl From<TokenizerError> for ServerLaunchError {
+    fn from(value: TokenizerError) -> Self {
+        Self::Tokenizer(value)
+    }
+}
+
 pub fn grpc_listen_addr(args: &ServerArgs) -> Result<SocketAddr, ServerLaunchError> {
     let mut addresses = (args.host.as_str(), args.port)
         .to_socket_addrs()
@@ -131,11 +142,21 @@ pub fn grpc_listen_addr(args: &ServerArgs) -> Result<SocketAddr, ServerLaunchErr
 }
 
 pub fn build_bootstrap_grpc_router_service(args: &ServerArgs) -> BootstrapGrpcRouterService {
+    try_build_bootstrap_grpc_router_service(args).expect("bootstrap tokenizer should load")
+}
+
+pub fn try_build_bootstrap_grpc_router_service(
+    args: &ServerArgs,
+) -> Result<BootstrapGrpcRouterService, ServerLaunchError> {
     let scheduler = Scheduler::new(ModelRunner::new(BootstrapForwardModel))
         .with_max_running_requests(args.max_running_requests);
-    let engine = Engine::new(ByteTokenizer, scheduler);
+    let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
+        &args.model_path,
+        args.tokenizer_path.as_deref(),
+    )?;
+    let engine = Engine::new(tokenizer, scheduler);
     let runtime = RouterRuntime::new(engine);
-    GrpcRouterService::with_server_args(runtime, args)
+    Ok(GrpcRouterService::with_server_args(runtime, args))
 }
 
 pub fn build_bootstrap_pd_grpc_router_service<E>(
@@ -143,6 +164,18 @@ pub fn build_bootstrap_pd_grpc_router_service<E>(
     registry: DecodeBootstrapRegistry,
     transfer_executor: E,
 ) -> BootstrapPdGrpcRouterService<E>
+where
+    E: KvCacheTransferExecutor,
+{
+    try_build_bootstrap_pd_grpc_router_service(args, registry, transfer_executor)
+        .expect("bootstrap tokenizer should load")
+}
+
+pub fn try_build_bootstrap_pd_grpc_router_service<E>(
+    args: &ServerArgs,
+    registry: DecodeBootstrapRegistry,
+    transfer_executor: E,
+) -> Result<BootstrapPdGrpcRouterService<E>, ServerLaunchError>
 where
     E: KvCacheTransferExecutor,
 {
@@ -157,10 +190,14 @@ where
         CachePageAllocator::new(args.num_reserved_decode_tokens),
     )
     .with_max_running_requests(args.max_running_requests);
-    let engine = Engine::new(ByteTokenizer, scheduler);
+    let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
+        &args.model_path,
+        args.tokenizer_path.as_deref(),
+    )?;
+    let engine = Engine::new(tokenizer, scheduler);
     let runtime = RouterRuntime::new(engine);
-    GrpcRouterService::with_server_args(runtime, args)
-        .with_max_transfer_polls(args.disaggregation_decode_polling_interval)
+    Ok(GrpcRouterService::with_server_args(runtime, args)
+        .with_max_transfer_polls(args.disaggregation_decode_polling_interval))
 }
 
 pub fn build_bootstrap_fake_pd_grpc_router_service(
@@ -195,10 +232,14 @@ pub async fn launch_grpc_server(args: ServerArgs) -> Result<(), ServerLaunchErro
 
     let addr = grpc_listen_addr(&args)?;
     if pd_config.mode == DisaggregationMode::Decode {
-        let service = build_bootstrap_fake_pd_grpc_router_service(&args);
+        let service = try_build_bootstrap_pd_grpc_router_service(
+            &args,
+            DecodeBootstrapRegistry::default(),
+            FakeKvCacheTransferExecutor::default(),
+        )?;
         serve_grpc_router(addr, service, true).await?;
     } else {
-        let service = build_bootstrap_grpc_router_service(&args);
+        let service = try_build_bootstrap_grpc_router_service(&args)?;
         serve_grpc_router(addr, service, true).await?;
     }
     Ok(())

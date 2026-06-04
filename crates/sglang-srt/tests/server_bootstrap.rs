@@ -1,16 +1,20 @@
+use std::fs;
+use std::path::PathBuf;
+
 use tonic::Request;
 
 use sglang_srt::cli::ServerArgs;
 use sglang_srt::proto::sglang::runtime::v1::generate_response::Body;
 use sglang_srt::proto::sglang::runtime::v1::sglang_service_server::SglangService;
 use sglang_srt::proto::sglang::runtime::v1::{
-    GetModelInfoRequest, RequestOptions, SamplingParams, TextGenerateRequest,
+    GetModelInfoRequest, RequestOptions, SamplingParams, TextGenerateRequest, TokenizeRequest,
 };
 use sglang_srt::server::{
     ServerLaunchError, build_bootstrap_fake_pd_grpc_router_service,
     build_bootstrap_grpc_router_service, build_bootstrap_pd_grpc_router_service, grpc_listen_addr,
-    launch_grpc_server,
+    launch_grpc_server, try_build_bootstrap_grpc_router_service,
 };
+use sglang_srt::tokenizer::TokenizerError;
 use sglang_srt::transfer::{
     DecodeBootstrapRegistry, DisaggregationMode, MooncakeBatchId, MooncakeBatchReleaser,
     MooncakeError, MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeTransferRequest,
@@ -113,6 +117,68 @@ async fn bootstrap_grpc_router_service_generates_through_model_runner() {
         tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
             .await
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_grpc_router_service_uses_local_hf_tokenizer_when_available() {
+    let model_dir = temp_model_dir("server-hf-tokenizer");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("tokenizer.json"),
+        word_level_tokenizer_json(),
+    )
+    .expect("tokenizer.json should be written");
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_dir.to_str().expect("temp model dir should be utf-8"),
+        "--grpc-mode",
+    ])
+    .expect("args should parse");
+    let service = build_bootstrap_grpc_router_service(&args);
+
+    let response = service
+        .tokenize(Request::new(TokenizeRequest {
+            text: "hello world".to_string(),
+            add_special_tokens: true,
+        }))
+        .await
+        .expect("tokenize should execute")
+        .into_inner();
+
+    assert_eq!(response.count, 2);
+    assert_eq!(response.token_ids, vec![1, 2]);
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn bootstrap_grpc_router_service_rejects_missing_explicit_tokenizer_path() {
+    let model_dir = temp_model_dir("server-missing-tokenizer");
+    let tokenizer_dir = model_dir.join("missing-tokenizer");
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_dir.to_str().expect("temp model dir should be utf-8"),
+        "--tokenizer-path",
+        tokenizer_dir
+            .to_str()
+            .expect("temp tokenizer dir should be utf-8"),
+        "--grpc-mode",
+    ])
+    .expect("args should parse");
+
+    let error = match try_build_bootstrap_grpc_router_service(&args) {
+        Ok(_) => panic!("explicit missing tokenizer path should fail"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error,
+        ServerLaunchError::Tokenizer(TokenizerError::TokenizerFileNotFound {
+            path: tokenizer_dir
+        })
     );
 }
 
@@ -387,4 +453,32 @@ impl MooncakeBatchReleaser for RecordingMooncakeBackend {
         self.freed_batches.push(batch_id);
         Ok(())
     }
+}
+
+fn word_level_tokenizer_json() -> &'static str {
+    r#"{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": {
+    "type": "Whitespace"
+  },
+  "post_processor": null,
+  "decoder": null,
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "[UNK]": 0,
+      "hello": 1,
+      "world": 2
+    },
+    "unk_token": "[UNK]"
+  }
+}"#
+}
+
+fn temp_model_dir(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("sglang-rs-{name}-{}", std::process::id()))
 }
