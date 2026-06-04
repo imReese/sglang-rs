@@ -137,12 +137,74 @@ fn safetensors_manifest_reads_indexed_tensor_payload_bytes() {
             bytes: vec![1, 2, 3, 4],
         })
     );
+    let tensor = artifacts
+        .safetensors()
+        .read_tensor("model.layers.0.ffn.experts.3.w1.weight")
+        .expect("indexed tensor payload should read")
+        .expect("indexed tensor should exist");
+    assert_eq!(tensor.element_count(), 4);
+    assert_eq!(tensor.dtype_byte_width(), 1);
     assert_eq!(
         artifacts
             .safetensors()
             .read_tensor("model.layers.404.mlp.down_proj.weight")
             .expect("unknown tensor should not read a shard"),
         None
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn safetensors_manifest_rejects_tensor_payload_length_mismatching_shape_and_dtype() {
+    let model_dir = temp_model_dir("tensor-payload-bad-shape-len");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(model_dir.join("config.json"), deepseek_v4_config_json())
+        .expect("config should be written");
+    fs::write(
+        model_dir.join("model.safetensors.index.json"),
+        safetensors_index_json(),
+    )
+    .expect("index should be written");
+    let bad_shard = model_dir.join("model-00001-of-00002.safetensors");
+    write_safetensors_file(
+        &bad_shard,
+        &[(
+            "model.layers.0.ffn.experts.3.w1.weight",
+            "BF16",
+            &[4],
+            [0, 4],
+        )],
+        &[1, 2, 3, 4],
+    )
+    .expect("first shard should be written");
+    write_safetensors_header(
+        &model_dir.join("model-00002-of-00002.safetensors"),
+        &[(
+            "model.layers.0.self_attn.q_b_proj.weight",
+            "BF16",
+            &[128, 128],
+            [0, 32768],
+        )],
+    )
+    .expect("second shard should be written");
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("local artifacts should load");
+
+    let error = artifacts
+        .safetensors()
+        .read_tensor("model.layers.0.ffn.experts.3.w1.weight")
+        .expect_err("payload length mismatch should be rejected");
+
+    assert!(
+        matches!(
+            error,
+            ModelArtifactError::InvalidSafetensorsData { ref path, ref message }
+                if path == &bad_shard
+                    && message.contains("metadata expects 8 bytes")
+                    && message.contains("data_offsets describe 4 bytes")
+        ),
+        "unexpected error: {error:?}"
     );
 
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");

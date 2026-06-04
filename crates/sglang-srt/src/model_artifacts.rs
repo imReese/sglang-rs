@@ -227,10 +227,34 @@ pub struct SafetensorsTensorMetadata {
     pub data_offsets: [usize; 2],
 }
 
+impl SafetensorsTensorMetadata {
+    pub fn element_count(&self) -> Option<usize> {
+        shape_element_count(&self.shape)
+    }
+
+    pub fn dtype_byte_width(&self) -> Option<usize> {
+        safetensors_dtype_byte_width(&self.dtype)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SafetensorsTensorData {
     pub metadata: SafetensorsTensorMetadata,
     pub bytes: Vec<u8>,
+}
+
+impl SafetensorsTensorData {
+    pub fn element_count(&self) -> usize {
+        self.metadata
+            .element_count()
+            .expect("loaded safetensors tensor element count should be validated")
+    }
+
+    pub fn dtype_byte_width(&self) -> usize {
+        self.metadata
+            .dtype_byte_width()
+            .expect("loaded safetensors tensor dtype should be validated")
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -320,6 +344,15 @@ impl SafetensorsHeader {
                 format!("tensor {tensor_name} data_offsets start is after end"),
             )
         })?;
+        let expected_tensor_len = expected_tensor_byte_len(path, tensor_name, &metadata)?;
+        if tensor_len != expected_tensor_len {
+            return Err(invalid_safetensors_data(
+                path,
+                format!(
+                    "tensor {tensor_name} metadata expects {expected_tensor_len} bytes but data_offsets describe {tensor_len} bytes"
+                ),
+            ));
+        }
         let payload_start = 8_usize.checked_add(self.header_len).ok_or_else(|| {
             invalid_safetensors_data(path, "safetensors payload start offset overflowed")
         })?;
@@ -609,6 +642,49 @@ fn invalid_safetensors_data(path: &Path, message: impl Into<String>) -> ModelArt
     ModelArtifactError::InvalidSafetensorsData {
         path: path.to_path_buf(),
         message: message.into(),
+    }
+}
+
+fn expected_tensor_byte_len(
+    path: &Path,
+    tensor_name: &str,
+    metadata: &SafetensorsTensorMetadata,
+) -> Result<usize, ModelArtifactError> {
+    let element_count = metadata.element_count().ok_or_else(|| {
+        invalid_safetensors_data(
+            path,
+            format!("tensor {tensor_name} element count overflowed"),
+        )
+    })?;
+    let dtype_byte_width = metadata.dtype_byte_width().ok_or_else(|| {
+        invalid_safetensors_data(
+            path,
+            format!(
+                "tensor {tensor_name} has unsupported safetensors dtype {}",
+                metadata.dtype
+            ),
+        )
+    })?;
+
+    element_count.checked_mul(dtype_byte_width).ok_or_else(|| {
+        invalid_safetensors_data(path, format!("tensor {tensor_name} byte length overflowed"))
+    })
+}
+
+fn shape_element_count(shape: &[usize]) -> Option<usize> {
+    shape
+        .iter()
+        .copied()
+        .try_fold(1_usize, |count, dimension| count.checked_mul(dimension))
+}
+
+fn safetensors_dtype_byte_width(dtype: &str) -> Option<usize> {
+    match dtype {
+        "BOOL" | "I8" | "U8" | "F8_E4M3" | "F8_E5M2" | "F8_E8M0" => Some(1),
+        "I16" | "U16" | "F16" | "BF16" => Some(2),
+        "I32" | "U32" | "F32" => Some(4),
+        "I64" | "U64" | "F64" => Some(8),
+        _ => None,
     }
 }
 
