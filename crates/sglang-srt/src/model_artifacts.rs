@@ -145,6 +145,29 @@ impl SafetensorsManifest {
         header.tensor_span(shard_path, tensor_name)
     }
 
+    pub fn tensor_span_entries(
+        &self,
+    ) -> Result<Vec<(String, SafetensorsTensorSpan)>, ModelArtifactError> {
+        let mut headers = BTreeMap::new();
+        let mut entries = Vec::with_capacity(self.tensor_names.len());
+        for tensor_name in &self.tensor_names {
+            let Some(shard_path) = self.shard_for_tensor(tensor_name) else {
+                continue;
+            };
+            let header = match headers.entry(shard_path.to_path_buf()) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(SafetensorsHeader::from_file(shard_path)?)
+                }
+            };
+            if let Some(span) = header.tensor_span(shard_path, tensor_name)? {
+                entries.push((tensor_name.clone(), span));
+            }
+        }
+
+        Ok(entries)
+    }
+
     pub fn read_tensor(
         &self,
         tensor_name: &str,

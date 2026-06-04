@@ -152,6 +152,94 @@ fn safetensors_manifest_describes_indexed_tensor_byte_span_without_loading_bytes
 }
 
 #[test]
+fn safetensors_manifest_enumerates_indexed_tensor_spans_across_shards() {
+    let model_dir = temp_model_dir("tensor-span-entries");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(model_dir.join("config.json"), deepseek_v4_config_json())
+        .expect("config should be written");
+    fs::write(
+        model_dir.join("model.safetensors.index.json"),
+        safetensors_index_json(),
+    )
+    .expect("index should be written");
+    let first_shard = model_dir.join("model-00001-of-00002.safetensors");
+    let first_header_len = write_safetensors_file(
+        &first_shard,
+        &[
+            ("model.embed_tokens.weight", "U8", &[2], [0, 2]),
+            ("model.layers.0.ffn.experts.3.w1.weight", "U8", &[3], [2, 5]),
+            (
+                "model.layers.0.self_attn.q_a_proj.weight",
+                "U8",
+                &[1],
+                [5, 6],
+            ),
+        ],
+        &[10, 11, 20, 21, 22, 30],
+    )
+    .expect("first shard should be written");
+    let second_shard = model_dir.join("model-00002-of-00002.safetensors");
+    let second_header_len = write_safetensors_file(
+        &second_shard,
+        &[(
+            "model.layers.0.self_attn.q_b_proj.weight",
+            "BF16",
+            &[2],
+            [0, 4],
+        )],
+        &[40, 41, 42, 43],
+    )
+    .expect("second shard should be written");
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("local artifacts should load");
+
+    let entries = artifacts
+        .safetensors()
+        .tensor_span_entries()
+        .expect("indexed tensor span entries should read");
+
+    assert_eq!(
+        entries
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "model.embed_tokens.weight",
+            "model.layers.0.ffn.experts.3.w1.weight",
+            "model.layers.0.self_attn.q_a_proj.weight",
+            "model.layers.0.self_attn.q_b_proj.weight",
+        ]
+    );
+    assert_eq!(entries[0].1.path, first_shard);
+    assert_eq!(
+        entries[0].1.absolute_byte_offset,
+        8 + first_header_len as u64
+    );
+    assert_eq!(entries[0].1.byte_len, 2);
+    assert_eq!(
+        entries[1].1.absolute_byte_offset,
+        8 + first_header_len as u64 + 2
+    );
+    assert_eq!(entries[1].1.byte_len, 3);
+    assert_eq!(entries[3].1.path, second_shard);
+    assert_eq!(
+        entries[3].1.absolute_byte_offset,
+        8 + second_header_len as u64
+    );
+    assert_eq!(
+        entries[1]
+            .1
+            .read()
+            .expect("span should read bytes")
+            .expect("span should load tensor")
+            .bytes,
+        vec![20, 21, 22]
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
 fn safetensors_manifest_reads_indexed_tensor_payload_bytes() {
     let model_dir = temp_model_dir("tensor-payload");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");
