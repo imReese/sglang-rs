@@ -574,6 +574,45 @@ fn engine_poll_transfers_updates_registry_and_unblocks_decode_dispatch() {
 }
 
 #[test]
+fn engine_token_generation_can_poll_transfer_and_continue_decode() {
+    let backend = RecordingMooncakeBackend::completed();
+    let worker = KvTransferModelWorker::new(
+        UnfinishedWorker,
+        registry_with_session("engine-poll-inline", 24),
+        MooncakeKvCacheTransferExecutor::new(
+            backend,
+            MooncakeKvCacheLayout {
+                source_base_addr: 0x9000,
+                page_size_bytes: 64,
+                target_base_offset: 0,
+            },
+            MooncakeTransferTarget { target_id: 14 },
+        ),
+    );
+    let scheduler =
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(2));
+    let mut engine = Engine::new(ByteTokenizer::default(), scheduler);
+
+    let output = engine
+        .generate_tokens_with_transfer_polling(
+            TokenGenerateRequest {
+                request_id: RequestId::from("engine-poll-inline"),
+                input_ids: vec![1, 2],
+                sampling: SamplingParams { max_new_tokens: 2 },
+                disaggregated_params: Some(disaggregated_params(24)),
+                data_parallel_rank: 0,
+            },
+            1,
+        )
+        .expect("engine should poll completed transfer and continue decode");
+
+    assert_eq!(output.request_id, RequestId::from("engine-poll-inline"));
+    assert_eq!(output.output_ids, vec![1, 1]);
+    assert!(output.finished);
+    assert_eq!(engine.scheduler().decode_queue_depth(), 0);
+}
+
+#[test]
 fn router_runtime_poll_transfers_exposes_control_plane_counts() {
     let backend = RecordingMooncakeBackend::completed();
     let worker = KvTransferModelWorker::new(
@@ -633,6 +672,63 @@ fn router_runtime_poll_transfers_exposes_control_plane_counts() {
             pending_batches: 0,
         }
     );
+}
+
+#[test]
+fn router_runtime_stream_can_poll_transfer_and_continue_decode() {
+    let backend = RecordingMooncakeBackend::completed();
+    let worker = KvTransferModelWorker::new(
+        UnfinishedWorker,
+        registry_with_session("router-poll-inline", 25),
+        MooncakeKvCacheTransferExecutor::new(
+            backend,
+            MooncakeKvCacheLayout {
+                source_base_addr: 0xa000,
+                page_size_bytes: 64,
+                target_base_offset: 0,
+            },
+            MooncakeTransferTarget { target_id: 15 },
+        ),
+    );
+    let scheduler =
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(2));
+    let engine = Engine::new(ByteTokenizer::default(), scheduler);
+    let mut runtime = RouterRuntime::new(engine);
+
+    let responses = runtime
+        .generate_stream_with_transfer_polling(
+            sglang_srt::router::RouterGenerateRequest {
+                request_id: "router-poll-inline".to_string(),
+                tokenized: Some(sglang_srt::router::RouterTokenizedInput {
+                    original_text: String::new(),
+                    input_ids: vec![1, 2],
+                }),
+                sampling_params: Some(sglang_srt::router::RouterSamplingParams {
+                    max_new_tokens: Some(2),
+                    ..Default::default()
+                }),
+                disaggregated_params: Some(sglang_srt::router::RouterDisaggregatedParams {
+                    bootstrap_host: "10.0.0.7".to_string(),
+                    bootstrap_port: 8998,
+                    bootstrap_room: 25,
+                }),
+                stream: true,
+                data_parallel_rank: 0,
+                trace_headers: Default::default(),
+            },
+            1,
+        )
+        .expect("router should poll completed transfer and continue streaming");
+
+    assert_eq!(responses.len(), 2);
+    assert!(matches!(
+        responses[0].body,
+        sglang_srt::router::RouterGenerateResponseBody::Chunk(_)
+    ));
+    assert!(matches!(
+        responses[1].body,
+        sglang_srt::router::RouterGenerateResponseBody::Complete(_)
+    ));
 }
 
 #[test]

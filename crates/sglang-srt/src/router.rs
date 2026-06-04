@@ -723,6 +723,67 @@ where
     }
 }
 
+impl<T, W> RouterRuntime<T, W>
+where
+    T: Tokenizer,
+    W: WorkerExecutor + KvTransferPoller,
+{
+    pub fn generate_stream_with_transfer_polling(
+        &mut self,
+        request: RouterGenerateRequest,
+        max_transfer_polls: usize,
+    ) -> Result<Vec<RouterGenerateResponse>, RouterRuntimeError> {
+        let validated_request = request.try_into_validated_token_request(self.validation_config)?;
+        self.ensure_generation_ready()?;
+        let prompt_tokens = validated_request.prompt_tokens as i32;
+        let stream = validated_request.stream;
+        let outputs = self.engine.generate_token_stream_with_transfer_polling(
+            validated_request.request,
+            max_transfer_polls,
+        )?;
+        let mut output_ids = Vec::new();
+        let mut responses = Vec::with_capacity(outputs.len());
+
+        for output in outputs {
+            let request_id = output.request_id.as_str().to_string();
+            output_ids.extend_from_slice(&output.output_ids);
+            let completion_tokens = output_ids.len() as i32;
+            let cached_tokens = output.cached_tokens as i32;
+
+            let body = if output.finished {
+                RouterGenerateResponseBody::Complete(RouterGenerateComplete {
+                    output_ids: output_ids.clone(),
+                    text: String::new(),
+                    finish_reason: "stop".to_string(),
+                    prompt_tokens,
+                    completion_tokens,
+                    cached_tokens,
+                    index: 0,
+                })
+            } else {
+                RouterGenerateResponseBody::Chunk(RouterGenerateStreamChunk {
+                    token_ids: output.output_ids,
+                    text: String::new(),
+                    prompt_tokens,
+                    completion_tokens,
+                    cached_tokens,
+                    index: 0,
+                })
+            };
+
+            responses.push(RouterGenerateResponse { request_id, body });
+        }
+
+        if !stream {
+            responses.retain(|response| {
+                matches!(response.body, RouterGenerateResponseBody::Complete(_))
+            });
+        }
+
+        Ok(responses)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum RouterProtocolError {
     MissingRequestId,

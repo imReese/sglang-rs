@@ -204,3 +204,98 @@ where
             .ok_or(SchedulerError::EmptyQueue.into())
     }
 }
+
+impl<T, W> Engine<T, W>
+where
+    T: Tokenizer,
+    W: WorkerExecutor + KvTransferPoller,
+{
+    pub fn generate_tokens_with_transfer_polling(
+        &mut self,
+        request: TokenGenerateRequest,
+        max_transfer_polls: usize,
+    ) -> Result<TokenGenerateOutput, RuntimeError> {
+        let outputs = self.generate_scheduled_stream_with_transfer_polling(
+            ScheduledRequest::new(request.request_id, request.input_ids, request.sampling)
+                .with_disaggregated_params(request.disaggregated_params)
+                .with_data_parallel_rank(request.data_parallel_rank),
+            max_transfer_polls,
+        )?;
+        let mut output_ids = Vec::new();
+        let mut final_output = None;
+
+        for output in outputs {
+            output_ids.extend_from_slice(&output.token_ids);
+            final_output = Some(output);
+        }
+
+        let final_output = final_output.ok_or(SchedulerError::EmptyQueue)?;
+
+        Ok(TokenGenerateOutput {
+            request_id: final_output.request_id,
+            output_ids,
+            cached_tokens: final_output.cached_tokens,
+            finished: final_output.finished,
+        })
+    }
+
+    pub fn generate_token_stream_with_transfer_polling(
+        &mut self,
+        request: TokenGenerateRequest,
+        max_transfer_polls: usize,
+    ) -> Result<Vec<TokenGenerateOutput>, RuntimeError> {
+        let outputs = self.generate_scheduled_stream_with_transfer_polling(
+            ScheduledRequest::new(request.request_id, request.input_ids, request.sampling)
+                .with_disaggregated_params(request.disaggregated_params)
+                .with_data_parallel_rank(request.data_parallel_rank),
+            max_transfer_polls,
+        )?;
+
+        Ok(outputs
+            .into_iter()
+            .map(|output| TokenGenerateOutput {
+                request_id: output.request_id,
+                output_ids: output.token_ids,
+                cached_tokens: output.cached_tokens,
+                finished: output.finished,
+            })
+            .collect())
+    }
+
+    fn generate_scheduled_stream_with_transfer_polling(
+        &mut self,
+        request: ScheduledRequest,
+        max_transfer_polls: usize,
+    ) -> Result<Vec<ScheduledOutput>, RuntimeError> {
+        self.scheduler.enqueue(request);
+        let mut scheduled_output = self.scheduler.dispatch_next()?;
+        let mut outputs = vec![scheduled_output.clone()];
+        let mut remaining_transfer_polls = max_transfer_polls;
+
+        while !scheduled_output.finished {
+            scheduled_output =
+                self.next_decode_output_with_transfer_polling(&mut remaining_transfer_polls)?;
+            outputs.push(scheduled_output.clone());
+        }
+
+        Ok(outputs)
+    }
+
+    fn next_decode_output_with_transfer_polling(
+        &mut self,
+        remaining_transfer_polls: &mut usize,
+    ) -> Result<ScheduledOutput, RuntimeError> {
+        loop {
+            match self.scheduler.dispatch_decode_batch(1) {
+                Ok(mut outputs) => {
+                    return outputs.pop().ok_or(SchedulerError::EmptyQueue.into());
+                }
+                Err(SchedulerError::DecodeNotReady { .. }) if *remaining_transfer_polls > 0 => {
+                    *remaining_transfer_polls -= 1;
+                    self.poll_transfers()?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+}

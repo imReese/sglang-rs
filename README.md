@@ -102,8 +102,9 @@ This repository currently contains the first `sglang-srt` runtime crate:
   runs transfer as part of scheduler prefill dispatch. It also exposes a
   decode-side KV-ready predicate used by scheduler decode batching to keep PD
   decode requests queued until their bootstrap room reaches `Success`, plus
-  engine/router polling hooks for advancing asynchronous Mooncake transfer
-  completions from the control plane. The
+  engine/router polling hooks and bounded transfer-polling generation entry
+  points for advancing asynchronous Mooncake transfer completions from the
+  control plane before decode resumes. The
   module also contains the initial Mooncake transfer-engine ABI boundary for
   memory registration and batch transfer.
 - `scheduler`: waiting queue, prefill/decode batch formation, request stages,
