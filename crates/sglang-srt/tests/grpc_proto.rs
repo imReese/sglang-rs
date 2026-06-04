@@ -193,6 +193,43 @@ async fn grpc_generate_streams_router_runtime_outputs() {
 }
 
 #[tokio::test]
+async fn grpc_generate_maps_running_request_limit_to_resource_exhausted() {
+    let mut scheduler = Scheduler::new(GrpcTwoStepWorker).with_max_running_requests(Some(1));
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("active"),
+        vec![1],
+        RuntimeSamplingParams { max_new_tokens: 2 },
+    ));
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should occupy the active slot");
+    let service = GrpcRouterService::from_engine(Engine::new(ByteTokenizer, scheduler));
+
+    let result = service
+        .generate(Request::new(GenerateRequest {
+            input_ids: vec![9],
+            original_text: String::new(),
+            sampling_params: Some(SamplingParams {
+                max_new_tokens: Some(2),
+                ..Default::default()
+            }),
+            options: Some(RequestOptions {
+                request_id: Some("over-capacity".to_string()),
+                stream: true,
+                data_parallel_rank: 0,
+                trace_headers: Default::default(),
+            }),
+            disaggregated_params: None,
+        }))
+        .await;
+
+    let Err(error) = result else {
+        panic!("capacity backpressure should be surfaced as grpc error");
+    };
+    assert_eq!(error.code(), Code::ResourceExhausted);
+}
+
+#[tokio::test]
 async fn grpc_generate_non_stream_returns_only_complete_response() {
     let service = GrpcRouterService::from_engine(Engine::new(
         ByteTokenizer,

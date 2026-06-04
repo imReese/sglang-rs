@@ -188,8 +188,15 @@ where
         &mut self,
         request: ScheduledRequest,
     ) -> Result<Vec<ScheduledOutput>, RuntimeError> {
+        let request_id = request.request_id().clone();
         self.scheduler.enqueue(request);
-        let mut scheduled_output = self.scheduler.dispatch_next()?;
+        let mut scheduled_output = match self.scheduler.dispatch_next() {
+            Ok(output) => output,
+            Err(error) => {
+                self.scheduler.abort_request(&request_id);
+                return Err(error.into());
+            }
+        };
         let mut outputs = vec![scheduled_output.clone()];
 
         while !scheduled_output.finished {

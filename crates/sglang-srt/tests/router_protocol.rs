@@ -776,6 +776,59 @@ fn router_runtime_abort_request_removes_queued_request() {
 }
 
 #[test]
+fn router_runtime_reports_running_request_limit_as_resource_exhausted_without_queuing_request() {
+    let tokenizer = ByteTokenizer::default();
+    let mut scheduler =
+        Scheduler::new(AlwaysUnfinishedRouterWorker).with_max_running_requests(Some(1));
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("active"),
+        vec![1],
+        SamplingParams { max_new_tokens: 2 },
+    ));
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should occupy the active slot");
+    let engine = Engine::new(tokenizer, scheduler);
+    let mut runtime = RouterRuntime::new(engine);
+
+    let error = runtime
+        .generate_stream(RouterGenerateRequest {
+            request_id: "over-capacity".to_string(),
+            tokenized: Some(RouterTokenizedInput {
+                original_text: String::new(),
+                input_ids: vec![9],
+            }),
+            sampling_params: Some(RouterSamplingParams {
+                max_new_tokens: Some(2),
+                ..Default::default()
+            }),
+            disaggregated_params: None,
+            stream: true,
+            data_parallel_rank: 0,
+            trace_headers: Default::default(),
+        })
+        .expect_err("capacity backpressure should reject the request");
+
+    assert!(matches!(
+        error,
+        sglang_srt::router::RouterRuntimeError::Protocol(
+            RouterProtocolError::RunningRequestLimitReached {
+                max_running_requests: 1
+            }
+        )
+    ));
+    assert_eq!(
+        RouterProtocolError::RunningRequestLimitReached {
+            max_running_requests: 1
+        }
+        .status_code(),
+        RouterStatusCode::ResourceExhausted
+    );
+    assert_eq!(runtime.load().waiting_queue_depth, 0);
+    assert_eq!(runtime.load().decode_queue_depth, 1);
+}
+
+#[test]
 fn router_runtime_streams_prefill_chunks_and_final_complete_response() {
     let tokenizer = ByteTokenizer::default();
     let scheduler = Scheduler::new(TwoStepRouterWorker::default());

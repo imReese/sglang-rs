@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cli::ServerArgs;
 use crate::engine::{Engine, RuntimeError};
+use crate::scheduler::SchedulerError;
 use crate::tokenizer::{Tokenizer, TokenizerError};
 use crate::types::{
     DisaggregatedParams, RequestId, SamplingParams, TokenGenerateOutput, TokenGenerateRequest,
@@ -845,6 +846,9 @@ pub enum RouterProtocolError {
         max_new_tokens: usize,
         max_context_tokens: usize,
     },
+    RunningRequestLimitReached {
+        max_running_requests: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -863,9 +867,9 @@ impl RouterProtocolError {
             | Self::EmptyTextInput
             | Self::InvalidIntegerSamplingParam { .. }
             | Self::InvalidFloatSamplingParam { .. } => RouterStatusCode::InvalidArgument,
-            Self::InputTooLong { .. } | Self::ContextOverflow { .. } => {
-                RouterStatusCode::ResourceExhausted
-            }
+            Self::InputTooLong { .. }
+            | Self::ContextOverflow { .. }
+            | Self::RunningRequestLimitReached { .. } => RouterStatusCode::ResourceExhausted,
             Self::GenerationPaused => RouterStatusCode::FailedPrecondition,
         }
     }
@@ -918,6 +922,14 @@ impl fmt::Display for RouterProtocolError {
                     "router input token count {input_tokens} plus max_new_tokens {max_new_tokens} exceeds context token limit {max_context_tokens}"
                 )
             }
+            Self::RunningRequestLimitReached {
+                max_running_requests,
+            } => {
+                write!(
+                    formatter,
+                    "router running request limit reached: {max_running_requests}"
+                )
+            }
         }
     }
 }
@@ -949,6 +961,15 @@ impl From<RouterProtocolError> for RouterRuntimeError {
 
 impl From<RuntimeError> for RouterRuntimeError {
     fn from(value: RuntimeError) -> Self {
+        if let RuntimeError::Scheduler(SchedulerError::RunningRequestLimitReached {
+            max_running_requests,
+        }) = value
+        {
+            return Self::Protocol(RouterProtocolError::RunningRequestLimitReached {
+                max_running_requests,
+            });
+        }
+
         Self::Runtime(value)
     }
 }
