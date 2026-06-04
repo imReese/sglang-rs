@@ -400,58 +400,67 @@ fn local_model_checkpoint_catalog_exposes_deepseek_v4_model_weights() {
             ("model.embed_tokens.weight", "U8", &[1], [0, 1]),
             ("model.norm.weight", "U8", &[1], [1, 2]),
             ("lm_head.weight", "U8", &[1], [2, 3]),
-            ("model.layers.0.self_attn.wq_a.weight", "U8", &[1], [3, 4]),
-            ("model.layers.0.self_attn.wq_b.weight", "U8", &[1], [4, 5]),
-            ("model.layers.0.self_attn.wkv.weight", "U8", &[1], [5, 6]),
-            ("model.layers.0.self_attn.q_norm.weight", "U8", &[1], [6, 7]),
+            ("model.hc_head_fn", "U8", &[1], [3, 4]),
+            ("model.hc_head_base", "U8", &[1], [4, 5]),
+            ("model.hc_head_scale", "U8", &[1], [5, 6]),
+            ("model.layers.0.self_attn.wq_a.weight", "U8", &[1], [6, 7]),
+            ("model.layers.0.self_attn.wq_b.weight", "U8", &[1], [7, 8]),
+            ("model.layers.0.self_attn.wkv.weight", "U8", &[1], [8, 9]),
+            (
+                "model.layers.0.self_attn.q_norm.weight",
+                "U8",
+                &[1],
+                [9, 10],
+            ),
             (
                 "model.layers.0.self_attn.kv_norm.weight",
                 "U8",
                 &[1],
-                [7, 8],
+                [10, 11],
             ),
-            ("model.layers.0.self_attn.wo_a.weight", "U8", &[1], [8, 9]),
-            ("model.layers.0.self_attn.wo_b.weight", "U8", &[1], [9, 10]),
+            ("model.layers.0.self_attn.wo_a.weight", "U8", &[1], [11, 12]),
+            ("model.layers.0.self_attn.wo_b.weight", "U8", &[1], [12, 13]),
             (
                 "model.layers.0.input_layernorm.weight",
                 "U8",
                 &[1],
-                [10, 11],
+                [13, 14],
             ),
             (
                 "model.layers.0.post_attention_layernorm.weight",
                 "U8",
                 &[1],
-                [11, 12],
+                [14, 15],
             ),
-            ("model.layers.0.hc_attn_fn", "U8", &[1], [12, 13]),
-            ("model.layers.0.hc_attn_base", "U8", &[1], [13, 14]),
-            ("model.layers.0.hc_attn_scale", "U8", &[1], [14, 15]),
-            ("model.layers.0.hc_ffn_fn", "U8", &[1], [15, 16]),
-            ("model.layers.0.hc_ffn_base", "U8", &[1], [16, 17]),
-            ("model.layers.0.hc_ffn_scale", "U8", &[1], [17, 18]),
-            ("model.layers.0.mlp.gate.weight", "U8", &[1], [18, 19]),
+            ("model.layers.0.hc_attn_fn", "U8", &[1], [15, 16]),
+            ("model.layers.0.hc_attn_base", "U8", &[1], [16, 17]),
+            ("model.layers.0.hc_attn_scale", "U8", &[1], [17, 18]),
+            ("model.layers.0.hc_ffn_fn", "U8", &[1], [18, 19]),
+            ("model.layers.0.hc_ffn_base", "U8", &[1], [19, 20]),
+            ("model.layers.0.hc_ffn_scale", "U8", &[1], [20, 21]),
+            ("model.layers.0.mlp.gate.weight", "U8", &[1], [21, 22]),
             (
                 "model.layers.0.ffn.experts.0.w1.weight",
                 "U8",
                 &[1],
-                [19, 20],
+                [22, 23],
             ),
             (
                 "model.layers.0.ffn.experts.0.w2.weight",
                 "U8",
                 &[1],
-                [20, 21],
+                [23, 24],
             ),
             (
                 "model.layers.0.ffn.experts.0.w3.weight",
                 "U8",
                 &[1],
-                [21, 22],
+                [24, 25],
             ),
         ],
         &[
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25,
         ],
     )
     .expect("shard should be written");
@@ -472,6 +481,9 @@ fn local_model_checkpoint_catalog_exposes_deepseek_v4_model_weights() {
     );
     assert_eq!(model.final_norm().tensor_name, "model.norm.weight");
     assert_eq!(model.lm_head().tensor_name, "lm_head.weight");
+    assert_eq!(model.hc_head_fn().tensor_name, "model.hc_head_fn");
+    assert_eq!(model.hc_head_base().tensor_name, "model.hc_head_base");
+    assert_eq!(model.hc_head_scale().tensor_name, "model.hc_head_scale");
     assert_eq!(
         model
             .layer(0)
@@ -487,6 +499,9 @@ fn local_model_checkpoint_catalog_exposes_deepseek_v4_model_weights() {
     assert_eq!(loaded_roots.token_embeddings().bytes, vec![1]);
     assert_eq!(loaded_roots.final_norm().bytes, vec![2]);
     assert_eq!(loaded_roots.lm_head().bytes, vec![3]);
+    assert_eq!(loaded_roots.hc_head_fn().bytes, vec![4]);
+    assert_eq!(loaded_roots.hc_head_base().bytes, vec![5]);
+    assert_eq!(loaded_roots.hc_head_scale().bytes, vec![6]);
 
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
@@ -529,6 +544,52 @@ fn local_model_checkpoint_catalog_rejects_missing_deepseek_v4_model_root_tensor(
                 if path == &model_dir
                     && message.contains("missing DeepSeek model tensor")
                     && message.contains("lm_head.weight")
+        ),
+        "unexpected error: {error:?}"
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn local_model_checkpoint_catalog_rejects_missing_deepseek_v4_hc_head_tensor() {
+    let model_dir = temp_model_dir("deepseek-v4-model-weights-missing-hc-head");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "model_type": "deepseek_v4",
+  "num_hidden_layers": 0
+}"#,
+    )
+    .expect("config should be written");
+    write_safetensors_file(
+        &model_dir.join("model.safetensors"),
+        &[
+            ("model.embed_tokens.weight", "U8", &[1], [0, 1]),
+            ("model.norm.weight", "U8", &[1], [1, 2]),
+            ("lm_head.weight", "U8", &[1], [2, 3]),
+        ],
+        &[1, 2, 3],
+    )
+    .expect("shard should be written");
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("local artifacts should load");
+    let checkpoint = artifacts
+        .checkpoint_catalog()
+        .expect("checkpoint catalog should build");
+
+    let error = checkpoint
+        .deepseek_model_weights()
+        .expect_err("missing DeepSeek V4 HC head tensor should fail model view validation");
+
+    assert!(
+        matches!(
+            error,
+            ModelArtifactError::InvalidSafetensorsData { ref path, ref message }
+                if path == &model_dir
+                    && message.contains("missing DeepSeek model tensor")
+                    && message.contains("model.hc_head_fn")
         ),
         "unexpected error: {error:?}"
     );

@@ -208,6 +208,9 @@ impl LocalModelCheckpointCatalog {
             token_embeddings: self.required_deepseek_model_tensor("model.embed_tokens.weight")?,
             final_norm: self.required_deepseek_model_tensor("model.norm.weight")?,
             lm_head: self.required_deepseek_model_tensor("lm_head.weight")?,
+            hc_head_fn: self.required_deepseek_model_tensor("model.hc_head_fn")?,
+            hc_head_base: self.required_deepseek_model_tensor("model.hc_head_base")?,
+            hc_head_scale: self.required_deepseek_model_tensor("model.hc_head_scale")?,
             layers,
         })
     }
@@ -300,6 +303,9 @@ pub struct DeepSeekModelTensorSpan {
 pub struct DeepSeekModelCheckpointWeights<'a> {
     token_embeddings: DeepSeekModelTensorSpan,
     final_norm: DeepSeekModelTensorSpan,
+    hc_head_fn: DeepSeekModelTensorSpan,
+    hc_head_base: DeepSeekModelTensorSpan,
+    hc_head_scale: DeepSeekModelTensorSpan,
     lm_head: DeepSeekModelTensorSpan,
     layers: Vec<DeepSeekLayerCheckpointWeights<'a>>,
 }
@@ -311,6 +317,18 @@ impl<'a> DeepSeekModelCheckpointWeights<'a> {
 
     pub fn final_norm(&self) -> &DeepSeekModelTensorSpan {
         &self.final_norm
+    }
+
+    pub fn hc_head_fn(&self) -> &DeepSeekModelTensorSpan {
+        &self.hc_head_fn
+    }
+
+    pub fn hc_head_base(&self) -> &DeepSeekModelTensorSpan {
+        &self.hc_head_base
+    }
+
+    pub fn hc_head_scale(&self) -> &DeepSeekModelTensorSpan {
+        &self.hc_head_scale
     }
 
     pub fn lm_head(&self) -> &DeepSeekModelTensorSpan {
@@ -333,6 +351,9 @@ impl<'a> DeepSeekModelCheckpointWeights<'a> {
         Ok(DeepSeekLoadedModelRootWeights {
             token_embeddings: read_required_tensor_span(&self.token_embeddings.span)?,
             final_norm: read_required_tensor_span(&self.final_norm.span)?,
+            hc_head_fn: read_required_tensor_span(&self.hc_head_fn.span)?,
+            hc_head_base: read_required_tensor_span(&self.hc_head_base.span)?,
+            hc_head_scale: read_required_tensor_span(&self.hc_head_scale.span)?,
             lm_head: read_required_tensor_span(&self.lm_head.span)?,
         })
     }
@@ -342,6 +363,9 @@ impl<'a> DeepSeekModelCheckpointWeights<'a> {
 pub struct DeepSeekLoadedModelRootWeights {
     token_embeddings: SafetensorsTensorData,
     final_norm: SafetensorsTensorData,
+    hc_head_fn: SafetensorsTensorData,
+    hc_head_base: SafetensorsTensorData,
+    hc_head_scale: SafetensorsTensorData,
     lm_head: SafetensorsTensorData,
 }
 
@@ -352,6 +376,18 @@ impl DeepSeekLoadedModelRootWeights {
 
     pub fn final_norm(&self) -> &SafetensorsTensorData {
         &self.final_norm
+    }
+
+    pub fn hc_head_fn(&self) -> &SafetensorsTensorData {
+        &self.hc_head_fn
+    }
+
+    pub fn hc_head_base(&self) -> &SafetensorsTensorData {
+        &self.hc_head_base
+    }
+
+    pub fn hc_head_scale(&self) -> &SafetensorsTensorData {
+        &self.hc_head_scale
     }
 
     pub fn lm_head(&self) -> &SafetensorsTensorData {
