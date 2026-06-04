@@ -86,6 +86,37 @@ struct ParsedTransferBackend {
     force_tcp_transport: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KvCacheDtype {
+    Auto,
+    Bfloat16,
+    Fp8E4M3,
+    Fp8E5M2,
+    Fp4E2M1,
+}
+
+impl KvCacheDtype {
+    fn parse(value: &str) -> Result<Self, PdConfigError> {
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "bf16" | "bfloat16" => Ok(Self::Bfloat16),
+            "fp8_e4m3" => Ok(Self::Fp8E4M3),
+            "fp8_e5m2" => Ok(Self::Fp8E5M2),
+            "fp4_e2m1" => Ok(Self::Fp4E2M1),
+            _ => Err(PdConfigError::InvalidKvCacheDtype(value.to_string())),
+        }
+    }
+
+    pub fn bytes_per_element(&self) -> Option<usize> {
+        match self {
+            Self::Auto => None,
+            Self::Bfloat16 => Some(2),
+            Self::Fp8E4M3 | Self::Fp8E5M2 => Some(1),
+            Self::Fp4E2M1 => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PdConfig {
     pub mode: DisaggregationMode,
@@ -97,6 +128,7 @@ pub struct PdConfig {
     pub decode_enable_offload_kvcache: bool,
     pub num_reserved_decode_tokens: usize,
     pub decode_polling_interval: usize,
+    pub kv_cache_dtype: KvCacheDtype,
     pub page_size: usize,
     pub base_gpu_id: usize,
     pub gpu_id_step: usize,
@@ -114,6 +146,7 @@ impl PdConfig {
     pub fn from_server_args(args: &ServerArgs) -> Result<Self, PdConfigError> {
         let mode = DisaggregationMode::parse(&args.disaggregation_mode)?;
         let backend = TransferBackend::parse(&args.disaggregation_transfer_backend)?;
+        let kv_cache_dtype = KvCacheDtype::parse(&args.kv_cache_dtype)?;
 
         if mode == DisaggregationMode::Prefill && backend.backend == TransferBackend::Fake {
             return Err(PdConfigError::FakePrefillUnsupported);
@@ -133,6 +166,7 @@ impl PdConfig {
             decode_enable_offload_kvcache: args.disaggregation_decode_enable_offload_kvcache,
             num_reserved_decode_tokens: args.num_reserved_decode_tokens,
             decode_polling_interval: args.disaggregation_decode_polling_interval,
+            kv_cache_dtype,
             page_size: args.page_size,
             base_gpu_id: args.base_gpu_id,
             gpu_id_step: args.gpu_id_step,
@@ -152,6 +186,8 @@ impl PdConfig {
 pub enum PdConfigError {
     InvalidDisaggregationMode(String),
     InvalidTransferBackend(String),
+    InvalidKvCacheDtype(String),
+    KvCacheDtypeRequiresModelMetadata(KvCacheDtype),
     FakePrefillUnsupported,
 }
 
@@ -165,6 +201,15 @@ impl fmt::Display for PdConfigError {
                 write!(
                     formatter,
                     "invalid disaggregation transfer backend: {backend}"
+                )
+            }
+            Self::InvalidKvCacheDtype(dtype) => {
+                write!(formatter, "invalid kv cache dtype: {dtype}")
+            }
+            Self::KvCacheDtypeRequiresModelMetadata(dtype) => {
+                write!(
+                    formatter,
+                    "kv cache dtype requires model metadata for byte width: {dtype:?}"
                 )
             }
             Self::FakePrefillUnsupported => {
@@ -899,6 +944,24 @@ impl MooncakeKvCacheLayout {
             page_size_bytes: config.page_size * token_size_bytes,
             target_base_offset,
         }
+    }
+
+    pub fn from_pd_config_kv_elements(
+        source_base_addr: usize,
+        kv_elements_per_token: usize,
+        target_base_offset: u64,
+        config: &PdConfig,
+    ) -> Result<Self, PdConfigError> {
+        let bytes_per_element = config.kv_cache_dtype.bytes_per_element().ok_or(
+            PdConfigError::KvCacheDtypeRequiresModelMetadata(config.kv_cache_dtype),
+        )?;
+
+        Ok(Self::from_pd_config(
+            source_base_addr,
+            kv_elements_per_token * bytes_per_element,
+            target_base_offset,
+            config,
+        ))
     }
 }
 

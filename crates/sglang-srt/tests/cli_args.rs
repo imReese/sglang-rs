@@ -14,6 +14,8 @@ fn parse_sglang_serve_style_worker_args() {
         "1",
         "--dp-size",
         "8",
+        "--kv-cache-dtype",
+        "bfloat16",
         "--page-size",
         "64",
         "--base-gpu-id",
@@ -30,6 +32,7 @@ fn parse_sglang_serve_style_worker_args() {
     assert_eq!(parsed.port, 8080);
     assert_eq!(parsed.tp_size, 1);
     assert_eq!(parsed.dp_size, 8);
+    assert_eq!(parsed.kv_cache_dtype, "bfloat16");
     assert_eq!(parsed.page_size, 64);
     assert_eq!(parsed.base_gpu_id, 2);
     assert_eq!(parsed.gpu_id_step, 3);
@@ -46,6 +49,7 @@ fn parse_model_alias_and_default_network_args() {
     assert_eq!(parsed.port, 30000);
     assert_eq!(parsed.tp_size, 1);
     assert_eq!(parsed.dp_size, 1);
+    assert_eq!(parsed.kv_cache_dtype, "auto");
     assert_eq!(parsed.page_size, 1);
     assert_eq!(parsed.base_gpu_id, 0);
     assert_eq!(parsed.gpu_id_step, 1);
@@ -145,6 +149,8 @@ fn parse_deepseek_pd_multinode_launch_args_as_structured_runtime_config() {
         "16",
         "--dp-size",
         "8",
+        "--kv-cache-dtype",
+        "fp8_e5m2",
         "--enable-dp-attention",
         "--moe-a2a-backend",
         "deepep",
@@ -161,6 +167,7 @@ fn parse_deepseek_pd_multinode_launch_args_as_structured_runtime_config() {
     assert_eq!(parsed.dist_init_addr.as_deref(), Some("10.0.0.1:5000"));
     assert_eq!(parsed.nnodes, 2);
     assert_eq!(parsed.node_rank, 1);
+    assert_eq!(parsed.kv_cache_dtype, "fp8_e5m2");
     assert!(parsed.enable_dp_attention);
     assert_eq!(parsed.moe_a2a_backend.as_deref(), Some("deepep"));
     assert_eq!(parsed.mem_fraction_static, Some(0.8));

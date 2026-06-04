@@ -13,6 +13,7 @@ pub struct ServerArgs {
     pub port: u16,
     pub tp_size: usize,
     pub dp_size: usize,
+    pub kv_cache_dtype: String,
     pub page_size: usize,
     pub base_gpu_id: usize,
     pub gpu_id_step: usize,
@@ -119,6 +120,9 @@ impl ArgParser {
                 "--dp-size" | "--dp" => {
                     self.parsed.dp_size = parse_usize("--dp-size", self.take_value("--dp-size")?)?;
                 }
+                "--kv-cache-dtype" => {
+                    self.parsed.kv_cache_dtype = self.take_value("--kv-cache-dtype")?;
+                }
                 "--page-size" => {
                     self.parsed.page_size =
                         parse_usize("--page-size", self.take_value("--page-size")?)?;
@@ -221,6 +225,7 @@ impl ArgParser {
             port: self.parsed.port,
             tp_size: self.parsed.tp_size,
             dp_size: self.parsed.dp_size,
+            kv_cache_dtype: self.parsed.kv_cache_dtype.clone(),
             page_size: self.parsed.page_size,
             base_gpu_id: self.parsed.base_gpu_id,
             gpu_id_step: self.parsed.gpu_id_step,
@@ -297,6 +302,7 @@ struct PartialServerArgs {
     port: u16,
     tp_size: usize,
     dp_size: usize,
+    kv_cache_dtype: String,
     page_size: usize,
     base_gpu_id: usize,
     gpu_id_step: usize,
@@ -330,6 +336,7 @@ impl Default for PartialServerArgs {
             port: 30000,
             tp_size: 1,
             dp_size: 1,
+            kv_cache_dtype: "auto".to_string(),
             page_size: 1,
             base_gpu_id: 0,
             gpu_id_step: 1,

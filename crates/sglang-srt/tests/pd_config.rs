@@ -1,6 +1,6 @@
 use sglang_srt::cli::ServerArgs;
 use sglang_srt::transfer::{
-    DisaggregationMode, KvPoll, MooncakeKvCacheLayout, MooncakeOpcode,
+    DisaggregationMode, KvCacheDtype, KvPoll, MooncakeKvCacheLayout, MooncakeOpcode,
     MooncakeTransferEngineConfig, MooncakeTransferStatusCode, PdConfig, PdConfigError,
     TransferBackend,
 };
@@ -149,6 +149,61 @@ fn pd_config_carries_page_size_for_mooncake_kv_layout() {
     assert_eq!(layout.source_base_addr, 0x1000);
     assert_eq!(layout.page_size_bytes, 1024);
     assert_eq!(layout.target_base_offset, 0x200);
+}
+
+#[test]
+fn pd_config_normalizes_kv_cache_dtype_for_mooncake_layout_bytes() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--disaggregation-mode",
+        "decode",
+        "--kv-cache-dtype",
+        "bf16",
+        "--page-size",
+        "64",
+    ])
+    .expect("args should parse");
+
+    let config = PdConfig::from_server_args(&args).expect("pd config should normalize");
+    let layout =
+        MooncakeKvCacheLayout::from_pd_config_kv_elements(0x1000, 512, 0x200, &config).unwrap();
+
+    assert_eq!(config.kv_cache_dtype, KvCacheDtype::Bfloat16);
+    assert_eq!(config.kv_cache_dtype.bytes_per_element(), Some(2));
+    assert_eq!(layout.page_size_bytes, 64 * 512 * 2);
+}
+
+#[test]
+fn pd_config_tracks_fp8_kv_cache_dtype_byte_width() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--kv-cache-dtype",
+        "fp8_e5m2",
+    ])
+    .expect("args should parse");
+
+    let config = PdConfig::from_server_args(&args).expect("pd config should normalize");
+
+    assert_eq!(config.kv_cache_dtype, KvCacheDtype::Fp8E5M2);
+    assert_eq!(config.kv_cache_dtype.bytes_per_element(), Some(1));
+}
+
+#[test]
+fn pd_config_rejects_unknown_kv_cache_dtype() {
+    let args =
+        ServerArgs::parse_from(["serve", "--model-path", "dummy", "--kv-cache-dtype", "int8"])
+            .expect("args should parse");
+
+    let error = PdConfig::from_server_args(&args).expect_err("unknown dtype should fail");
+
+    assert_eq!(
+        error,
+        PdConfigError::InvalidKvCacheDtype("int8".to_string())
+    );
 }
 
 #[test]
