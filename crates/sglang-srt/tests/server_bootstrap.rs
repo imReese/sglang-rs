@@ -339,6 +339,69 @@ fn bootstrap_grpc_router_service_rejects_incomplete_local_moe_checkpoint() {
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
 
+#[test]
+fn bootstrap_grpc_router_service_rejects_duplicate_local_layer_tensors() {
+    let model_dir = temp_model_dir("server-duplicate-layer-tensors");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        deepseek_v4_model_config_json(),
+    )
+    .expect("config should be written");
+    let first_shard = model_dir.join("model-00001.safetensors");
+    write_safetensors_file(
+        &first_shard,
+        &[(
+            "model.layers.0.self_attn.q_a_proj.weight",
+            "U8",
+            &[1],
+            [0, 1],
+        )],
+        &[1],
+    )
+    .expect("first shard should be written");
+    let second_shard = model_dir.join("model-00002.safetensors");
+    write_safetensors_file(
+        &second_shard,
+        &[(
+            "model.layers.0.self_attn.q_a_proj.weight",
+            "U8",
+            &[1],
+            [0, 1],
+        )],
+        &[2],
+    )
+    .expect("second shard should be written");
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_dir.to_str().expect("temp model dir should be utf-8"),
+        "--grpc-mode",
+    ])
+    .expect("args should parse");
+
+    let error = match try_build_bootstrap_grpc_router_service(&args) {
+        Ok(_) => panic!("duplicate local layer tensor should fail bootstrap"),
+        Err(error) => error,
+    };
+
+    assert!(
+        matches!(
+            error,
+            ServerLaunchError::ModelArtifact(ModelArtifactError::InvalidSafetensorsData {
+                ref path,
+                ref message,
+            }) if path == &second_shard
+                && message.contains("duplicate layer tensor suffix")
+                && message.contains("layer 0")
+                && message.contains("self_attn.q_a_proj.weight")
+        ),
+        "unexpected error: {error:?}"
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
 #[tokio::test]
 async fn bootstrap_pd_grpc_router_service_polls_transfer_before_decode() {
     let args = ServerArgs::parse_from([

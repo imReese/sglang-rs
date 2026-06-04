@@ -328,6 +328,57 @@ fn local_model_artifacts_exposes_routed_expert_weight_catalog() {
 }
 
 #[test]
+fn local_model_artifacts_builds_checkpoint_catalog_for_layer_and_routed_weights() {
+    let model_dir = temp_model_dir("local-checkpoint-catalog");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "model_type": "deepseek_v4",
+  "num_hidden_layers": 1,
+  "n_routed_experts": 1,
+  "first_k_dense_replace": 0,
+  "moe_layer_freq": 1
+}"#,
+    )
+    .expect("config should be written");
+    write_safetensors_file(
+        &model_dir.join("model.safetensors"),
+        &[
+            (
+                "model.layers.0.self_attn.q_a_proj.weight",
+                "U8",
+                &[1],
+                [0, 1],
+            ),
+            ("model.layers.0.ffn.experts.0.w1.weight", "U8", &[1], [1, 2]),
+            ("model.layers.0.ffn.experts.0.w2.weight", "U8", &[1], [2, 3]),
+            ("model.layers.0.ffn.experts.0.w3.weight", "U8", &[1], [3, 4]),
+        ],
+        &[1, 2, 3, 4],
+    )
+    .expect("shard should be written");
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("local artifacts should load");
+
+    let catalog = artifacts
+        .checkpoint_catalog()
+        .expect("complete checkpoint catalog should build");
+
+    assert_eq!(catalog.layer_tensors().tensor_count(), 4);
+    assert!(
+        catalog
+            .layer_tensors()
+            .span(0, "self_attn.q_a_proj.weight")
+            .is_some()
+    );
+    assert_eq!(catalog.routed_experts().group_count(), 1);
+    assert!(catalog.routed_experts().group(0, 0).is_some());
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
 fn local_model_artifacts_rejects_missing_routed_expert_checkpoint_groups() {
     let model_dir = temp_model_dir("routed-expert-coverage-missing");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");

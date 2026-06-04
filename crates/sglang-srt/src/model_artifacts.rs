@@ -55,6 +55,10 @@ impl LocalModelArtifacts {
         SafetensorsRoutedExpertWeightCatalog::from_local_model_artifacts(self)
     }
 
+    pub fn checkpoint_catalog(&self) -> Result<LocalModelCheckpointCatalog, ModelArtifactError> {
+        LocalModelCheckpointCatalog::from_local_model_artifacts(self)
+    }
+
     fn validate_routed_expert_checkpoint_coverage_for_groups(
         &self,
         groups: &[SafetensorsRoutedExpertWeightGroup],
@@ -152,6 +156,34 @@ pub struct RoutedExpertCheckpointCoverage {
     pub actual_group_count: usize,
     pub expected_weight_count: usize,
     pub actual_weight_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalModelCheckpointCatalog {
+    layer_tensors: SafetensorsLayerTensorCatalog,
+    routed_experts: SafetensorsRoutedExpertWeightCatalog,
+}
+
+impl LocalModelCheckpointCatalog {
+    pub fn from_local_model_artifacts(
+        artifacts: &LocalModelArtifacts,
+    ) -> Result<Self, ModelArtifactError> {
+        let layer_tensors = artifacts.safetensors().layer_tensor_catalog()?;
+        let routed_experts = artifacts.routed_expert_weight_catalog()?;
+
+        Ok(Self {
+            layer_tensors,
+            routed_experts,
+        })
+    }
+
+    pub fn layer_tensors(&self) -> &SafetensorsLayerTensorCatalog {
+        &self.layer_tensors
+    }
+
+    pub fn routed_experts(&self) -> &SafetensorsRoutedExpertWeightCatalog {
+        &self.routed_experts
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

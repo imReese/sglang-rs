@@ -224,7 +224,7 @@ fn validate_local_model_artifacts_if_present(args: &ServerArgs) -> Result<(), Se
         Err(ModelArtifactError::NoSafetensorsWeights { .. }) => return Ok(()),
         Err(error) => return Err(error.into()),
     };
-    artifacts.validate_routed_expert_checkpoint_coverage()?;
+    artifacts.checkpoint_catalog()?;
     Ok(())
 }
 
