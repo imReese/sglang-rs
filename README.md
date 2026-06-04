@@ -96,7 +96,9 @@ This repository currently contains the first `sglang-srt` runtime crate:
   parsed `ServerArgs`, including model metadata propagation and an injectable PD
   service builder that wraps the bootstrap model runner with
   `KvTransferModelWorker`, a finite decode KV page pool, and bounded transfer
-  polling.
+  polling. The bootstrap launcher can run the decode-side PD path with the fake
+  transfer backend for local/runtime wiring tests and explicitly rejects
+  unsupported real PD backends until Mooncake/model KV memory wiring lands.
 - `tokenizer`: tokenizer trait plus a temporary byte tokenizer for tests.
 - `transfer`: PD disaggregation mode/backend normalization, including
   SGLang-compatible `mooncake_tcp` handling, decode bootstrap session tracking,

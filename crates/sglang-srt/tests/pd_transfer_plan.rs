@@ -5,10 +5,10 @@ use sglang_srt::router::{RouterRuntime, RouterTransferPollResponse};
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler, SchedulerError};
 use sglang_srt::tokenizer::ByteTokenizer;
 use sglang_srt::transfer::{
-    DecodeBootstrapRegistry, DecodeBootstrapSession, KvCacheTransferError, KvCacheTransferExecutor,
-    KvCacheTransferPlan, KvCacheTransferPlanError, KvCacheTransferSpan, KvPoll,
-    KvTransferModelWorker, MooncakeBatchId, MooncakeError, MooncakeKvCacheLayout,
-    MooncakeKvCacheTransferExecutor, MooncakeOpcode, MooncakeSubmittedBatch,
+    DecodeBootstrapRegistry, DecodeBootstrapSession, FakeKvCacheTransferExecutor,
+    KvCacheTransferError, KvCacheTransferExecutor, KvCacheTransferPlan, KvCacheTransferPlanError,
+    KvCacheTransferSpan, KvPoll, KvTransferModelWorker, MooncakeBatchId, MooncakeError,
+    MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeOpcode, MooncakeSubmittedBatch,
     MooncakeTransferRequest, MooncakeTransferStatus, MooncakeTransferStatusCode,
     MooncakeTransferStatusReader, MooncakeTransferSubmitter, MooncakeTransferTarget,
     MooncakeTransferTargetResolver, build_mooncake_kv_transfer_requests,
@@ -207,6 +207,23 @@ fn executor_marks_non_noop_transfer_spans_success_after_submit() {
     assert_eq!(executor.seen_rooms, vec![4]);
     assert_eq!(
         registry.get(4).expect("session should remain").status(),
+        KvPoll::Success
+    );
+}
+
+#[test]
+fn fake_transfer_executor_marks_spans_success_inline() {
+    let transfer_plan = transfer_plan_for_request("pd-fake", &[1, 2], None, 27);
+    let mut registry = registry_with_session("pd-fake", 27);
+    let mut executor = FakeKvCacheTransferExecutor::default();
+
+    let summary = execute_kv_cache_transfer_plan(&mut registry, &mut executor, &transfer_plan)
+        .expect("fake transfer should execute inline");
+
+    assert_eq!(summary.submitted_spans(), 1);
+    assert_eq!(executor.transferred_rooms(), &[27]);
+    assert_eq!(
+        registry.get(27).expect("session should remain").status(),
         KvPoll::Success
     );
 }

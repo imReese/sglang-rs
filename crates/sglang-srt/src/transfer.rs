@@ -545,6 +545,24 @@ pub trait KvCacheTransferExecutor {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FakeKvCacheTransferExecutor {
+    transferred_rooms: Vec<i32>,
+}
+
+impl FakeKvCacheTransferExecutor {
+    pub fn transferred_rooms(&self) -> &[i32] {
+        &self.transferred_rooms
+    }
+}
+
+impl KvCacheTransferExecutor for FakeKvCacheTransferExecutor {
+    fn transfer_span(&mut self, span: &KvCacheTransferSpan) -> Result<(), KvCacheTransferError> {
+        self.transferred_rooms.push(span.bootstrap_room());
+        Ok(())
+    }
+}
+
 pub fn execute_kv_cache_transfer_plan<E>(
     registry: &mut DecodeBootstrapRegistry,
     executor: &mut E,

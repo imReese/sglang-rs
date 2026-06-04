@@ -7,13 +7,15 @@ use sglang_srt::proto::sglang::runtime::v1::{
     GetModelInfoRequest, RequestOptions, SamplingParams, TextGenerateRequest,
 };
 use sglang_srt::server::{
+    ServerLaunchError, build_bootstrap_fake_pd_grpc_router_service,
     build_bootstrap_grpc_router_service, build_bootstrap_pd_grpc_router_service, grpc_listen_addr,
+    launch_grpc_server,
 };
 use sglang_srt::transfer::{
-    DecodeBootstrapRegistry, MooncakeBatchId, MooncakeError, MooncakeKvCacheLayout,
-    MooncakeKvCacheTransferExecutor, MooncakeTransferRequest, MooncakeTransferStatus,
-    MooncakeTransferStatusCode, MooncakeTransferStatusReader, MooncakeTransferSubmitter,
-    MooncakeTransferTarget,
+    DecodeBootstrapRegistry, DisaggregationMode, MooncakeBatchId, MooncakeError,
+    MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeTransferRequest,
+    MooncakeTransferStatus, MooncakeTransferStatusCode, MooncakeTransferStatusReader,
+    MooncakeTransferSubmitter, MooncakeTransferTarget, TransferBackend,
 };
 
 #[test]
@@ -186,6 +188,92 @@ async fn bootstrap_pd_grpc_router_service_polls_transfer_before_decode() {
         tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
             .await
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_fake_pd_grpc_router_service_uses_decode_transfer_path() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--grpc-mode",
+        "--disaggregation-mode",
+        "decode",
+        "--disaggregation-transfer-backend",
+        "fake",
+        "--disaggregation-decode-polling-interval",
+        "1",
+        "--num-reserved-decode-tokens",
+        "8",
+    ])
+    .expect("args should parse");
+    let service = build_bootstrap_fake_pd_grpc_router_service(&args);
+
+    let mut stream = service
+        .text_generate(Request::new(TextGenerateRequest {
+            text: "hi".to_string(),
+            sampling_params: Some(SamplingParams {
+                max_new_tokens: Some(2),
+                ..Default::default()
+            }),
+            options: Some(RequestOptions {
+                request_id: Some("bootstrap-fake-pd".to_string()),
+                stream: true,
+                data_parallel_rank: 1,
+                trace_headers: Default::default(),
+            }),
+            disaggregated_params: Some(
+                sglang_srt::proto::sglang::runtime::v1::DisaggregatedParams {
+                    bootstrap_host: "10.0.0.9".to_string(),
+                    bootstrap_port: 8998,
+                    bootstrap_room: 42,
+                },
+            ),
+        }))
+        .await
+        .expect("fake PD bootstrap service should generate")
+        .into_inner();
+
+    let first = tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
+        .await
+        .expect("first response")
+        .expect("first response should be ok");
+    let second = tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
+        .await
+        .expect("second response")
+        .expect("second response should be ok");
+
+    assert_eq!(first.request_id, "bootstrap-fake-pd");
+    assert!(matches!(first.body, Some(Body::Chunk(_))));
+    assert_eq!(second.request_id, "bootstrap-fake-pd");
+    assert!(matches!(second.body, Some(Body::Complete(_))));
+}
+
+#[tokio::test]
+async fn launch_grpc_server_rejects_unsupported_bootstrap_pd_backend() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--grpc-mode",
+        "--disaggregation-mode",
+        "decode",
+        "--disaggregation-transfer-backend",
+        "mooncake",
+    ])
+    .expect("args should parse");
+
+    let error = launch_grpc_server(args)
+        .await
+        .expect_err("unsupported PD backend should fail before serving");
+
+    assert_eq!(
+        error,
+        ServerLaunchError::UnsupportedBootstrapPdRuntime {
+            mode: DisaggregationMode::Decode,
+            transfer_backend: TransferBackend::Mooncake,
+        }
     );
 }
 
