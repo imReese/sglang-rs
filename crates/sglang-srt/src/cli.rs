@@ -13,6 +13,7 @@ pub struct ServerArgs {
     pub port: u16,
     pub tp_size: usize,
     pub dp_size: usize,
+    pub page_size: usize,
     pub base_gpu_id: usize,
     pub gpu_id_step: usize,
     pub nnodes: usize,
@@ -118,6 +119,10 @@ impl ArgParser {
                 "--dp-size" | "--dp" => {
                     self.parsed.dp_size = parse_usize("--dp-size", self.take_value("--dp-size")?)?;
                 }
+                "--page-size" => {
+                    self.parsed.page_size =
+                        parse_usize("--page-size", self.take_value("--page-size")?)?;
+                }
                 "--base-gpu-id" => {
                     self.parsed.base_gpu_id =
                         parse_usize("--base-gpu-id", self.take_value("--base-gpu-id")?)?;
@@ -216,6 +221,7 @@ impl ArgParser {
             port: self.parsed.port,
             tp_size: self.parsed.tp_size,
             dp_size: self.parsed.dp_size,
+            page_size: self.parsed.page_size,
             base_gpu_id: self.parsed.base_gpu_id,
             gpu_id_step: self.parsed.gpu_id_step,
             nnodes: self.parsed.nnodes,
@@ -291,6 +297,7 @@ struct PartialServerArgs {
     port: u16,
     tp_size: usize,
     dp_size: usize,
+    page_size: usize,
     base_gpu_id: usize,
     gpu_id_step: usize,
     nnodes: usize,
@@ -323,6 +330,7 @@ impl Default for PartialServerArgs {
             port: 30000,
             tp_size: 1,
             dp_size: 1,
+            page_size: 1,
             base_gpu_id: 0,
             gpu_id_step: 1,
             nnodes: 1,

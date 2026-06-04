@@ -14,6 +14,8 @@ fn parse_sglang_serve_style_worker_args() {
         "1",
         "--dp-size",
         "8",
+        "--page-size",
+        "64",
         "--base-gpu-id",
         "2",
         "--gpu-id-step",
@@ -28,6 +30,7 @@ fn parse_sglang_serve_style_worker_args() {
     assert_eq!(parsed.port, 8080);
     assert_eq!(parsed.tp_size, 1);
     assert_eq!(parsed.dp_size, 8);
+    assert_eq!(parsed.page_size, 64);
     assert_eq!(parsed.base_gpu_id, 2);
     assert_eq!(parsed.gpu_id_step, 3);
     assert!(parsed.grpc_mode);
@@ -43,6 +46,7 @@ fn parse_model_alias_and_default_network_args() {
     assert_eq!(parsed.port, 30000);
     assert_eq!(parsed.tp_size, 1);
     assert_eq!(parsed.dp_size, 1);
+    assert_eq!(parsed.page_size, 1);
     assert_eq!(parsed.base_gpu_id, 0);
     assert_eq!(parsed.gpu_id_step, 1);
     assert!(!parsed.grpc_mode);

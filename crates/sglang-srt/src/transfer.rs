@@ -97,6 +97,7 @@ pub struct PdConfig {
     pub decode_enable_offload_kvcache: bool,
     pub num_reserved_decode_tokens: usize,
     pub decode_polling_interval: usize,
+    pub page_size: usize,
     pub base_gpu_id: usize,
     pub gpu_id_step: usize,
     pub nnodes: usize,
@@ -132,6 +133,7 @@ impl PdConfig {
             decode_enable_offload_kvcache: args.disaggregation_decode_enable_offload_kvcache,
             num_reserved_decode_tokens: args.num_reserved_decode_tokens,
             decode_polling_interval: args.disaggregation_decode_polling_interval,
+            page_size: args.page_size,
             base_gpu_id: args.base_gpu_id,
             gpu_id_step: args.gpu_id_step,
             nnodes: args.nnodes,
@@ -883,6 +885,21 @@ pub struct MooncakeKvCacheLayout {
     pub source_base_addr: usize,
     pub page_size_bytes: usize,
     pub target_base_offset: u64,
+}
+
+impl MooncakeKvCacheLayout {
+    pub fn from_pd_config(
+        source_base_addr: usize,
+        token_size_bytes: usize,
+        target_base_offset: u64,
+        config: &PdConfig,
+    ) -> Self {
+        Self {
+            source_base_addr,
+            page_size_bytes: config.page_size * token_size_bytes,
+            target_base_offset,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -1,7 +1,8 @@
 use sglang_srt::cli::ServerArgs;
 use sglang_srt::transfer::{
-    DisaggregationMode, KvPoll, MooncakeOpcode, MooncakeTransferEngineConfig,
-    MooncakeTransferStatusCode, PdConfig, PdConfigError, TransferBackend,
+    DisaggregationMode, KvPoll, MooncakeKvCacheLayout, MooncakeOpcode,
+    MooncakeTransferEngineConfig, MooncakeTransferStatusCode, PdConfig, PdConfigError,
+    TransferBackend,
 };
 
 #[cfg(feature = "mooncake-link")]
@@ -126,6 +127,28 @@ fn mooncake_engine_config_uses_upstream_gpu_placement_args() {
     assert_eq!(pd_config.base_gpu_id, 2);
     assert_eq!(pd_config.gpu_id_step, 3);
     assert_eq!(engine_config.gpu_id, 5);
+}
+
+#[test]
+fn pd_config_carries_page_size_for_mooncake_kv_layout() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--disaggregation-mode",
+        "decode",
+        "--page-size",
+        "64",
+    ])
+    .expect("args should parse");
+
+    let config = PdConfig::from_server_args(&args).expect("pd config should normalize");
+    let layout = MooncakeKvCacheLayout::from_pd_config(0x1000, 16, 0x200, &config);
+
+    assert_eq!(config.page_size, 64);
+    assert_eq!(layout.source_base_addr, 0x1000);
+    assert_eq!(layout.page_size_bytes, 1024);
+    assert_eq!(layout.target_base_offset, 0x200);
 }
 
 #[test]
