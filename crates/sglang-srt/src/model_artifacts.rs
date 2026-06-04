@@ -613,12 +613,63 @@ impl SafetensorsRoutedExpertWeightCatalog {
         self.groups.keys().copied()
     }
 
+    pub fn layer_ids(&self) -> impl Iterator<Item = usize> + '_ {
+        let mut previous = None;
+        self.groups.keys().filter_map(move |(layer_id, _)| {
+            if previous == Some(*layer_id) {
+                return None;
+            }
+            previous = Some(*layer_id);
+            Some(*layer_id)
+        })
+    }
+
+    pub fn layer(&self, layer_id: usize) -> Option<SafetensorsRoutedExpertLayerWeights<'_>> {
+        let groups = self
+            .groups
+            .range((layer_id, 0)..=(layer_id, usize::MAX))
+            .map(|(_, group)| group)
+            .collect::<Vec<_>>();
+        if groups.is_empty() {
+            return None;
+        }
+
+        Some(SafetensorsRoutedExpertLayerWeights { layer_id, groups })
+    }
+
     pub fn group(
         &self,
         layer_id: usize,
         expert_id: usize,
     ) -> Option<&SafetensorsRoutedExpertWeightGroup> {
         self.groups.get(&(layer_id, expert_id))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SafetensorsRoutedExpertLayerWeights<'a> {
+    layer_id: usize,
+    groups: Vec<&'a SafetensorsRoutedExpertWeightGroup>,
+}
+
+impl<'a> SafetensorsRoutedExpertLayerWeights<'a> {
+    pub fn layer_id(&self) -> usize {
+        self.layer_id
+    }
+
+    pub fn expert_count(&self) -> usize {
+        self.groups.len()
+    }
+
+    pub fn expert_ids(&self) -> impl Iterator<Item = usize> + '_ {
+        self.groups.iter().map(|group| group.expert_id)
+    }
+
+    pub fn group(&self, expert_id: usize) -> Option<&'a SafetensorsRoutedExpertWeightGroup> {
+        self.groups
+            .iter()
+            .copied()
+            .find(|group| group.expert_id == expert_id)
     }
 }
 

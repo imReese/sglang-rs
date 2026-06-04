@@ -265,6 +265,16 @@ fn local_model_artifacts_builds_routed_expert_weight_catalog_for_lookup() {
         catalog.coordinates().collect::<Vec<_>>(),
         vec![(0, 0), (0, 1), (1, 0), (1, 1)]
     );
+    assert_eq!(catalog.layer_ids().collect::<Vec<_>>(), vec![0, 1]);
+    let layer = catalog
+        .layer(1)
+        .expect("catalog should expose layer 1 expert weights");
+    assert_eq!(layer.layer_id(), 1);
+    assert_eq!(layer.expert_count(), 2);
+    assert_eq!(layer.expert_ids().collect::<Vec<_>>(), vec![0, 1]);
+    assert!(layer.group(0).is_some());
+    assert!(layer.group(2).is_none());
+
     let group = catalog
         .group(1, 1)
         .expect("catalog should look up layer 1 expert 1");
