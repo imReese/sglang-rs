@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use sglang_srt::model_artifacts::{
     LocalModelArtifacts, ModelArtifactError, SafetensorsTensorData, SafetensorsTensorMetadata,
+    SafetensorsTensorSpan,
 };
 
 #[test]
@@ -87,6 +88,64 @@ fn local_model_artifacts_loads_deepseek_v4_config_and_indexed_safetensors() {
             .probe_routed_expert_weight_dtype()
             .expect("routed expert dtype probe should read header"),
         Some("F8_E4M3".to_string())
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn safetensors_manifest_describes_indexed_tensor_byte_span_without_loading_bytes() {
+    let model_dir = temp_model_dir("tensor-span");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(model_dir.join("config.json"), deepseek_v4_config_json())
+        .expect("config should be written");
+    fs::write(
+        model_dir.join("model.safetensors.index.json"),
+        safetensors_index_json(),
+    )
+    .expect("index should be written");
+    let shard_path = model_dir.join("model-00001-of-00002.safetensors");
+    let header_len = write_safetensors_file(
+        &shard_path,
+        &[("model.layers.0.ffn.experts.3.w1.weight", "U8", &[4], [2, 6])],
+        &[9, 8, 1, 2, 3, 4, 7],
+    )
+    .expect("first shard should be written");
+    write_safetensors_header(
+        &model_dir.join("model-00002-of-00002.safetensors"),
+        &[(
+            "model.layers.0.self_attn.q_b_proj.weight",
+            "BF16",
+            &[128, 128],
+            [0, 32768],
+        )],
+    )
+    .expect("second shard should be written");
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("local artifacts should load");
+
+    assert_eq!(
+        artifacts
+            .safetensors()
+            .tensor_span("model.layers.0.ffn.experts.3.w1.weight")
+            .expect("indexed tensor span should read"),
+        Some(SafetensorsTensorSpan {
+            path: shard_path,
+            metadata: SafetensorsTensorMetadata {
+                dtype: "U8".to_string(),
+                shape: vec![4],
+                data_offsets: [2, 6],
+            },
+            absolute_byte_offset: 8 + header_len as u64 + 2,
+            byte_len: 4,
+        })
+    );
+    assert_eq!(
+        artifacts
+            .safetensors()
+            .tensor_span("model.layers.404.mlp.down_proj.weight")
+            .expect("unknown tensor should not read a shard"),
+        None
     );
 
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
@@ -352,7 +411,7 @@ fn safetensors_index_json() -> &'static str {
 fn write_safetensors_header(
     path: &std::path::Path,
     tensors: &[(&str, &str, &[usize], [usize; 2])],
-) -> std::io::Result<()> {
+) -> std::io::Result<usize> {
     write_safetensors_file(path, tensors, &[])
 }
 
@@ -360,7 +419,7 @@ fn write_safetensors_file(
     path: &std::path::Path,
     tensors: &[(&str, &str, &[usize], [usize; 2])],
     payload: &[u8],
-) -> std::io::Result<()> {
+) -> std::io::Result<usize> {
     let mut fields = Vec::new();
     for (name, dtype, shape, data_offsets) in tensors {
         let shape = shape
@@ -378,7 +437,8 @@ fn write_safetensors_file(
     bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
     bytes.extend_from_slice(header.as_bytes());
     bytes.extend_from_slice(payload);
-    fs::write(path, bytes)
+    fs::write(path, bytes)?;
+    Ok(header.len())
 }
 
 fn temp_model_dir(name: &str) -> PathBuf {

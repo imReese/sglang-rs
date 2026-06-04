@@ -134,15 +134,25 @@ impl SafetensorsManifest {
         SafetensorsHeader::from_file(shard_path).map(|header| header.tensor_metadata(tensor_name))
     }
 
-    pub fn read_tensor(
+    pub fn tensor_span(
         &self,
         tensor_name: &str,
-    ) -> Result<Option<SafetensorsTensorData>, ModelArtifactError> {
+    ) -> Result<Option<SafetensorsTensorSpan>, ModelArtifactError> {
         let Some(shard_path) = self.shard_for_tensor(tensor_name) else {
             return Ok(None);
         };
         let header = SafetensorsHeader::from_file(shard_path)?;
-        header.read_tensor(shard_path, tensor_name)
+        header.tensor_span(shard_path, tensor_name)
+    }
+
+    pub fn read_tensor(
+        &self,
+        tensor_name: &str,
+    ) -> Result<Option<SafetensorsTensorData>, ModelArtifactError> {
+        let Some(span) = self.tensor_span(tensor_name)? else {
+            return Ok(None);
+        };
+        span.read()
     }
 
     pub fn probe_routed_expert_weight_dtype(&self) -> Result<Option<String>, ModelArtifactError> {
@@ -258,6 +268,40 @@ impl SafetensorsTensorData {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SafetensorsTensorSpan {
+    pub path: PathBuf,
+    pub metadata: SafetensorsTensorMetadata,
+    pub absolute_byte_offset: u64,
+    pub byte_len: usize,
+}
+
+impl SafetensorsTensorSpan {
+    pub fn read(&self) -> Result<Option<SafetensorsTensorData>, ModelArtifactError> {
+        let mut file =
+            fs::File::open(&self.path).map_err(|error| ModelArtifactError::ReadWeightShard {
+                path: self.path.clone(),
+                message: error.to_string(),
+            })?;
+        file.seek(SeekFrom::Start(self.absolute_byte_offset))
+            .map_err(|error| ModelArtifactError::ReadWeightShard {
+                path: self.path.clone(),
+                message: error.to_string(),
+            })?;
+        let mut bytes = vec![0_u8; self.byte_len];
+        file.read_exact(&mut bytes)
+            .map_err(|error| ModelArtifactError::ReadWeightShard {
+                path: self.path.clone(),
+                message: error.to_string(),
+            })?;
+
+        Ok(Some(SafetensorsTensorData {
+            metadata: self.metadata.clone(),
+            bytes,
+        }))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SafetensorsHeader {
     header_len: usize,
     tensors: BTreeMap<String, SafetensorsTensorMetadata>,
@@ -328,11 +372,11 @@ impl SafetensorsHeader {
         self.tensors.get(tensor_name).cloned()
     }
 
-    pub fn read_tensor(
+    pub fn tensor_span(
         &self,
         path: impl AsRef<Path>,
         tensor_name: &str,
-    ) -> Result<Option<SafetensorsTensorData>, ModelArtifactError> {
+    ) -> Result<Option<SafetensorsTensorSpan>, ModelArtifactError> {
         let path = path.as_ref();
         let Some(metadata) = self.tensors.get(tensor_name).cloned() else {
             return Ok(None);
@@ -378,11 +422,10 @@ impl SafetensorsHeader {
             )
         })?;
 
-        let mut file =
-            fs::File::open(path).map_err(|error| ModelArtifactError::ReadWeightShard {
-                path: path.to_path_buf(),
-                message: error.to_string(),
-            })?;
+        let file = fs::File::open(path).map_err(|error| ModelArtifactError::ReadWeightShard {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })?;
         let shard_len = file
             .metadata()
             .map_err(|error| ModelArtifactError::ReadWeightShard {
@@ -397,19 +440,23 @@ impl SafetensorsHeader {
             ));
         }
 
-        file.seek(SeekFrom::Start(absolute_start))
-            .map_err(|error| ModelArtifactError::ReadWeightShard {
-                path: path.to_path_buf(),
-                message: error.to_string(),
-            })?;
-        let mut bytes = vec![0_u8; tensor_len];
-        file.read_exact(&mut bytes)
-            .map_err(|error| ModelArtifactError::ReadWeightShard {
-                path: path.to_path_buf(),
-                message: error.to_string(),
-            })?;
+        Ok(Some(SafetensorsTensorSpan {
+            path: path.to_path_buf(),
+            metadata,
+            absolute_byte_offset: absolute_start,
+            byte_len: tensor_len,
+        }))
+    }
 
-        Ok(Some(SafetensorsTensorData { metadata, bytes }))
+    pub fn read_tensor(
+        &self,
+        path: impl AsRef<Path>,
+        tensor_name: &str,
+    ) -> Result<Option<SafetensorsTensorData>, ModelArtifactError> {
+        let Some(span) = self.tensor_span(path, tensor_name)? else {
+            return Ok(None);
+        };
+        span.read()
     }
 
     fn routed_expert_weight_dtype(&self) -> Option<String> {
