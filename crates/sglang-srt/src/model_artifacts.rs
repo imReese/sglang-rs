@@ -392,6 +392,12 @@ impl SafetensorsManifest {
         }))
     }
 
+    pub fn layer_tensor_catalog(
+        &self,
+    ) -> Result<SafetensorsLayerTensorCatalog, ModelArtifactError> {
+        SafetensorsLayerTensorCatalog::from_safetensors_manifest(self)
+    }
+
     pub fn checkpoint_fingerprint_entries(
         &self,
     ) -> Result<Vec<SafetensorsCheckpointFingerprintEntry>, ModelArtifactError> {
@@ -601,6 +607,64 @@ pub struct SafetensorsLayerTensorSpan {
     pub layer_id: usize,
     pub suffix: String,
     pub span: SafetensorsTensorSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SafetensorsLayerTensorCatalog {
+    tensors: BTreeMap<(usize, String), SafetensorsLayerTensorSpan>,
+}
+
+impl SafetensorsLayerTensorCatalog {
+    pub fn from_safetensors_manifest(
+        manifest: &SafetensorsManifest,
+    ) -> Result<Self, ModelArtifactError> {
+        let mut tensors = BTreeMap::new();
+        for entry in manifest.layer_tensor_spans()? {
+            let key = (entry.layer_id, entry.suffix.clone());
+            match tensors.entry(key) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(entry);
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    return Err(invalid_safetensors_data(
+                        &entry.span.path,
+                        format!(
+                            "duplicate layer tensor suffix for layer {}: {}",
+                            entry.layer_id, entry.suffix
+                        ),
+                    ));
+                }
+            }
+        }
+
+        Ok(Self { tensors })
+    }
+
+    pub fn tensor_count(&self) -> usize {
+        self.tensors.len()
+    }
+
+    pub fn layer_ids(&self) -> impl Iterator<Item = usize> + '_ {
+        let mut previous = None;
+        self.tensors.keys().filter_map(move |(layer_id, _)| {
+            if previous == Some(*layer_id) {
+                return None;
+            }
+            previous = Some(*layer_id);
+            Some(*layer_id)
+        })
+    }
+
+    pub fn suffixes(&self, layer_id: usize) -> impl Iterator<Item = &str> + '_ {
+        self.tensors
+            .range((layer_id, String::new())..)
+            .take_while(move |((entry_layer_id, _), _)| *entry_layer_id == layer_id)
+            .map(|((_, suffix), _)| suffix.as_str())
+    }
+
+    pub fn span(&self, layer_id: usize, suffix: &str) -> Option<&SafetensorsLayerTensorSpan> {
+        self.tensors.get(&(layer_id, suffix.to_string()))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use sglang_srt::model_artifacts::{
     HfModelConfig, LocalModelArtifacts, ModelArtifactError, SafetensorsCheckpointFingerprintEntry,
-    SafetensorsLayerTensorSpan, SafetensorsRoutedExpertProjection,
+    SafetensorsLayerTensorCatalog, SafetensorsLayerTensorSpan, SafetensorsRoutedExpertProjection,
     SafetensorsRoutedExpertWeightCatalog, SafetensorsRoutedExpertWeightGroup,
     SafetensorsRoutedExpertWeightSpan, SafetensorsTensorData, SafetensorsTensorMetadata,
     SafetensorsTensorSpan,
@@ -742,6 +742,79 @@ fn safetensors_manifest_indexes_layer_tensor_spans_by_suffix() {
             .layer_tensor_span(0, "self_attn.nope.weight")
             .expect("missing layer tensor lookup should still read spans"),
         None
+    );
+    let catalog = SafetensorsLayerTensorCatalog::from_safetensors_manifest(artifacts.safetensors())
+        .expect("layer tensor catalog should build from manifest");
+    assert_eq!(catalog.tensor_count(), 3);
+    assert_eq!(catalog.layer_ids().collect::<Vec<_>>(), vec![0]);
+    assert_eq!(
+        catalog.suffixes(0).collect::<Vec<_>>(),
+        vec![
+            "ffn.experts.3.w1.weight",
+            "self_attn.q_a_proj.weight",
+            "self_attn.q_b_proj.weight",
+        ]
+    );
+    assert_eq!(
+        catalog
+            .span(0, "self_attn.q_b_proj.weight")
+            .map(|entry| (entry.tensor_name.as_str(), entry.span.byte_len)),
+        Some(("model.layers.0.self_attn.q_b_proj.weight", 2))
+    );
+    assert!(catalog.span(0, "self_attn.nope.weight").is_none());
+    assert!(catalog.span(1, "self_attn.q_b_proj.weight").is_none());
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn safetensors_layer_tensor_catalog_rejects_duplicate_layer_suffixes() {
+    let model_dir = temp_model_dir("duplicate-layer-tensor-suffixes");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(model_dir.join("config.json"), deepseek_v4_config_json())
+        .expect("config should be written");
+    let first_shard = model_dir.join("model-00001.safetensors");
+    write_safetensors_file(
+        &first_shard,
+        &[(
+            "model.layers.0.self_attn.q_a_proj.weight",
+            "U8",
+            &[1],
+            [0, 1],
+        )],
+        &[1],
+    )
+    .expect("first shard should be written");
+    let second_shard = model_dir.join("model-00002.safetensors");
+    write_safetensors_file(
+        &second_shard,
+        &[(
+            "model.layers.0.self_attn.q_a_proj.weight",
+            "U8",
+            &[1],
+            [0, 1],
+        )],
+        &[2],
+    )
+    .expect("second shard should be written");
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("local artifacts should load");
+
+    let error = artifacts
+        .safetensors()
+        .layer_tensor_catalog()
+        .expect_err("duplicate layer tensor suffix should be rejected");
+
+    assert!(
+        matches!(
+            error,
+            ModelArtifactError::InvalidSafetensorsData { ref path, ref message }
+                if path == &second_shard
+                    && message.contains("duplicate layer tensor suffix")
+                    && message.contains("layer 0")
+                    && message.contains("self_attn.q_a_proj.weight")
+        ),
+        "unexpected error: {error:?}"
     );
 
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
