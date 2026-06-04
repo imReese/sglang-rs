@@ -3,7 +3,8 @@ use std::path::PathBuf;
 
 use sglang_srt::model_artifacts::{
     LocalModelArtifacts, ModelArtifactError, SafetensorsCheckpointFingerprintEntry,
-    SafetensorsTensorData, SafetensorsTensorMetadata, SafetensorsTensorSpan,
+    SafetensorsRoutedExpertProjection, SafetensorsRoutedExpertWeightSpan, SafetensorsTensorData,
+    SafetensorsTensorMetadata, SafetensorsTensorSpan,
 };
 
 #[test]
@@ -429,6 +430,188 @@ fn safetensors_manifest_builds_stable_checkpoint_fingerprint_entries() {
                 absolute_byte_offset: 8 + second_header_len as u64,
                 byte_len: 4,
                 fnv1a64: fnv1a64(&[40, 41, 42, 43]),
+            },
+        ]
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn safetensors_manifest_groups_routed_expert_weight_spans() {
+    let model_dir = temp_model_dir("routed-expert-weight-spans");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(model_dir.join("config.json"), deepseek_v4_config_json())
+        .expect("config should be written");
+    fs::write(
+        model_dir.join("model.safetensors.index.json"),
+        r#"{
+  "weight_map": {
+    "model.layers.0.ffn.experts.3.w1.weight": "model-00001-of-00002.safetensors",
+    "model.layers.0.ffn.experts.3.w2.weight": "model-00001-of-00002.safetensors",
+    "model.layers.0.ffn.experts.3.w3.weight": "model-00002-of-00002.safetensors",
+    "model.layers.1.mlp.experts.42.gate_proj.weight": "model-00002-of-00002.safetensors",
+    "model.layers.1.mlp.experts.42.up_proj.weight": "model-00002-of-00002.safetensors",
+    "model.layers.1.mlp.experts.42.down_proj.weight": "model-00002-of-00002.safetensors",
+    "model.layers.1.mlp.shared_experts.gate_proj.weight": "model-00002-of-00002.safetensors",
+    "model.layers.1.self_attn.q_b_proj.weight": "model-00002-of-00002.safetensors"
+  }
+}"#,
+    )
+    .expect("index should be written");
+    let first_shard = model_dir.join("model-00001-of-00002.safetensors");
+    let first_header_len = write_safetensors_file(
+        &first_shard,
+        &[
+            ("model.layers.0.ffn.experts.3.w1.weight", "U8", &[2], [0, 2]),
+            ("model.layers.0.ffn.experts.3.w2.weight", "U8", &[3], [2, 5]),
+        ],
+        &[10, 11, 20, 21, 22],
+    )
+    .expect("first shard should be written");
+    let second_shard = model_dir.join("model-00002-of-00002.safetensors");
+    let second_header_len = write_safetensors_file(
+        &second_shard,
+        &[
+            ("model.layers.0.ffn.experts.3.w3.weight", "U8", &[1], [0, 1]),
+            (
+                "model.layers.1.mlp.experts.42.down_proj.weight",
+                "U8",
+                &[4],
+                [1, 5],
+            ),
+            (
+                "model.layers.1.mlp.experts.42.gate_proj.weight",
+                "U8",
+                &[2],
+                [5, 7],
+            ),
+            (
+                "model.layers.1.mlp.experts.42.up_proj.weight",
+                "U8",
+                &[3],
+                [7, 10],
+            ),
+            (
+                "model.layers.1.mlp.shared_experts.gate_proj.weight",
+                "U8",
+                &[1],
+                [10, 11],
+            ),
+            (
+                "model.layers.1.self_attn.q_b_proj.weight",
+                "U8",
+                &[1],
+                [11, 12],
+            ),
+        ],
+        &[30, 40, 41, 42, 43, 50, 51, 60, 61, 62, 70, 80],
+    )
+    .expect("second shard should be written");
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("local artifacts should load");
+
+    assert_eq!(
+        artifacts
+            .safetensors()
+            .routed_expert_weight_spans()
+            .expect("routed expert weight spans should parse"),
+        vec![
+            SafetensorsRoutedExpertWeightSpan {
+                tensor_name: "model.layers.0.ffn.experts.3.w1.weight".to_string(),
+                layer_id: 0,
+                expert_id: 3,
+                projection: SafetensorsRoutedExpertProjection::Gate,
+                span: SafetensorsTensorSpan {
+                    path: first_shard.clone(),
+                    metadata: SafetensorsTensorMetadata {
+                        dtype: "U8".to_string(),
+                        shape: vec![2],
+                        data_offsets: [0, 2],
+                    },
+                    absolute_byte_offset: 8 + first_header_len as u64,
+                    byte_len: 2,
+                },
+            },
+            SafetensorsRoutedExpertWeightSpan {
+                tensor_name: "model.layers.0.ffn.experts.3.w2.weight".to_string(),
+                layer_id: 0,
+                expert_id: 3,
+                projection: SafetensorsRoutedExpertProjection::Down,
+                span: SafetensorsTensorSpan {
+                    path: first_shard,
+                    metadata: SafetensorsTensorMetadata {
+                        dtype: "U8".to_string(),
+                        shape: vec![3],
+                        data_offsets: [2, 5],
+                    },
+                    absolute_byte_offset: 8 + first_header_len as u64 + 2,
+                    byte_len: 3,
+                },
+            },
+            SafetensorsRoutedExpertWeightSpan {
+                tensor_name: "model.layers.0.ffn.experts.3.w3.weight".to_string(),
+                layer_id: 0,
+                expert_id: 3,
+                projection: SafetensorsRoutedExpertProjection::Up,
+                span: SafetensorsTensorSpan {
+                    path: second_shard.clone(),
+                    metadata: SafetensorsTensorMetadata {
+                        dtype: "U8".to_string(),
+                        shape: vec![1],
+                        data_offsets: [0, 1],
+                    },
+                    absolute_byte_offset: 8 + second_header_len as u64,
+                    byte_len: 1,
+                },
+            },
+            SafetensorsRoutedExpertWeightSpan {
+                tensor_name: "model.layers.1.mlp.experts.42.down_proj.weight".to_string(),
+                layer_id: 1,
+                expert_id: 42,
+                projection: SafetensorsRoutedExpertProjection::Down,
+                span: SafetensorsTensorSpan {
+                    path: second_shard.clone(),
+                    metadata: SafetensorsTensorMetadata {
+                        dtype: "U8".to_string(),
+                        shape: vec![4],
+                        data_offsets: [1, 5],
+                    },
+                    absolute_byte_offset: 8 + second_header_len as u64 + 1,
+                    byte_len: 4,
+                },
+            },
+            SafetensorsRoutedExpertWeightSpan {
+                tensor_name: "model.layers.1.mlp.experts.42.gate_proj.weight".to_string(),
+                layer_id: 1,
+                expert_id: 42,
+                projection: SafetensorsRoutedExpertProjection::Gate,
+                span: SafetensorsTensorSpan {
+                    path: second_shard.clone(),
+                    metadata: SafetensorsTensorMetadata {
+                        dtype: "U8".to_string(),
+                        shape: vec![2],
+                        data_offsets: [5, 7],
+                    },
+                    absolute_byte_offset: 8 + second_header_len as u64 + 5,
+                    byte_len: 2,
+                },
+            },
+            SafetensorsRoutedExpertWeightSpan {
+                tensor_name: "model.layers.1.mlp.experts.42.up_proj.weight".to_string(),
+                layer_id: 1,
+                expert_id: 42,
+                projection: SafetensorsRoutedExpertProjection::Up,
+                span: SafetensorsTensorSpan {
+                    path: second_shard,
+                    metadata: SafetensorsTensorMetadata {
+                        dtype: "U8".to_string(),
+                        shape: vec![3],
+                        data_offsets: [7, 10],
+                    },
+                    absolute_byte_offset: 8 + second_header_len as u64 + 7,
+                    byte_len: 3,
+                },
             },
         ]
     );

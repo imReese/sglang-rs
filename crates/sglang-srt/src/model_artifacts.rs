@@ -205,6 +205,27 @@ impl SafetensorsManifest {
             .collect()
     }
 
+    pub fn routed_expert_weight_spans(
+        &self,
+    ) -> Result<Vec<SafetensorsRoutedExpertWeightSpan>, ModelArtifactError> {
+        let spans = self
+            .tensor_span_entries()?
+            .into_iter()
+            .filter_map(|(tensor_name, span)| {
+                parse_routed_expert_weight_name(&tensor_name).map(
+                    |(layer_id, expert_id, projection)| SafetensorsRoutedExpertWeightSpan {
+                        tensor_name,
+                        layer_id,
+                        expert_id,
+                        projection,
+                        span,
+                    },
+                )
+            })
+            .collect();
+        Ok(spans)
+    }
+
     pub fn read_tensor(
         &self,
         tensor_name: &str,
@@ -354,6 +375,22 @@ impl SafetensorsCheckpointFingerprintEntry {
             fnv1a64,
         })
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SafetensorsRoutedExpertProjection {
+    Gate,
+    Up,
+    Down,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SafetensorsRoutedExpertWeightSpan {
+    pub tensor_name: String,
+    pub layer_id: usize,
+    pub expert_id: usize,
+    pub projection: SafetensorsRoutedExpertProjection,
+    pub span: SafetensorsTensorSpan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -885,24 +922,42 @@ fn fnv1a64_update(mut checksum: u64, bytes: &[u8]) -> u64 {
 }
 
 fn is_routed_expert_weight(tensor_name: &str) -> bool {
-    let Some((_, suffix)) = tensor_name.split_once(".experts.") else {
-        return false;
+    parse_routed_expert_weight_name(tensor_name).is_some()
+}
+
+fn parse_routed_expert_weight_name(
+    tensor_name: &str,
+) -> Option<(usize, usize, SafetensorsRoutedExpertProjection)> {
+    let parts = tensor_name.split('.').collect::<Vec<_>>();
+    let layer_id = parts.windows(2).find_map(|window| {
+        if window[0] == "layers" {
+            parse_usize_segment(window[1])
+        } else {
+            None
+        }
+    })?;
+
+    let experts_index = parts.iter().position(|part| *part == "experts")?;
+    let expert_id = parts
+        .get(experts_index + 1)
+        .and_then(|part| parse_usize_segment(part))?;
+    let projection = match *parts.get(experts_index + 2)? {
+        "w1" | "gate_proj" => SafetensorsRoutedExpertProjection::Gate,
+        "w2" | "down_proj" => SafetensorsRoutedExpertProjection::Down,
+        "w3" | "up_proj" => SafetensorsRoutedExpertProjection::Up,
+        _ => return None,
     };
-    let mut parts = suffix.split('.');
-    let Some(expert_id) = parts.next() else {
-        return false;
-    };
-    if expert_id.is_empty() || !expert_id.bytes().all(|byte| byte.is_ascii_digit()) {
-        return false;
+    if parts.get(experts_index + 3) != Some(&"weight") || experts_index + 4 != parts.len() {
+        return None;
     }
 
-    matches!(
-        parts.collect::<Vec<_>>().as_slice(),
-        ["w1", "weight"]
-            | ["w2", "weight"]
-            | ["w3", "weight"]
-            | ["down_proj", "weight"]
-            | ["up_proj", "weight"]
-            | ["gate_proj", "weight"]
-    )
+    Some((layer_id, expert_id, projection))
+}
+
+fn parse_usize_segment(value: &str) -> Option<usize> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+
+    value.parse().ok()
 }
