@@ -489,6 +489,28 @@ fn local_model_checkpoint_catalog_exposes_deepseek_v4_moe_layer_weights() {
         }
     }
 
+    let loaded = layer
+        .read_tensors()
+        .expect("DeepSeek V4 MoE layer tensors should read");
+    assert_eq!(loaded.layer_id(), 0);
+    assert_eq!(loaded.wq_a().bytes, vec![1]);
+    match loaded.feed_forward() {
+        sglang_srt::model_artifacts::DeepSeekLoadedLayerFeedForwardWeights::Moe {
+            gate,
+            routed_experts,
+        } => {
+            assert_eq!(gate.bytes, vec![16]);
+            assert_eq!(routed_experts.len(), 1);
+            assert_eq!(routed_experts[0].expert_id(), 0);
+            assert_eq!(routed_experts[0].gate().bytes, vec![17]);
+            assert_eq!(routed_experts[0].down().bytes, vec![18]);
+            assert_eq!(routed_experts[0].up().bytes, vec![19]);
+        }
+        sglang_srt::model_artifacts::DeepSeekLoadedLayerFeedForwardWeights::Dense { .. } => {
+            panic!("loaded MoE layer should expose loaded MoE feed-forward weights")
+        }
+    }
+
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
 
@@ -587,6 +609,25 @@ fn local_model_checkpoint_catalog_exposes_deepseek_v4_dense_layer_weights() {
         }
         DeepSeekLayerFeedForwardCheckpointWeights::Moe { .. } => {
             panic!("dense layer should expose dense feed-forward weights")
+        }
+    }
+
+    let loaded = layer
+        .read_tensors()
+        .expect("DeepSeek V4 dense layer tensors should read");
+    assert_eq!(loaded.layer_id(), 0);
+    assert_eq!(loaded.wq_a().bytes, vec![1]);
+    assert_eq!(loaded.hc_ffn_scale().bytes, vec![15]);
+    match loaded.feed_forward() {
+        sglang_srt::model_artifacts::DeepSeekLoadedLayerFeedForwardWeights::Dense {
+            gate_up_proj,
+            down_proj,
+        } => {
+            assert_eq!(gate_up_proj.bytes, vec![16]);
+            assert_eq!(down_proj.bytes, vec![17]);
+        }
+        sglang_srt::model_artifacts::DeepSeekLoadedLayerFeedForwardWeights::Moe { .. } => {
+            panic!("loaded dense layer should expose loaded dense feed-forward weights")
         }
     }
 

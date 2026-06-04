@@ -283,6 +283,48 @@ pub enum DeepSeekLayerFeedForwardCheckpointWeights<'a> {
 }
 
 impl<'a> DeepSeekLayerCheckpointWeights<'a> {
+    pub fn read_tensors(&self) -> Result<DeepSeekLoadedLayerCheckpointWeights, ModelArtifactError> {
+        Ok(DeepSeekLoadedLayerCheckpointWeights {
+            layer_id: self.layer_id,
+            wq_a: read_required_tensor_span(&self.wq_a.span)?,
+            wq_b: read_required_tensor_span(&self.wq_b.span)?,
+            wkv: read_required_tensor_span(&self.wkv.span)?,
+            q_norm: read_required_tensor_span(&self.q_norm.span)?,
+            kv_norm: read_required_tensor_span(&self.kv_norm.span)?,
+            wo_a: read_required_tensor_span(&self.wo_a.span)?,
+            wo_b: read_required_tensor_span(&self.wo_b.span)?,
+            input_layernorm: read_required_tensor_span(&self.input_layernorm.span)?,
+            post_attention_layernorm: read_required_tensor_span(
+                &self.post_attention_layernorm.span,
+            )?,
+            hc_attn_fn: read_required_tensor_span(&self.hc_attn_fn.span)?,
+            hc_attn_base: read_required_tensor_span(&self.hc_attn_base.span)?,
+            hc_attn_scale: read_required_tensor_span(&self.hc_attn_scale.span)?,
+            hc_ffn_fn: read_required_tensor_span(&self.hc_ffn_fn.span)?,
+            hc_ffn_base: read_required_tensor_span(&self.hc_ffn_base.span)?,
+            hc_ffn_scale: read_required_tensor_span(&self.hc_ffn_scale.span)?,
+            feed_forward: match &self.feed_forward {
+                DeepSeekLayerFeedForwardCheckpointWeights::Dense {
+                    gate_up_proj,
+                    down_proj,
+                } => DeepSeekLoadedLayerFeedForwardWeights::Dense {
+                    gate_up_proj: read_required_tensor_span(&gate_up_proj.span)?,
+                    down_proj: read_required_tensor_span(&down_proj.span)?,
+                },
+                DeepSeekLayerFeedForwardCheckpointWeights::Moe {
+                    gate,
+                    routed_experts,
+                } => DeepSeekLoadedLayerFeedForwardWeights::Moe {
+                    gate: read_required_tensor_span(&gate.span)?,
+                    routed_experts: routed_experts
+                        .groups()
+                        .map(DeepSeekLoadedRoutedExpertWeights::from_group)
+                        .collect::<Result<Vec<_>, _>>()?,
+                },
+            },
+        })
+    }
+
     pub fn layer_id(&self) -> usize {
         self.layer_id
     }
@@ -349,6 +391,144 @@ impl<'a> DeepSeekLayerCheckpointWeights<'a> {
 
     pub fn feed_forward(&self) -> &DeepSeekLayerFeedForwardCheckpointWeights<'a> {
         &self.feed_forward
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeepSeekLoadedLayerCheckpointWeights {
+    layer_id: usize,
+    wq_a: SafetensorsTensorData,
+    wq_b: SafetensorsTensorData,
+    wkv: SafetensorsTensorData,
+    q_norm: SafetensorsTensorData,
+    kv_norm: SafetensorsTensorData,
+    wo_a: SafetensorsTensorData,
+    wo_b: SafetensorsTensorData,
+    input_layernorm: SafetensorsTensorData,
+    post_attention_layernorm: SafetensorsTensorData,
+    hc_attn_fn: SafetensorsTensorData,
+    hc_attn_base: SafetensorsTensorData,
+    hc_attn_scale: SafetensorsTensorData,
+    hc_ffn_fn: SafetensorsTensorData,
+    hc_ffn_base: SafetensorsTensorData,
+    hc_ffn_scale: SafetensorsTensorData,
+    feed_forward: DeepSeekLoadedLayerFeedForwardWeights,
+}
+
+impl DeepSeekLoadedLayerCheckpointWeights {
+    pub fn layer_id(&self) -> usize {
+        self.layer_id
+    }
+
+    pub fn wq_a(&self) -> &SafetensorsTensorData {
+        &self.wq_a
+    }
+
+    pub fn wq_b(&self) -> &SafetensorsTensorData {
+        &self.wq_b
+    }
+
+    pub fn wkv(&self) -> &SafetensorsTensorData {
+        &self.wkv
+    }
+
+    pub fn q_norm(&self) -> &SafetensorsTensorData {
+        &self.q_norm
+    }
+
+    pub fn kv_norm(&self) -> &SafetensorsTensorData {
+        &self.kv_norm
+    }
+
+    pub fn wo_a(&self) -> &SafetensorsTensorData {
+        &self.wo_a
+    }
+
+    pub fn wo_b(&self) -> &SafetensorsTensorData {
+        &self.wo_b
+    }
+
+    pub fn input_layernorm(&self) -> &SafetensorsTensorData {
+        &self.input_layernorm
+    }
+
+    pub fn post_attention_layernorm(&self) -> &SafetensorsTensorData {
+        &self.post_attention_layernorm
+    }
+
+    pub fn hc_attn_fn(&self) -> &SafetensorsTensorData {
+        &self.hc_attn_fn
+    }
+
+    pub fn hc_attn_base(&self) -> &SafetensorsTensorData {
+        &self.hc_attn_base
+    }
+
+    pub fn hc_attn_scale(&self) -> &SafetensorsTensorData {
+        &self.hc_attn_scale
+    }
+
+    pub fn hc_ffn_fn(&self) -> &SafetensorsTensorData {
+        &self.hc_ffn_fn
+    }
+
+    pub fn hc_ffn_base(&self) -> &SafetensorsTensorData {
+        &self.hc_ffn_base
+    }
+
+    pub fn hc_ffn_scale(&self) -> &SafetensorsTensorData {
+        &self.hc_ffn_scale
+    }
+
+    pub fn feed_forward(&self) -> &DeepSeekLoadedLayerFeedForwardWeights {
+        &self.feed_forward
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeepSeekLoadedLayerFeedForwardWeights {
+    Dense {
+        gate_up_proj: SafetensorsTensorData,
+        down_proj: SafetensorsTensorData,
+    },
+    Moe {
+        gate: SafetensorsTensorData,
+        routed_experts: Vec<DeepSeekLoadedRoutedExpertWeights>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeepSeekLoadedRoutedExpertWeights {
+    expert_id: usize,
+    gate: SafetensorsTensorData,
+    up: SafetensorsTensorData,
+    down: SafetensorsTensorData,
+}
+
+impl DeepSeekLoadedRoutedExpertWeights {
+    fn from_group(group: &SafetensorsRoutedExpertWeightGroup) -> Result<Self, ModelArtifactError> {
+        Ok(Self {
+            expert_id: group.expert_id,
+            gate: read_required_tensor_span(&group.gate)?,
+            up: read_required_tensor_span(&group.up)?,
+            down: read_required_tensor_span(&group.down)?,
+        })
+    }
+
+    pub fn expert_id(&self) -> usize {
+        self.expert_id
+    }
+
+    pub fn gate(&self) -> &SafetensorsTensorData {
+        &self.gate
+    }
+
+    pub fn up(&self) -> &SafetensorsTensorData {
+        &self.up
+    }
+
+    pub fn down(&self) -> &SafetensorsTensorData {
+        &self.down
     }
 }
 
@@ -979,6 +1159,10 @@ impl<'a> SafetensorsRoutedExpertLayerWeights<'a> {
             .copied()
             .find(|group| group.expert_id == expert_id)
     }
+
+    pub fn groups(&self) -> impl Iterator<Item = &'a SafetensorsRoutedExpertWeightGroup> + '_ {
+        self.groups.iter().copied()
+    }
 }
 
 #[derive(Debug)]
@@ -1546,6 +1730,20 @@ fn invalid_safetensors_data(path: &Path, message: impl Into<String>) -> ModelArt
         path: path.to_path_buf(),
         message: message.into(),
     }
+}
+
+fn read_required_tensor_span(
+    span: &SafetensorsTensorSpan,
+) -> Result<SafetensorsTensorData, ModelArtifactError> {
+    span.read()?.ok_or_else(|| {
+        invalid_safetensors_data(
+            &span.path,
+            format!(
+                "missing safetensors payload at byte offset {}",
+                span.absolute_byte_offset
+            ),
+        )
+    })
 }
 
 fn expected_tensor_byte_len(
