@@ -81,6 +81,49 @@ impl LocalModelArtifacts {
             ));
         }
 
+        let n_routed_experts = self.config.n_routed_experts.ok_or_else(|| {
+            invalid_safetensors_data(
+                &self.model_path,
+                "expected routed expert count is missing from model config",
+            )
+        })?;
+        let expected_coordinates: BTreeSet<(usize, usize)> = self
+            .config
+            .moe_layer_ids()
+            .into_iter()
+            .flat_map(|layer_id| (0..n_routed_experts).map(move |expert_id| (layer_id, expert_id)))
+            .collect();
+        let actual_coordinates: BTreeSet<(usize, usize)> = groups
+            .iter()
+            .map(|group| (group.layer_id, group.expert_id))
+            .collect();
+        if actual_coordinates != expected_coordinates {
+            let missing = expected_coordinates
+                .difference(&actual_coordinates)
+                .next()
+                .map(|(layer_id, expert_id)| {
+                    format!(
+                        "missing expected routed expert group layer {layer_id} expert {expert_id}"
+                    )
+                });
+            let unexpected = actual_coordinates
+                .difference(&expected_coordinates)
+                .next()
+                .map(|(layer_id, expert_id)| {
+                    format!("unexpected routed expert group layer {layer_id} expert {expert_id}")
+                });
+            let detail = [missing, unexpected]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("; ");
+
+            return Err(invalid_safetensors_data(
+                &self.model_path,
+                format!("routed expert checkpoint coordinate mismatch: {detail}"),
+            ));
+        }
+
         Ok(RoutedExpertCheckpointCoverage {
             expected_group_count,
             actual_group_count,

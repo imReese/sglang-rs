@@ -262,6 +262,76 @@ fn local_model_artifacts_rejects_missing_routed_expert_checkpoint_groups() {
 }
 
 #[test]
+fn local_model_artifacts_rejects_mismatched_routed_expert_checkpoint_coordinates() {
+    let model_dir = temp_model_dir("routed-expert-coverage-wrong-coordinates");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "model_type": "deepseek_v4",
+  "num_hidden_layers": 2,
+  "n_routed_experts": 2,
+  "first_k_dense_replace": 0,
+  "moe_layer_freq": 1
+}"#,
+    )
+    .expect("config should be written");
+    write_safetensors_file(
+        &model_dir.join("model.safetensors"),
+        &[
+            ("model.layers.0.ffn.experts.0.w1.weight", "U8", &[1], [0, 1]),
+            ("model.layers.0.ffn.experts.0.w2.weight", "U8", &[1], [1, 2]),
+            ("model.layers.0.ffn.experts.0.w3.weight", "U8", &[1], [2, 3]),
+            ("model.layers.0.ffn.experts.1.w1.weight", "U8", &[1], [3, 4]),
+            ("model.layers.0.ffn.experts.1.w2.weight", "U8", &[1], [4, 5]),
+            ("model.layers.0.ffn.experts.1.w3.weight", "U8", &[1], [5, 6]),
+            ("model.layers.9.ffn.experts.0.w1.weight", "U8", &[1], [6, 7]),
+            ("model.layers.9.ffn.experts.0.w2.weight", "U8", &[1], [7, 8]),
+            ("model.layers.9.ffn.experts.0.w3.weight", "U8", &[1], [8, 9]),
+            (
+                "model.layers.9.ffn.experts.1.w1.weight",
+                "U8",
+                &[1],
+                [9, 10],
+            ),
+            (
+                "model.layers.9.ffn.experts.1.w2.weight",
+                "U8",
+                &[1],
+                [10, 11],
+            ),
+            (
+                "model.layers.9.ffn.experts.1.w3.weight",
+                "U8",
+                &[1],
+                [11, 12],
+            ),
+        ],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+    )
+    .expect("shard should be written");
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("local artifacts should load");
+
+    let error = artifacts
+        .validate_routed_expert_checkpoint_coverage()
+        .expect_err("mismatched routed expert coordinates should fail coverage validation");
+
+    assert!(
+        matches!(
+            error,
+            ModelArtifactError::InvalidSafetensorsData { ref path, ref message }
+                if path == &model_dir
+                    && message.contains("missing expected routed expert group layer 1 expert 0")
+                    && message.contains("unexpected routed expert group layer 9 expert 0")
+        ),
+        "unexpected error: {error:?}"
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
 fn local_model_artifacts_skips_routed_expert_coverage_for_dense_configs() {
     let model_dir = temp_model_dir("dense-checkpoint-coverage");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");
