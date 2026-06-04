@@ -151,7 +151,7 @@ fn fake_bootstrap_prefill_dispatch_does_not_publish_pages_to_radix_cache() {
         ScheduledRequest::new(
             RequestId::from("req-fake-bootstrap"),
             vec![1, 2, 3],
-            SamplingParams { max_new_tokens: 1 },
+            SamplingParams::new(1),
         )
         .with_disaggregated_params(Some(DisaggregatedParams {
             bootstrap_host: FAKE_BOOTSTRAP_HOST.to_string(),
@@ -295,7 +295,7 @@ fn flush_cache_rejects_when_decode_requests_are_active() {
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("req-active"),
         vec![1, 2],
-        SamplingParams { max_new_tokens: 2 },
+        SamplingParams::new(2),
     ));
 
     scheduler
@@ -325,6 +325,6 @@ fn enqueue_request<W>(scheduler: &mut Scheduler<W>, request_id: &str, input_ids:
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from(request_id),
         input_ids.to_vec(),
-        SamplingParams { max_new_tokens: 1 },
+        SamplingParams::new(1),
     ));
 }

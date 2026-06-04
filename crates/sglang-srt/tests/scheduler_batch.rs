@@ -191,7 +191,7 @@ fn abort_request_removes_decode_request_by_id() {
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("decode-a"),
         vec![1],
-        SamplingParams { max_new_tokens: 2 },
+        SamplingParams::new(2),
     ));
 
     scheduler
@@ -209,12 +209,12 @@ fn next_prefill_batch_respects_max_running_request_capacity() {
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("active-decode"),
         vec![1],
-        SamplingParams { max_new_tokens: 2 },
+        SamplingParams::new(2),
     ));
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("waiting-prefill"),
         vec![2],
-        SamplingParams { max_new_tokens: 2 },
+        SamplingParams::new(2),
     ));
 
     scheduler
@@ -291,6 +291,6 @@ fn enqueue_request<W>(scheduler: &mut Scheduler<W>, request_id: &str, input_ids:
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from(request_id),
         input_ids.to_vec(),
-        SamplingParams { max_new_tokens: 1 },
+        SamplingParams::new(1),
     ));
 }

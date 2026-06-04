@@ -65,7 +65,7 @@ fn pd_workers_route_prefill_and_decode_batches_to_separate_executors() {
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("pd-request"),
         vec![1, 2, 3],
-        SamplingParams { max_new_tokens: 2 },
+        SamplingParams::new(2),
     ));
 
     let prefill_outputs = scheduler

@@ -1,6 +1,7 @@
 use sglang_srt::cache::{CachePageId, RadixCache};
 use sglang_srt::model_executor::{
-    ForwardModel, ModelForwardError, ModelForwardOutput, ModelRunner, ModelWorkerBatch,
+    ForwardModel, LogitSampler, ModelForwardError, ModelForwardOutput, ModelRunner,
+    ModelWorkerBatch, SamplingRandomSource,
 };
 use sglang_srt::scheduler::{
     ForwardMode, ScheduleBatch, ScheduledRequest, Scheduler, SchedulerError,
@@ -120,7 +121,7 @@ fn model_worker_batch_for_decode_uses_last_output_token_and_next_position() {
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("req-decode"),
         vec![1, 2, 3],
-        SamplingParams { max_new_tokens: 4 },
+        SamplingParams::new(4),
     ));
 
     scheduler
@@ -147,12 +148,12 @@ fn model_worker_batch_exposes_last_input_token_per_decode_request() {
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("decode-a"),
         vec![1, 2],
-        SamplingParams { max_new_tokens: 4 },
+        SamplingParams::new(4),
     ));
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("decode-b"),
         vec![3],
-        SamplingParams { max_new_tokens: 4 },
+        SamplingParams::new(4),
     ));
 
     scheduler
@@ -197,7 +198,7 @@ fn model_worker_batch_exposes_pd_bootstrap_metadata() {
     let request = ScheduledRequest::new(
         RequestId::from("pd-bootstrap"),
         vec![1, 2, 3],
-        SamplingParams { max_new_tokens: 2 },
+        SamplingParams::new(2),
     )
     .with_disaggregated_params(Some(DisaggregatedParams {
         bootstrap_host: "10.0.0.7".to_string(),
@@ -227,7 +228,7 @@ fn model_worker_batch_exposes_data_parallel_rank_for_pd_bootstrap() {
     let request = ScheduledRequest::new(
         RequestId::from("pd-dp-rank"),
         vec![1, 2, 3],
-        SamplingParams { max_new_tokens: 1 },
+        SamplingParams::new(1),
     )
     .with_data_parallel_rank(7);
     let mut scheduler = Scheduler::new(NoopWorker);
@@ -246,7 +247,7 @@ fn scheduled_request_detects_fake_bootstrap_radix_cache_skip() {
     let request = ScheduledRequest::new(
         RequestId::from("fake-bootstrap"),
         vec![1, 2, 3],
-        SamplingParams { max_new_tokens: 1 },
+        SamplingParams::new(1),
     )
     .with_disaggregated_params(Some(DisaggregatedParams {
         bootstrap_host: FAKE_BOOTSTRAP_HOST.to_string(),
@@ -283,12 +284,12 @@ fn model_runner_calls_forward_and_returns_argmax_tokens() {
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("req-a"),
         vec![10, 11],
-        SamplingParams { max_new_tokens: 1 },
+        SamplingParams::new(1),
     ));
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("req-b"),
         vec![20],
-        SamplingParams { max_new_tokens: 1 },
+        SamplingParams::new(1),
     ));
 
     let outputs = scheduler
@@ -304,6 +305,47 @@ fn model_runner_calls_forward_and_returns_argmax_tokens() {
         scheduler.worker().model().seen_forward_modes,
         vec![ForwardMode::Prefill]
     );
+}
+
+struct FixedSamplingRandomSource {
+    values: Vec<f32>,
+}
+
+impl SamplingRandomSource for FixedSamplingRandomSource {
+    fn next_unit_f32(&mut self) -> f32 {
+        self.values.remove(0)
+    }
+}
+
+#[derive(Default)]
+struct SamplingForwardModel;
+
+impl ForwardModel for SamplingForwardModel {
+    fn forward(
+        &mut self,
+        _batch: &ModelWorkerBatch,
+    ) -> Result<ModelForwardOutput, ModelForwardError> {
+        ModelForwardOutput::new(vec![vec![-0.223_143_55, -1.609_438]])
+    }
+}
+
+#[test]
+fn model_runner_samples_from_temperature_scaled_logits() {
+    let sampler = LogitSampler::new(FixedSamplingRandomSource { values: vec![0.85] });
+    let mut scheduler = Scheduler::new(ModelRunner::with_sampler(SamplingForwardModel, sampler));
+    let mut sampling = SamplingParams::new(1);
+    sampling.temperature = Some(1.0);
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("sampled"),
+        vec![10, 11],
+        sampling,
+    ));
+
+    let outputs = scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should dispatch through model runner");
+
+    assert_eq!(outputs[0].token_ids, vec![1]);
 }
 
 #[derive(Default)]
@@ -334,12 +376,12 @@ fn model_runner_samples_last_token_logits_from_flattened_prefill_output() {
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("prefill-a"),
         vec![10, 11],
-        SamplingParams { max_new_tokens: 1 },
+        SamplingParams::new(1),
     ));
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("prefill-b"),
         vec![20, 21, 22],
-        SamplingParams { max_new_tokens: 1 },
+        SamplingParams::new(1),
     ));
 
     let outputs = scheduler
@@ -419,7 +461,7 @@ fn model_runner_requeues_decode_until_scheduler_reaches_max_new_tokens() {
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("runner-decode"),
         vec![10, 11],
-        SamplingParams { max_new_tokens: 2 },
+        SamplingParams::new(2),
     ));
 
     let prefill_outputs = scheduler
@@ -451,13 +493,46 @@ impl ForwardModel for EmptyForwardModel {
     }
 }
 
+#[derive(Default)]
+struct ExtraForwardModel;
+
+impl ForwardModel for ExtraForwardModel {
+    fn forward(
+        &mut self,
+        _batch: &ModelWorkerBatch,
+    ) -> Result<ModelForwardOutput, ModelForwardError> {
+        ModelForwardOutput::new(vec![vec![0.0, 1.0], vec![1.0, 0.0]])
+    }
+}
+
+#[test]
+fn model_runner_rejects_extra_forward_outputs() {
+    let mut scheduler = Scheduler::new(ModelRunner::new(ExtraForwardModel));
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("runner-extra"),
+        vec![10, 11],
+        SamplingParams::new(1),
+    ));
+
+    let error = scheduler
+        .dispatch_prefill_batch(1)
+        .expect_err("extra model output should become a scheduler error");
+
+    assert!(matches!(error, SchedulerError::Worker(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("model forward output count (2) must match request count (1)")
+    );
+}
+
 #[test]
 fn model_runner_returns_forward_errors_without_panicking() {
     let mut scheduler = Scheduler::new(ModelRunner::new(EmptyForwardModel));
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("runner-error"),
         vec![10, 11],
-        SamplingParams { max_new_tokens: 1 },
+        SamplingParams::new(1),
     ));
 
     let error = scheduler
@@ -492,7 +567,7 @@ fn model_runner_propagates_forward_runtime_errors() {
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("runner-forward-error"),
         vec![10, 11],
-        SamplingParams { max_new_tokens: 1 },
+        SamplingParams::new(1),
     ));
 
     let error = scheduler
@@ -511,6 +586,6 @@ fn enqueue_request<W>(scheduler: &mut Scheduler<W>, request_id: &str, input_ids:
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from(request_id),
         input_ids.to_vec(),
-        SamplingParams { max_new_tokens: 4 },
+        SamplingParams::new(4),
     ));
 }

@@ -116,7 +116,7 @@ fn scheduler_applies_radix_cache_match_before_dispatching_to_worker() {
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("req-with-prefix"),
         vec![30, 31, 32, 33],
-        SamplingParams { max_new_tokens: 1 },
+        SamplingParams::new(1),
     ));
 
     scheduler.dispatch_next().expect("dispatch should succeed");

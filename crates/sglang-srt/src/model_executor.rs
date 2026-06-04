@@ -1,6 +1,7 @@
 use crate::cache::CachePageId;
 use crate::scheduler::{ForwardMode, ScheduleBatch, ScheduledRequest};
-use crate::types::{DisaggregatedParams, RequestId};
+use crate::types::{DisaggregatedParams, RequestId, SamplingParams};
+use rand::RngExt as _;
 use std::fmt;
 
 use crate::worker::{
@@ -194,17 +195,8 @@ impl ModelForwardOutput {
         &self.logits
     }
 
-    fn into_argmax_tokens(self) -> Result<Vec<u32>, ModelForwardError> {
+    fn into_logits(self) -> Vec<Vec<f32>> {
         self.logits
-            .into_iter()
-            .map(|row| {
-                row.iter()
-                    .enumerate()
-                    .max_by(|(_, left), (_, right)| left.total_cmp(right))
-                    .map(|(index, _)| index as u32)
-                    .ok_or(ModelForwardError::EmptyVocabulary)
-            })
-            .collect()
     }
 }
 
@@ -222,6 +214,9 @@ pub enum ModelForwardError {
         logit_count: usize,
     },
     MissingRequestTokenLogits {
+        request_index: usize,
+    },
+    InvalidProbabilityDistribution {
         request_index: usize,
     },
 }
@@ -252,6 +247,10 @@ impl fmt::Display for ModelForwardError {
                 formatter,
                 "model forward request {request_index} has no input token logits"
             ),
+            Self::InvalidProbabilityDistribution { request_index } => write!(
+                formatter,
+                "model forward request {request_index} produced an invalid sampling distribution"
+            ),
         }
     }
 }
@@ -273,13 +272,185 @@ fn validate_logits(logits: &[Vec<f32>]) -> Result<(), ModelForwardError> {
     Ok(())
 }
 
-pub struct ModelRunner<M> {
-    model: M,
+pub trait SamplingRandomSource {
+    fn next_unit_f32(&mut self) -> f32;
 }
 
-impl<M> ModelRunner<M> {
+#[derive(Clone, Debug, Default)]
+pub struct SystemRandomSource;
+
+impl SamplingRandomSource for SystemRandomSource {
+    fn next_unit_f32(&mut self) -> f32 {
+        rand::rng().random::<f32>()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LogitSampler<R = SystemRandomSource> {
+    random: R,
+}
+
+impl<R> LogitSampler<R> {
+    pub fn new(random: R) -> Self {
+        Self { random }
+    }
+}
+
+impl Default for LogitSampler<SystemRandomSource> {
+    fn default() -> Self {
+        Self::new(SystemRandomSource)
+    }
+}
+
+impl<R> LogitSampler<R>
+where
+    R: SamplingRandomSource,
+{
+    fn sample(
+        &mut self,
+        output: ModelForwardOutput,
+        batch: &ScheduleBatch,
+    ) -> Result<Vec<u32>, ModelForwardError> {
+        let logits = output.into_logits();
+        if logits.len() != batch.batch_size() {
+            return Err(ModelForwardError::BatchSizeMismatch {
+                request_count: batch.batch_size(),
+                output_count: logits.len(),
+            });
+        }
+
+        logits
+            .into_iter()
+            .zip(batch.requests())
+            .enumerate()
+            .map(|(request_index, (logits, request))| {
+                self.sample_row(request_index, &logits, request.sampling())
+            })
+            .collect()
+    }
+
+    fn sample_row(
+        &mut self,
+        request_index: usize,
+        logits: &[f32],
+        sampling: &SamplingParams,
+    ) -> Result<u32, ModelForwardError> {
+        if sampling.temperature.is_none()
+            && sampling.top_p.is_none()
+            && sampling.top_k.is_none()
+            && sampling.min_p.is_none()
+        {
+            return argmax_token(logits);
+        }
+
+        let temperature = sampling.temperature.unwrap_or(1.0);
+        if temperature <= f32::EPSILON || sampling.top_k == Some(1) {
+            return argmax_token(logits);
+        }
+
+        let max_scaled_logit = logits
+            .iter()
+            .map(|logit| logit / temperature)
+            .max_by(f32::total_cmp)
+            .ok_or(ModelForwardError::EmptyVocabulary)?;
+        let mut candidates = logits
+            .iter()
+            .enumerate()
+            .map(|(token_id, logit)| (token_id, ((logit / temperature) - max_scaled_logit).exp()))
+            .collect::<Vec<_>>();
+
+        if candidates
+            .iter()
+            .any(|(_, probability)| !probability.is_finite() || *probability < 0.0)
+        {
+            return Err(ModelForwardError::InvalidProbabilityDistribution { request_index });
+        }
+
+        candidates.sort_by(|(_, left), (_, right)| right.total_cmp(left));
+
+        if let Some(top_k) = sampling.top_k.and_then(|top_k| usize::try_from(top_k).ok())
+            && top_k > 0
+            && top_k < candidates.len()
+        {
+            candidates.truncate(top_k);
+        }
+
+        let top_p = sampling.top_p.unwrap_or(1.0);
+        let min_p = sampling.min_p.unwrap_or(0.0);
+        let max_probability = candidates
+            .first()
+            .map(|(_, probability)| *probability)
+            .ok_or(ModelForwardError::EmptyVocabulary)?;
+        let min_probability = max_probability * min_p;
+        let mut cumulative_probability = 0.0;
+        let mut filtered = Vec::with_capacity(candidates.len());
+
+        for (token_id, probability) in candidates {
+            let keep_for_top_p = cumulative_probability <= top_p;
+            cumulative_probability += probability;
+
+            if keep_for_top_p && probability >= min_probability {
+                filtered.push((token_id, probability));
+            }
+        }
+
+        let total_probability = filtered
+            .iter()
+            .map(|(_, probability)| *probability)
+            .sum::<f32>();
+        if !total_probability.is_finite() || total_probability <= 0.0 {
+            return Err(ModelForwardError::InvalidProbabilityDistribution { request_index });
+        }
+
+        let random = self.next_bounded_unit_f32();
+        let target = random * total_probability;
+        let mut cumulative_probability = 0.0;
+        for (token_id, probability) in filtered.iter() {
+            cumulative_probability += *probability;
+            if target < cumulative_probability {
+                return Ok(*token_id as u32);
+            }
+        }
+
+        filtered
+            .last()
+            .map(|(token_id, _)| *token_id as u32)
+            .ok_or(ModelForwardError::InvalidProbabilityDistribution { request_index })
+    }
+
+    fn next_bounded_unit_f32(&mut self) -> f32 {
+        let random = self.random.next_unit_f32();
+        if random.is_finite() {
+            random.clamp(0.0, f32::from_bits(0x3f7f_ffff))
+        } else {
+            0.0
+        }
+    }
+}
+
+fn argmax_token(logits: &[f32]) -> Result<u32, ModelForwardError> {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(index, _)| index as u32)
+        .ok_or(ModelForwardError::EmptyVocabulary)
+}
+
+pub struct ModelRunner<M, S = LogitSampler<SystemRandomSource>> {
+    model: M,
+    sampler: S,
+}
+
+impl<M> ModelRunner<M, LogitSampler<SystemRandomSource>> {
     pub fn new(model: M) -> Self {
-        Self { model }
+        Self::with_sampler(model, LogitSampler::default())
+    }
+}
+
+impl<M, S> ModelRunner<M, S> {
+    pub fn with_sampler(model: M, sampler: S) -> Self {
+        Self { model, sampler }
     }
 
     pub fn model(&self) -> &M {
@@ -291,9 +462,10 @@ impl<M> ModelRunner<M> {
     }
 }
 
-impl<M> FallibleModelWorker for ModelRunner<M>
+impl<M, S> FallibleModelWorker for ModelRunner<M, S>
 where
     M: ForwardModel,
+    S: LogitSamplerLike,
 {
     fn try_generate_batch(
         &mut self,
@@ -304,8 +476,9 @@ where
             .model
             .forward(&worker_batch)
             .map_err(|error| WorkerExecutionError::Runtime(error.to_string()))?;
-        let token_ids = forward_output
-            .into_argmax_tokens()
+        let token_ids = self
+            .sampler
+            .sample(forward_output, batch)
             .map_err(|error| WorkerExecutionError::Runtime(error.to_string()))?;
 
         if token_ids.len() != batch.batch_size() {
@@ -325,5 +498,26 @@ where
                 .map(|token_id| GeneratedToken::unfinished(vec![token_id]))
                 .collect(),
         )?)
+    }
+}
+
+pub trait LogitSamplerLike {
+    fn sample(
+        &mut self,
+        output: ModelForwardOutput,
+        batch: &ScheduleBatch,
+    ) -> Result<Vec<u32>, ModelForwardError>;
+}
+
+impl<R> LogitSamplerLike for LogitSampler<R>
+where
+    R: SamplingRandomSource,
+{
+    fn sample(
+        &mut self,
+        output: ModelForwardOutput,
+        batch: &ScheduleBatch,
+    ) -> Result<Vec<u32>, ModelForwardError> {
+        LogitSampler::sample(self, output, batch)
     }
 }

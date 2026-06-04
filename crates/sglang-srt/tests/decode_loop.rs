@@ -39,7 +39,7 @@ fn unfinished_prefill_output_is_requeued_for_decode_until_finished() {
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("req-decode"),
         vec![1, 2, 3],
-        SamplingParams { max_new_tokens: 2 },
+        SamplingParams::new(2),
     ));
 
     let prefill_outputs = scheduler
@@ -90,7 +90,7 @@ fn scheduler_finishes_request_when_max_new_tokens_is_reached() {
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("req-max-new-tokens"),
         vec![1, 2, 3],
-        SamplingParams { max_new_tokens: 1 },
+        SamplingParams::new(1),
     ));
 
     let outputs = scheduler

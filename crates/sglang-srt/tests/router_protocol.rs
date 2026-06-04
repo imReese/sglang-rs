@@ -79,7 +79,7 @@ fn router_generate_request_maps_to_tokenized_engine_request() {
 
     assert_eq!(token_request.request_id, RequestId::from("router-rid"));
     assert_eq!(token_request.input_ids, vec![101, 202, 303]);
-    assert_eq!(token_request.sampling, SamplingParams { max_new_tokens: 7 });
+    assert_eq!(token_request.sampling, SamplingParams::new(7));
     assert_eq!(token_request.data_parallel_rank, 2);
     assert!(token_request.disaggregated_params.is_none());
 }
@@ -181,9 +181,7 @@ fn router_sampling_params_default_to_sglang_max_new_tokens() {
 
     assert_eq!(
         token_request.sampling,
-        SamplingParams {
-            max_new_tokens: DEFAULT_MAX_NEW_TOKENS
-        }
+        SamplingParams::new(DEFAULT_MAX_NEW_TOKENS)
     );
 }
 
@@ -292,7 +290,11 @@ fn router_generate_request_accepts_valid_extended_sampling_params() {
         .try_into_token_generate_request()
         .expect("valid extended sampling params should map");
 
-    assert_eq!(token_request.sampling, SamplingParams { max_new_tokens: 8 });
+    assert_eq!(token_request.sampling.max_new_tokens, 8);
+    assert_eq!(token_request.sampling.temperature, Some(0.7));
+    assert_eq!(token_request.sampling.top_p, Some(0.95));
+    assert_eq!(token_request.sampling.top_k, Some(40));
+    assert_eq!(token_request.sampling.min_p, Some(0.0));
 }
 
 #[test]
@@ -751,7 +753,7 @@ fn router_runtime_abort_request_removes_queued_request() {
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("abort-me"),
         vec![1, 2, 3],
-        SamplingParams { max_new_tokens: 1 },
+        SamplingParams::new(1),
     ));
     let engine = Engine::new(tokenizer, scheduler);
     let mut runtime = RouterRuntime::new(engine);
@@ -787,7 +789,7 @@ fn router_runtime_reports_running_request_limit_as_resource_exhausted_without_qu
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("active"),
         vec![1],
-        SamplingParams { max_new_tokens: 2 },
+        SamplingParams::new(2),
     ));
     scheduler
         .dispatch_prefill_batch(1)
@@ -1079,7 +1081,7 @@ fn router_runtime_flush_cache_reports_failure_when_decode_requests_are_active() 
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("active"),
         vec![1, 2],
-        SamplingParams { max_new_tokens: 2 },
+        SamplingParams::new(2),
     ));
     scheduler
         .dispatch_prefill_batch(1)

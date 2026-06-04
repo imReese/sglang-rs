@@ -60,7 +60,13 @@ impl RouterSamplingParams {
             None => DEFAULT_MAX_NEW_TOKENS,
         };
 
-        Ok(SamplingParams { max_new_tokens })
+        Ok(SamplingParams {
+            max_new_tokens,
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            min_p: self.min_p,
+        })
     }
 }
 
@@ -263,7 +269,7 @@ fn next_router_request_id() -> String {
     format!("sglang-rs-{timestamp_nanos:x}-{sequence:x}")
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct ValidatedTokenGenerateRequest {
     prompt_tokens: usize,
     stream: bool,

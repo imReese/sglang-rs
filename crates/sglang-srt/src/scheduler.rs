@@ -22,7 +22,7 @@ pub enum ForwardMode {
     Decode,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ScheduledRequest {
     request_id: RequestId,
     input_ids: Vec<u32>,
@@ -206,7 +206,7 @@ pub struct Scheduler<W> {
     worker: W,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ScheduleBatch {
     forward_mode: ForwardMode,
     requests: Vec<ScheduledRequest>,

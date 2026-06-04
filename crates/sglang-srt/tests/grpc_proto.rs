@@ -198,7 +198,7 @@ async fn grpc_generate_maps_running_request_limit_to_resource_exhausted() {
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("active"),
         vec![1],
-        RuntimeSamplingParams { max_new_tokens: 2 },
+        RuntimeSamplingParams::new(2),
     ));
     scheduler
         .dispatch_prefill_batch(1)
@@ -687,7 +687,7 @@ async fn grpc_get_load_reports_scheduler_metrics() {
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("load-waiting"),
         vec![1, 2, 3],
-        RuntimeSamplingParams { max_new_tokens: 1 },
+        RuntimeSamplingParams::new(1),
     ));
     let runtime = RouterRuntime::new(Engine::new(ByteTokenizer, scheduler));
     let service = GrpcRouterService::new(runtime);
@@ -726,7 +726,7 @@ async fn grpc_abort_removes_queued_request() {
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("grpc-abort"),
         vec![1, 2, 3],
-        RuntimeSamplingParams { max_new_tokens: 1 },
+        RuntimeSamplingParams::new(1),
     ));
     let runtime = RouterRuntime::new(Engine::new(ByteTokenizer, scheduler));
     let service = GrpcRouterService::new(runtime);

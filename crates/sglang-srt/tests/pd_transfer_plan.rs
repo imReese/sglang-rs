@@ -63,7 +63,7 @@ fn transfer_plan_uses_uncached_prefill_pages_as_pd_delta() {
         ScheduledRequest::new(
             RequestId::from("pd-delta"),
             vec![10, 11, 12, 13],
-            SamplingParams { max_new_tokens: 1 },
+            SamplingParams::new(1),
         )
         .with_disaggregated_params(Some(disaggregated_params(77)))
         .with_data_parallel_rank(3),
@@ -110,7 +110,7 @@ fn transfer_plan_keeps_noop_span_when_decode_radix_cache_satisfies_full_prefix()
         ScheduledRequest::new(
             RequestId::from("pd-noop"),
             vec![20, 21, 22],
-            SamplingParams { max_new_tokens: 1 },
+            SamplingParams::new(1),
         )
         .with_disaggregated_params(Some(disaggregated_params(88))),
     );
@@ -140,15 +140,11 @@ fn transfer_plan_skips_non_pd_prefill_requests_but_consumes_their_cache_pages() 
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("local"),
         vec![1, 2],
-        SamplingParams { max_new_tokens: 1 },
+        SamplingParams::new(1),
     ));
     scheduler.enqueue(
-        ScheduledRequest::new(
-            RequestId::from("pd"),
-            vec![3, 4, 5],
-            SamplingParams { max_new_tokens: 1 },
-        )
-        .with_disaggregated_params(Some(disaggregated_params(99))),
+        ScheduledRequest::new(RequestId::from("pd"), vec![3, 4, 5], SamplingParams::new(1))
+            .with_disaggregated_params(Some(disaggregated_params(99))),
     );
 
     let batch = scheduler
@@ -177,7 +173,7 @@ fn transfer_plan_rejects_decode_worker_batches() {
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("decode"),
         vec![1, 2],
-        SamplingParams { max_new_tokens: 2 },
+        SamplingParams::new(2),
     ));
     scheduler
         .dispatch_prefill_batch(1)
@@ -300,7 +296,7 @@ fn transfer_model_worker_submits_pd_prefill_transfer_during_scheduler_dispatch()
         ScheduledRequest::new(
             RequestId::from("pd-dispatch"),
             vec![1, 2, 3],
-            SamplingParams { max_new_tokens: 1 },
+            SamplingParams::new(1),
         )
         .with_disaggregated_params(Some(disaggregated_params(15))),
     );
@@ -335,7 +331,7 @@ fn transfer_model_worker_registers_pd_prefill_session_before_transfer() {
         ScheduledRequest::new(
             RequestId::from("pd-auto-register"),
             vec![1, 2, 3],
-            SamplingParams { max_new_tokens: 2 },
+            SamplingParams::new(2),
         )
         .with_disaggregated_params(Some(disaggregated_params(26)))
         .with_data_parallel_rank(2),
@@ -368,7 +364,7 @@ fn transfer_model_worker_skips_non_pd_prefill_transfer() {
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("local-dispatch"),
         vec![1, 2],
-        SamplingParams { max_new_tokens: 1 },
+        SamplingParams::new(1),
     ));
 
     scheduler
@@ -402,7 +398,7 @@ fn transfer_model_worker_propagates_transfer_failure_and_scheduler_releases_page
         ScheduledRequest::new(
             RequestId::from("pd-transfer-fail"),
             vec![1, 2],
-            SamplingParams { max_new_tokens: 1 },
+            SamplingParams::new(1),
         )
         .with_disaggregated_params(Some(disaggregated_params(16))),
     );
@@ -451,7 +447,7 @@ fn transfer_model_worker_blocks_default_decode_dispatch_until_kv_success() {
         ScheduledRequest::new(
             RequestId::from("pd-decode-wait"),
             vec![1, 2],
-            SamplingParams { max_new_tokens: 2 },
+            SamplingParams::new(2),
         )
         .with_disaggregated_params(Some(disaggregated_params(19))),
     );
@@ -505,7 +501,7 @@ fn transfer_model_worker_fails_default_decode_dispatch_when_kv_failed() {
         ScheduledRequest::new(
             RequestId::from("pd-decode-failed"),
             vec![1, 2],
-            SamplingParams { max_new_tokens: 2 },
+            SamplingParams::new(2),
         )
         .with_disaggregated_params(Some(disaggregated_params(20))),
     );
@@ -544,7 +540,7 @@ fn scheduler_abort_removes_pd_bootstrap_session_for_decode_request() {
         ScheduledRequest::new(
             RequestId::from("pd-abort-cleanup"),
             vec![1, 2],
-            SamplingParams { max_new_tokens: 2 },
+            SamplingParams::new(2),
         )
         .with_disaggregated_params(Some(disaggregated_params(31))),
     );
@@ -582,7 +578,7 @@ fn engine_token_generation_waits_when_pd_decode_kv_is_not_ready() {
         .generate_tokens(TokenGenerateRequest {
             request_id: RequestId::from("engine-pd-wait"),
             input_ids: vec![1, 2],
-            sampling: SamplingParams { max_new_tokens: 2 },
+            sampling: SamplingParams::new(2),
             disaggregated_params: Some(disaggregated_params(21)),
             data_parallel_rank: 0,
         })
@@ -620,7 +616,7 @@ fn engine_poll_transfers_updates_registry_and_unblocks_decode_dispatch() {
         .generate_tokens(TokenGenerateRequest {
             request_id: RequestId::from("engine-poll"),
             input_ids: vec![1, 2],
-            sampling: SamplingParams { max_new_tokens: 2 },
+            sampling: SamplingParams::new(2),
             disaggregated_params: Some(disaggregated_params(22)),
             data_parallel_rank: 0,
         })
@@ -670,7 +666,7 @@ fn engine_token_generation_can_poll_transfer_and_continue_decode() {
             TokenGenerateRequest {
                 request_id: RequestId::from("engine-poll-inline"),
                 input_ids: vec![1, 2],
-                sampling: SamplingParams { max_new_tokens: 2 },
+                sampling: SamplingParams::new(2),
                 disaggregated_params: Some(disaggregated_params(24)),
                 data_parallel_rank: 0,
             },
@@ -811,7 +807,7 @@ fn decode_batch_ready_check_keeps_pd_request_queued_until_kv_success() {
         ScheduledRequest::new(
             RequestId::from("decode-waits"),
             vec![1, 2],
-            SamplingParams { max_new_tokens: 2 },
+            SamplingParams::new(2),
         )
         .with_disaggregated_params(Some(disaggregated_params(17))),
     );
@@ -857,7 +853,7 @@ fn decode_kv_ready_check_reports_missing_bootstrap_session() {
         ScheduledRequest::new(
             RequestId::from("missing-session"),
             vec![1, 2],
-            SamplingParams { max_new_tokens: 2 },
+            SamplingParams::new(2),
         )
         .with_disaggregated_params(Some(disaggregated_params(18))),
     );
@@ -1094,7 +1090,7 @@ fn mooncake_executor_resolves_target_per_bootstrap_room() {
         ScheduledRequest::new(
             RequestId::from("room-a"),
             vec![1, 2],
-            SamplingParams { max_new_tokens: 1 },
+            SamplingParams::new(1),
         )
         .with_disaggregated_params(Some(disaggregated_params(11))),
     );
@@ -1102,7 +1098,7 @@ fn mooncake_executor_resolves_target_per_bootstrap_room() {
         ScheduledRequest::new(
             RequestId::from("room-b"),
             vec![3, 4],
-            SamplingParams { max_new_tokens: 1 },
+            SamplingParams::new(1),
         )
         .with_disaggregated_params(Some(disaggregated_params(12))),
     );
@@ -1416,7 +1412,7 @@ fn transfer_plan_for_request(
         ScheduledRequest::new(
             RequestId::from(request_id),
             input_ids.to_vec(),
-            SamplingParams { max_new_tokens: 1 },
+            SamplingParams::new(1),
         )
         .with_disaggregated_params(Some(disaggregated_params(bootstrap_room))),
     );

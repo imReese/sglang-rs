@@ -49,7 +49,7 @@ fn generation_request_runs_through_tokenizer_scheduler_worker_and_detokenizer() 
         .generate(GenerateRequest {
             request_id: RequestId::from("req-1"),
             prompt: "hello".to_string(),
-            sampling: SamplingParams { max_new_tokens: 2 },
+            sampling: SamplingParams::new(2),
         })
         .expect("request should run");
 
@@ -78,7 +78,7 @@ fn generation_request_drives_decode_until_the_request_finishes() {
         .generate(GenerateRequest {
             request_id: RequestId::from("req-2"),
             prompt: "hello".to_string(),
-            sampling: SamplingParams { max_new_tokens: 2 },
+            sampling: SamplingParams::new(2),
         })
         .expect("request should run");
 
@@ -101,7 +101,7 @@ fn tokenized_generation_request_bypasses_tokenizer_for_router_generate_rpc() {
         .generate_tokens(TokenGenerateRequest {
             request_id: RequestId::from("router-req"),
             input_ids: vec![11, 22, 33],
-            sampling: SamplingParams { max_new_tokens: 2 },
+            sampling: SamplingParams::new(2),
             disaggregated_params: None,
             data_parallel_rank: 0,
         })
@@ -123,7 +123,7 @@ fn scheduler_exposes_waiting_queue_depth_before_dispatch() {
     scheduler.enqueue(sglang_srt::scheduler::ScheduledRequest::new(
         RequestId::from("req-queued"),
         vec![1, 2, 3],
-        SamplingParams { max_new_tokens: 4 },
+        SamplingParams::new(4),
     ));
 
     assert_eq!(scheduler.waiting_queue_depth(), 1);

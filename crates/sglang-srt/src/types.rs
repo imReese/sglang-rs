@@ -13,9 +13,34 @@ impl From<&str> for RequestId {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SamplingParams {
     pub max_new_tokens: usize,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<i32>,
+    pub min_p: Option<f32>,
+}
+
+impl SamplingParams {
+    pub fn new(max_new_tokens: usize) -> Self {
+        Self {
+            max_new_tokens,
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for SamplingParams {
+    fn default() -> Self {
+        Self {
+            max_new_tokens: 0,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            min_p: None,
+        }
+    }
 }
 
 pub const FAKE_BOOTSTRAP_HOST: &str = "2.2.2.2";
@@ -27,7 +52,7 @@ pub struct DisaggregatedParams {
     pub bootstrap_room: i32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct GenerateRequest {
     pub request_id: RequestId,
     pub prompt: String,
@@ -41,7 +66,7 @@ pub struct GenerateOutput {
     pub finished: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TokenGenerateRequest {
     pub request_id: RequestId,
     pub input_ids: Vec<u32>,
