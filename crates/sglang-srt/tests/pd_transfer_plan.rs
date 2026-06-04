@@ -1076,6 +1076,19 @@ impl MooncakeTransferSubmitter for RecordingMooncakeSubmitter {
     }
 }
 
+impl MooncakeTransferStatusReader for RecordingMooncakeSubmitter {
+    fn transfer_status(
+        &mut self,
+        _batch_id: MooncakeBatchId,
+        _task_id: usize,
+    ) -> Result<MooncakeTransferStatus, MooncakeError> {
+        Ok(MooncakeTransferStatus {
+            status: MooncakeTransferStatusCode::Completed as i32,
+            transferred_bytes: 0,
+        })
+    }
+}
+
 #[derive(Default)]
 struct RecordingMooncakeBackend {
     submitted_requests: Vec<Vec<MooncakeTransferRequest>>,

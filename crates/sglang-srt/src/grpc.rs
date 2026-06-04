@@ -51,6 +51,7 @@ pub const SGLANG_RUNTIME_FILE_DESCRIPTOR_SET: &[u8] =
 pub struct GrpcRouterService<T, W> {
     runtime: Arc<Mutex<RouterRuntime<T, W>>>,
     model_info: Option<RouterGetModelInfoResponse>,
+    max_transfer_polls: usize,
 }
 
 #[derive(Debug)]
@@ -87,6 +88,7 @@ impl<T, W> GrpcRouterService<T, W> {
         Self {
             runtime: Arc::new(Mutex::new(runtime)),
             model_info: None,
+            max_transfer_polls: 0,
         }
     }
 
@@ -97,7 +99,13 @@ impl<T, W> GrpcRouterService<T, W> {
         Self {
             runtime: Arc::new(Mutex::new(runtime)),
             model_info: Some(model_info),
+            max_transfer_polls: 0,
         }
+    }
+
+    pub fn with_max_transfer_polls(mut self, max_transfer_polls: usize) -> Self {
+        self.max_transfer_polls = max_transfer_polls;
+        self
     }
 
     pub fn with_server_args(runtime: RouterRuntime<T, W>, args: &ServerArgs) -> Self {
@@ -221,7 +229,7 @@ where
             .runtime
             .lock()
             .map_err(|_| Status::internal("router runtime mutex poisoned"))?
-            .generate_text_stream(request)
+            .generate_text_stream_with_transfer_polling(request, self.max_transfer_polls)
             .map_err(router_runtime_error_to_status)?
             .into_iter()
             .map(router_generate_response_to_proto_response)
@@ -242,7 +250,7 @@ where
             .runtime
             .lock()
             .map_err(|_| Status::internal("router runtime mutex poisoned"))?
-            .generate_stream(request)
+            .generate_stream_with_transfer_polling(request, self.max_transfer_polls)
             .map_err(router_runtime_error_to_status)?
             .into_iter()
             .map(router_generate_response_to_proto_response)

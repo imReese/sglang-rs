@@ -18,7 +18,16 @@ use sglang_srt::proto::sglang::runtime::v1::{
 use sglang_srt::router::{RouterProtocolError, RouterRuntime};
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::tokenizer::ByteTokenizer;
-use sglang_srt::types::{RequestId, SamplingParams as RuntimeSamplingParams};
+use sglang_srt::transfer::{
+    DecodeBootstrapRegistry, DecodeBootstrapSession, KvTransferModelWorker, MooncakeBatchId,
+    MooncakeError, MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeTransferRequest,
+    MooncakeTransferStatus, MooncakeTransferStatusCode, MooncakeTransferStatusReader,
+    MooncakeTransferSubmitter, MooncakeTransferTarget,
+};
+use sglang_srt::types::{
+    DisaggregatedParams as RuntimeDisaggregatedParams, RequestId,
+    SamplingParams as RuntimeSamplingParams,
+};
 use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
 
 #[derive(Default)]
@@ -231,6 +240,133 @@ async fn grpc_generate_non_stream_returns_only_complete_response() {
             }
         ))
     );
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn grpc_generate_can_poll_pd_transfer_before_decode() {
+    let worker = KvTransferModelWorker::new(
+        GrpcTwoStepWorker,
+        grpc_registry_with_session("grpc-pd-poll", 31),
+        MooncakeKvCacheTransferExecutor::new(
+            RecordingMooncakeBackend::completed(),
+            MooncakeKvCacheLayout {
+                source_base_addr: 0x1000,
+                page_size_bytes: 64,
+                target_base_offset: 0,
+            },
+            MooncakeTransferTarget { target_id: 9 },
+        ),
+    );
+    let service = GrpcRouterService::from_engine(Engine::new(
+        ByteTokenizer,
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(2)),
+    ))
+    .with_max_transfer_polls(1);
+
+    let mut stream = service
+        .generate(Request::new(GenerateRequest {
+            input_ids: vec![1, 2],
+            original_text: String::new(),
+            sampling_params: Some(SamplingParams {
+                max_new_tokens: Some(2),
+                ..Default::default()
+            }),
+            options: Some(RequestOptions {
+                request_id: Some("grpc-pd-poll".to_string()),
+                stream: true,
+                data_parallel_rank: 0,
+                trace_headers: Default::default(),
+            }),
+            disaggregated_params: Some(
+                sglang_srt::proto::sglang::runtime::v1::DisaggregatedParams {
+                    bootstrap_host: "10.0.0.7".to_string(),
+                    bootstrap_port: 8998,
+                    bootstrap_room: 31,
+                },
+            ),
+        }))
+        .await
+        .expect("grpc generate should poll transfer and execute")
+        .into_inner();
+
+    let first = stream
+        .next()
+        .await
+        .expect("first response")
+        .expect("first response ok");
+    let second = stream
+        .next()
+        .await
+        .expect("second response")
+        .expect("second response ok");
+
+    assert!(matches!(first.body, Some(Body::Chunk(_))));
+    assert!(matches!(second.body, Some(Body::Complete(_))));
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn grpc_text_generate_can_poll_pd_transfer_before_decode() {
+    let worker = KvTransferModelWorker::new(
+        GrpcTwoStepWorker,
+        grpc_registry_with_session("grpc-text-pd-poll", 32),
+        MooncakeKvCacheTransferExecutor::new(
+            RecordingMooncakeBackend::completed(),
+            MooncakeKvCacheLayout {
+                source_base_addr: 0x2000,
+                page_size_bytes: 64,
+                target_base_offset: 0,
+            },
+            MooncakeTransferTarget { target_id: 10 },
+        ),
+    );
+    let service = GrpcRouterService::from_engine(Engine::new(
+        ByteTokenizer,
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(2)),
+    ))
+    .with_max_transfer_polls(1);
+
+    let mut stream = service
+        .text_generate(Request::new(TextGenerateRequest {
+            text: "Hi".to_string(),
+            sampling_params: Some(SamplingParams {
+                max_new_tokens: Some(2),
+                ..Default::default()
+            }),
+            options: Some(RequestOptions {
+                request_id: Some("grpc-text-pd-poll".to_string()),
+                stream: true,
+                data_parallel_rank: 0,
+                trace_headers: Default::default(),
+            }),
+            disaggregated_params: Some(
+                sglang_srt::proto::sglang::runtime::v1::DisaggregatedParams {
+                    bootstrap_host: "10.0.0.7".to_string(),
+                    bootstrap_port: 8998,
+                    bootstrap_room: 32,
+                },
+            ),
+        }))
+        .await
+        .expect("grpc text generate should poll transfer and execute")
+        .into_inner();
+
+    let first = stream
+        .next()
+        .await
+        .expect("first response")
+        .expect("first response ok");
+    let second = stream
+        .next()
+        .await
+        .expect("second response")
+        .expect("second response ok");
+
+    assert_eq!(first.request_id, "grpc-text-pd-poll");
+    assert!(matches!(first.body, Some(Body::Chunk(_))));
+    assert_eq!(second.request_id, "grpc-text-pd-poll");
+    assert!(matches!(second.body, Some(Body::Complete(_))));
     assert!(stream.next().await.is_none());
 }
 
@@ -686,4 +822,65 @@ async fn grpc_pause_generation_rejects_generate_until_continued() {
     assert_eq!(response.request_id, "grpc-continued");
     assert!(matches!(response.body, Some(Body::Complete(_))));
     assert!(stream.next().await.is_none());
+}
+
+#[derive(Default)]
+struct RecordingMooncakeBackend {
+    submitted_batches: usize,
+    statuses: Vec<MooncakeTransferStatusCode>,
+}
+
+impl RecordingMooncakeBackend {
+    fn completed() -> Self {
+        Self {
+            submitted_batches: 0,
+            statuses: vec![MooncakeTransferStatusCode::Completed],
+        }
+    }
+}
+
+impl MooncakeTransferSubmitter for RecordingMooncakeBackend {
+    fn submit_transfer(
+        &mut self,
+        requests: &mut [MooncakeTransferRequest],
+    ) -> Result<MooncakeBatchId, MooncakeError> {
+        assert!(!requests.is_empty());
+        self.submitted_batches += 1;
+        Ok(500 + self.submitted_batches as MooncakeBatchId - 1)
+    }
+}
+
+impl MooncakeTransferStatusReader for RecordingMooncakeBackend {
+    fn transfer_status(
+        &mut self,
+        _batch_id: MooncakeBatchId,
+        task_id: usize,
+    ) -> Result<MooncakeTransferStatus, MooncakeError> {
+        let status = self
+            .statuses
+            .get(task_id)
+            .or_else(|| self.statuses.last())
+            .copied()
+            .expect("recording Mooncake backend needs at least one status");
+        Ok(MooncakeTransferStatus {
+            status: status as i32,
+            transferred_bytes: 0,
+        })
+    }
+}
+
+fn grpc_registry_with_session(request_id: &str, bootstrap_room: i32) -> DecodeBootstrapRegistry {
+    let mut registry = DecodeBootstrapRegistry::default();
+    registry
+        .register(DecodeBootstrapSession::new(
+            RequestId::from(request_id),
+            RuntimeDisaggregatedParams {
+                bootstrap_host: "10.0.0.7".to_string(),
+                bootstrap_port: 8998,
+                bootstrap_room,
+            },
+            0,
+        ))
+        .expect("session should register");
+    registry
 }

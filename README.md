@@ -104,7 +104,9 @@ This repository currently contains the first `sglang-srt` runtime crate:
   decode requests queued until their bootstrap room reaches `Success`, plus
   engine/router polling hooks and bounded transfer-polling generation entry
   points for advancing asynchronous Mooncake transfer completions from the
-  control plane before decode resumes. The
+  control plane before decode resumes. The gRPC adapter can use the same path
+  through a bounded `with_max_transfer_polls` service setting for tokenized and
+  text generate RPCs. The
   module also contains the initial Mooncake transfer-engine ABI boundary for
   memory registration and batch transfer.
 - `scheduler`: waiting queue, prefill/decode batch formation, request stages,

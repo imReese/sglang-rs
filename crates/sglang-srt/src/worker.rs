@@ -1,6 +1,7 @@
 use std::fmt;
 
 use crate::scheduler::{ForwardMode, ScheduleBatch, ScheduledOutput, ScheduledRequest};
+use crate::transfer::{KvCacheTransferError, MooncakeTransferPollSummary};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GeneratedToken {
@@ -134,6 +135,10 @@ pub trait FallibleModelWorker {
     ) -> Result<DecodeRequestState, WorkerExecutionError> {
         Ok(DecodeRequestState::Ready)
     }
+
+    fn poll_transfers(&mut self) -> Result<MooncakeTransferPollSummary, KvCacheTransferError> {
+        Ok(MooncakeTransferPollSummary::default())
+    }
 }
 
 pub trait WorkerExecutor {
@@ -146,6 +151,8 @@ pub trait WorkerExecutor {
         &self,
         request: &ScheduledRequest,
     ) -> Result<DecodeRequestState, WorkerExecutionError>;
+
+    fn poll_transfers(&mut self) -> Result<MooncakeTransferPollSummary, KvCacheTransferError>;
 }
 
 impl<W> FallibleModelWorker for W
@@ -176,6 +183,10 @@ where
         request: &ScheduledRequest,
     ) -> Result<DecodeRequestState, WorkerExecutionError> {
         FallibleModelWorker::decode_request_state(self, request)
+    }
+
+    fn poll_transfers(&mut self) -> Result<MooncakeTransferPollSummary, KvCacheTransferError> {
+        FallibleModelWorker::poll_transfers(self)
     }
 }
 

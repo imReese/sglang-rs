@@ -536,6 +536,13 @@ pub trait KvCacheTransferExecutor {
     fn completes_inline(&self) -> bool {
         true
     }
+
+    fn poll_transfers(
+        &mut self,
+        _registry: &mut DecodeBootstrapRegistry,
+    ) -> Result<MooncakeTransferPollSummary, KvCacheTransferError> {
+        Ok(MooncakeTransferPollSummary::default())
+    }
 }
 
 pub fn execute_kv_cache_transfer_plan<E>(
@@ -705,6 +712,10 @@ where
             },
             None => Ok(DecodeRequestState::Pending),
         }
+    }
+
+    fn poll_transfers(&mut self) -> Result<MooncakeTransferPollSummary, KvCacheTransferError> {
+        self.transfer_executor.poll_transfers(&mut self.registry)
     }
 }
 
@@ -1004,10 +1015,6 @@ where
     Ok(summary)
 }
 
-pub trait KvTransferPoller {
-    fn poll_transfers(&mut self) -> Result<MooncakeTransferPollSummary, KvCacheTransferError>;
-}
-
 pub struct MooncakeKvCacheTransferExecutor<S, R = FixedMooncakeTransferTargetResolver> {
     submitter: S,
     layout: MooncakeKvCacheLayout,
@@ -1083,19 +1090,9 @@ where
     }
 }
 
-impl<W, S, R> KvTransferPoller for KvTransferModelWorker<W, MooncakeKvCacheTransferExecutor<S, R>>
-where
-    S: MooncakeTransferStatusReader,
-{
-    fn poll_transfers(&mut self) -> Result<MooncakeTransferPollSummary, KvCacheTransferError> {
-        self.transfer_executor
-            .poll_submitted_transfers(&mut self.registry)
-    }
-}
-
 impl<S, R> KvCacheTransferExecutor for MooncakeKvCacheTransferExecutor<S, R>
 where
-    S: MooncakeTransferSubmitter,
+    S: MooncakeTransferSubmitter + MooncakeTransferStatusReader,
     R: MooncakeTransferTargetResolver,
 {
     fn transfer_span(&mut self, span: &KvCacheTransferSpan) -> Result<(), KvCacheTransferError> {
@@ -1122,6 +1119,13 @@ where
 
     fn completes_inline(&self) -> bool {
         false
+    }
+
+    fn poll_transfers(
+        &mut self,
+        registry: &mut DecodeBootstrapRegistry,
+    ) -> Result<MooncakeTransferPollSummary, KvCacheTransferError> {
+        self.poll_submitted_transfers(registry)
     }
 }
 

@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::scheduler::{ScheduledOutput, ScheduledRequest, Scheduler, SchedulerError};
 use crate::tokenizer::{Tokenizer, TokenizerError};
-use crate::transfer::{KvCacheTransferError, KvTransferPoller, MooncakeTransferPollSummary};
+use crate::transfer::{KvCacheTransferError, MooncakeTransferPollSummary};
 use crate::types::{
     GenerateOutput, GenerateRequest, RequestId, TokenGenerateOutput, TokenGenerateRequest,
 };
@@ -77,7 +77,7 @@ impl<T, W> Engine<T, W> {
 
 impl<T, W> Engine<T, W>
 where
-    W: KvTransferPoller,
+    W: WorkerExecutor,
 {
     pub fn poll_transfers(&mut self) -> Result<MooncakeTransferPollSummary, RuntimeError> {
         Ok(self.scheduler.worker_mut().poll_transfers()?)
@@ -208,7 +208,7 @@ where
 impl<T, W> Engine<T, W>
 where
     T: Tokenizer,
-    W: WorkerExecutor + KvTransferPoller,
+    W: WorkerExecutor,
 {
     pub fn generate_tokens_with_transfer_polling(
         &mut self,

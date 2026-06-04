@@ -6,7 +6,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::cli::ServerArgs;
 use crate::engine::{Engine, RuntimeError};
 use crate::tokenizer::{Tokenizer, TokenizerError};
-use crate::transfer::KvTransferPoller;
 use crate::types::{
     DisaggregatedParams, RequestId, SamplingParams, TokenGenerateOutput, TokenGenerateRequest,
 };
@@ -552,7 +551,7 @@ impl<T, W> RouterRuntime<T, W> {
 
 impl<T, W> RouterRuntime<T, W>
 where
-    W: KvTransferPoller,
+    W: WorkerExecutor,
 {
     pub fn poll_transfers(&mut self) -> Result<RouterTransferPollResponse, RouterRuntimeError> {
         let summary = self.engine.poll_transfers()?;
@@ -726,7 +725,7 @@ where
 impl<T, W> RouterRuntime<T, W>
 where
     T: Tokenizer,
-    W: WorkerExecutor + KvTransferPoller,
+    W: WorkerExecutor,
 {
     pub fn generate_stream_with_transfer_polling(
         &mut self,
@@ -778,6 +777,39 @@ where
             responses.retain(|response| {
                 matches!(response.body, RouterGenerateResponseBody::Complete(_))
             });
+        }
+
+        Ok(responses)
+    }
+
+    pub fn generate_text_stream_with_transfer_polling(
+        &mut self,
+        request: RouterTextGenerateRequest,
+        max_transfer_polls: usize,
+    ) -> Result<Vec<RouterGenerateResponse>, RouterRuntimeError> {
+        if request.text.is_empty() {
+            return Err(RouterProtocolError::EmptyTextInput.into());
+        }
+
+        let input_ids = self.engine.tokenize(&request.text);
+        let mut responses = self.generate_stream_with_transfer_polling(
+            RouterGenerateRequest {
+                request_id: request.request_id,
+                tokenized: Some(RouterTokenizedInput {
+                    original_text: request.text,
+                    input_ids,
+                }),
+                sampling_params: request.sampling_params,
+                disaggregated_params: request.disaggregated_params,
+                stream: request.stream,
+                data_parallel_rank: request.data_parallel_rank,
+                trace_headers: request.trace_headers,
+            },
+            max_transfer_polls,
+        )?;
+
+        for response in &mut responses {
+            self.fill_generate_response_text(response)?;
         }
 
         Ok(responses)
