@@ -1,3 +1,6 @@
+use std::fs;
+use std::path::PathBuf;
+
 use sglang_srt::cli::ServerArgs;
 use sglang_srt::transfer::{
     DisaggregationMode, KvCacheDtype, KvCacheModelLayout, KvPoll, MooncakeKvCacheLayout,
@@ -191,17 +194,17 @@ fn pd_config_builds_mooncake_layout_from_model_kv_geometry() {
     .expect("args should parse");
 
     let config = PdConfig::from_server_args(&args).expect("pd config should normalize");
-    let model_layout = KvCacheModelLayout {
-        num_layers: 61,
-        kv_heads: 1,
-        head_dim: 512,
-    };
+    let model_layout = KvCacheModelLayout::multi_tensor(61, 1, 512, 2);
 
     let layout =
         MooncakeKvCacheLayout::from_pd_config_model_layout(0x1000, 0x200, &config, &model_layout)
             .unwrap();
 
     assert_eq!(model_layout.elements_per_token(), Some(61 * 2 * 512));
+    assert_eq!(
+        model_layout.token_size_bytes(config.kv_cache_dtype),
+        Ok(61 * 2 * 512 * 2)
+    );
     assert_eq!(layout.page_size_bytes, 64 * 61 * 2 * 512 * 2);
 }
 
@@ -236,13 +239,61 @@ fn pd_config_carries_cli_kv_model_geometry_for_mooncake_layout() {
 
     assert_eq!(
         model_layout,
-        KvCacheModelLayout {
-            num_layers: 61,
-            kv_heads: 1,
-            head_dim: 512,
-        }
+        KvCacheModelLayout::multi_tensor(61, 1, 512, 2)
     );
     assert_eq!(layout.page_size_bytes, 64 * 61 * 2 * 512 * 2);
+}
+
+#[test]
+fn pd_config_derives_deepseek_v4_kv_layout_from_model_config() {
+    let model_dir = temp_model_dir("deepseek-v4-kv-layout");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+            "model_type": "deepseek_v4",
+            "num_hidden_layers": 43,
+            "qk_nope_head_dim": 448,
+            "qk_rope_head_dim": 64,
+            "num_key_value_heads": 1
+        }"#,
+    )
+    .expect("config should be written");
+
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_dir.to_str().expect("temp dir should be utf8"),
+        "--disaggregation-mode",
+        "decode",
+        "--disaggregation-transfer-backend",
+        "mooncake",
+        "--kv-cache-dtype",
+        "fp8_e4m3",
+        "--page-size",
+        "256",
+    ])
+    .expect("args should parse");
+
+    let config = PdConfig::from_server_args(&args).expect("pd config should normalize");
+    let model_layout = config
+        .kv_cache_model_layout
+        .expect("DeepSeek V4 config should produce a KV model layout");
+    let layout =
+        MooncakeKvCacheLayout::from_pd_config_model_layout(0x1000, 0x200, &config, &model_layout)
+            .unwrap();
+
+    assert_eq!(
+        model_layout,
+        KvCacheModelLayout::packed_bytes_per_layer(43, 584)
+    );
+    assert_eq!(
+        model_layout.token_size_bytes(config.kv_cache_dtype),
+        Ok(43 * 584)
+    );
+    assert_eq!(layout.page_size_bytes, 256 * 43 * 584);
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
 
 #[test]
@@ -375,4 +426,8 @@ fn linked_mooncake_engine_constructor_is_available_under_feature() {
     ) -> Result<LinkedMooncakeTransferEngine, MooncakeError> = LinkedMooncakeTransferEngine::new;
 
     let _ = constructor;
+}
+
+fn temp_model_dir(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("sglang-rs-{name}-{}", std::process::id()))
 }

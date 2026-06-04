@@ -15,7 +15,7 @@ use sglang_srt::transfer::{
     DecodeBootstrapRegistry, DisaggregationMode, MooncakeBatchId, MooncakeBatchReleaser,
     MooncakeError, MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeTransferRequest,
     MooncakeTransferStatus, MooncakeTransferStatusCode, MooncakeTransferStatusReader,
-    MooncakeTransferSubmitter, MooncakeTransferTarget, TransferBackend,
+    MooncakeTransferSubmitter, MooncakeTransferTarget, PdConfigError, TransferBackend,
 };
 
 #[test]
@@ -285,6 +285,14 @@ async fn launch_grpc_server_rejects_unsupported_bootstrap_pd_backend() {
         "decode",
         "--disaggregation-transfer-backend",
         "mooncake",
+        "--kv-cache-dtype",
+        "bfloat16",
+        "--kv-cache-num-layers",
+        "61",
+        "--kv-cache-kv-heads",
+        "1",
+        "--kv-cache-head-dim",
+        "512",
     ])
     .expect("args should parse");
 
@@ -298,6 +306,32 @@ async fn launch_grpc_server_rejects_unsupported_bootstrap_pd_backend() {
             mode: DisaggregationMode::Decode,
             transfer_backend: TransferBackend::Mooncake,
         }
+    );
+}
+
+#[tokio::test]
+async fn launch_grpc_server_requires_kv_model_layout_for_mooncake_decode() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--grpc-mode",
+        "--disaggregation-mode",
+        "decode",
+        "--disaggregation-transfer-backend",
+        "mooncake",
+        "--kv-cache-dtype",
+        "bfloat16",
+    ])
+    .expect("args should parse");
+
+    let error = launch_grpc_server(args)
+        .await
+        .expect_err("missing Mooncake KV layout should fail before serving");
+
+    assert_eq!(
+        error,
+        ServerLaunchError::PdConfig(PdConfigError::MissingMooncakeKvCacheModelLayout)
     );
 }
 

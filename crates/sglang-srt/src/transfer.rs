@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::ffi::{NulError, c_char, c_int, c_void};
 use std::fmt;
+use std::fs;
+use std::path::Path;
 
 use crate::cache::CachePageId;
 use crate::cli::ServerArgs;
@@ -122,15 +124,167 @@ pub struct KvCacheModelLayout {
     pub num_layers: usize,
     pub kv_heads: usize,
     pub head_dim: usize,
+    pub kv_tensors_per_token: usize,
+    pub bytes_per_token_per_layer: Option<usize>,
 }
 
 impl KvCacheModelLayout {
+    pub fn multi_tensor(
+        num_layers: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        kv_tensors_per_token: usize,
+    ) -> Self {
+        Self {
+            num_layers,
+            kv_heads,
+            head_dim,
+            kv_tensors_per_token,
+            bytes_per_token_per_layer: None,
+        }
+    }
+
+    pub fn packed_bytes_per_layer(num_layers: usize, bytes_per_token_per_layer: usize) -> Self {
+        Self {
+            num_layers,
+            kv_heads: 1,
+            head_dim: bytes_per_token_per_layer,
+            kv_tensors_per_token: 1,
+            bytes_per_token_per_layer: Some(bytes_per_token_per_layer),
+        }
+    }
+
     pub fn elements_per_token(&self) -> Option<usize> {
         self.num_layers
-            .checked_mul(2)
+            .checked_mul(self.kv_tensors_per_token)
             .and_then(|value| value.checked_mul(self.kv_heads))
             .and_then(|value| value.checked_mul(self.head_dim))
     }
+
+    pub fn token_size_bytes(&self, dtype: KvCacheDtype) -> Result<usize, PdConfigError> {
+        if let Some(bytes_per_token_per_layer) = self.bytes_per_token_per_layer {
+            return self
+                .num_layers
+                .checked_mul(bytes_per_token_per_layer)
+                .ok_or(PdConfigError::KvCacheLayoutOverflow);
+        }
+
+        let elements_per_token = self
+            .elements_per_token()
+            .ok_or(PdConfigError::KvCacheLayoutOverflow)?;
+        let bytes_per_element = dtype
+            .bytes_per_element()
+            .ok_or(PdConfigError::KvCacheDtypeRequiresModelMetadata(dtype))?;
+
+        elements_per_token
+            .checked_mul(bytes_per_element)
+            .ok_or(PdConfigError::KvCacheLayoutOverflow)
+    }
+
+    fn from_model_path(model_path: &str) -> Result<Option<Self>, PdConfigError> {
+        let model_path = Path::new(model_path);
+        if !model_path.is_dir() {
+            return Ok(None);
+        }
+
+        let config_path = model_path.join("config.json");
+        if !config_path.is_file() {
+            return Ok(None);
+        }
+
+        let config = fs::read_to_string(&config_path).map_err(|error| {
+            PdConfigError::InvalidModelConfig(format!(
+                "failed to read {}: {error}",
+                config_path.display()
+            ))
+        })?;
+        let config: serde_json::Value = serde_json::from_str(&config).map_err(|error| {
+            PdConfigError::InvalidModelConfig(format!(
+                "failed to parse {}: {error}",
+                config_path.display()
+            ))
+        })?;
+
+        Self::from_hf_config_value(&config)
+    }
+
+    fn from_hf_config_value(config: &serde_json::Value) -> Result<Option<Self>, PdConfigError> {
+        let Some(num_layers) = read_usize_field(config, "num_hidden_layers")? else {
+            return Ok(None);
+        };
+
+        if config.get("model_type").and_then(serde_json::Value::as_str) == Some("deepseek_v4") {
+            let qk_nope_head_dim = required_usize_field(config, "qk_nope_head_dim")?;
+            let qk_rope_head_dim = required_usize_field(config, "qk_rope_head_dim")?;
+            if qk_nope_head_dim % 64 != 0 {
+                return Err(PdConfigError::InvalidModelConfig(format!(
+                    "qk_nope_head_dim must be divisible by 64 for DeepSeek V4 packed KV layout: {qk_nope_head_dim}"
+                )));
+            }
+
+            let rope_bytes = qk_rope_head_dim
+                .checked_mul(2)
+                .ok_or(PdConfigError::KvCacheLayoutOverflow)?;
+            let scale_bytes = qk_nope_head_dim / 64;
+            let bytes_per_token_per_layer = qk_nope_head_dim
+                .checked_add(rope_bytes)
+                .and_then(|value| value.checked_add(scale_bytes))
+                .and_then(|value| value.checked_add(1))
+                .ok_or(PdConfigError::KvCacheLayoutOverflow)?;
+
+            return Ok(Some(Self::packed_bytes_per_layer(
+                num_layers,
+                bytes_per_token_per_layer,
+            )));
+        }
+
+        let num_attention_heads = required_usize_field(config, "num_attention_heads")?;
+        let kv_heads =
+            read_usize_field(config, "num_key_value_heads")?.unwrap_or(num_attention_heads);
+        let head_dim = match read_usize_field(config, "head_dim")? {
+            Some(head_dim) => head_dim,
+            None => {
+                let hidden_size = required_usize_field(config, "hidden_size")?;
+                if num_attention_heads == 0 || hidden_size % num_attention_heads != 0 {
+                    return Err(PdConfigError::InvalidModelConfig(format!(
+                        "hidden_size ({hidden_size}) must be divisible by num_attention_heads ({num_attention_heads})"
+                    )));
+                }
+                hidden_size / num_attention_heads
+            }
+        };
+
+        Ok(Some(Self::multi_tensor(num_layers, kv_heads, head_dim, 2)))
+    }
+}
+
+fn read_usize_field(
+    config: &serde_json::Value,
+    field: &'static str,
+) -> Result<Option<usize>, PdConfigError> {
+    let Some(value) = config.get(field) else {
+        return Ok(None);
+    };
+
+    let Some(value) = value.as_u64() else {
+        return Err(PdConfigError::InvalidModelConfig(format!(
+            "{field} must be an unsigned integer"
+        )));
+    };
+
+    usize::try_from(value).map(Some).map_err(|_| {
+        PdConfigError::InvalidModelConfig(format!(
+            "{field} is too large for this platform: {value}"
+        ))
+    })
+}
+
+fn required_usize_field(
+    config: &serde_json::Value,
+    field: &'static str,
+) -> Result<usize, PdConfigError> {
+    read_usize_field(config, field)?
+        .ok_or_else(|| PdConfigError::InvalidModelConfig(format!("missing required field {field}")))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -169,12 +323,10 @@ impl PdConfig {
             args.kv_cache_kv_heads,
             args.kv_cache_head_dim,
         ) {
-            (None, None, None) => None,
-            (Some(num_layers), Some(kv_heads), Some(head_dim)) => Some(KvCacheModelLayout {
-                num_layers,
-                kv_heads,
-                head_dim,
-            }),
+            (None, None, None) => KvCacheModelLayout::from_model_path(&args.model_path)?,
+            (Some(num_layers), Some(kv_heads), Some(head_dim)) => Some(
+                KvCacheModelLayout::multi_tensor(num_layers, kv_heads, head_dim, 2),
+            ),
             _ => return Err(PdConfigError::IncompleteKvCacheModelLayout),
         };
 
@@ -218,7 +370,9 @@ pub enum PdConfigError {
     InvalidDisaggregationMode(String),
     InvalidTransferBackend(String),
     InvalidKvCacheDtype(String),
+    InvalidModelConfig(String),
     IncompleteKvCacheModelLayout,
+    MissingMooncakeKvCacheModelLayout,
     KvCacheDtypeRequiresModelMetadata(KvCacheDtype),
     KvCacheLayoutOverflow,
     FakePrefillUnsupported,
@@ -239,8 +393,14 @@ impl fmt::Display for PdConfigError {
             Self::InvalidKvCacheDtype(dtype) => {
                 write!(formatter, "invalid kv cache dtype: {dtype}")
             }
+            Self::InvalidModelConfig(message) => {
+                write!(formatter, "invalid model config: {message}")
+            }
             Self::IncompleteKvCacheModelLayout => formatter
                 .write_str("kv cache model layout requires num layers, KV heads, and head dim"),
+            Self::MissingMooncakeKvCacheModelLayout => {
+                formatter.write_str("mooncake decode requires kv cache model layout")
+            }
             Self::KvCacheDtypeRequiresModelMetadata(dtype) => {
                 write!(
                     formatter,
@@ -1014,16 +1174,17 @@ impl MooncakeKvCacheLayout {
         config: &PdConfig,
         model_layout: &KvCacheModelLayout,
     ) -> Result<Self, PdConfigError> {
-        let kv_elements_per_token = model_layout
-            .elements_per_token()
+        let token_size_bytes = model_layout.token_size_bytes(config.kv_cache_dtype)?;
+        let page_size_bytes = config
+            .page_size
+            .checked_mul(token_size_bytes)
             .ok_or(PdConfigError::KvCacheLayoutOverflow)?;
 
-        Self::from_pd_config_kv_elements(
+        Ok(Self {
             source_base_addr,
-            kv_elements_per_token,
+            page_size_bytes,
             target_base_offset,
-            config,
-        )
+        })
     }
 }
 

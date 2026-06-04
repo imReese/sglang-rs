@@ -175,6 +175,14 @@ pub fn build_bootstrap_fake_pd_grpc_router_service(
 
 pub async fn launch_grpc_server(args: ServerArgs) -> Result<(), ServerLaunchError> {
     let pd_config = PdConfig::from_server_args(&args)?;
+    if pd_config.mode == DisaggregationMode::Decode
+        && pd_config.transfer_backend == TransferBackend::Mooncake
+        && pd_config.kv_cache_model_layout.is_none()
+    {
+        return Err(ServerLaunchError::PdConfig(
+            PdConfigError::MissingMooncakeKvCacheModelLayout,
+        ));
+    }
     if pd_config.mode != DisaggregationMode::Null
         && (pd_config.mode != DisaggregationMode::Decode
             || pd_config.transfer_backend != TransferBackend::Fake)
