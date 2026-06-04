@@ -45,6 +45,20 @@ impl LocalModelArtifacts {
     pub fn validate_routed_expert_checkpoint_coverage(
         &self,
     ) -> Result<RoutedExpertCheckpointCoverage, ModelArtifactError> {
+        let groups = self.safetensors.routed_expert_weight_groups()?;
+        self.validate_routed_expert_checkpoint_coverage_for_groups(&groups)
+    }
+
+    pub fn routed_expert_weight_catalog(
+        &self,
+    ) -> Result<SafetensorsRoutedExpertWeightCatalog, ModelArtifactError> {
+        SafetensorsRoutedExpertWeightCatalog::from_local_model_artifacts(self)
+    }
+
+    fn validate_routed_expert_checkpoint_coverage_for_groups(
+        &self,
+        groups: &[SafetensorsRoutedExpertWeightGroup],
+    ) -> Result<RoutedExpertCheckpointCoverage, ModelArtifactError> {
         let Some(expected_group_count) = self.config.expected_routed_expert_group_count() else {
             return Ok(RoutedExpertCheckpointCoverage {
                 expected_group_count: 0,
@@ -63,7 +77,6 @@ impl LocalModelArtifacts {
                 )
             })?;
 
-        let groups = self.safetensors.routed_expert_weight_groups()?;
         let actual_group_count = groups.len();
         let actual_weight_count = actual_group_count.checked_mul(3).ok_or_else(|| {
             invalid_safetensors_data(
@@ -567,6 +580,46 @@ pub struct SafetensorsRoutedExpertWeightGroup {
     pub gate: SafetensorsTensorSpan,
     pub up: SafetensorsTensorSpan,
     pub down: SafetensorsTensorSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SafetensorsRoutedExpertWeightCatalog {
+    groups: BTreeMap<(usize, usize), SafetensorsRoutedExpertWeightGroup>,
+}
+
+impl SafetensorsRoutedExpertWeightCatalog {
+    pub fn from_local_model_artifacts(
+        artifacts: &LocalModelArtifacts,
+    ) -> Result<Self, ModelArtifactError> {
+        let groups = artifacts
+            .safetensors()
+            .routed_expert_weight_groups()?
+            .into_iter()
+            .collect::<Vec<_>>();
+        artifacts.validate_routed_expert_checkpoint_coverage_for_groups(&groups)?;
+        let groups = groups
+            .into_iter()
+            .map(|group| ((group.layer_id, group.expert_id), group))
+            .collect();
+
+        Ok(Self { groups })
+    }
+
+    pub fn group_count(&self) -> usize {
+        self.groups.len()
+    }
+
+    pub fn coordinates(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.groups.keys().copied()
+    }
+
+    pub fn group(
+        &self,
+        layer_id: usize,
+        expert_id: usize,
+    ) -> Option<&SafetensorsRoutedExpertWeightGroup> {
+        self.groups.get(&(layer_id, expert_id))
+    }
 }
 
 #[derive(Debug)]

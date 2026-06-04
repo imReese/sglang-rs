@@ -3,9 +3,9 @@ use std::path::PathBuf;
 
 use sglang_srt::model_artifacts::{
     HfModelConfig, LocalModelArtifacts, ModelArtifactError, SafetensorsCheckpointFingerprintEntry,
-    SafetensorsRoutedExpertProjection, SafetensorsRoutedExpertWeightGroup,
-    SafetensorsRoutedExpertWeightSpan, SafetensorsTensorData, SafetensorsTensorMetadata,
-    SafetensorsTensorSpan,
+    SafetensorsRoutedExpertProjection, SafetensorsRoutedExpertWeightCatalog,
+    SafetensorsRoutedExpertWeightGroup, SafetensorsRoutedExpertWeightSpan, SafetensorsTensorData,
+    SafetensorsTensorMetadata, SafetensorsTensorSpan,
 };
 
 #[test]
@@ -200,6 +200,118 @@ fn local_model_artifacts_validates_routed_expert_checkpoint_coverage() {
     assert_eq!(summary.actual_group_count, 4);
     assert_eq!(summary.expected_weight_count, 12);
     assert_eq!(summary.actual_weight_count, 12);
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn local_model_artifacts_builds_routed_expert_weight_catalog_for_lookup() {
+    let model_dir = temp_model_dir("routed-expert-weight-catalog");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "model_type": "deepseek_v4",
+  "num_hidden_layers": 2,
+  "n_routed_experts": 2,
+  "first_k_dense_replace": 0,
+  "moe_layer_freq": 1
+}"#,
+    )
+    .expect("config should be written");
+    let shard = model_dir.join("model.safetensors");
+    let header_len = write_safetensors_file(
+        &shard,
+        &[
+            ("model.layers.0.ffn.experts.0.w1.weight", "U8", &[1], [0, 1]),
+            ("model.layers.0.ffn.experts.0.w2.weight", "U8", &[1], [1, 2]),
+            ("model.layers.0.ffn.experts.0.w3.weight", "U8", &[1], [2, 3]),
+            ("model.layers.0.ffn.experts.1.w1.weight", "U8", &[1], [3, 4]),
+            ("model.layers.0.ffn.experts.1.w2.weight", "U8", &[1], [4, 5]),
+            ("model.layers.0.ffn.experts.1.w3.weight", "U8", &[1], [5, 6]),
+            ("model.layers.1.ffn.experts.0.w1.weight", "U8", &[1], [6, 7]),
+            ("model.layers.1.ffn.experts.0.w2.weight", "U8", &[1], [7, 8]),
+            ("model.layers.1.ffn.experts.0.w3.weight", "U8", &[1], [8, 9]),
+            (
+                "model.layers.1.ffn.experts.1.w1.weight",
+                "U8",
+                &[1],
+                [9, 10],
+            ),
+            (
+                "model.layers.1.ffn.experts.1.w2.weight",
+                "U8",
+                &[1],
+                [10, 11],
+            ),
+            (
+                "model.layers.1.ffn.experts.1.w3.weight",
+                "U8",
+                &[1],
+                [11, 12],
+            ),
+        ],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+    )
+    .expect("shard should be written");
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("local artifacts should load");
+
+    let catalog = SafetensorsRoutedExpertWeightCatalog::from_local_model_artifacts(&artifacts)
+        .expect("complete routed expert checkpoint should build catalog");
+
+    assert_eq!(catalog.group_count(), 4);
+    assert_eq!(
+        catalog.coordinates().collect::<Vec<_>>(),
+        vec![(0, 0), (0, 1), (1, 0), (1, 1)]
+    );
+    let group = catalog
+        .group(1, 1)
+        .expect("catalog should look up layer 1 expert 1");
+    assert_eq!(group.layer_id, 1);
+    assert_eq!(group.expert_id, 1);
+    assert_eq!(group.gate.absolute_byte_offset, 8 + header_len as u64 + 9);
+    assert_eq!(group.down.absolute_byte_offset, 8 + header_len as u64 + 10);
+    assert_eq!(group.up.absolute_byte_offset, 8 + header_len as u64 + 11);
+    assert!(catalog.group(9, 0).is_none());
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn local_model_artifacts_exposes_routed_expert_weight_catalog() {
+    let model_dir = temp_model_dir("local-routed-expert-weight-catalog");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "model_type": "deepseek_v4",
+  "num_hidden_layers": 1,
+  "n_routed_experts": 1,
+  "first_k_dense_replace": 0,
+  "moe_layer_freq": 1
+}"#,
+    )
+    .expect("config should be written");
+    write_safetensors_file(
+        &model_dir.join("model.safetensors"),
+        &[
+            ("model.layers.0.ffn.experts.0.w1.weight", "U8", &[1], [0, 1]),
+            ("model.layers.0.ffn.experts.0.w2.weight", "U8", &[1], [1, 2]),
+            ("model.layers.0.ffn.experts.0.w3.weight", "U8", &[1], [2, 3]),
+        ],
+        &[1, 2, 3],
+    )
+    .expect("shard should be written");
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("local artifacts should load");
+
+    let catalog = artifacts
+        .routed_expert_weight_catalog()
+        .expect("local artifacts should expose routed expert catalog");
+
+    assert_eq!(catalog.group_count(), 1);
+    assert!(catalog.group(0, 0).is_some());
 
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
