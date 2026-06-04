@@ -10,12 +10,11 @@ use sglang_srt::server::{
     build_bootstrap_grpc_router_service, build_bootstrap_pd_grpc_router_service, grpc_listen_addr,
 };
 use sglang_srt::transfer::{
-    DecodeBootstrapRegistry, DecodeBootstrapSession, MooncakeBatchId, MooncakeError,
-    MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeTransferRequest,
-    MooncakeTransferStatus, MooncakeTransferStatusCode, MooncakeTransferStatusReader,
-    MooncakeTransferSubmitter, MooncakeTransferTarget,
+    DecodeBootstrapRegistry, MooncakeBatchId, MooncakeError, MooncakeKvCacheLayout,
+    MooncakeKvCacheTransferExecutor, MooncakeTransferRequest, MooncakeTransferStatus,
+    MooncakeTransferStatusCode, MooncakeTransferStatusReader, MooncakeTransferSubmitter,
+    MooncakeTransferTarget,
 };
-use sglang_srt::types::{DisaggregatedParams, RequestId};
 
 #[test]
 fn grpc_listen_addr_uses_server_host_and_port() {
@@ -130,7 +129,6 @@ async fn bootstrap_pd_grpc_router_service_polls_transfer_before_decode() {
         "8",
     ])
     .expect("args should parse");
-    let registry = bootstrap_registry_with_session("bootstrap-pd", 41);
     let transfer_executor = MooncakeKvCacheTransferExecutor::new(
         RecordingMooncakeBackend::completed(),
         MooncakeKvCacheLayout {
@@ -140,7 +138,11 @@ async fn bootstrap_pd_grpc_router_service_polls_transfer_before_decode() {
         },
         MooncakeTransferTarget { target_id: 17 },
     );
-    let service = build_bootstrap_pd_grpc_router_service(&args, registry, transfer_executor);
+    let service = build_bootstrap_pd_grpc_router_service(
+        &args,
+        DecodeBootstrapRegistry::default(),
+        transfer_executor,
+    );
 
     let mut stream = service
         .text_generate(Request::new(TextGenerateRequest {
@@ -230,23 +232,4 @@ impl MooncakeTransferStatusReader for RecordingMooncakeBackend {
             transferred_bytes: 0,
         })
     }
-}
-
-fn bootstrap_registry_with_session(
-    request_id: &str,
-    bootstrap_room: i32,
-) -> DecodeBootstrapRegistry {
-    let mut registry = DecodeBootstrapRegistry::default();
-    registry
-        .register(DecodeBootstrapSession::new(
-            RequestId::from(request_id),
-            DisaggregatedParams {
-                bootstrap_host: "10.0.0.9".to_string(),
-                bootstrap_port: 8998,
-                bootstrap_room,
-            },
-            0,
-        ))
-        .expect("session should register");
-    registry
 }

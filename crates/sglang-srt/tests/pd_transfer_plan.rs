@@ -313,6 +313,40 @@ fn transfer_model_worker_submits_pd_prefill_transfer_during_scheduler_dispatch()
 }
 
 #[test]
+fn transfer_model_worker_registers_pd_prefill_session_before_transfer() {
+    let worker = KvTransferModelWorker::new(
+        FinishedWorker,
+        DecodeBootstrapRegistry::default(),
+        RecordingTransferExecutor::default(),
+    );
+    let mut scheduler =
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(4));
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("pd-auto-register"),
+            vec![1, 2, 3],
+            SamplingParams { max_new_tokens: 1 },
+        )
+        .with_disaggregated_params(Some(disaggregated_params(26)))
+        .with_data_parallel_rank(2),
+    );
+
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill dispatch should auto-register and transfer KV");
+
+    let worker = scheduler.worker();
+    let session = worker
+        .registry()
+        .get(26)
+        .expect("bootstrap session should be registered from request metadata");
+    assert_eq!(session.request_id(), &RequestId::from("pd-auto-register"));
+    assert_eq!(session.data_parallel_rank(), 2);
+    assert_eq!(session.status(), KvPoll::Success);
+    assert_eq!(worker.transfer_executor().seen_rooms, vec![26]);
+}
+
+#[test]
 fn transfer_model_worker_skips_non_pd_prefill_transfer() {
     let worker = KvTransferModelWorker::new(
         FinishedWorker,

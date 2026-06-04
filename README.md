@@ -104,7 +104,8 @@ This repository currently contains the first `sglang-srt` runtime crate:
   executor abstraction that drives bootstrap-room status transitions,
   bootstrap-room-aware Mooncake target resolution, Mooncake KV transfer request
   construction, batch status polling, and a `KvTransferModelWorker` wrapper that
-  runs transfer as part of scheduler prefill dispatch. It also exposes a
+  registers PD bootstrap sessions from prefill request metadata and runs
+  transfer as part of scheduler prefill dispatch. It also exposes a
   decode-side KV-ready predicate used by scheduler decode batching to keep PD
   decode requests queued until their bootstrap room reaches `Success`, plus
   engine/router polling hooks and bounded transfer-polling generation entry

@@ -672,6 +672,12 @@ where
         let output = self.worker.try_generate_batch(batch)?;
 
         if batch.forward_mode() == ForwardMode::Prefill {
+            self.register_prefill_bootstrap_sessions(batch)
+                .map_err(|error| {
+                    WorkerExecutionError::Runtime(format!(
+                        "KV transfer bootstrap registration failed: {error}"
+                    ))
+                })?;
             let worker_batch = ModelWorkerBatch::from_schedule_batch(batch);
             let transfer_plan = KvCacheTransferPlan::from_prefill_worker_batch(&worker_batch)
                 .map_err(|error| {
@@ -716,6 +722,34 @@ where
 
     fn poll_transfers(&mut self) -> Result<MooncakeTransferPollSummary, KvCacheTransferError> {
         self.transfer_executor.poll_transfers(&mut self.registry)
+    }
+}
+
+impl<W, E> KvTransferModelWorker<W, E> {
+    fn register_prefill_bootstrap_sessions(
+        &mut self,
+        batch: &ScheduleBatch,
+    ) -> Result<(), DecodeBootstrapRegistryError> {
+        for request in batch.requests() {
+            let Some(disaggregated_params) = request.disaggregated_params().cloned() else {
+                continue;
+            };
+            if self
+                .registry
+                .get(disaggregated_params.bootstrap_room)
+                .is_some()
+            {
+                continue;
+            }
+
+            self.registry.register(DecodeBootstrapSession::new(
+                request.request_id().clone(),
+                disaggregated_params,
+                request.data_parallel_rank(),
+            ))?;
+        }
+
+        Ok(())
     }
 }
 
