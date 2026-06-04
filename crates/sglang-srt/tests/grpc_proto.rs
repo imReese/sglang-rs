@@ -20,9 +20,9 @@ use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::tokenizer::ByteTokenizer;
 use sglang_srt::transfer::{
     DecodeBootstrapRegistry, DecodeBootstrapSession, KvTransferModelWorker, MooncakeBatchId,
-    MooncakeError, MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeTransferRequest,
-    MooncakeTransferStatus, MooncakeTransferStatusCode, MooncakeTransferStatusReader,
-    MooncakeTransferSubmitter, MooncakeTransferTarget,
+    MooncakeBatchReleaser, MooncakeError, MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor,
+    MooncakeTransferRequest, MooncakeTransferStatus, MooncakeTransferStatusCode,
+    MooncakeTransferStatusReader, MooncakeTransferSubmitter, MooncakeTransferTarget,
 };
 use sglang_srt::types::{
     DisaggregatedParams as RuntimeDisaggregatedParams, RequestId,
@@ -828,6 +828,7 @@ async fn grpc_pause_generation_rejects_generate_until_continued() {
 struct RecordingMooncakeBackend {
     submitted_batches: usize,
     statuses: Vec<MooncakeTransferStatusCode>,
+    freed_batches: Vec<MooncakeBatchId>,
 }
 
 impl RecordingMooncakeBackend {
@@ -835,6 +836,7 @@ impl RecordingMooncakeBackend {
         Self {
             submitted_batches: 0,
             statuses: vec![MooncakeTransferStatusCode::Completed],
+            freed_batches: Vec::new(),
         }
     }
 }
@@ -866,6 +868,13 @@ impl MooncakeTransferStatusReader for RecordingMooncakeBackend {
             status: status as i32,
             transferred_bytes: 0,
         })
+    }
+}
+
+impl MooncakeBatchReleaser for RecordingMooncakeBackend {
+    fn free_batch(&mut self, batch_id: MooncakeBatchId) -> Result<(), MooncakeError> {
+        self.freed_batches.push(batch_id);
+        Ok(())
     }
 }
 

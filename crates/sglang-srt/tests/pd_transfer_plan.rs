@@ -7,11 +7,11 @@ use sglang_srt::tokenizer::ByteTokenizer;
 use sglang_srt::transfer::{
     DecodeBootstrapRegistry, DecodeBootstrapSession, FakeKvCacheTransferExecutor,
     KvCacheTransferError, KvCacheTransferExecutor, KvCacheTransferPlan, KvCacheTransferPlanError,
-    KvCacheTransferSpan, KvPoll, KvTransferModelWorker, MooncakeBatchId, MooncakeError,
-    MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeOpcode, MooncakeSubmittedBatch,
-    MooncakeTransferRequest, MooncakeTransferStatus, MooncakeTransferStatusCode,
-    MooncakeTransferStatusReader, MooncakeTransferSubmitter, MooncakeTransferTarget,
-    MooncakeTransferTargetResolver, build_mooncake_kv_transfer_requests,
+    KvCacheTransferSpan, KvPoll, KvTransferModelWorker, MooncakeBatchId, MooncakeBatchReleaser,
+    MooncakeError, MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeOpcode,
+    MooncakeSubmittedBatch, MooncakeTransferRequest, MooncakeTransferStatus,
+    MooncakeTransferStatusCode, MooncakeTransferStatusReader, MooncakeTransferSubmitter,
+    MooncakeTransferTarget, MooncakeTransferTargetResolver, build_mooncake_kv_transfer_requests,
     execute_kv_cache_transfer_plan, is_decode_request_kv_ready, poll_mooncake_transfer_batches,
 };
 use sglang_srt::types::{DisaggregatedParams, RequestId, SamplingParams, TokenGenerateRequest};
@@ -944,6 +944,60 @@ fn mooncake_executor_submits_built_requests_through_transfer_submitter() {
 }
 
 #[test]
+fn mooncake_executor_clears_completed_submitted_transfers_after_poll() {
+    let transfer_plan = transfer_plan_for_request("pd-mooncake-cleanup", &[61, 62], None, 28);
+    let mut registry = registry_with_session("pd-mooncake-cleanup", 28);
+    let mut executor = MooncakeKvCacheTransferExecutor::new(
+        RecordingMooncakeBackend::completed(),
+        MooncakeKvCacheLayout {
+            source_base_addr: 0x2100,
+            page_size_bytes: 128,
+            target_base_offset: 0x9100,
+        },
+        MooncakeTransferTarget { target_id: 8 },
+    );
+    execute_kv_cache_transfer_plan(&mut registry, &mut executor, &transfer_plan)
+        .expect("mooncake executor should submit");
+    assert_eq!(executor.submitted_transfers().len(), 1);
+
+    let summary = executor
+        .poll_submitted_transfers(&mut registry)
+        .expect("completed transfer should poll successfully");
+
+    assert_eq!(summary.completed_batches(), 1);
+    assert!(executor.submitted_transfers().is_empty());
+    assert!(executor.submitted_batches().is_empty());
+    assert_eq!(executor.submitter().freed_batches, vec![300]);
+}
+
+#[test]
+fn mooncake_executor_keeps_pending_submitted_transfers_after_poll() {
+    let transfer_plan =
+        transfer_plan_for_request("pd-mooncake-pending-cleanup", &[63, 64], None, 29);
+    let mut registry = registry_with_session("pd-mooncake-pending-cleanup", 29);
+    let mut executor = MooncakeKvCacheTransferExecutor::new(
+        RecordingMooncakeBackend::pending(),
+        MooncakeKvCacheLayout {
+            source_base_addr: 0x2200,
+            page_size_bytes: 128,
+            target_base_offset: 0x9200,
+        },
+        MooncakeTransferTarget { target_id: 8 },
+    );
+    execute_kv_cache_transfer_plan(&mut registry, &mut executor, &transfer_plan)
+        .expect("mooncake executor should submit");
+
+    let summary = executor
+        .poll_submitted_transfers(&mut registry)
+        .expect("pending transfer should poll successfully");
+
+    assert_eq!(summary.pending_batches(), 1);
+    assert_eq!(executor.submitted_batches(), &[300]);
+    assert_eq!(executor.submitted_transfers().len(), 1);
+    assert!(executor.submitter().freed_batches.is_empty());
+}
+
+#[test]
 fn mooncake_executor_maps_request_build_errors_to_transfer_runtime_errors() {
     let transfer_plan = transfer_plan_for_request("pd-bad-layout", &[70], None, 10);
     let mut registry = registry_with_session("pd-bad-layout", 10);
@@ -1115,6 +1169,7 @@ impl KvCacheTransferExecutor for RecordingTransferExecutor {
 #[derive(Default)]
 struct RecordingMooncakeSubmitter {
     submitted_requests: Vec<Vec<MooncakeTransferRequest>>,
+    freed_batches: Vec<MooncakeBatchId>,
 }
 
 impl MooncakeTransferSubmitter for RecordingMooncakeSubmitter {
@@ -1140,10 +1195,18 @@ impl MooncakeTransferStatusReader for RecordingMooncakeSubmitter {
     }
 }
 
+impl MooncakeBatchReleaser for RecordingMooncakeSubmitter {
+    fn free_batch(&mut self, batch_id: MooncakeBatchId) -> Result<(), MooncakeError> {
+        self.freed_batches.push(batch_id);
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 struct RecordingMooncakeBackend {
     submitted_requests: Vec<Vec<MooncakeTransferRequest>>,
     statuses: Vec<MooncakeTransferStatusCode>,
+    freed_batches: Vec<MooncakeBatchId>,
 }
 
 impl RecordingMooncakeBackend {
@@ -1151,6 +1214,15 @@ impl RecordingMooncakeBackend {
         Self {
             submitted_requests: Vec::new(),
             statuses: vec![MooncakeTransferStatusCode::Completed],
+            freed_batches: Vec::new(),
+        }
+    }
+
+    fn pending() -> Self {
+        Self {
+            submitted_requests: Vec::new(),
+            statuses: vec![MooncakeTransferStatusCode::Pending],
+            freed_batches: Vec::new(),
         }
     }
 }
@@ -1181,6 +1253,13 @@ impl MooncakeTransferStatusReader for RecordingMooncakeBackend {
             status: status as i32,
             transferred_bytes: 0,
         })
+    }
+}
+
+impl MooncakeBatchReleaser for RecordingMooncakeBackend {
+    fn free_batch(&mut self, batch_id: MooncakeBatchId) -> Result<(), MooncakeError> {
+        self.freed_batches.push(batch_id);
+        Ok(())
     }
 }
 

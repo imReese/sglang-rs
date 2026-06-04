@@ -975,6 +975,10 @@ pub trait MooncakeTransferStatusReader {
     ) -> Result<MooncakeTransferStatus, MooncakeError>;
 }
 
+pub trait MooncakeBatchReleaser {
+    fn free_batch(&mut self, batch_id: MooncakeBatchId) -> Result<(), MooncakeError>;
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MooncakeSubmittedBatch {
     bootstrap_room: i32,
@@ -1067,6 +1071,53 @@ where
     Ok(summary)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MooncakePolledBatchState {
+    Completed,
+    Pending,
+}
+
+fn poll_mooncake_submitted_batch<R>(
+    registry: &mut DecodeBootstrapRegistry,
+    reader: &mut R,
+    batch: &MooncakeSubmittedBatch,
+) -> Result<MooncakePolledBatchState, KvCacheTransferError>
+where
+    R: MooncakeTransferStatusReader,
+{
+    let mut completed_tasks = 0;
+
+    for task_id in 0..batch.task_count() {
+        let status = reader
+            .transfer_status(batch.batch_id(), task_id)
+            .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
+        match MooncakeTransferStatusCode::try_from(status.status)? {
+            MooncakeTransferStatusCode::Completed => {
+                completed_tasks += 1;
+            }
+            MooncakeTransferStatusCode::Waiting | MooncakeTransferStatusCode::Pending => {}
+            MooncakeTransferStatusCode::Invalid
+            | MooncakeTransferStatusCode::Canceled
+            | MooncakeTransferStatusCode::Timeout
+            | MooncakeTransferStatusCode::Failed => {
+                registry.update_status(batch.bootstrap_room(), KvPoll::Failed)?;
+                return Err(KvCacheTransferError::Runtime(format!(
+                    "Mooncake transfer batch {} task {task_id} failed with status {}",
+                    batch.batch_id(),
+                    status.status
+                )));
+            }
+        }
+    }
+
+    if completed_tasks == batch.task_count() {
+        registry.update_status(batch.bootstrap_room(), KvPoll::Success)?;
+        Ok(MooncakePolledBatchState::Completed)
+    } else {
+        Ok(MooncakePolledBatchState::Pending)
+    }
+}
+
 pub struct MooncakeKvCacheTransferExecutor<S, R = FixedMooncakeTransferTargetResolver> {
     submitter: S,
     layout: MooncakeKvCacheLayout,
@@ -1131,20 +1182,45 @@ impl<S, R> MooncakeKvCacheTransferExecutor<S, R> {
 
 impl<S, R> MooncakeKvCacheTransferExecutor<S, R>
 where
-    S: MooncakeTransferStatusReader,
+    S: MooncakeTransferStatusReader + MooncakeBatchReleaser,
 {
     pub fn poll_submitted_transfers(
         &mut self,
         registry: &mut DecodeBootstrapRegistry,
     ) -> Result<MooncakeTransferPollSummary, KvCacheTransferError> {
         let submitted_transfers = self.submitted_transfers.clone();
-        poll_mooncake_transfer_batches(registry, &mut self.submitter, &submitted_transfers)
+        let mut summary = MooncakeTransferPollSummary::default();
+        let mut pending_transfers = Vec::new();
+
+        for transfer in submitted_transfers {
+            match poll_mooncake_submitted_batch(registry, &mut self.submitter, &transfer)? {
+                MooncakePolledBatchState::Completed => {
+                    self.submitter
+                        .free_batch(transfer.batch_id())
+                        .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
+                    summary.completed_batches += 1;
+                }
+                MooncakePolledBatchState::Pending => {
+                    pending_transfers.push(transfer);
+                    summary.pending_batches += 1;
+                }
+            }
+        }
+
+        self.submitted_transfers = pending_transfers;
+        self.submitted_batches = self
+            .submitted_transfers
+            .iter()
+            .map(MooncakeSubmittedBatch::batch_id)
+            .collect();
+
+        Ok(summary)
     }
 }
 
 impl<S, R> KvCacheTransferExecutor for MooncakeKvCacheTransferExecutor<S, R>
 where
-    S: MooncakeTransferSubmitter + MooncakeTransferStatusReader,
+    S: MooncakeTransferSubmitter + MooncakeTransferStatusReader + MooncakeBatchReleaser,
     R: MooncakeTransferTargetResolver,
 {
     fn transfer_span(&mut self, span: &KvCacheTransferSpan) -> Result<(), KvCacheTransferError> {
@@ -1327,6 +1403,13 @@ impl MooncakeTransferStatusReader for LinkedMooncakeTransferEngine {
         task_id: usize,
     ) -> Result<MooncakeTransferStatus, MooncakeError> {
         LinkedMooncakeTransferEngine::transfer_status(self, batch_id, task_id)
+    }
+}
+
+#[cfg(feature = "mooncake-link")]
+impl MooncakeBatchReleaser for LinkedMooncakeTransferEngine {
+    fn free_batch(&mut self, batch_id: MooncakeBatchId) -> Result<(), MooncakeError> {
+        LinkedMooncakeTransferEngine::free_batch(self, batch_id)
     }
 }
 

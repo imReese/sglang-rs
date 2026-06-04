@@ -12,8 +12,8 @@ use sglang_srt::server::{
     launch_grpc_server,
 };
 use sglang_srt::transfer::{
-    DecodeBootstrapRegistry, DisaggregationMode, MooncakeBatchId, MooncakeError,
-    MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeTransferRequest,
+    DecodeBootstrapRegistry, DisaggregationMode, MooncakeBatchId, MooncakeBatchReleaser,
+    MooncakeError, MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeTransferRequest,
     MooncakeTransferStatus, MooncakeTransferStatusCode, MooncakeTransferStatusReader,
     MooncakeTransferSubmitter, MooncakeTransferTarget, TransferBackend,
 };
@@ -281,6 +281,7 @@ async fn launch_grpc_server_rejects_unsupported_bootstrap_pd_backend() {
 struct RecordingMooncakeBackend {
     submitted_batches: usize,
     statuses: Vec<MooncakeTransferStatusCode>,
+    freed_batches: Vec<MooncakeBatchId>,
 }
 
 impl RecordingMooncakeBackend {
@@ -288,6 +289,7 @@ impl RecordingMooncakeBackend {
         Self {
             submitted_batches: 0,
             statuses: vec![MooncakeTransferStatusCode::Completed],
+            freed_batches: Vec::new(),
         }
     }
 }
@@ -319,5 +321,12 @@ impl MooncakeTransferStatusReader for RecordingMooncakeBackend {
             status: status as i32,
             transferred_bytes: 0,
         })
+    }
+}
+
+impl MooncakeBatchReleaser for RecordingMooncakeBackend {
+    fn free_batch(&mut self, batch_id: MooncakeBatchId) -> Result<(), MooncakeError> {
+        self.freed_batches.push(batch_id);
+        Ok(())
     }
 }
