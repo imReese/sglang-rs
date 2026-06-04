@@ -298,6 +298,32 @@ fn router_generate_request_accepts_valid_extended_sampling_params() {
 }
 
 #[test]
+fn router_generate_request_accepts_top_k_minus_one_as_unbounded_sampling() {
+    let request = RouterGenerateRequest {
+        request_id: "top-k-disabled".to_string(),
+        tokenized: Some(RouterTokenizedInput {
+            original_text: String::new(),
+            input_ids: vec![1],
+        }),
+        sampling_params: Some(RouterSamplingParams {
+            max_new_tokens: Some(8),
+            top_k: Some(-1),
+            ..Default::default()
+        }),
+        disaggregated_params: None,
+        stream: false,
+        data_parallel_rank: 0,
+        trace_headers: Default::default(),
+    };
+
+    let token_request = request
+        .try_into_token_generate_request()
+        .expect("top_k=-1 should disable top-k filtering like upstream SGLang");
+
+    assert_eq!(token_request.sampling.top_k, Some(-1));
+}
+
+#[test]
 fn router_generate_request_rejects_invalid_float_sampling_params() {
     let request = RouterGenerateRequest {
         request_id: "bad-top-p".to_string(),
@@ -324,7 +350,40 @@ fn router_generate_request_rejects_invalid_float_sampling_params() {
         RouterProtocolError::InvalidFloatSamplingParam {
             field: "top_p",
             value: 1.1,
-            expected: "finite and in [0, 1]",
+            expected: "finite and in (0, 1]",
+        }
+    );
+    assert_eq!(error.status_code(), RouterStatusCode::InvalidArgument);
+}
+
+#[test]
+fn router_generate_request_rejects_zero_top_p() {
+    let request = RouterGenerateRequest {
+        request_id: "zero-top-p".to_string(),
+        tokenized: Some(RouterTokenizedInput {
+            original_text: String::new(),
+            input_ids: vec![1],
+        }),
+        sampling_params: Some(RouterSamplingParams {
+            top_p: Some(0.0),
+            ..Default::default()
+        }),
+        disaggregated_params: None,
+        stream: false,
+        data_parallel_rank: 0,
+        trace_headers: Default::default(),
+    };
+
+    let error = request
+        .try_into_token_generate_request()
+        .expect_err("top_p=0 should be rejected");
+
+    assert_eq!(
+        error,
+        RouterProtocolError::InvalidFloatSamplingParam {
+            field: "top_p",
+            value: 0.0,
+            expected: "finite and in (0, 1]",
         }
     );
     assert_eq!(error.status_code(), RouterStatusCode::InvalidArgument);

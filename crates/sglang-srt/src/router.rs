@@ -39,12 +39,12 @@ pub struct RouterSamplingParams {
 impl RouterSamplingParams {
     fn into_sampling_params(self) -> Result<SamplingParams, RouterProtocolError> {
         validate_optional_non_negative_float("temperature", self.temperature)?;
-        validate_optional_unit_float("top_p", self.top_p)?;
+        validate_optional_positive_unit_float("top_p", self.top_p)?;
         validate_optional_unit_float("min_p", self.min_p)?;
         validate_optional_non_negative_float("frequency_penalty", self.frequency_penalty)?;
         validate_optional_non_negative_float("presence_penalty", self.presence_penalty)?;
         validate_optional_positive_float("repetition_penalty", self.repetition_penalty)?;
-        validate_optional_non_negative_i32("top_k", self.top_k)?;
+        validate_optional_unbounded_or_positive_i32("top_k", self.top_k)?;
         validate_optional_positive_i32("n", self.n)?;
         validate_optional_positive_i32("best_of", self.best_of)?;
 
@@ -147,18 +147,36 @@ fn validate_optional_unit_float(
     Ok(())
 }
 
-fn validate_optional_non_negative_i32(
+fn validate_optional_positive_unit_float(
+    field: &'static str,
+    value: Option<f32>,
+) -> Result<(), RouterProtocolError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) || value == 0.0 {
+        return Err(RouterProtocolError::InvalidFloatSamplingParam {
+            field,
+            value,
+            expected: "finite and in (0, 1]",
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_optional_unbounded_or_positive_i32(
     field: &'static str,
     value: Option<i32>,
 ) -> Result<(), RouterProtocolError> {
     let Some(value) = value else {
         return Ok(());
     };
-    if value < 0 {
+    if value != -1 && value < 1 {
         return Err(RouterProtocolError::InvalidIntegerSamplingParam {
             field,
             value,
-            expected: "non-negative",
+            expected: "-1 or positive",
         });
     }
 
