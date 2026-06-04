@@ -160,6 +160,8 @@ pub struct RoutedExpertCheckpointCoverage {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalModelCheckpointCatalog {
+    model_path: PathBuf,
+    config: HfModelConfig,
     layer_tensors: SafetensorsLayerTensorCatalog,
     routed_experts: SafetensorsRoutedExpertWeightCatalog,
 }
@@ -172,6 +174,8 @@ impl LocalModelCheckpointCatalog {
         let routed_experts = artifacts.routed_expert_weight_catalog()?;
 
         Ok(Self {
+            model_path: artifacts.model_path().to_path_buf(),
+            config: artifacts.config().clone(),
             layer_tensors,
             routed_experts,
         })
@@ -183,6 +187,154 @@ impl LocalModelCheckpointCatalog {
 
     pub fn routed_experts(&self) -> &SafetensorsRoutedExpertWeightCatalog {
         &self.routed_experts
+    }
+
+    pub fn deepseek_layer_weights(
+        &self,
+        layer_id: usize,
+    ) -> Result<DeepSeekLayerCheckpointWeights<'_>, ModelArtifactError> {
+        let routed_experts = if self.config.is_moe_layer(layer_id) {
+            Some(self.routed_experts.layer(layer_id).ok_or_else(|| {
+                invalid_safetensors_data(
+                    &self.model_path,
+                    format!("missing DeepSeek layer {layer_id} routed expert weights"),
+                )
+            })?)
+        } else {
+            None
+        };
+
+        Ok(DeepSeekLayerCheckpointWeights {
+            layer_id,
+            wq_a: self.required_deepseek_layer_tensor(layer_id, "self_attn.wq_a.weight")?,
+            wq_b: self.required_deepseek_layer_tensor(layer_id, "self_attn.wq_b.weight")?,
+            wkv: self.required_deepseek_layer_tensor(layer_id, "self_attn.wkv.weight")?,
+            q_norm: self.required_deepseek_layer_tensor(layer_id, "self_attn.q_norm.weight")?,
+            kv_norm: self.required_deepseek_layer_tensor(layer_id, "self_attn.kv_norm.weight")?,
+            wo_a: self.required_deepseek_layer_tensor(layer_id, "self_attn.wo_a.weight")?,
+            wo_b: self.required_deepseek_layer_tensor(layer_id, "self_attn.wo_b.weight")?,
+            input_layernorm: self
+                .required_deepseek_layer_tensor(layer_id, "input_layernorm.weight")?,
+            post_attention_layernorm: self
+                .required_deepseek_layer_tensor(layer_id, "post_attention_layernorm.weight")?,
+            hc_attn_fn: self.required_deepseek_layer_tensor(layer_id, "hc_attn_fn")?,
+            hc_attn_base: self.required_deepseek_layer_tensor(layer_id, "hc_attn_base")?,
+            hc_attn_scale: self.required_deepseek_layer_tensor(layer_id, "hc_attn_scale")?,
+            hc_ffn_fn: self.required_deepseek_layer_tensor(layer_id, "hc_ffn_fn")?,
+            hc_ffn_base: self.required_deepseek_layer_tensor(layer_id, "hc_ffn_base")?,
+            hc_ffn_scale: self.required_deepseek_layer_tensor(layer_id, "hc_ffn_scale")?,
+            mlp_gate: self.required_deepseek_layer_tensor(layer_id, "mlp.gate.weight")?,
+            routed_experts,
+        })
+    }
+
+    fn required_deepseek_layer_tensor(
+        &self,
+        layer_id: usize,
+        suffix: &str,
+    ) -> Result<&SafetensorsLayerTensorSpan, ModelArtifactError> {
+        self.layer_tensors.span(layer_id, suffix).ok_or_else(|| {
+            invalid_safetensors_data(
+                &self.model_path,
+                format!("missing DeepSeek layer {layer_id} tensor {suffix}"),
+            )
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeepSeekLayerCheckpointWeights<'a> {
+    layer_id: usize,
+    wq_a: &'a SafetensorsLayerTensorSpan,
+    wq_b: &'a SafetensorsLayerTensorSpan,
+    wkv: &'a SafetensorsLayerTensorSpan,
+    q_norm: &'a SafetensorsLayerTensorSpan,
+    kv_norm: &'a SafetensorsLayerTensorSpan,
+    wo_a: &'a SafetensorsLayerTensorSpan,
+    wo_b: &'a SafetensorsLayerTensorSpan,
+    input_layernorm: &'a SafetensorsLayerTensorSpan,
+    post_attention_layernorm: &'a SafetensorsLayerTensorSpan,
+    hc_attn_fn: &'a SafetensorsLayerTensorSpan,
+    hc_attn_base: &'a SafetensorsLayerTensorSpan,
+    hc_attn_scale: &'a SafetensorsLayerTensorSpan,
+    hc_ffn_fn: &'a SafetensorsLayerTensorSpan,
+    hc_ffn_base: &'a SafetensorsLayerTensorSpan,
+    hc_ffn_scale: &'a SafetensorsLayerTensorSpan,
+    mlp_gate: &'a SafetensorsLayerTensorSpan,
+    routed_experts: Option<SafetensorsRoutedExpertLayerWeights<'a>>,
+}
+
+impl<'a> DeepSeekLayerCheckpointWeights<'a> {
+    pub fn layer_id(&self) -> usize {
+        self.layer_id
+    }
+
+    pub fn wq_a(&self) -> &'a SafetensorsLayerTensorSpan {
+        self.wq_a
+    }
+
+    pub fn wq_b(&self) -> &'a SafetensorsLayerTensorSpan {
+        self.wq_b
+    }
+
+    pub fn wkv(&self) -> &'a SafetensorsLayerTensorSpan {
+        self.wkv
+    }
+
+    pub fn q_norm(&self) -> &'a SafetensorsLayerTensorSpan {
+        self.q_norm
+    }
+
+    pub fn kv_norm(&self) -> &'a SafetensorsLayerTensorSpan {
+        self.kv_norm
+    }
+
+    pub fn wo_a(&self) -> &'a SafetensorsLayerTensorSpan {
+        self.wo_a
+    }
+
+    pub fn wo_b(&self) -> &'a SafetensorsLayerTensorSpan {
+        self.wo_b
+    }
+
+    pub fn input_layernorm(&self) -> &'a SafetensorsLayerTensorSpan {
+        self.input_layernorm
+    }
+
+    pub fn post_attention_layernorm(&self) -> &'a SafetensorsLayerTensorSpan {
+        self.post_attention_layernorm
+    }
+
+    pub fn hc_attn_fn(&self) -> &'a SafetensorsLayerTensorSpan {
+        self.hc_attn_fn
+    }
+
+    pub fn hc_attn_base(&self) -> &'a SafetensorsLayerTensorSpan {
+        self.hc_attn_base
+    }
+
+    pub fn hc_attn_scale(&self) -> &'a SafetensorsLayerTensorSpan {
+        self.hc_attn_scale
+    }
+
+    pub fn hc_ffn_fn(&self) -> &'a SafetensorsLayerTensorSpan {
+        self.hc_ffn_fn
+    }
+
+    pub fn hc_ffn_base(&self) -> &'a SafetensorsLayerTensorSpan {
+        self.hc_ffn_base
+    }
+
+    pub fn hc_ffn_scale(&self) -> &'a SafetensorsLayerTensorSpan {
+        self.hc_ffn_scale
+    }
+
+    pub fn mlp_gate(&self) -> &'a SafetensorsLayerTensorSpan {
+        self.mlp_gate
+    }
+
+    pub fn routed_experts(&self) -> Option<&SafetensorsRoutedExpertLayerWeights<'a>> {
+        self.routed_experts.as_ref()
     }
 }
 
