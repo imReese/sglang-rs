@@ -251,6 +251,30 @@ async fn bootstrap_fake_pd_grpc_router_service_uses_decode_transfer_path() {
 }
 
 #[tokio::test]
+async fn bootstrap_pd_grpc_router_service_applies_max_running_requests() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--grpc-mode",
+        "--disaggregation-mode",
+        "decode",
+        "--disaggregation-transfer-backend",
+        "fake",
+        "--max-running-requests",
+        "1",
+    ])
+    .expect("args should parse");
+    let service = build_bootstrap_fake_pd_grpc_router_service(&args);
+    let runtime = service
+        .runtime()
+        .lock()
+        .expect("runtime lock should be held");
+
+    assert_eq!(runtime.engine().scheduler().max_running_requests(), Some(1));
+}
+
+#[tokio::test]
 async fn launch_grpc_server_rejects_unsupported_bootstrap_pd_backend() {
     let args = ServerArgs::parse_from([
         "serve",

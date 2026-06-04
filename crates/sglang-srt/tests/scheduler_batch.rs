@@ -204,6 +204,50 @@ fn abort_request_removes_decode_request_by_id() {
 }
 
 #[test]
+fn next_prefill_batch_respects_max_running_request_capacity() {
+    let mut scheduler = Scheduler::new(UnfinishedWorker).with_max_running_requests(Some(1));
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("active-decode"),
+        vec![1],
+        SamplingParams { max_new_tokens: 2 },
+    ));
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("waiting-prefill"),
+        vec![2],
+        SamplingParams { max_new_tokens: 2 },
+    ));
+
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("first prefill should occupy the only active slot");
+
+    assert_eq!(scheduler.decode_queue_depth(), 1);
+    assert_eq!(scheduler.waiting_queue_depth(), 1);
+    assert!(matches!(
+        scheduler.next_prefill_batch(1),
+        Err(
+            sglang_srt::scheduler::SchedulerError::RunningRequestLimitReached {
+                max_running_requests: 1
+            }
+        )
+    ));
+    assert_eq!(scheduler.waiting_queue_depth(), 1);
+
+    scheduler
+        .dispatch_decode_batch(1)
+        .expect("decode should finish and release the active slot");
+    let batch = scheduler
+        .next_prefill_batch(1)
+        .expect("waiting prefill should be admitted after decode finishes");
+
+    assert_eq!(
+        batch.requests()[0].request_id(),
+        &RequestId::from("waiting-prefill")
+    );
+    assert_eq!(scheduler.waiting_queue_depth(), 0);
+}
+
+#[test]
 fn dispatch_prefill_batch_sends_batch_to_worker_and_returns_outputs_by_request() {
     let mut scheduler = Scheduler::new(RecordingBatchWorker::default());
     enqueue_request(&mut scheduler, "req-a", &[1]);

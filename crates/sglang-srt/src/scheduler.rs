@@ -146,6 +146,7 @@ impl ScheduledRequest {
 #[derive(Debug, Eq, PartialEq)]
 pub enum SchedulerError {
     EmptyQueue,
+    RunningRequestLimitReached { max_running_requests: usize },
     DecodeNotReady { request_id: RequestId },
     CacheAllocation(CacheAllocationError),
     Worker(WorkerExecutionError),
@@ -155,6 +156,12 @@ impl fmt::Display for SchedulerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyQueue => formatter.write_str("scheduler queue is empty"),
+            Self::RunningRequestLimitReached {
+                max_running_requests,
+            } => write!(
+                formatter,
+                "running request limit reached: {max_running_requests}"
+            ),
             Self::DecodeNotReady { request_id } => {
                 write!(
                     formatter,
@@ -195,6 +202,7 @@ pub struct Scheduler<W> {
     decode_queue: VecDeque<ScheduledRequest>,
     prefix_cache: RadixCache,
     cache_page_allocator: Option<CachePageAllocator>,
+    max_running_requests: Option<usize>,
     worker: W,
 }
 
@@ -254,6 +262,7 @@ impl<W> Scheduler<W> {
             decode_queue: VecDeque::new(),
             prefix_cache,
             cache_page_allocator: None,
+            max_running_requests: None,
             worker,
         }
     }
@@ -268,8 +277,18 @@ impl<W> Scheduler<W> {
             decode_queue: VecDeque::new(),
             prefix_cache,
             cache_page_allocator: Some(cache_page_allocator),
+            max_running_requests: None,
             worker,
         }
+    }
+
+    pub fn with_max_running_requests(mut self, max_running_requests: Option<usize>) -> Self {
+        self.max_running_requests = max_running_requests;
+        self
+    }
+
+    pub fn max_running_requests(&self) -> Option<usize> {
+        self.max_running_requests
     }
 
     pub fn enqueue(&mut self, request: ScheduledRequest) {
@@ -344,6 +363,7 @@ impl<W> Scheduler<W> {
             return Err(SchedulerError::EmptyQueue);
         }
 
+        let max_batch_size = max_batch_size.min(self.remaining_running_request_capacity()?);
         let mut requests = Vec::with_capacity(max_batch_size.min(self.waiting_queue.len()));
         let mut uncached_token_count = 0;
 
@@ -381,6 +401,21 @@ impl<W> Scheduler<W> {
         }
 
         Ok(ScheduleBatch::prefill(requests))
+    }
+
+    fn remaining_running_request_capacity(&self) -> Result<usize, SchedulerError> {
+        let Some(max_running_requests) = self.max_running_requests else {
+            return Ok(usize::MAX);
+        };
+
+        let remaining = max_running_requests.saturating_sub(self.decode_queue.len());
+        if remaining == 0 {
+            return Err(SchedulerError::RunningRequestLimitReached {
+                max_running_requests,
+            });
+        }
+
+        Ok(remaining)
     }
 
     fn prepare_prefill_request(

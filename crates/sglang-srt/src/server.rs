@@ -131,7 +131,8 @@ pub fn grpc_listen_addr(args: &ServerArgs) -> Result<SocketAddr, ServerLaunchErr
 }
 
 pub fn build_bootstrap_grpc_router_service(args: &ServerArgs) -> BootstrapGrpcRouterService {
-    let scheduler = Scheduler::new(ModelRunner::new(BootstrapForwardModel));
+    let scheduler = Scheduler::new(ModelRunner::new(BootstrapForwardModel))
+        .with_max_running_requests(args.max_running_requests);
     let engine = Engine::new(ByteTokenizer, scheduler);
     let runtime = RouterRuntime::new(engine);
     GrpcRouterService::with_server_args(runtime, args)
@@ -154,7 +155,8 @@ where
         worker,
         RadixCache::default(),
         CachePageAllocator::new(args.num_reserved_decode_tokens),
-    );
+    )
+    .with_max_running_requests(args.max_running_requests);
     let engine = Engine::new(ByteTokenizer, scheduler);
     let runtime = RouterRuntime::new(engine);
     GrpcRouterService::with_server_args(runtime, args)
