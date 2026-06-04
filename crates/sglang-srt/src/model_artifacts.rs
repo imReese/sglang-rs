@@ -59,6 +59,17 @@ impl LocalModelArtifacts {
         LocalModelCheckpointCatalog::from_local_model_artifacts(self)
     }
 
+    pub fn validate_checkpoint_for_supported_model(&self) -> Result<(), ModelArtifactError> {
+        let checkpoint = self.checkpoint_catalog()?;
+        match self.config.model_type.as_deref() {
+            Some("deepseek_v4") => {
+                checkpoint.deepseek_model_weights()?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn validate_routed_expert_checkpoint_coverage_for_groups(
         &self,
         groups: &[SafetensorsRoutedExpertWeightGroup],

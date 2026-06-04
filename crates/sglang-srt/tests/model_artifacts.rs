@@ -395,6 +395,71 @@ fn local_model_artifacts_builds_checkpoint_catalog_for_layer_and_routed_weights(
 }
 
 #[test]
+fn local_model_artifacts_dispatches_checkpoint_validation_by_model_type() {
+    let deepseek_dir = temp_model_dir("deepseek-v4-dispatch-validation");
+    fs::create_dir_all(&deepseek_dir).expect("temp model dir should be created");
+    fs::write(
+        deepseek_dir.join("config.json"),
+        r#"{
+  "model_type": "deepseek_v4",
+  "num_hidden_layers": 0
+}"#,
+    )
+    .expect("config should be written");
+    write_safetensors_file(
+        &deepseek_dir.join("model.safetensors"),
+        &[
+            ("model.embed_tokens.weight", "U8", &[1], [0, 1]),
+            ("model.norm.weight", "U8", &[1], [1, 2]),
+        ],
+        &[1, 2],
+    )
+    .expect("shard should be written");
+    let deepseek_artifacts = LocalModelArtifacts::from_model_path(&deepseek_dir)
+        .expect("DeepSeek local artifacts should load");
+
+    let error = deepseek_artifacts
+        .validate_checkpoint_for_supported_model()
+        .expect_err("DeepSeek V4 dispatch should enforce DeepSeek checkpoint structure");
+
+    assert!(
+        matches!(
+            error,
+            ModelArtifactError::InvalidSafetensorsData { ref path, ref message }
+                if path == &deepseek_dir
+                    && message.contains("missing DeepSeek model tensor")
+                    && message.contains("lm_head.weight")
+        ),
+        "unexpected error: {error:?}"
+    );
+
+    let generic_dir = temp_model_dir("generic-dispatch-validation");
+    fs::create_dir_all(&generic_dir).expect("temp model dir should be created");
+    fs::write(
+        generic_dir.join("config.json"),
+        r#"{
+  "model_type": "llama"
+}"#,
+    )
+    .expect("config should be written");
+    write_safetensors_file(
+        &generic_dir.join("model.safetensors"),
+        &[("model.embed_tokens.weight", "U8", &[1], [0, 1])],
+        &[7],
+    )
+    .expect("shard should be written");
+    let generic_artifacts = LocalModelArtifacts::from_model_path(&generic_dir)
+        .expect("generic local artifacts should load");
+
+    generic_artifacts
+        .validate_checkpoint_for_supported_model()
+        .expect("unknown model dispatch should keep generic artifact validation");
+
+    fs::remove_dir_all(deepseek_dir).expect("temp model dir should be removed");
+    fs::remove_dir_all(generic_dir).expect("temp model dir should be removed");
+}
+
+#[test]
 fn local_model_checkpoint_catalog_exposes_deepseek_v4_model_weights() {
     let model_dir = temp_model_dir("deepseek-v4-model-weights");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");

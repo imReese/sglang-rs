@@ -224,10 +224,7 @@ fn validate_local_model_artifacts_if_present(args: &ServerArgs) -> Result<(), Se
         Err(ModelArtifactError::NoSafetensorsWeights { .. }) => return Ok(()),
         Err(error) => return Err(error.into()),
     };
-    let checkpoint = artifacts.checkpoint_catalog()?;
-    if artifacts.config().model_type.as_deref() == Some("deepseek_v4") {
-        checkpoint.deepseek_model_weights()?;
-    }
+    artifacts.validate_checkpoint_for_supported_model()?;
     Ok(())
 }
 
