@@ -145,6 +145,7 @@ pub struct PdConfig {
     pub num_reserved_decode_tokens: usize,
     pub decode_polling_interval: usize,
     pub kv_cache_dtype: KvCacheDtype,
+    pub kv_cache_model_layout: Option<KvCacheModelLayout>,
     pub page_size: usize,
     pub base_gpu_id: usize,
     pub gpu_id_step: usize,
@@ -163,6 +164,19 @@ impl PdConfig {
         let mode = DisaggregationMode::parse(&args.disaggregation_mode)?;
         let backend = TransferBackend::parse(&args.disaggregation_transfer_backend)?;
         let kv_cache_dtype = KvCacheDtype::parse(&args.kv_cache_dtype)?;
+        let kv_cache_model_layout = match (
+            args.kv_cache_num_layers,
+            args.kv_cache_kv_heads,
+            args.kv_cache_head_dim,
+        ) {
+            (None, None, None) => None,
+            (Some(num_layers), Some(kv_heads), Some(head_dim)) => Some(KvCacheModelLayout {
+                num_layers,
+                kv_heads,
+                head_dim,
+            }),
+            _ => return Err(PdConfigError::IncompleteKvCacheModelLayout),
+        };
 
         if mode == DisaggregationMode::Prefill && backend.backend == TransferBackend::Fake {
             return Err(PdConfigError::FakePrefillUnsupported);
@@ -183,6 +197,7 @@ impl PdConfig {
             num_reserved_decode_tokens: args.num_reserved_decode_tokens,
             decode_polling_interval: args.disaggregation_decode_polling_interval,
             kv_cache_dtype,
+            kv_cache_model_layout,
             page_size: args.page_size,
             base_gpu_id: args.base_gpu_id,
             gpu_id_step: args.gpu_id_step,
@@ -203,6 +218,7 @@ pub enum PdConfigError {
     InvalidDisaggregationMode(String),
     InvalidTransferBackend(String),
     InvalidKvCacheDtype(String),
+    IncompleteKvCacheModelLayout,
     KvCacheDtypeRequiresModelMetadata(KvCacheDtype),
     KvCacheLayoutOverflow,
     FakePrefillUnsupported,
@@ -223,6 +239,8 @@ impl fmt::Display for PdConfigError {
             Self::InvalidKvCacheDtype(dtype) => {
                 write!(formatter, "invalid kv cache dtype: {dtype}")
             }
+            Self::IncompleteKvCacheModelLayout => formatter
+                .write_str("kv cache model layout requires num layers, KV heads, and head dim"),
             Self::KvCacheDtypeRequiresModelMetadata(dtype) => {
                 write!(
                     formatter,

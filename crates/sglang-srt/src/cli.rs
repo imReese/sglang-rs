@@ -14,6 +14,9 @@ pub struct ServerArgs {
     pub tp_size: usize,
     pub dp_size: usize,
     pub kv_cache_dtype: String,
+    pub kv_cache_num_layers: Option<usize>,
+    pub kv_cache_kv_heads: Option<usize>,
+    pub kv_cache_head_dim: Option<usize>,
     pub page_size: usize,
     pub base_gpu_id: usize,
     pub gpu_id_step: usize,
@@ -123,6 +126,24 @@ impl ArgParser {
                 "--kv-cache-dtype" => {
                     self.parsed.kv_cache_dtype = self.take_value("--kv-cache-dtype")?;
                 }
+                "--kv-cache-num-layers" => {
+                    self.parsed.kv_cache_num_layers = Some(parse_usize(
+                        "--kv-cache-num-layers",
+                        self.take_value("--kv-cache-num-layers")?,
+                    )?);
+                }
+                "--kv-cache-kv-heads" => {
+                    self.parsed.kv_cache_kv_heads = Some(parse_usize(
+                        "--kv-cache-kv-heads",
+                        self.take_value("--kv-cache-kv-heads")?,
+                    )?);
+                }
+                "--kv-cache-head-dim" => {
+                    self.parsed.kv_cache_head_dim = Some(parse_usize(
+                        "--kv-cache-head-dim",
+                        self.take_value("--kv-cache-head-dim")?,
+                    )?);
+                }
                 "--page-size" => {
                     self.parsed.page_size =
                         parse_usize("--page-size", self.take_value("--page-size")?)?;
@@ -226,6 +247,9 @@ impl ArgParser {
             tp_size: self.parsed.tp_size,
             dp_size: self.parsed.dp_size,
             kv_cache_dtype: self.parsed.kv_cache_dtype.clone(),
+            kv_cache_num_layers: self.parsed.kv_cache_num_layers,
+            kv_cache_kv_heads: self.parsed.kv_cache_kv_heads,
+            kv_cache_head_dim: self.parsed.kv_cache_head_dim,
             page_size: self.parsed.page_size,
             base_gpu_id: self.parsed.base_gpu_id,
             gpu_id_step: self.parsed.gpu_id_step,
@@ -303,6 +327,9 @@ struct PartialServerArgs {
     tp_size: usize,
     dp_size: usize,
     kv_cache_dtype: String,
+    kv_cache_num_layers: Option<usize>,
+    kv_cache_kv_heads: Option<usize>,
+    kv_cache_head_dim: Option<usize>,
     page_size: usize,
     base_gpu_id: usize,
     gpu_id_step: usize,
@@ -337,6 +364,9 @@ impl Default for PartialServerArgs {
             tp_size: 1,
             dp_size: 1,
             kv_cache_dtype: "auto".to_string(),
+            kv_cache_num_layers: None,
+            kv_cache_kv_heads: None,
+            kv_cache_head_dim: None,
             page_size: 1,
             base_gpu_id: 0,
             gpu_id_step: 1,

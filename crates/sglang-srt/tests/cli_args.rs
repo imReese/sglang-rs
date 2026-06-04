@@ -151,6 +151,12 @@ fn parse_deepseek_pd_multinode_launch_args_as_structured_runtime_config() {
         "8",
         "--kv-cache-dtype",
         "fp8_e5m2",
+        "--kv-cache-num-layers",
+        "61",
+        "--kv-cache-kv-heads",
+        "1",
+        "--kv-cache-head-dim",
+        "512",
         "--enable-dp-attention",
         "--moe-a2a-backend",
         "deepep",
@@ -168,6 +174,9 @@ fn parse_deepseek_pd_multinode_launch_args_as_structured_runtime_config() {
     assert_eq!(parsed.nnodes, 2);
     assert_eq!(parsed.node_rank, 1);
     assert_eq!(parsed.kv_cache_dtype, "fp8_e5m2");
+    assert_eq!(parsed.kv_cache_num_layers, Some(61));
+    assert_eq!(parsed.kv_cache_kv_heads, Some(1));
+    assert_eq!(parsed.kv_cache_head_dim, Some(512));
     assert!(parsed.enable_dp_attention);
     assert_eq!(parsed.moe_a2a_backend.as_deref(), Some("deepep"));
     assert_eq!(parsed.mem_fraction_static, Some(0.8));

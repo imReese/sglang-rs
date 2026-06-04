@@ -206,6 +206,64 @@ fn pd_config_builds_mooncake_layout_from_model_kv_geometry() {
 }
 
 #[test]
+fn pd_config_carries_cli_kv_model_geometry_for_mooncake_layout() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "deepseek-ai/DeepSeek-V3-0324",
+        "--disaggregation-mode",
+        "decode",
+        "--kv-cache-dtype",
+        "bfloat16",
+        "--kv-cache-num-layers",
+        "61",
+        "--kv-cache-kv-heads",
+        "1",
+        "--kv-cache-head-dim",
+        "512",
+        "--page-size",
+        "64",
+    ])
+    .expect("args should parse");
+
+    let config = PdConfig::from_server_args(&args).expect("pd config should normalize");
+    let model_layout = config
+        .kv_cache_model_layout
+        .expect("kv cache model layout should be present");
+    let layout =
+        MooncakeKvCacheLayout::from_pd_config_model_layout(0x1000, 0x200, &config, &model_layout)
+            .unwrap();
+
+    assert_eq!(
+        model_layout,
+        KvCacheModelLayout {
+            num_layers: 61,
+            kv_heads: 1,
+            head_dim: 512,
+        }
+    );
+    assert_eq!(layout.page_size_bytes, 64 * 61 * 2 * 512 * 2);
+}
+
+#[test]
+fn pd_config_rejects_partial_cli_kv_model_geometry() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--kv-cache-num-layers",
+        "61",
+        "--kv-cache-head-dim",
+        "512",
+    ])
+    .expect("args should parse");
+
+    let error = PdConfig::from_server_args(&args).expect_err("partial geometry should fail");
+
+    assert_eq!(error, PdConfigError::IncompleteKvCacheModelLayout);
+}
+
+#[test]
 fn pd_config_rejects_kv_layout_byte_overflow() {
     let args = ServerArgs::parse_from([
         "serve",
