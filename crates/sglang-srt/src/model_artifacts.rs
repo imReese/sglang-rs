@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -134,6 +134,17 @@ impl SafetensorsManifest {
         SafetensorsHeader::from_file(shard_path).map(|header| header.tensor_metadata(tensor_name))
     }
 
+    pub fn read_tensor(
+        &self,
+        tensor_name: &str,
+    ) -> Result<Option<SafetensorsTensorData>, ModelArtifactError> {
+        let Some(shard_path) = self.shard_for_tensor(tensor_name) else {
+            return Ok(None);
+        };
+        let header = SafetensorsHeader::from_file(shard_path)?;
+        header.read_tensor(shard_path, tensor_name)
+    }
+
     pub fn probe_routed_expert_weight_dtype(&self) -> Result<Option<String>, ModelArtifactError> {
         if let Some(tensor_name) = self
             .tensor_names
@@ -217,7 +228,14 @@ pub struct SafetensorsTensorMetadata {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SafetensorsTensorData {
+    pub metadata: SafetensorsTensorMetadata,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SafetensorsHeader {
+    header_len: usize,
     tensors: BTreeMap<String, SafetensorsTensorMetadata>,
 }
 
@@ -276,11 +294,89 @@ impl SafetensorsHeader {
             );
         }
 
-        Ok(Self { tensors })
+        Ok(Self {
+            header_len,
+            tensors,
+        })
     }
 
     pub fn tensor_metadata(&self, tensor_name: &str) -> Option<SafetensorsTensorMetadata> {
         self.tensors.get(tensor_name).cloned()
+    }
+
+    pub fn read_tensor(
+        &self,
+        path: impl AsRef<Path>,
+        tensor_name: &str,
+    ) -> Result<Option<SafetensorsTensorData>, ModelArtifactError> {
+        let path = path.as_ref();
+        let Some(metadata) = self.tensors.get(tensor_name).cloned() else {
+            return Ok(None);
+        };
+        let [start, end] = metadata.data_offsets;
+        let tensor_len = end.checked_sub(start).ok_or_else(|| {
+            invalid_safetensors_data(
+                path,
+                format!("tensor {tensor_name} data_offsets start is after end"),
+            )
+        })?;
+        let payload_start = 8_usize.checked_add(self.header_len).ok_or_else(|| {
+            invalid_safetensors_data(path, "safetensors payload start offset overflowed")
+        })?;
+        let absolute_start = payload_start.checked_add(start).ok_or_else(|| {
+            invalid_safetensors_data(
+                path,
+                format!("tensor {tensor_name} start offset overflowed"),
+            )
+        })?;
+        let absolute_end = payload_start.checked_add(end).ok_or_else(|| {
+            invalid_safetensors_data(path, format!("tensor {tensor_name} end offset overflowed"))
+        })?;
+        let absolute_start = u64::try_from(absolute_start).map_err(|_| {
+            invalid_safetensors_data(
+                path,
+                format!("tensor {tensor_name} start offset overflows u64"),
+            )
+        })?;
+        let absolute_end = u64::try_from(absolute_end).map_err(|_| {
+            invalid_safetensors_data(
+                path,
+                format!("tensor {tensor_name} end offset overflows u64"),
+            )
+        })?;
+
+        let mut file =
+            fs::File::open(path).map_err(|error| ModelArtifactError::ReadWeightShard {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })?;
+        let shard_len = file
+            .metadata()
+            .map_err(|error| ModelArtifactError::ReadWeightShard {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })?
+            .len();
+        if absolute_end > shard_len {
+            return Err(invalid_safetensors_data(
+                path,
+                format!("tensor {tensor_name} payload extends past end of shard"),
+            ));
+        }
+
+        file.seek(SeekFrom::Start(absolute_start))
+            .map_err(|error| ModelArtifactError::ReadWeightShard {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })?;
+        let mut bytes = vec![0_u8; tensor_len];
+        file.read_exact(&mut bytes)
+            .map_err(|error| ModelArtifactError::ReadWeightShard {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })?;
+
+        Ok(Some(SafetensorsTensorData { metadata, bytes }))
     }
 
     fn routed_expert_weight_dtype(&self) -> Option<String> {
@@ -303,6 +399,7 @@ pub enum ModelArtifactError {
     ReadModelDirectory { path: PathBuf, message: String },
     ReadWeightShard { path: PathBuf, message: String },
     InvalidSafetensorsHeader { path: PathBuf, message: String },
+    InvalidSafetensorsData { path: PathBuf, message: String },
 }
 
 impl fmt::Display for ModelArtifactError {
@@ -369,6 +466,13 @@ impl fmt::Display for ModelArtifactError {
                 write!(
                     formatter,
                     "failed to parse safetensors header {}: {message}",
+                    path.display()
+                )
+            }
+            Self::InvalidSafetensorsData { path, message } => {
+                write!(
+                    formatter,
+                    "failed to read safetensors tensor data {}: {message}",
                     path.display()
                 )
             }
@@ -499,6 +603,13 @@ fn parse_tensor_metadata(
         shape,
         data_offsets,
     })
+}
+
+fn invalid_safetensors_data(path: &Path, message: impl Into<String>) -> ModelArtifactError {
+    ModelArtifactError::InvalidSafetensorsData {
+        path: path.to_path_buf(),
+        message: message.into(),
+    }
 }
 
 fn is_routed_expert_weight(tensor_name: &str) -> bool {
