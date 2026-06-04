@@ -204,7 +204,7 @@ impl LocalModelCheckpointCatalog {
             .map(|layer_id| self.deepseek_layer_weights(layer_id))
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(DeepSeekModelCheckpointWeights {
+        let weights = DeepSeekModelCheckpointWeights {
             token_embeddings: self.required_deepseek_model_tensor("model.embed_tokens.weight")?,
             final_norm: self.required_deepseek_model_tensor("model.norm.weight")?,
             lm_head: self.required_deepseek_model_tensor("lm_head.weight")?,
@@ -212,7 +212,9 @@ impl LocalModelCheckpointCatalog {
             hc_head_base: self.required_deepseek_model_tensor("model.hc_head_base")?,
             hc_head_scale: self.required_deepseek_model_tensor("model.hc_head_scale")?,
             layers,
-        })
+        };
+        self.validate_deepseek_hc_head_shapes(&weights)?;
+        Ok(weights)
     }
 
     pub fn deepseek_layer_weights(
@@ -290,6 +292,50 @@ impl LocalModelCheckpointCatalog {
                     format!("missing DeepSeek model tensor {tensor_name}"),
                 )
             })
+    }
+
+    fn validate_deepseek_hc_head_shapes(
+        &self,
+        weights: &DeepSeekModelCheckpointWeights<'_>,
+    ) -> Result<(), ModelArtifactError> {
+        let hidden_size = self.config.hidden_size.ok_or_else(|| {
+            invalid_safetensors_data(
+                &self.model_path,
+                "missing DeepSeek model hidden_size config for HC head validation",
+            )
+        })?;
+        let hc_mult = self.config.hc_mult.ok_or_else(|| {
+            invalid_safetensors_data(
+                &self.model_path,
+                "missing DeepSeek model hc_mult config for HC head validation",
+            )
+        })?;
+        let hc_dim = hc_mult.checked_mul(hidden_size).ok_or_else(|| {
+            invalid_safetensors_data(&self.model_path, "DeepSeek HC head dimension overflowed")
+        })?;
+
+        self.validate_deepseek_model_tensor_shape(weights.hc_head_fn(), &[hc_mult, hc_dim])?;
+        self.validate_deepseek_model_tensor_shape(weights.hc_head_base(), &[hc_mult])?;
+        self.validate_deepseek_model_tensor_shape(weights.hc_head_scale(), &[1])?;
+        Ok(())
+    }
+
+    fn validate_deepseek_model_tensor_shape(
+        &self,
+        tensor: &DeepSeekModelTensorSpan,
+        expected_shape: &[usize],
+    ) -> Result<(), ModelArtifactError> {
+        if tensor.span.metadata.shape == expected_shape {
+            return Ok(());
+        }
+
+        Err(invalid_safetensors_data(
+            &self.model_path,
+            format!(
+                "DeepSeek model tensor {} shape {:?} does not match expected {:?}",
+                tensor.tensor_name, tensor.span.metadata.shape, expected_shape
+            ),
+        ))
     }
 }
 
@@ -678,6 +724,23 @@ impl DeepSeekLoadedRoutedExpertWeights {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct HfConfigFloat(f64);
+
+impl HfConfigFloat {
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl PartialEq for HfConfigFloat {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for HfConfigFloat {}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HfModelConfig {
     pub model_type: Option<String>,
@@ -693,6 +756,11 @@ pub struct HfModelConfig {
     pub num_experts_per_tok: Option<usize>,
     pub first_k_dense_replace: Option<usize>,
     pub moe_layer_freq: Option<usize>,
+    pub hc_mult: Option<usize>,
+    pub hc_sinkhorn_iters: Option<usize>,
+    pub rms_norm_eps: Option<HfConfigFloat>,
+    pub hc_eps: Option<HfConfigFloat>,
+    pub tie_word_embeddings: Option<bool>,
 }
 
 impl HfModelConfig {
@@ -728,6 +796,11 @@ impl HfModelConfig {
             num_experts_per_tok: read_usize_field(&value, "num_experts_per_tok", &config_path)?,
             first_k_dense_replace: read_usize_field(&value, "first_k_dense_replace", &config_path)?,
             moe_layer_freq: read_usize_field(&value, "moe_layer_freq", &config_path)?,
+            hc_mult: read_usize_field(&value, "hc_mult", &config_path)?,
+            hc_sinkhorn_iters: read_usize_field(&value, "hc_sinkhorn_iters", &config_path)?,
+            rms_norm_eps: read_f64_field(&value, "rms_norm_eps", &config_path)?,
+            hc_eps: read_f64_field(&value, "hc_eps", &config_path)?,
+            tie_word_embeddings: read_bool_field(&value, "tie_word_embeddings", &config_path)?,
         })
     }
 
@@ -1806,6 +1879,51 @@ fn read_usize_field(
         .map_err(|_| ModelArtifactError::InvalidModelConfig {
             path: config_path.to_path_buf(),
             message: format!("field {field} does not fit in usize"),
+        })
+}
+
+fn read_f64_field(
+    value: &serde_json::Value,
+    field: &'static str,
+    config_path: &Path,
+) -> Result<Option<HfConfigFloat>, ModelArtifactError> {
+    let Some(raw) = value.get(field) else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    let Some(value) = raw.as_f64() else {
+        return Err(ModelArtifactError::InvalidModelConfig {
+            path: config_path.to_path_buf(),
+            message: format!("field {field} must be a finite number"),
+        });
+    };
+    if !value.is_finite() {
+        return Err(ModelArtifactError::InvalidModelConfig {
+            path: config_path.to_path_buf(),
+            message: format!("field {field} must be a finite number"),
+        });
+    }
+    Ok(Some(HfConfigFloat(value)))
+}
+
+fn read_bool_field(
+    value: &serde_json::Value,
+    field: &'static str,
+    config_path: &Path,
+) -> Result<Option<bool>, ModelArtifactError> {
+    let Some(raw) = value.get(field) else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    raw.as_bool()
+        .map(Some)
+        .ok_or_else(|| ModelArtifactError::InvalidModelConfig {
+            path: config_path.to_path_buf(),
+            message: format!("field {field} must be a boolean"),
         })
 }
 

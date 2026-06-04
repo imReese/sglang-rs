@@ -110,6 +110,8 @@ async fn bootstrap_grpc_router_service_reports_local_moe_checkpoint_coverage() {
         r#"{
   "model_type": "deepseek_v4",
   "num_hidden_layers": 1,
+  "hidden_size": 1,
+  "hc_mult": 1,
   "n_routed_experts": 1,
   "first_k_dense_replace": 0,
   "moe_layer_freq": 1
@@ -155,7 +157,7 @@ async fn bootstrap_grpc_router_service_reports_local_moe_checkpoint_coverage() {
             ("model.embed_tokens.weight", "U8", &[1], [0, 1]),
             ("model.norm.weight", "U8", &[1], [1, 2]),
             ("lm_head.weight", "U8", &[1], [2, 3]),
-            ("model.hc_head_fn", "U8", &[1], [3, 4]),
+            ("model.hc_head_fn", "U8", &[1, 1], [3, 4]),
             ("model.hc_head_base", "U8", &[1], [4, 5]),
             ("model.hc_head_scale", "U8", &[1], [5, 6]),
             ("model.layers.0.self_attn.wq_a.weight", "U8", &[1], [6, 7]),

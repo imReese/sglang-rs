@@ -61,6 +61,17 @@ fn local_model_artifacts_loads_deepseek_v4_config_and_indexed_safetensors() {
     assert_eq!(artifacts.config().num_experts_per_tok, Some(8));
     assert_eq!(artifacts.config().first_k_dense_replace, Some(3));
     assert_eq!(artifacts.config().moe_layer_freq, Some(2));
+    assert_eq!(artifacts.config().hc_mult, Some(4));
+    assert_eq!(artifacts.config().hc_sinkhorn_iters, Some(20));
+    assert_eq!(
+        artifacts.config().rms_norm_eps.map(|value| value.get()),
+        Some(1e-6)
+    );
+    assert_eq!(
+        artifacts.config().hc_eps.map(|value| value.get()),
+        Some(1e-6)
+    );
+    assert_eq!(artifacts.config().tie_word_embeddings, Some(false));
     assert_eq!(
         artifacts.config().moe_layer_ids(),
         vec![
@@ -299,6 +310,8 @@ fn local_model_artifacts_exposes_routed_expert_weight_catalog() {
         r#"{
   "model_type": "deepseek_v4",
   "num_hidden_layers": 1,
+  "hidden_size": 1,
+  "hc_mult": 1,
   "n_routed_experts": 1,
   "first_k_dense_replace": 0,
   "moe_layer_freq": 1
@@ -337,6 +350,8 @@ fn local_model_artifacts_builds_checkpoint_catalog_for_layer_and_routed_weights(
         r#"{
   "model_type": "deepseek_v4",
   "num_hidden_layers": 1,
+  "hidden_size": 1,
+  "hc_mult": 1,
   "n_routed_experts": 1,
   "first_k_dense_replace": 0,
   "moe_layer_freq": 1
@@ -388,6 +403,8 @@ fn local_model_checkpoint_catalog_exposes_deepseek_v4_model_weights() {
         r#"{
   "model_type": "deepseek_v4",
   "num_hidden_layers": 1,
+  "hidden_size": 1,
+  "hc_mult": 1,
   "n_routed_experts": 1,
   "first_k_dense_replace": 0,
   "moe_layer_freq": 1
@@ -400,7 +417,7 @@ fn local_model_checkpoint_catalog_exposes_deepseek_v4_model_weights() {
             ("model.embed_tokens.weight", "U8", &[1], [0, 1]),
             ("model.norm.weight", "U8", &[1], [1, 2]),
             ("lm_head.weight", "U8", &[1], [2, 3]),
-            ("model.hc_head_fn", "U8", &[1], [3, 4]),
+            ("model.hc_head_fn", "U8", &[1, 1], [3, 4]),
             ("model.hc_head_base", "U8", &[1], [4, 5]),
             ("model.hc_head_scale", "U8", &[1], [5, 6]),
             ("model.layers.0.self_attn.wq_a.weight", "U8", &[1], [6, 7]),
@@ -590,6 +607,58 @@ fn local_model_checkpoint_catalog_rejects_missing_deepseek_v4_hc_head_tensor() {
                 if path == &model_dir
                     && message.contains("missing DeepSeek model tensor")
                     && message.contains("model.hc_head_fn")
+        ),
+        "unexpected error: {error:?}"
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn local_model_checkpoint_catalog_rejects_deepseek_v4_hc_head_shape_mismatch() {
+    let model_dir = temp_model_dir("deepseek-v4-model-weights-hc-head-shape");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "model_type": "deepseek_v4",
+  "num_hidden_layers": 0,
+  "hidden_size": 2,
+  "hc_mult": 2
+}"#,
+    )
+    .expect("config should be written");
+    write_safetensors_file(
+        &model_dir.join("model.safetensors"),
+        &[
+            ("model.embed_tokens.weight", "U8", &[1], [0, 1]),
+            ("model.norm.weight", "U8", &[1], [1, 2]),
+            ("lm_head.weight", "U8", &[1], [2, 3]),
+            ("model.hc_head_fn", "U8", &[3], [3, 6]),
+            ("model.hc_head_base", "U8", &[2], [6, 8]),
+            ("model.hc_head_scale", "U8", &[1], [8, 9]),
+        ],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9],
+    )
+    .expect("shard should be written");
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("local artifacts should load");
+    let checkpoint = artifacts
+        .checkpoint_catalog()
+        .expect("checkpoint catalog should build");
+
+    let error = checkpoint
+        .deepseek_model_weights()
+        .expect_err("invalid DeepSeek V4 HC head tensor shape should fail model validation");
+
+    assert!(
+        matches!(
+            error,
+            ModelArtifactError::InvalidSafetensorsData { ref path, ref message }
+                if path == &model_dir
+                    && message.contains("DeepSeek model tensor model.hc_head_fn")
+                    && message.contains("shape")
+                    && message.contains("[2, 4]")
         ),
         "unexpected error: {error:?}"
     );
@@ -2250,6 +2319,11 @@ fn deepseek_v4_config_json() -> &'static str {
   "num_experts_per_tok": 8,
   "first_k_dense_replace": 3,
   "moe_layer_freq": 2,
+  "hc_mult": 4,
+  "hc_sinkhorn_iters": 20,
+  "rms_norm_eps": 1e-6,
+  "hc_eps": 1e-6,
+  "tie_word_embeddings": false,
   "num_key_value_heads": 1,
   "qk_nope_head_dim": 448,
   "qk_rope_head_dim": 64,
