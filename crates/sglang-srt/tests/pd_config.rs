@@ -129,6 +129,43 @@ fn mooncake_engine_config_uses_upstream_gpu_placement_args() {
 }
 
 #[test]
+fn pd_config_carries_deepseek_distributed_runtime_args() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "deepseek-ai/DeepSeek-V3-0324",
+        "--disaggregation-mode",
+        "decode",
+        "--trust-remote-code",
+        "--dist-init-addr",
+        "10.0.0.1:5000",
+        "--nnodes",
+        "2",
+        "--node-rank",
+        "1",
+        "--enable-dp-attention",
+        "--moe-a2a-backend",
+        "deepep",
+        "--mem-fraction-static",
+        "0.8",
+        "--max-running-requests",
+        "128",
+    ])
+    .expect("DeepSeek PD launch args should parse");
+
+    let config = PdConfig::from_server_args(&args).expect("pd config should normalize");
+
+    assert!(config.trust_remote_code);
+    assert_eq!(config.dist_init_addr.as_deref(), Some("10.0.0.1:5000"));
+    assert_eq!(config.nnodes, 2);
+    assert_eq!(config.node_rank, 1);
+    assert!(config.enable_dp_attention);
+    assert_eq!(config.moe_a2a_backend.as_deref(), Some("deepep"));
+    assert_eq!(config.mem_fraction_static, Some(0.8));
+    assert_eq!(config.max_running_requests, Some(128));
+}
+
+#[test]
 fn mooncake_ffi_enums_match_upstream_c_and_sglang_poll_values() {
     assert_eq!(MooncakeOpcode::Read as i32, 0);
     assert_eq!(MooncakeOpcode::Write as i32, 1);

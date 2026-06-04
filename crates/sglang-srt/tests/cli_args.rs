@@ -54,7 +54,6 @@ fn parse_preserves_unknown_server_args_for_future_compatibility() {
         "serve",
         "--model-path",
         "dummy",
-        "--trust-remote-code",
         "--attention-backend",
         "flashinfer",
     ])
@@ -62,12 +61,9 @@ fn parse_preserves_unknown_server_args_for_future_compatibility() {
 
     assert_eq!(
         parsed.extra_args,
-        vec![
-            "--trust-remote-code".to_string(),
-            "--attention-backend".to_string(),
-            "flashinfer".to_string()
-        ]
+        vec!["--attention-backend".to_string(), "flashinfer".to_string()]
     );
+    assert!(!parsed.trust_remote_code);
 }
 
 #[test]
@@ -119,5 +115,51 @@ fn parse_pd_disaggregation_args_matches_sglang_server_args() {
     assert!(parsed.disaggregation_decode_enable_offload_kvcache);
     assert_eq!(parsed.num_reserved_decode_tokens, 1024);
     assert_eq!(parsed.disaggregation_decode_polling_interval, 2);
+    assert!(parsed.extra_args.is_empty());
+}
+
+#[test]
+fn parse_deepseek_pd_multinode_launch_args_as_structured_runtime_config() {
+    let parsed = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "deepseek-ai/DeepSeek-V3-0324",
+        "--disaggregation-mode",
+        "decode",
+        "--host",
+        "10.0.0.8",
+        "--port",
+        "30001",
+        "--trust-remote-code",
+        "--dist-init-addr",
+        "10.0.0.1:5000",
+        "--nnodes",
+        "2",
+        "--node-rank",
+        "1",
+        "--tp-size",
+        "16",
+        "--dp-size",
+        "8",
+        "--enable-dp-attention",
+        "--moe-a2a-backend",
+        "deepep",
+        "--mem-fraction-static",
+        "0.8",
+        "--max-running-requests",
+        "128",
+    ])
+    .expect("DeepSeek PD launch args should parse");
+
+    assert_eq!(parsed.model_path, "deepseek-ai/DeepSeek-V3-0324");
+    assert_eq!(parsed.disaggregation_mode, "decode");
+    assert!(parsed.trust_remote_code);
+    assert_eq!(parsed.dist_init_addr.as_deref(), Some("10.0.0.1:5000"));
+    assert_eq!(parsed.nnodes, 2);
+    assert_eq!(parsed.node_rank, 1);
+    assert!(parsed.enable_dp_attention);
+    assert_eq!(parsed.moe_a2a_backend.as_deref(), Some("deepep"));
+    assert_eq!(parsed.mem_fraction_static, Some(0.8));
+    assert_eq!(parsed.max_running_requests, Some(128));
     assert!(parsed.extra_args.is_empty());
 }

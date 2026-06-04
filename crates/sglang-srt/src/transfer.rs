@@ -86,7 +86,7 @@ struct ParsedTransferBackend {
     force_tcp_transport: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PdConfig {
     pub mode: DisaggregationMode,
     pub transfer_backend: TransferBackend,
@@ -99,6 +99,14 @@ pub struct PdConfig {
     pub decode_polling_interval: usize,
     pub base_gpu_id: usize,
     pub gpu_id_step: usize,
+    pub nnodes: usize,
+    pub node_rank: usize,
+    pub dist_init_addr: Option<String>,
+    pub trust_remote_code: bool,
+    pub enable_dp_attention: bool,
+    pub moe_a2a_backend: Option<String>,
+    pub mem_fraction_static: Option<f32>,
+    pub max_running_requests: Option<usize>,
 }
 
 impl PdConfig {
@@ -126,6 +134,14 @@ impl PdConfig {
             decode_polling_interval: args.disaggregation_decode_polling_interval,
             base_gpu_id: args.base_gpu_id,
             gpu_id_step: args.gpu_id_step,
+            nnodes: args.nnodes,
+            node_rank: args.node_rank,
+            dist_init_addr: args.dist_init_addr.clone(),
+            trust_remote_code: args.trust_remote_code,
+            enable_dp_attention: args.enable_dp_attention,
+            moe_a2a_backend: args.moe_a2a_backend.clone(),
+            mem_fraction_static: args.mem_fraction_static,
+            max_running_requests: args.max_running_requests,
         })
     }
 }

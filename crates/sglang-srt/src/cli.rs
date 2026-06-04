@@ -5,7 +5,7 @@ pub enum CliCommand {
     Serve,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ServerArgs {
     pub command: CliCommand,
     pub model_path: String,
@@ -15,6 +15,14 @@ pub struct ServerArgs {
     pub dp_size: usize,
     pub base_gpu_id: usize,
     pub gpu_id_step: usize,
+    pub nnodes: usize,
+    pub node_rank: usize,
+    pub dist_init_addr: Option<String>,
+    pub trust_remote_code: bool,
+    pub enable_dp_attention: bool,
+    pub moe_a2a_backend: Option<String>,
+    pub mem_fraction_static: Option<f32>,
+    pub max_running_requests: Option<usize>,
     pub grpc_mode: bool,
     pub served_model_name: Option<String>,
     pub tokenizer_path: Option<String>,
@@ -47,6 +55,7 @@ pub enum CliParseError {
     MissingValue(&'static str),
     InvalidPort(String),
     InvalidUsize { flag: &'static str, value: String },
+    InvalidFloat { flag: &'static str, value: String },
 }
 
 impl fmt::Display for CliParseError {
@@ -57,6 +66,7 @@ impl fmt::Display for CliParseError {
             Self::MissingValue(flag) => write!(formatter, "missing value for {flag}"),
             Self::InvalidPort(value) => write!(formatter, "invalid port: {value}"),
             Self::InvalidUsize { flag, value } => write!(formatter, "invalid {flag}: {value}"),
+            Self::InvalidFloat { flag, value } => write!(formatter, "invalid {flag}: {value}"),
         }
     }
 }
@@ -115,6 +125,37 @@ impl ArgParser {
                 "--gpu-id-step" => {
                     self.parsed.gpu_id_step =
                         parse_usize("--gpu-id-step", self.take_value("--gpu-id-step")?)?;
+                }
+                "--nnodes" => {
+                    self.parsed.nnodes = parse_usize("--nnodes", self.take_value("--nnodes")?)?;
+                }
+                "--node-rank" => {
+                    self.parsed.node_rank =
+                        parse_usize("--node-rank", self.take_value("--node-rank")?)?;
+                }
+                "--dist-init-addr" => {
+                    self.parsed.dist_init_addr = Some(self.take_value("--dist-init-addr")?);
+                }
+                "--trust-remote-code" => {
+                    self.parsed.trust_remote_code = true;
+                }
+                "--enable-dp-attention" => {
+                    self.parsed.enable_dp_attention = true;
+                }
+                "--moe-a2a-backend" => {
+                    self.parsed.moe_a2a_backend = Some(self.take_value("--moe-a2a-backend")?);
+                }
+                "--mem-fraction-static" => {
+                    self.parsed.mem_fraction_static = Some(parse_f32(
+                        "--mem-fraction-static",
+                        self.take_value("--mem-fraction-static")?,
+                    )?);
+                }
+                "--max-running-requests" => {
+                    self.parsed.max_running_requests = Some(parse_usize(
+                        "--max-running-requests",
+                        self.take_value("--max-running-requests")?,
+                    )?);
                 }
                 "--grpc-mode" => {
                     self.parsed.grpc_mode = true;
@@ -177,6 +218,14 @@ impl ArgParser {
             dp_size: self.parsed.dp_size,
             base_gpu_id: self.parsed.base_gpu_id,
             gpu_id_step: self.parsed.gpu_id_step,
+            nnodes: self.parsed.nnodes,
+            node_rank: self.parsed.node_rank,
+            dist_init_addr: self.parsed.dist_init_addr.clone(),
+            trust_remote_code: self.parsed.trust_remote_code,
+            enable_dp_attention: self.parsed.enable_dp_attention,
+            moe_a2a_backend: self.parsed.moe_a2a_backend.clone(),
+            mem_fraction_static: self.parsed.mem_fraction_static,
+            max_running_requests: self.parsed.max_running_requests,
             grpc_mode: self.parsed.grpc_mode,
             served_model_name: self.parsed.served_model_name.clone(),
             tokenizer_path: self.parsed.tokenizer_path.clone(),
@@ -244,6 +293,14 @@ struct PartialServerArgs {
     dp_size: usize,
     base_gpu_id: usize,
     gpu_id_step: usize,
+    nnodes: usize,
+    node_rank: usize,
+    dist_init_addr: Option<String>,
+    trust_remote_code: bool,
+    enable_dp_attention: bool,
+    moe_a2a_backend: Option<String>,
+    mem_fraction_static: Option<f32>,
+    max_running_requests: Option<usize>,
     grpc_mode: bool,
     served_model_name: Option<String>,
     tokenizer_path: Option<String>,
@@ -268,6 +325,14 @@ impl Default for PartialServerArgs {
             dp_size: 1,
             base_gpu_id: 0,
             gpu_id_step: 1,
+            nnodes: 1,
+            node_rank: 0,
+            dist_init_addr: None,
+            trust_remote_code: false,
+            enable_dp_attention: false,
+            moe_a2a_backend: None,
+            mem_fraction_static: None,
+            max_running_requests: None,
             grpc_mode: false,
             served_model_name: None,
             tokenizer_path: None,
@@ -288,4 +353,10 @@ fn parse_usize(flag: &'static str, value: String) -> Result<usize, CliParseError
     value
         .parse::<usize>()
         .map_err(|_| CliParseError::InvalidUsize { flag, value })
+}
+
+fn parse_f32(flag: &'static str, value: String) -> Result<f32, CliParseError> {
+    value
+        .parse::<f32>()
+        .map_err(|_| CliParseError::InvalidFloat { flag, value })
 }
