@@ -3,9 +3,10 @@ use std::path::PathBuf;
 
 use sglang_srt::model_artifacts::{
     HfModelConfig, LocalModelArtifacts, ModelArtifactError, SafetensorsCheckpointFingerprintEntry,
-    SafetensorsRoutedExpertProjection, SafetensorsRoutedExpertWeightCatalog,
-    SafetensorsRoutedExpertWeightGroup, SafetensorsRoutedExpertWeightSpan, SafetensorsTensorData,
-    SafetensorsTensorMetadata, SafetensorsTensorSpan,
+    SafetensorsLayerTensorSpan, SafetensorsRoutedExpertProjection,
+    SafetensorsRoutedExpertWeightCatalog, SafetensorsRoutedExpertWeightGroup,
+    SafetensorsRoutedExpertWeightSpan, SafetensorsTensorData, SafetensorsTensorMetadata,
+    SafetensorsTensorSpan,
 };
 
 #[test]
@@ -657,6 +658,90 @@ fn safetensors_manifest_enumerates_indexed_tensor_spans_across_shards() {
             .expect("span should load tensor")
             .bytes,
         vec![20, 21, 22]
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn safetensors_manifest_indexes_layer_tensor_spans_by_suffix() {
+    let model_dir = temp_model_dir("layer-tensor-spans");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(model_dir.join("config.json"), deepseek_v4_config_json())
+        .expect("config should be written");
+    let shard = model_dir.join("model.safetensors");
+    let header_len = write_safetensors_file(
+        &shard,
+        &[
+            ("model.embed_tokens.weight", "U8", &[2], [0, 2]),
+            (
+                "model.layers.0.self_attn.q_a_proj.weight",
+                "U8",
+                &[1],
+                [2, 3],
+            ),
+            (
+                "model.layers.0.self_attn.q_b_proj.weight",
+                "U8",
+                &[2],
+                [3, 5],
+            ),
+            ("model.layers.0.ffn.experts.3.w1.weight", "U8", &[3], [5, 8]),
+        ],
+        &[10, 11, 20, 30, 31, 40, 41, 42],
+    )
+    .expect("shard should be written");
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("local artifacts should load");
+
+    let layer_spans = artifacts
+        .safetensors()
+        .layer_tensor_spans()
+        .expect("layer tensor spans should be indexed");
+
+    assert_eq!(
+        layer_spans
+            .iter()
+            .map(|entry| (entry.layer_id, entry.suffix.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (0, "ffn.experts.3.w1.weight"),
+            (0, "self_attn.q_a_proj.weight"),
+            (0, "self_attn.q_b_proj.weight"),
+        ]
+    );
+    assert_eq!(
+        layer_spans[1],
+        SafetensorsLayerTensorSpan {
+            tensor_name: "model.layers.0.self_attn.q_a_proj.weight".to_string(),
+            layer_id: 0,
+            suffix: "self_attn.q_a_proj.weight".to_string(),
+            span: SafetensorsTensorSpan {
+                path: shard,
+                metadata: SafetensorsTensorMetadata {
+                    dtype: "U8".to_string(),
+                    shape: vec![1],
+                    data_offsets: [2, 3],
+                },
+                absolute_byte_offset: 8 + header_len as u64 + 2,
+                byte_len: 1,
+            },
+        }
+    );
+    assert_eq!(
+        artifacts
+            .safetensors()
+            .layer_tensor_span(0, "self_attn.q_b_proj.weight")
+            .expect("layer tensor lookup should read spans")
+            .map(|entry| (entry.layer_id, entry.suffix, entry.span.byte_len)),
+        Some((0, "self_attn.q_b_proj.weight".to_string(), 2))
+    );
+    assert_eq!(
+        artifacts
+            .safetensors()
+            .layer_tensor_span(0, "self_attn.nope.weight")
+            .expect("missing layer tensor lookup should still read spans"),
+        None
     );
 
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");

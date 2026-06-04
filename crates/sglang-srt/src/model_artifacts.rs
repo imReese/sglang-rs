@@ -354,6 +354,44 @@ impl SafetensorsManifest {
         Ok(entries)
     }
 
+    pub fn layer_tensor_spans(
+        &self,
+    ) -> Result<Vec<SafetensorsLayerTensorSpan>, ModelArtifactError> {
+        let spans = self
+            .tensor_span_entries()?
+            .into_iter()
+            .filter_map(|(tensor_name, span)| {
+                parse_layer_tensor_name(&tensor_name).map(|(layer_id, suffix)| {
+                    SafetensorsLayerTensorSpan {
+                        tensor_name,
+                        layer_id,
+                        suffix,
+                        span,
+                    }
+                })
+            })
+            .collect();
+        Ok(spans)
+    }
+
+    pub fn layer_tensor_span(
+        &self,
+        layer_id: usize,
+        suffix: &str,
+    ) -> Result<Option<SafetensorsLayerTensorSpan>, ModelArtifactError> {
+        let tensor_name = format!("model.layers.{layer_id}.{suffix}");
+        let Some(span) = self.tensor_span(&tensor_name)? else {
+            return Ok(None);
+        };
+
+        Ok(Some(SafetensorsLayerTensorSpan {
+            tensor_name,
+            layer_id,
+            suffix: suffix.to_string(),
+            span,
+        }))
+    }
+
     pub fn checkpoint_fingerprint_entries(
         &self,
     ) -> Result<Vec<SafetensorsCheckpointFingerprintEntry>, ModelArtifactError> {
@@ -555,6 +593,14 @@ impl SafetensorsCheckpointFingerprintEntry {
             fnv1a64,
         })
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SafetensorsLayerTensorSpan {
+    pub tensor_name: String,
+    pub layer_id: usize,
+    pub suffix: String,
+    pub span: SafetensorsTensorSpan,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1296,6 +1342,17 @@ fn fnv1a64_update(mut checksum: u64, bytes: &[u8]) -> u64 {
 
 fn is_routed_expert_weight(tensor_name: &str) -> bool {
     parse_routed_expert_weight_name(tensor_name).is_some()
+}
+
+fn parse_layer_tensor_name(tensor_name: &str) -> Option<(usize, String)> {
+    let remainder = tensor_name.strip_prefix("model.layers.")?;
+    let (layer_id, suffix) = remainder.split_once('.')?;
+    let layer_id = parse_usize_segment(layer_id)?;
+    if suffix.is_empty() {
+        return None;
+    }
+
+    Some((layer_id, suffix.to_string()))
 }
 
 fn parse_routed_expert_weight_name(
