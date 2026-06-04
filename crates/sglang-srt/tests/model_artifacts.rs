@@ -468,6 +468,80 @@ fn local_model_artifacts_accepts_unindexed_safetensors_shards() {
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
 
+#[test]
+fn safetensors_manifest_finds_tensor_spans_in_unindexed_shards() {
+    let model_dir = temp_model_dir("unindexed-tensor-spans");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(model_dir.join("config.json"), deepseek_v4_config_json())
+        .expect("config should be written");
+    let first_shard = model_dir.join("model-00001.safetensors");
+    let first_header_len = write_safetensors_file(
+        &first_shard,
+        &[
+            (
+                "model.layers.1.mlp.experts.42.down_proj.weight",
+                "U8",
+                &[3],
+                [0, 3],
+            ),
+            ("model.norm.weight", "BF16", &[2], [3, 7]),
+        ],
+        &[1, 2, 3, 4, 5, 6, 7],
+    )
+    .expect("first shard should be written");
+    let second_shard = model_dir.join("model-00002.safetensors");
+    let second_header_len = write_safetensors_file(
+        &second_shard,
+        &[("lm_head.weight", "U8", &[2], [0, 2])],
+        &[8, 9],
+    )
+    .expect("second shard should be written");
+    let artifacts = LocalModelArtifacts::from_model_path(&model_dir)
+        .expect("unindexed safetensors shards should load");
+
+    assert_eq!(
+        artifacts
+            .safetensors()
+            .tensor_span("model.norm.weight")
+            .expect("unindexed tensor span should read"),
+        Some(SafetensorsTensorSpan {
+            path: first_shard.clone(),
+            metadata: SafetensorsTensorMetadata {
+                dtype: "BF16".to_string(),
+                shape: vec![2],
+                data_offsets: [3, 7],
+            },
+            absolute_byte_offset: 8 + first_header_len as u64 + 3,
+            byte_len: 4,
+        })
+    );
+    let entries = artifacts
+        .safetensors()
+        .tensor_span_entries()
+        .expect("unindexed tensor span entries should read");
+    assert_eq!(
+        entries
+            .iter()
+            .map(|(name, span)| (name.as_str(), span.path.clone(), span.absolute_byte_offset))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "model.layers.1.mlp.experts.42.down_proj.weight",
+                first_shard,
+                8 + first_header_len as u64,
+            ),
+            (
+                "model.norm.weight",
+                model_dir.join("model-00001.safetensors"),
+                8 + first_header_len as u64 + 3,
+            ),
+            ("lm_head.weight", second_shard, 8 + second_header_len as u64,),
+        ]
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
 fn deepseek_v4_config_json() -> &'static str {
     r#"{
   "model_type": "deepseek_v4",

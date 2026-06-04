@@ -128,26 +128,52 @@ impl SafetensorsManifest {
         &self,
         tensor_name: &str,
     ) -> Result<Option<SafetensorsTensorMetadata>, ModelArtifactError> {
-        let Some(shard_path) = self.shard_for_tensor(tensor_name) else {
-            return Ok(None);
-        };
-        SafetensorsHeader::from_file(shard_path).map(|header| header.tensor_metadata(tensor_name))
+        if let Some(shard_path) = self.shard_for_tensor(tensor_name) {
+            return SafetensorsHeader::from_file(shard_path)
+                .map(|header| header.tensor_metadata(tensor_name));
+        }
+
+        for shard_path in &self.shard_paths {
+            let header = SafetensorsHeader::from_file(shard_path)?;
+            if let Some(metadata) = header.tensor_metadata(tensor_name) {
+                return Ok(Some(metadata));
+            }
+        }
+
+        Ok(None)
     }
 
     pub fn tensor_span(
         &self,
         tensor_name: &str,
     ) -> Result<Option<SafetensorsTensorSpan>, ModelArtifactError> {
-        let Some(shard_path) = self.shard_for_tensor(tensor_name) else {
-            return Ok(None);
-        };
-        let header = SafetensorsHeader::from_file(shard_path)?;
-        header.tensor_span(shard_path, tensor_name)
+        if let Some(shard_path) = self.shard_for_tensor(tensor_name) {
+            let header = SafetensorsHeader::from_file(shard_path)?;
+            return header.tensor_span(shard_path, tensor_name);
+        }
+
+        for shard_path in &self.shard_paths {
+            let header = SafetensorsHeader::from_file(shard_path)?;
+            if let Some(span) = header.tensor_span(shard_path, tensor_name)? {
+                return Ok(Some(span));
+            }
+        }
+
+        Ok(None)
     }
 
     pub fn tensor_span_entries(
         &self,
     ) -> Result<Vec<(String, SafetensorsTensorSpan)>, ModelArtifactError> {
+        if self.tensor_names.is_empty() {
+            let mut entries = Vec::new();
+            for shard_path in &self.shard_paths {
+                let header = SafetensorsHeader::from_file(shard_path)?;
+                entries.extend(header.tensor_span_entries(shard_path)?);
+            }
+            return Ok(entries);
+        }
+
         let mut headers = BTreeMap::new();
         let mut entries = Vec::with_capacity(self.tensor_names.len());
         for tensor_name in &self.tensor_names {
@@ -395,6 +421,10 @@ impl SafetensorsHeader {
         self.tensors.get(tensor_name).cloned()
     }
 
+    pub fn tensor_names(&self) -> impl Iterator<Item = &str> {
+        self.tensors.keys().map(String::as_str)
+    }
+
     pub fn tensor_span(
         &self,
         path: impl AsRef<Path>,
@@ -480,6 +510,21 @@ impl SafetensorsHeader {
             return Ok(None);
         };
         span.read()
+    }
+
+    pub fn tensor_span_entries(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<Vec<(String, SafetensorsTensorSpan)>, ModelArtifactError> {
+        let path = path.as_ref();
+        let mut entries = Vec::with_capacity(self.tensors.len());
+        for tensor_name in self.tensor_names() {
+            if let Some(span) = self.tensor_span(path, tensor_name)? {
+                entries.push((tensor_name.to_string(), span));
+            }
+        }
+
+        Ok(entries)
     }
 
     fn routed_expert_weight_dtype(&self) -> Option<String> {
