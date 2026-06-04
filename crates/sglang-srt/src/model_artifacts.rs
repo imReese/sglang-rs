@@ -194,6 +194,17 @@ impl SafetensorsManifest {
         Ok(entries)
     }
 
+    pub fn checkpoint_fingerprint_entries(
+        &self,
+    ) -> Result<Vec<SafetensorsCheckpointFingerprintEntry>, ModelArtifactError> {
+        self.tensor_span_entries()?
+            .into_iter()
+            .map(|(tensor_name, span)| {
+                SafetensorsCheckpointFingerprintEntry::from_span(tensor_name, span)
+            })
+            .collect()
+    }
+
     pub fn read_tensor(
         &self,
         tensor_name: &str,
@@ -313,6 +324,35 @@ impl SafetensorsTensorData {
         self.metadata
             .dtype_byte_width()
             .expect("loaded safetensors tensor dtype should be validated")
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SafetensorsCheckpointFingerprintEntry {
+    pub tensor_name: String,
+    pub path: PathBuf,
+    pub dtype: String,
+    pub shape: Vec<usize>,
+    pub absolute_byte_offset: u64,
+    pub byte_len: usize,
+    pub fnv1a64: u64,
+}
+
+impl SafetensorsCheckpointFingerprintEntry {
+    fn from_span(
+        tensor_name: String,
+        span: SafetensorsTensorSpan,
+    ) -> Result<Self, ModelArtifactError> {
+        let fnv1a64 = span.fnv1a64_checksum()?;
+        Ok(Self {
+            tensor_name,
+            path: span.path,
+            dtype: span.metadata.dtype,
+            shape: span.metadata.shape,
+            absolute_byte_offset: span.absolute_byte_offset,
+            byte_len: span.byte_len,
+            fnv1a64,
+        })
     }
 }
 

@@ -2,8 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use sglang_srt::model_artifacts::{
-    LocalModelArtifacts, ModelArtifactError, SafetensorsTensorData, SafetensorsTensorMetadata,
-    SafetensorsTensorSpan,
+    LocalModelArtifacts, ModelArtifactError, SafetensorsCheckpointFingerprintEntry,
+    SafetensorsTensorData, SafetensorsTensorMetadata, SafetensorsTensorSpan,
 };
 
 #[test]
@@ -341,6 +341,96 @@ fn safetensors_tensor_span_computes_checksum_over_payload_slice() {
         span.fnv1a64_checksum()
             .expect("span checksum should stream payload"),
         fnv1a64(&[1, 2, 3, 4, 5])
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn safetensors_manifest_builds_stable_checkpoint_fingerprint_entries() {
+    let model_dir = temp_model_dir("checkpoint-fingerprint");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(model_dir.join("config.json"), deepseek_v4_config_json())
+        .expect("config should be written");
+    fs::write(
+        model_dir.join("model.safetensors.index.json"),
+        safetensors_index_json(),
+    )
+    .expect("index should be written");
+    let first_shard = model_dir.join("model-00001-of-00002.safetensors");
+    let first_header_len = write_safetensors_file(
+        &first_shard,
+        &[
+            ("model.embed_tokens.weight", "U8", &[2], [0, 2]),
+            ("model.layers.0.ffn.experts.3.w1.weight", "U8", &[3], [2, 5]),
+            (
+                "model.layers.0.self_attn.q_a_proj.weight",
+                "U8",
+                &[1],
+                [5, 6],
+            ),
+        ],
+        &[10, 11, 20, 21, 22, 30],
+    )
+    .expect("first shard should be written");
+    let second_shard = model_dir.join("model-00002-of-00002.safetensors");
+    let second_header_len = write_safetensors_file(
+        &second_shard,
+        &[(
+            "model.layers.0.self_attn.q_b_proj.weight",
+            "BF16",
+            &[2],
+            [0, 4],
+        )],
+        &[40, 41, 42, 43],
+    )
+    .expect("second shard should be written");
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("local artifacts should load");
+
+    assert_eq!(
+        artifacts
+            .safetensors()
+            .checkpoint_fingerprint_entries()
+            .expect("checkpoint fingerprint should stream tensor spans"),
+        vec![
+            SafetensorsCheckpointFingerprintEntry {
+                tensor_name: "model.embed_tokens.weight".to_string(),
+                path: first_shard.clone(),
+                dtype: "U8".to_string(),
+                shape: vec![2],
+                absolute_byte_offset: 8 + first_header_len as u64,
+                byte_len: 2,
+                fnv1a64: fnv1a64(&[10, 11]),
+            },
+            SafetensorsCheckpointFingerprintEntry {
+                tensor_name: "model.layers.0.ffn.experts.3.w1.weight".to_string(),
+                path: first_shard.clone(),
+                dtype: "U8".to_string(),
+                shape: vec![3],
+                absolute_byte_offset: 8 + first_header_len as u64 + 2,
+                byte_len: 3,
+                fnv1a64: fnv1a64(&[20, 21, 22]),
+            },
+            SafetensorsCheckpointFingerprintEntry {
+                tensor_name: "model.layers.0.self_attn.q_a_proj.weight".to_string(),
+                path: first_shard,
+                dtype: "U8".to_string(),
+                shape: vec![1],
+                absolute_byte_offset: 8 + first_header_len as u64 + 5,
+                byte_len: 1,
+                fnv1a64: fnv1a64(&[30]),
+            },
+            SafetensorsCheckpointFingerprintEntry {
+                tensor_name: "model.layers.0.self_attn.q_b_proj.weight".to_string(),
+                path: second_shard,
+                dtype: "BF16".to_string(),
+                shape: vec![2],
+                absolute_byte_offset: 8 + second_header_len as u64,
+                byte_len: 4,
+                fnv1a64: fnv1a64(&[40, 41, 42, 43]),
+            },
+        ]
     );
 
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
