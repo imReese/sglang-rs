@@ -41,6 +41,61 @@ impl LocalModelArtifacts {
     pub fn safetensors(&self) -> &SafetensorsManifest {
         &self.safetensors
     }
+
+    pub fn validate_routed_expert_checkpoint_coverage(
+        &self,
+    ) -> Result<RoutedExpertCheckpointCoverage, ModelArtifactError> {
+        let Some(expected_group_count) = self.config.expected_routed_expert_group_count() else {
+            return Ok(RoutedExpertCheckpointCoverage {
+                expected_group_count: 0,
+                actual_group_count: 0,
+                expected_weight_count: 0,
+                actual_weight_count: 0,
+            });
+        };
+        let expected_weight_count = self
+            .config
+            .expected_routed_expert_weight_count()
+            .ok_or_else(|| {
+                invalid_safetensors_data(
+                    &self.model_path,
+                    "expected routed expert weight count overflowed",
+                )
+            })?;
+
+        let groups = self.safetensors.routed_expert_weight_groups()?;
+        let actual_group_count = groups.len();
+        let actual_weight_count = actual_group_count.checked_mul(3).ok_or_else(|| {
+            invalid_safetensors_data(
+                &self.model_path,
+                "actual routed expert weight count overflowed",
+            )
+        })?;
+
+        if actual_group_count != expected_group_count {
+            return Err(invalid_safetensors_data(
+                &self.model_path,
+                format!(
+                    "expected {expected_group_count} routed expert groups from model config but found {actual_group_count}"
+                ),
+            ));
+        }
+
+        Ok(RoutedExpertCheckpointCoverage {
+            expected_group_count,
+            actual_group_count,
+            expected_weight_count,
+            actual_weight_count,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RoutedExpertCheckpointCoverage {
+    pub expected_group_count: usize,
+    pub actual_group_count: usize,
+    pub expected_weight_count: usize,
+    pub actual_weight_count: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

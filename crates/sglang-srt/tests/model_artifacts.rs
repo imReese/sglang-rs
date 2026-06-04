@@ -121,6 +121,180 @@ fn local_model_artifacts_loads_deepseek_v4_config_and_indexed_safetensors() {
 }
 
 #[test]
+fn local_model_artifacts_validates_routed_expert_checkpoint_coverage() {
+    let model_dir = temp_model_dir("routed-expert-coverage");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "model_type": "deepseek_v4",
+  "num_hidden_layers": 2,
+  "n_routed_experts": 2,
+  "first_k_dense_replace": 0,
+  "moe_layer_freq": 1
+}"#,
+    )
+    .expect("config should be written");
+    fs::write(
+        model_dir.join("model.safetensors.index.json"),
+        r#"{
+  "weight_map": {
+    "model.layers.0.ffn.experts.0.w1.weight": "model.safetensors",
+    "model.layers.0.ffn.experts.0.w2.weight": "model.safetensors",
+    "model.layers.0.ffn.experts.0.w3.weight": "model.safetensors",
+    "model.layers.0.ffn.experts.1.w1.weight": "model.safetensors",
+    "model.layers.0.ffn.experts.1.w2.weight": "model.safetensors",
+    "model.layers.0.ffn.experts.1.w3.weight": "model.safetensors",
+    "model.layers.1.ffn.experts.0.w1.weight": "model.safetensors",
+    "model.layers.1.ffn.experts.0.w2.weight": "model.safetensors",
+    "model.layers.1.ffn.experts.0.w3.weight": "model.safetensors",
+    "model.layers.1.ffn.experts.1.w1.weight": "model.safetensors",
+    "model.layers.1.ffn.experts.1.w2.weight": "model.safetensors",
+    "model.layers.1.ffn.experts.1.w3.weight": "model.safetensors"
+  }
+}"#,
+    )
+    .expect("index should be written");
+    write_safetensors_file(
+        &model_dir.join("model.safetensors"),
+        &[
+            ("model.layers.0.ffn.experts.0.w1.weight", "U8", &[1], [0, 1]),
+            ("model.layers.0.ffn.experts.0.w2.weight", "U8", &[1], [1, 2]),
+            ("model.layers.0.ffn.experts.0.w3.weight", "U8", &[1], [2, 3]),
+            ("model.layers.0.ffn.experts.1.w1.weight", "U8", &[1], [3, 4]),
+            ("model.layers.0.ffn.experts.1.w2.weight", "U8", &[1], [4, 5]),
+            ("model.layers.0.ffn.experts.1.w3.weight", "U8", &[1], [5, 6]),
+            ("model.layers.1.ffn.experts.0.w1.weight", "U8", &[1], [6, 7]),
+            ("model.layers.1.ffn.experts.0.w2.weight", "U8", &[1], [7, 8]),
+            ("model.layers.1.ffn.experts.0.w3.weight", "U8", &[1], [8, 9]),
+            (
+                "model.layers.1.ffn.experts.1.w1.weight",
+                "U8",
+                &[1],
+                [9, 10],
+            ),
+            (
+                "model.layers.1.ffn.experts.1.w2.weight",
+                "U8",
+                &[1],
+                [10, 11],
+            ),
+            (
+                "model.layers.1.ffn.experts.1.w3.weight",
+                "U8",
+                &[1],
+                [11, 12],
+            ),
+        ],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+    )
+    .expect("shard should be written");
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("local artifacts should load");
+
+    let summary = artifacts
+        .validate_routed_expert_checkpoint_coverage()
+        .expect("complete routed expert checkpoint should validate");
+
+    assert_eq!(summary.expected_group_count, 4);
+    assert_eq!(summary.actual_group_count, 4);
+    assert_eq!(summary.expected_weight_count, 12);
+    assert_eq!(summary.actual_weight_count, 12);
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn local_model_artifacts_rejects_missing_routed_expert_checkpoint_groups() {
+    let model_dir = temp_model_dir("routed-expert-coverage-missing");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "model_type": "deepseek_v4",
+  "num_hidden_layers": 2,
+  "n_routed_experts": 2,
+  "first_k_dense_replace": 0,
+  "moe_layer_freq": 1
+}"#,
+    )
+    .expect("config should be written");
+    fs::write(
+        model_dir.join("model.safetensors.index.json"),
+        r#"{
+  "weight_map": {
+    "model.layers.0.ffn.experts.0.w1.weight": "model.safetensors",
+    "model.layers.0.ffn.experts.0.w2.weight": "model.safetensors",
+    "model.layers.0.ffn.experts.0.w3.weight": "model.safetensors"
+  }
+}"#,
+    )
+    .expect("index should be written");
+    write_safetensors_file(
+        &model_dir.join("model.safetensors"),
+        &[
+            ("model.layers.0.ffn.experts.0.w1.weight", "U8", &[1], [0, 1]),
+            ("model.layers.0.ffn.experts.0.w2.weight", "U8", &[1], [1, 2]),
+            ("model.layers.0.ffn.experts.0.w3.weight", "U8", &[1], [2, 3]),
+        ],
+        &[1, 2, 3],
+    )
+    .expect("shard should be written");
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("local artifacts should load");
+
+    let error = artifacts
+        .validate_routed_expert_checkpoint_coverage()
+        .expect_err("missing routed expert groups should fail coverage validation");
+
+    assert!(
+        matches!(
+            error,
+            ModelArtifactError::InvalidSafetensorsData { ref path, ref message }
+                if path == &model_dir
+                    && message.contains("expected 4 routed expert groups")
+                    && message.contains("found 1")
+        ),
+        "unexpected error: {error:?}"
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn local_model_artifacts_skips_routed_expert_coverage_for_dense_configs() {
+    let model_dir = temp_model_dir("dense-checkpoint-coverage");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "model_type": "llama",
+  "num_hidden_layers": 2
+}"#,
+    )
+    .expect("config should be written");
+    write_safetensors_file(
+        &model_dir.join("model.safetensors"),
+        &[("model.layers.0.mlp.down_proj.weight", "U8", &[1], [0, 1])],
+        &[1],
+    )
+    .expect("shard should be written");
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("local artifacts should load");
+
+    let summary = artifacts
+        .validate_routed_expert_checkpoint_coverage()
+        .expect("dense config should not require routed expert coverage");
+
+    assert_eq!(summary.expected_group_count, 0);
+    assert_eq!(summary.actual_group_count, 0);
+    assert_eq!(summary.expected_weight_count, 0);
+    assert_eq!(summary.actual_weight_count, 0);
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
 fn hf_model_config_treats_null_optional_moe_fields_as_absent() {
     let model_dir = temp_model_dir("null-optional-moe-config");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");
