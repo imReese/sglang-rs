@@ -158,15 +158,33 @@ pub struct ModelForwardOutput {
 
 impl ModelForwardOutput {
     pub fn new(logits: Vec<Vec<f32>>) -> Result<Self, ModelForwardError> {
-        let Some(first_row) = logits.first() else {
-            return Ok(Self { logits });
-        };
-        let vocab_size = first_row.len();
-        if vocab_size == 0 {
-            return Err(ModelForwardError::EmptyVocabulary);
+        validate_logits(&logits)?;
+        Ok(Self { logits })
+    }
+
+    pub fn from_token_logits(
+        batch: &ModelWorkerBatch,
+        token_logits: Vec<Vec<f32>>,
+    ) -> Result<Self, ModelForwardError> {
+        validate_logits(&token_logits)?;
+        if token_logits.len() != batch.input_ids().len() {
+            return Err(ModelForwardError::TokenLogitCountMismatch {
+                token_count: batch.input_ids().len(),
+                logit_count: token_logits.len(),
+            });
         }
-        if logits.iter().any(|row| row.len() != vocab_size) {
-            return Err(ModelForwardError::RaggedLogits);
+
+        let mut logits = Vec::with_capacity(batch.request_ids().len());
+        for (request_index, (offset, token_count)) in batch
+            .request_offsets()
+            .iter()
+            .zip(batch.input_token_counts())
+            .enumerate()
+        {
+            if *token_count == 0 {
+                return Err(ModelForwardError::MissingRequestTokenLogits { request_index });
+            }
+            logits.push(token_logits[*offset + *token_count - 1].clone());
         }
 
         Ok(Self { logits })
@@ -199,6 +217,13 @@ pub enum ModelForwardError {
         request_count: usize,
         output_count: usize,
     },
+    TokenLogitCountMismatch {
+        token_count: usize,
+        logit_count: usize,
+    },
+    MissingRequestTokenLogits {
+        request_index: usize,
+    },
 }
 
 impl fmt::Display for ModelForwardError {
@@ -216,11 +241,37 @@ impl fmt::Display for ModelForwardError {
                 formatter,
                 "model forward output count ({output_count}) must match request count ({request_count})"
             ),
+            Self::TokenLogitCountMismatch {
+                token_count,
+                logit_count,
+            } => write!(
+                formatter,
+                "model forward token logit count ({logit_count}) must match input token count ({token_count})"
+            ),
+            Self::MissingRequestTokenLogits { request_index } => write!(
+                formatter,
+                "model forward request {request_index} has no input token logits"
+            ),
         }
     }
 }
 
 impl std::error::Error for ModelForwardError {}
+
+fn validate_logits(logits: &[Vec<f32>]) -> Result<(), ModelForwardError> {
+    let Some(first_row) = logits.first() else {
+        return Ok(());
+    };
+    let vocab_size = first_row.len();
+    if vocab_size == 0 {
+        return Err(ModelForwardError::EmptyVocabulary);
+    }
+    if logits.iter().any(|row| row.len() != vocab_size) {
+        return Err(ModelForwardError::RaggedLogits);
+    }
+
+    Ok(())
+}
 
 pub struct ModelRunner<M> {
     model: M,

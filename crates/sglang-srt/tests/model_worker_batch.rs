@@ -307,6 +307,95 @@ fn model_runner_calls_forward_and_returns_argmax_tokens() {
 }
 
 #[derive(Default)]
+struct FlattenedPrefillLogitsModel;
+
+impl ForwardModel for FlattenedPrefillLogitsModel {
+    fn forward(
+        &mut self,
+        batch: &ModelWorkerBatch,
+    ) -> Result<ModelForwardOutput, ModelForwardError> {
+        assert_eq!(batch.input_ids(), &[10, 11, 20, 21, 22]);
+        ModelForwardOutput::from_token_logits(
+            batch,
+            vec![
+                vec![9.0, 0.1, 0.2],
+                vec![0.1, 9.0, 0.2],
+                vec![0.2, 0.3, 9.0],
+                vec![0.4, 0.5, 9.0],
+                vec![0.5, 9.0, 0.6],
+            ],
+        )
+    }
+}
+
+#[test]
+fn model_runner_samples_last_token_logits_from_flattened_prefill_output() {
+    let mut scheduler = Scheduler::new(ModelRunner::new(FlattenedPrefillLogitsModel));
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("prefill-a"),
+        vec![10, 11],
+        SamplingParams { max_new_tokens: 1 },
+    ));
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("prefill-b"),
+        vec![20, 21, 22],
+        SamplingParams { max_new_tokens: 1 },
+    ));
+
+    let outputs = scheduler
+        .dispatch_prefill_batch(2)
+        .expect("prefill should dispatch through model runner");
+
+    assert_eq!(outputs[0].token_ids, vec![1]);
+    assert_eq!(outputs[1].token_ids, vec![1]);
+}
+
+#[test]
+fn model_forward_output_rejects_flattened_logits_with_wrong_token_count() {
+    let mut scheduler = Scheduler::new(NoopWorker);
+    enqueue_request(&mut scheduler, "prefill-a", &[10, 11]);
+    enqueue_request(&mut scheduler, "prefill-b", &[20]);
+    let batch = scheduler
+        .next_prefill_batch(2)
+        .expect("batch should be available");
+    let worker_batch = ModelWorkerBatch::from_schedule_batch(&batch);
+
+    let error =
+        ModelForwardOutput::from_token_logits(&worker_batch, vec![vec![9.0, 0.1], vec![0.1, 9.0]])
+            .expect_err("token logits must match flattened input token count");
+
+    assert_eq!(
+        error,
+        ModelForwardError::TokenLogitCountMismatch {
+            token_count: 3,
+            logit_count: 2,
+        }
+    );
+}
+
+#[test]
+fn model_forward_output_rejects_flattened_logits_for_request_without_input_tokens() {
+    let mut cache = RadixCache::default();
+    cache
+        .insert(&[10, 11], &[CachePageId::from(100), CachePageId::from(101)])
+        .expect("insert should succeed");
+    let mut scheduler = Scheduler::with_prefix_cache(NoopWorker, cache);
+    enqueue_request(&mut scheduler, "prefill-a", &[10, 11]);
+    let batch = scheduler
+        .next_prefill_batch(1)
+        .expect("batch should be available");
+    let worker_batch = ModelWorkerBatch::from_schedule_batch(&batch);
+
+    let error = ModelForwardOutput::from_token_logits(&worker_batch, Vec::new())
+        .expect_err("fully cached requests should not index missing token logits");
+
+    assert_eq!(
+        error,
+        ModelForwardError::MissingRequestTokenLogits { request_index: 0 }
+    );
+}
+
+#[derive(Default)]
 struct TwoStepForwardModel {
     seen_forward_modes: Vec<ForwardMode>,
 }
