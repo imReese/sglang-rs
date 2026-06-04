@@ -162,6 +162,7 @@ pub struct RoutedExpertCheckpointCoverage {
 pub struct LocalModelCheckpointCatalog {
     model_path: PathBuf,
     config: HfModelConfig,
+    safetensors: SafetensorsManifest,
     layer_tensors: SafetensorsLayerTensorCatalog,
     routed_experts: SafetensorsRoutedExpertWeightCatalog,
 }
@@ -176,6 +177,7 @@ impl LocalModelCheckpointCatalog {
         Ok(Self {
             model_path: artifacts.model_path().to_path_buf(),
             config: artifacts.config().clone(),
+            safetensors: artifacts.safetensors().clone(),
             layer_tensors,
             routed_experts,
         })
@@ -187,6 +189,27 @@ impl LocalModelCheckpointCatalog {
 
     pub fn routed_experts(&self) -> &SafetensorsRoutedExpertWeightCatalog {
         &self.routed_experts
+    }
+
+    pub fn deepseek_model_weights(
+        &self,
+    ) -> Result<DeepSeekModelCheckpointWeights<'_>, ModelArtifactError> {
+        let num_hidden_layers = self.config.num_hidden_layers.ok_or_else(|| {
+            invalid_safetensors_data(
+                &self.model_path,
+                "missing DeepSeek model num_hidden_layers config",
+            )
+        })?;
+        let layers = (0..num_hidden_layers)
+            .map(|layer_id| self.deepseek_layer_weights(layer_id))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(DeepSeekModelCheckpointWeights {
+            token_embeddings: self.required_deepseek_model_tensor("model.embed_tokens.weight")?,
+            final_norm: self.required_deepseek_model_tensor("model.norm.weight")?,
+            lm_head: self.required_deepseek_model_tensor("lm_head.weight")?,
+            layers,
+        })
     }
 
     pub fn deepseek_layer_weights(
@@ -246,6 +269,93 @@ impl LocalModelCheckpointCatalog {
                 format!("missing DeepSeek layer {layer_id} tensor {suffix}"),
             )
         })
+    }
+
+    fn required_deepseek_model_tensor(
+        &self,
+        tensor_name: &str,
+    ) -> Result<DeepSeekModelTensorSpan, ModelArtifactError> {
+        self.safetensors
+            .tensor_span(tensor_name)?
+            .map(|span| DeepSeekModelTensorSpan {
+                tensor_name: tensor_name.to_string(),
+                span,
+            })
+            .ok_or_else(|| {
+                invalid_safetensors_data(
+                    &self.model_path,
+                    format!("missing DeepSeek model tensor {tensor_name}"),
+                )
+            })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeepSeekModelTensorSpan {
+    pub tensor_name: String,
+    pub span: SafetensorsTensorSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeepSeekModelCheckpointWeights<'a> {
+    token_embeddings: DeepSeekModelTensorSpan,
+    final_norm: DeepSeekModelTensorSpan,
+    lm_head: DeepSeekModelTensorSpan,
+    layers: Vec<DeepSeekLayerCheckpointWeights<'a>>,
+}
+
+impl<'a> DeepSeekModelCheckpointWeights<'a> {
+    pub fn token_embeddings(&self) -> &DeepSeekModelTensorSpan {
+        &self.token_embeddings
+    }
+
+    pub fn final_norm(&self) -> &DeepSeekModelTensorSpan {
+        &self.final_norm
+    }
+
+    pub fn lm_head(&self) -> &DeepSeekModelTensorSpan {
+        &self.lm_head
+    }
+
+    pub fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
+    pub fn layers(&self) -> &[DeepSeekLayerCheckpointWeights<'a>] {
+        &self.layers
+    }
+
+    pub fn layer(&self, layer_id: usize) -> Option<&DeepSeekLayerCheckpointWeights<'a>> {
+        self.layers.get(layer_id)
+    }
+
+    pub fn read_root_tensors(&self) -> Result<DeepSeekLoadedModelRootWeights, ModelArtifactError> {
+        Ok(DeepSeekLoadedModelRootWeights {
+            token_embeddings: read_required_tensor_span(&self.token_embeddings.span)?,
+            final_norm: read_required_tensor_span(&self.final_norm.span)?,
+            lm_head: read_required_tensor_span(&self.lm_head.span)?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeepSeekLoadedModelRootWeights {
+    token_embeddings: SafetensorsTensorData,
+    final_norm: SafetensorsTensorData,
+    lm_head: SafetensorsTensorData,
+}
+
+impl DeepSeekLoadedModelRootWeights {
+    pub fn token_embeddings(&self) -> &SafetensorsTensorData {
+        &self.token_embeddings
+    }
+
+    pub fn final_norm(&self) -> &SafetensorsTensorData {
+        &self.final_norm
+    }
+
+    pub fn lm_head(&self) -> &SafetensorsTensorData {
+        &self.lm_head
     }
 }
 
