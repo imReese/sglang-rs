@@ -137,7 +137,10 @@ impl ModelWorkerBatch {
 }
 
 pub trait ForwardModel {
-    fn forward(&mut self, batch: &ModelWorkerBatch) -> ModelForwardOutput;
+    fn forward(
+        &mut self,
+        batch: &ModelWorkerBatch,
+    ) -> Result<ModelForwardOutput, ModelForwardError>;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -183,6 +186,7 @@ impl ModelForwardOutput {
 pub enum ModelForwardError {
     EmptyVocabulary,
     RaggedLogits,
+    Runtime(String),
     BatchSizeMismatch {
         request_count: usize,
         output_count: usize,
@@ -196,6 +200,7 @@ impl fmt::Display for ModelForwardError {
                 formatter.write_str("model forward output has empty vocabulary")
             }
             Self::RaggedLogits => formatter.write_str("model forward output logits are ragged"),
+            Self::Runtime(message) => formatter.write_str(message),
             Self::BatchSizeMismatch {
                 request_count,
                 output_count,
@@ -236,7 +241,10 @@ where
         batch: &ScheduleBatch,
     ) -> Result<BatchGeneratedTokens, WorkerExecutionError> {
         let worker_batch = ModelWorkerBatch::from_schedule_batch(batch);
-        let forward_output = self.model.forward(&worker_batch);
+        let forward_output = self
+            .model
+            .forward(&worker_batch)
+            .map_err(|error| WorkerExecutionError::Runtime(error.to_string()))?;
         let token_ids = forward_output
             .into_argmax_tokens()
             .map_err(|error| WorkerExecutionError::Runtime(error.to_string()))?;

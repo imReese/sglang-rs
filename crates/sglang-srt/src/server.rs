@@ -7,7 +7,9 @@ use crate::cli::ServerArgs;
 use crate::engine::Engine;
 use crate::grpc::{GrpcRouterService, GrpcServeError, serve_grpc_router};
 use crate::model_artifacts::{LocalModelArtifacts, ModelArtifactError};
-use crate::model_executor::{ForwardModel, ModelForwardOutput, ModelRunner, ModelWorkerBatch};
+use crate::model_executor::{
+    ForwardModel, ModelForwardError, ModelForwardOutput, ModelRunner, ModelWorkerBatch,
+};
 use crate::router::RouterRuntime;
 use crate::scheduler::Scheduler;
 use crate::tokenizer::{RuntimeTokenizer, TokenizerError};
@@ -20,7 +22,10 @@ use crate::transfer::{
 pub struct BootstrapForwardModel;
 
 impl ForwardModel for BootstrapForwardModel {
-    fn forward(&mut self, batch: &ModelWorkerBatch) -> ModelForwardOutput {
+    fn forward(
+        &mut self,
+        batch: &ModelWorkerBatch,
+    ) -> Result<ModelForwardOutput, ModelForwardError> {
         let mut logits = Vec::with_capacity(batch.request_ids().len());
         for _ in batch.request_ids() {
             let mut row = vec![0.0; (b' ' as usize) + 1];
@@ -28,7 +33,7 @@ impl ForwardModel for BootstrapForwardModel {
             logits.push(row);
         }
 
-        ModelForwardOutput::new(logits).expect("bootstrap logits should be rectangular")
+        ModelForwardOutput::new(logits)
     }
 }
 

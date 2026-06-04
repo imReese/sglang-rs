@@ -1,5 +1,7 @@
 use sglang_srt::cache::{CachePageId, RadixCache};
-use sglang_srt::model_executor::{ForwardModel, ModelForwardOutput, ModelRunner, ModelWorkerBatch};
+use sglang_srt::model_executor::{
+    ForwardModel, ModelForwardError, ModelForwardOutput, ModelRunner, ModelWorkerBatch,
+};
 use sglang_srt::scheduler::{
     ForwardMode, ScheduleBatch, ScheduledRequest, Scheduler, SchedulerError,
 };
@@ -218,13 +220,15 @@ struct RecordingForwardModel {
 }
 
 impl ForwardModel for RecordingForwardModel {
-    fn forward(&mut self, batch: &ModelWorkerBatch) -> ModelForwardOutput {
+    fn forward(
+        &mut self,
+        batch: &ModelWorkerBatch,
+    ) -> Result<ModelForwardOutput, ModelForwardError> {
         self.seen_input_ids = batch.input_ids().to_vec();
         self.seen_positions = batch.positions().to_vec();
         self.seen_forward_modes.push(batch.forward_mode());
 
         ModelForwardOutput::new(vec![vec![0.1, 9.0, 0.2], vec![0.0, 0.5, 8.0]])
-            .expect("logits should be rectangular")
     }
 }
 
@@ -263,15 +267,14 @@ struct TwoStepForwardModel {
 }
 
 impl ForwardModel for TwoStepForwardModel {
-    fn forward(&mut self, batch: &ModelWorkerBatch) -> ModelForwardOutput {
+    fn forward(
+        &mut self,
+        batch: &ModelWorkerBatch,
+    ) -> Result<ModelForwardOutput, ModelForwardError> {
         self.seen_forward_modes.push(batch.forward_mode());
         match batch.forward_mode() {
-            ForwardMode::Prefill => {
-                ModelForwardOutput::new(vec![vec![0.0, 4.0, 0.1]]).expect("valid logits")
-            }
-            ForwardMode::Decode => {
-                ModelForwardOutput::new(vec![vec![0.0, 0.1, 4.0]]).expect("valid logits")
-            }
+            ForwardMode::Prefill => ModelForwardOutput::new(vec![vec![0.0, 4.0, 0.1]]),
+            ForwardMode::Decode => ModelForwardOutput::new(vec![vec![0.0, 0.1, 4.0]]),
         }
     }
 }
@@ -306,8 +309,11 @@ fn model_runner_requeues_decode_until_scheduler_reaches_max_new_tokens() {
 struct EmptyForwardModel;
 
 impl ForwardModel for EmptyForwardModel {
-    fn forward(&mut self, _batch: &ModelWorkerBatch) -> ModelForwardOutput {
-        ModelForwardOutput::new(Vec::new()).expect("empty batch logits are constructible")
+    fn forward(
+        &mut self,
+        _batch: &ModelWorkerBatch,
+    ) -> Result<ModelForwardOutput, ModelForwardError> {
+        ModelForwardOutput::new(Vec::new())
     }
 }
 
@@ -329,6 +335,41 @@ fn model_runner_returns_forward_errors_without_panicking() {
         error
             .to_string()
             .contains("model forward output count (0) must match request count (1)")
+    );
+}
+
+#[derive(Default)]
+struct FailingForwardModel;
+
+impl ForwardModel for FailingForwardModel {
+    fn forward(
+        &mut self,
+        _batch: &ModelWorkerBatch,
+    ) -> Result<ModelForwardOutput, ModelForwardError> {
+        Err(ModelForwardError::Runtime(
+            "DeepSeek V4 CPU fallback does not support tensor dtype F8_E4M3".to_string(),
+        ))
+    }
+}
+
+#[test]
+fn model_runner_propagates_forward_runtime_errors() {
+    let mut scheduler = Scheduler::new(ModelRunner::new(FailingForwardModel));
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("runner-forward-error"),
+        vec![10, 11],
+        SamplingParams { max_new_tokens: 1 },
+    ));
+
+    let error = scheduler
+        .dispatch_prefill_batch(1)
+        .expect_err("fallible model forward errors should become scheduler errors");
+
+    assert!(matches!(error, SchedulerError::Worker(_)));
+    assert!(
+        error
+            .to_string()
+            .contains("DeepSeek V4 CPU fallback does not support tensor dtype F8_E4M3")
     );
 }
 
