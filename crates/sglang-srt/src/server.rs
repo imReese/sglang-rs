@@ -1,10 +1,12 @@
 use std::fmt;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::path::Path;
 
 use crate::cache::{CachePageAllocator, RadixCache};
 use crate::cli::ServerArgs;
 use crate::engine::Engine;
 use crate::grpc::{GrpcRouterService, GrpcServeError, serve_grpc_router};
+use crate::model_artifacts::{LocalModelArtifacts, ModelArtifactError};
 use crate::model_executor::{ForwardModel, ModelForwardOutput, ModelRunner, ModelWorkerBatch};
 use crate::router::RouterRuntime;
 use crate::scheduler::Scheduler;
@@ -51,6 +53,7 @@ pub enum ServerLaunchError {
         mode: DisaggregationMode,
         transfer_backend: TransferBackend,
     },
+    ModelArtifact(ModelArtifactError),
     Tokenizer(TokenizerError),
     Grpc(GrpcServeError),
 }
@@ -80,6 +83,7 @@ impl PartialEq for ServerLaunchError {
                 },
             ) => left_mode == right_mode && left_backend == right_backend,
             (Self::Tokenizer(left), Self::Tokenizer(right)) => left == right,
+            (Self::ModelArtifact(left), Self::ModelArtifact(right)) => left == right,
             _ => false,
         }
     }
@@ -102,6 +106,7 @@ impl fmt::Display for ServerLaunchError {
                 formatter,
                 "bootstrap server does not support PD runtime mode {mode:?} with backend {transfer_backend:?}"
             ),
+            Self::ModelArtifact(error) => write!(formatter, "model artifact error: {error}"),
             Self::Tokenizer(error) => write!(formatter, "tokenizer error: {error}"),
             Self::Grpc(error) => write!(formatter, "{error}"),
         }
@@ -119,6 +124,12 @@ impl From<GrpcServeError> for ServerLaunchError {
 impl From<PdConfigError> for ServerLaunchError {
     fn from(value: PdConfigError) -> Self {
         Self::PdConfig(value)
+    }
+}
+
+impl From<ModelArtifactError> for ServerLaunchError {
+    fn from(value: ModelArtifactError) -> Self {
+        Self::ModelArtifact(value)
     }
 }
 
@@ -148,6 +159,7 @@ pub fn build_bootstrap_grpc_router_service(args: &ServerArgs) -> BootstrapGrpcRo
 pub fn try_build_bootstrap_grpc_router_service(
     args: &ServerArgs,
 ) -> Result<BootstrapGrpcRouterService, ServerLaunchError> {
+    validate_local_model_artifacts_if_present(args)?;
     let scheduler = Scheduler::new(ModelRunner::new(BootstrapForwardModel))
         .with_max_running_requests(args.max_running_requests);
     let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
@@ -179,6 +191,7 @@ pub fn try_build_bootstrap_pd_grpc_router_service<E>(
 where
     E: KvCacheTransferExecutor,
 {
+    validate_local_model_artifacts_if_present(args)?;
     let worker = KvTransferModelWorker::new(
         ModelRunner::new(BootstrapForwardModel),
         registry,
@@ -198,6 +211,21 @@ where
     let runtime = RouterRuntime::new(engine);
     Ok(GrpcRouterService::with_server_args(runtime, args)
         .with_max_transfer_polls(args.disaggregation_decode_polling_interval))
+}
+
+fn validate_local_model_artifacts_if_present(args: &ServerArgs) -> Result<(), ServerLaunchError> {
+    let model_path = Path::new(&args.model_path);
+    if !model_path.is_dir() || !model_path.join("config.json").is_file() {
+        return Ok(());
+    }
+
+    let artifacts = match LocalModelArtifacts::from_model_path(model_path) {
+        Ok(artifacts) => artifacts,
+        Err(ModelArtifactError::NoSafetensorsWeights { .. }) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    artifacts.validate_routed_expert_checkpoint_coverage()?;
+    Ok(())
 }
 
 pub fn build_bootstrap_fake_pd_grpc_router_service(

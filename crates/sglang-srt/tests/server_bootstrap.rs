@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use tonic::Request;
 
 use sglang_srt::cli::ServerArgs;
+use sglang_srt::model_artifacts::ModelArtifactError;
 use sglang_srt::proto::sglang::runtime::v1::generate_response::Body;
 use sglang_srt::proto::sglang::runtime::v1::sglang_service_server::SglangService;
 use sglang_srt::proto::sglang::runtime::v1::{
@@ -212,6 +213,71 @@ fn bootstrap_grpc_router_service_rejects_missing_explicit_tokenizer_path() {
             path: tokenizer_dir
         })
     );
+}
+
+#[test]
+fn bootstrap_grpc_router_service_rejects_incomplete_local_moe_checkpoint() {
+    let model_dir = temp_model_dir("server-incomplete-moe-checkpoint");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "model_type": "deepseek_v4",
+  "num_hidden_layers": 2,
+  "n_routed_experts": 2,
+  "first_k_dense_replace": 0,
+  "moe_layer_freq": 1
+}"#,
+    )
+    .expect("config should be written");
+    fs::write(
+        model_dir.join("model.safetensors.index.json"),
+        r#"{
+  "weight_map": {
+    "model.layers.0.ffn.experts.0.w1.weight": "model.safetensors",
+    "model.layers.0.ffn.experts.0.w2.weight": "model.safetensors",
+    "model.layers.0.ffn.experts.0.w3.weight": "model.safetensors"
+  }
+}"#,
+    )
+    .expect("index should be written");
+    write_safetensors_file(
+        &model_dir.join("model.safetensors"),
+        &[
+            ("model.layers.0.ffn.experts.0.w1.weight", "U8", &[1], [0, 1]),
+            ("model.layers.0.ffn.experts.0.w2.weight", "U8", &[1], [1, 2]),
+            ("model.layers.0.ffn.experts.0.w3.weight", "U8", &[1], [2, 3]),
+        ],
+        &[1, 2, 3],
+    )
+    .expect("shard should be written");
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_dir.to_str().expect("temp model dir should be utf-8"),
+        "--grpc-mode",
+    ])
+    .expect("args should parse");
+
+    let error = match try_build_bootstrap_grpc_router_service(&args) {
+        Ok(_) => panic!("incomplete local MoE checkpoint should fail bootstrap"),
+        Err(error) => error,
+    };
+
+    assert!(
+        matches!(
+            error,
+            ServerLaunchError::ModelArtifact(ModelArtifactError::InvalidSafetensorsData {
+                ref path,
+                ref message,
+            }) if path == &model_dir
+                && message.contains("expected 4 routed expert groups")
+                && message.contains("found 1")
+        ),
+        "unexpected error: {error:?}"
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
 
 #[tokio::test]
@@ -518,6 +584,31 @@ fn deepseek_v4_model_config_json() -> &'static str {
   "max_position_embeddings": 163840,
   "num_hidden_layers": 43
 }"#
+}
+
+fn write_safetensors_file(
+    path: &std::path::Path,
+    tensors: &[(&str, &str, &[usize], [usize; 2])],
+    payload: &[u8],
+) -> std::io::Result<()> {
+    let mut fields = Vec::new();
+    for (name, dtype, shape, data_offsets) in tensors {
+        let shape = shape
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        fields.push(format!(
+            r#""{name}":{{"dtype":"{dtype}","shape":[{shape}],"data_offsets":[{},{}]}}"#,
+            data_offsets[0], data_offsets[1]
+        ));
+    }
+    let header = format!("{{{}}}", fields.join(","));
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(header.as_bytes());
+    bytes.extend_from_slice(payload);
+    fs::write(path, bytes)
 }
 
 fn temp_model_dir(name: &str) -> PathBuf {
