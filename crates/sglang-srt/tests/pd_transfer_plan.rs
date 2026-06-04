@@ -319,20 +319,13 @@ fn transfer_model_worker_submits_pd_prefill_transfer_during_scheduler_dispatch()
         1
     );
     assert_eq!(worker.transfer_executor().seen_rooms, vec![15]);
-    assert_eq!(
-        worker
-            .registry()
-            .get(15)
-            .expect("bootstrap session should remain")
-            .status(),
-        KvPoll::Success
-    );
+    assert!(worker.registry().get(15).is_none());
 }
 
 #[test]
 fn transfer_model_worker_registers_pd_prefill_session_before_transfer() {
     let worker = KvTransferModelWorker::new(
-        FinishedWorker,
+        UnfinishedWorker,
         DecodeBootstrapRegistry::default(),
         RecordingTransferExecutor::default(),
     );
@@ -342,7 +335,7 @@ fn transfer_model_worker_registers_pd_prefill_session_before_transfer() {
         ScheduledRequest::new(
             RequestId::from("pd-auto-register"),
             vec![1, 2, 3],
-            SamplingParams { max_new_tokens: 1 },
+            SamplingParams { max_new_tokens: 2 },
         )
         .with_disaggregated_params(Some(disaggregated_params(26)))
         .with_data_parallel_rank(2),
@@ -539,6 +532,34 @@ fn transfer_model_worker_fails_default_decode_dispatch_when_kv_failed() {
 }
 
 #[test]
+fn scheduler_abort_removes_pd_bootstrap_session_for_decode_request() {
+    let worker = KvTransferModelWorker::new(
+        UnfinishedWorker,
+        DecodeBootstrapRegistry::default(),
+        RecordingTransferExecutor::default(),
+    );
+    let mut scheduler =
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(2));
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("pd-abort-cleanup"),
+            vec![1, 2],
+            SamplingParams { max_new_tokens: 2 },
+        )
+        .with_disaggregated_params(Some(disaggregated_params(31))),
+    );
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should register bootstrap session and queue decode");
+    assert!(scheduler.worker().registry().get(31).is_some());
+
+    assert!(scheduler.abort_request(&RequestId::from("pd-abort-cleanup")));
+
+    assert!(scheduler.worker().registry().get(31).is_none());
+    assert_eq!(scheduler.decode_queue_depth(), 0);
+}
+
+#[test]
 fn engine_token_generation_waits_when_pd_decode_kv_is_not_ready() {
     let worker = KvTransferModelWorker::new(
         UnfinishedWorker,
@@ -661,6 +682,7 @@ fn engine_token_generation_can_poll_transfer_and_continue_decode() {
     assert_eq!(output.output_ids, vec![1, 1]);
     assert!(output.finished);
     assert_eq!(engine.scheduler().decode_queue_depth(), 0);
+    assert!(engine.scheduler().worker().registry().get(24).is_none());
 }
 
 #[test]

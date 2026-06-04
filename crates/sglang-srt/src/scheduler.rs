@@ -290,12 +290,21 @@ impl<W> Scheduler<W> {
             .map(CachePageAllocator::available_pages)
     }
 
-    pub fn abort_request(&mut self, request_id: &RequestId) -> bool {
-        if remove_request_from_queue(&mut self.waiting_queue, request_id) {
+    pub fn abort_request(&mut self, request_id: &RequestId) -> bool
+    where
+        W: WorkerExecutor,
+    {
+        if let Some(request) = remove_request_from_queue(&mut self.waiting_queue, request_id) {
+            self.worker.complete_request(&request);
             return true;
         }
 
-        remove_request_from_queue(&mut self.decode_queue, request_id)
+        if let Some(request) = remove_request_from_queue(&mut self.decode_queue, request_id) {
+            self.worker.complete_request(&request);
+            return true;
+        }
+
+        false
     }
 
     pub fn worker(&self) -> &W {
@@ -569,6 +578,7 @@ where
 
             if finished {
                 request.set_stage(RequestStage::Finished);
+                self.worker.complete_request(&request);
             } else {
                 request.set_stage(RequestStage::DecodeWaiting);
                 self.decode_queue.push_back(request.clone());
@@ -636,13 +646,13 @@ fn scheduled_output(
 fn remove_request_from_queue(
     queue: &mut VecDeque<ScheduledRequest>,
     request_id: &RequestId,
-) -> bool {
+) -> Option<ScheduledRequest> {
     let Some(index) = queue
         .iter()
         .position(|request| request.request_id() == request_id)
     else {
-        return false;
+        return None;
     };
 
-    queue.remove(index).is_some()
+    queue.remove(index)
 }

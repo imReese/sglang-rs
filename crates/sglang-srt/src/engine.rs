@@ -70,7 +70,10 @@ impl<T, W> Engine<T, W> {
         self.scheduler.flush_cache()
     }
 
-    pub fn abort_request(&mut self, request_id: &RequestId) -> bool {
+    pub fn abort_request(&mut self, request_id: &RequestId) -> bool
+    where
+        W: WorkerExecutor,
+    {
         self.scheduler.abort_request(request_id)
     }
 }

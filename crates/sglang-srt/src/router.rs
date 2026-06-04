@@ -522,7 +522,10 @@ impl<T, W> RouterRuntime<T, W> {
     pub fn abort_request(
         &mut self,
         request_id: &str,
-    ) -> Result<RouterControlResponse, RouterProtocolError> {
+    ) -> Result<RouterControlResponse, RouterProtocolError>
+    where
+        W: WorkerExecutor,
+    {
         if request_id.is_empty() {
             return Err(RouterProtocolError::MissingRequestId);
         }

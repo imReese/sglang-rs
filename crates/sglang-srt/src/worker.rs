@@ -139,6 +139,8 @@ pub trait FallibleModelWorker {
     fn poll_transfers(&mut self) -> Result<MooncakeTransferPollSummary, KvCacheTransferError> {
         Ok(MooncakeTransferPollSummary::default())
     }
+
+    fn complete_request(&mut self, _request: &ScheduledRequest) {}
 }
 
 pub trait WorkerExecutor {
@@ -153,6 +155,8 @@ pub trait WorkerExecutor {
     ) -> Result<DecodeRequestState, WorkerExecutionError>;
 
     fn poll_transfers(&mut self) -> Result<MooncakeTransferPollSummary, KvCacheTransferError>;
+
+    fn complete_request(&mut self, request: &ScheduledRequest);
 }
 
 impl<W> FallibleModelWorker for W
@@ -187,6 +191,10 @@ where
 
     fn poll_transfers(&mut self) -> Result<MooncakeTransferPollSummary, KvCacheTransferError> {
         FallibleModelWorker::poll_transfers(self)
+    }
+
+    fn complete_request(&mut self, request: &ScheduledRequest) {
+        FallibleModelWorker::complete_request(self, request)
     }
 }
 

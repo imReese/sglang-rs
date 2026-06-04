@@ -741,6 +741,14 @@ where
     fn poll_transfers(&mut self) -> Result<MooncakeTransferPollSummary, KvCacheTransferError> {
         self.transfer_executor.poll_transfers(&mut self.registry)
     }
+
+    fn complete_request(&mut self, request: &ScheduledRequest) {
+        if let Some(disaggregated_params) = request.disaggregated_params() {
+            self.registry.remove(disaggregated_params.bootstrap_room);
+        }
+
+        self.worker.complete_request(request)
+    }
 }
 
 impl<W, E> KvTransferModelWorker<W, E> {
