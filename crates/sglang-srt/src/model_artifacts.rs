@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -123,6 +124,37 @@ impl SafetensorsManifest {
         &self.shard_paths
     }
 
+    pub fn tensor_metadata(
+        &self,
+        tensor_name: &str,
+    ) -> Result<Option<SafetensorsTensorMetadata>, ModelArtifactError> {
+        let Some(shard_path) = self.shard_for_tensor(tensor_name) else {
+            return Ok(None);
+        };
+        SafetensorsHeader::from_file(shard_path).map(|header| header.tensor_metadata(tensor_name))
+    }
+
+    pub fn probe_routed_expert_weight_dtype(&self) -> Result<Option<String>, ModelArtifactError> {
+        if let Some(tensor_name) = self
+            .tensor_names
+            .iter()
+            .find(|name| is_routed_expert_weight(name))
+        {
+            return Ok(self
+                .tensor_metadata(tensor_name)?
+                .map(|metadata| metadata.dtype));
+        }
+
+        for shard_path in &self.shard_paths {
+            let header = SafetensorsHeader::from_file(shard_path)?;
+            if let Some(dtype) = header.routed_expert_weight_dtype() {
+                return Ok(Some(dtype));
+            }
+        }
+
+        Ok(None)
+    }
+
     fn from_index_path(model_path: &Path, index_path: PathBuf) -> Result<Self, ModelArtifactError> {
         let raw = fs::read_to_string(&index_path).map_err(|error| {
             ModelArtifactError::ReadSafetensorsIndex {
@@ -178,6 +210,88 @@ impl SafetensorsManifest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SafetensorsTensorMetadata {
+    pub dtype: String,
+    pub shape: Vec<usize>,
+    pub data_offsets: [usize; 2],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SafetensorsHeader {
+    tensors: BTreeMap<String, SafetensorsTensorMetadata>,
+}
+
+impl SafetensorsHeader {
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ModelArtifactError> {
+        let path = path.as_ref();
+        let mut file =
+            fs::File::open(path).map_err(|error| ModelArtifactError::ReadWeightShard {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })?;
+        let mut header_len_bytes = [0_u8; 8];
+        file.read_exact(&mut header_len_bytes).map_err(|error| {
+            ModelArtifactError::ReadWeightShard {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            }
+        })?;
+        let header_len = u64::from_le_bytes(header_len_bytes);
+        let header_len = usize::try_from(header_len).map_err(|_| {
+            ModelArtifactError::InvalidSafetensorsHeader {
+                path: path.to_path_buf(),
+                message: "header length does not fit in usize".to_string(),
+            }
+        })?;
+        let mut header = vec![0_u8; header_len];
+        file.read_exact(&mut header)
+            .map_err(|error| ModelArtifactError::ReadWeightShard {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })?;
+        let value: serde_json::Value = serde_json::from_slice(&header).map_err(|error| {
+            ModelArtifactError::InvalidSafetensorsHeader {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            }
+        })?;
+        let header_object =
+            value
+                .as_object()
+                .ok_or_else(|| ModelArtifactError::InvalidSafetensorsHeader {
+                    path: path.to_path_buf(),
+                    message: "header must be a JSON object".to_string(),
+                })?;
+        let mut tensors = BTreeMap::new();
+        for (tensor_name, metadata) in header_object {
+            if tensor_name == "__metadata__" {
+                continue;
+            }
+            let Some(metadata) = metadata.as_object() else {
+                continue;
+            };
+            tensors.insert(
+                tensor_name.clone(),
+                parse_tensor_metadata(&path.to_path_buf(), tensor_name, metadata)?,
+            );
+        }
+
+        Ok(Self { tensors })
+    }
+
+    pub fn tensor_metadata(&self, tensor_name: &str) -> Option<SafetensorsTensorMetadata> {
+        self.tensors.get(tensor_name).cloned()
+    }
+
+    fn routed_expert_weight_dtype(&self) -> Option<String> {
+        self.tensors
+            .iter()
+            .find(|(tensor_name, _)| is_routed_expert_weight(tensor_name))
+            .map(|(_, metadata)| metadata.dtype.clone())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ModelArtifactError {
     ModelPathNotLocalDirectory { path: PathBuf },
     ReadModelConfig { path: PathBuf, message: String },
@@ -187,6 +301,8 @@ pub enum ModelArtifactError {
     MissingWeightShard { path: PathBuf },
     NoSafetensorsWeights { path: PathBuf },
     ReadModelDirectory { path: PathBuf, message: String },
+    ReadWeightShard { path: PathBuf, message: String },
+    InvalidSafetensorsHeader { path: PathBuf, message: String },
 }
 
 impl fmt::Display for ModelArtifactError {
@@ -239,6 +355,20 @@ impl fmt::Display for ModelArtifactError {
                 write!(
                     formatter,
                     "failed to read model directory {}: {message}",
+                    path.display()
+                )
+            }
+            Self::ReadWeightShard { path, message } => {
+                write!(
+                    formatter,
+                    "failed to read safetensors shard {}: {message}",
+                    path.display()
+                )
+            }
+            Self::InvalidSafetensorsHeader { path, message } => {
+                write!(
+                    formatter,
+                    "failed to parse safetensors header {}: {message}",
                     path.display()
                 )
             }
@@ -307,4 +437,89 @@ fn read_usize_field(
             path: config_path.to_path_buf(),
             message: format!("field {field} does not fit in usize"),
         })
+}
+
+fn parse_tensor_metadata(
+    path: &Path,
+    tensor_name: &str,
+    metadata: &serde_json::Map<String, serde_json::Value>,
+) -> Result<SafetensorsTensorMetadata, ModelArtifactError> {
+    let dtype = metadata
+        .get("dtype")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ModelArtifactError::InvalidSafetensorsHeader {
+            path: path.to_path_buf(),
+            message: format!("tensor {tensor_name} is missing string dtype"),
+        })?
+        .to_string();
+    let shape = metadata
+        .get("shape")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| ModelArtifactError::InvalidSafetensorsHeader {
+            path: path.to_path_buf(),
+            message: format!("tensor {tensor_name} is missing shape array"),
+        })?
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| ModelArtifactError::InvalidSafetensorsHeader {
+                    path: path.to_path_buf(),
+                    message: format!("tensor {tensor_name} shape contains a non-usize dimension"),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let offsets = metadata
+        .get("data_offsets")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| ModelArtifactError::InvalidSafetensorsHeader {
+            path: path.to_path_buf(),
+            message: format!("tensor {tensor_name} is missing data_offsets array"),
+        })?;
+    if offsets.len() != 2 {
+        return Err(ModelArtifactError::InvalidSafetensorsHeader {
+            path: path.to_path_buf(),
+            message: format!("tensor {tensor_name} data_offsets must have two entries"),
+        });
+    }
+    let mut data_offsets = [0_usize; 2];
+    for (index, value) in offsets.iter().enumerate() {
+        data_offsets[index] = value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| ModelArtifactError::InvalidSafetensorsHeader {
+                path: path.to_path_buf(),
+                message: format!("tensor {tensor_name} data_offsets contains a non-usize offset"),
+            })?;
+    }
+
+    Ok(SafetensorsTensorMetadata {
+        dtype,
+        shape,
+        data_offsets,
+    })
+}
+
+fn is_routed_expert_weight(tensor_name: &str) -> bool {
+    let Some((_, suffix)) = tensor_name.split_once(".experts.") else {
+        return false;
+    };
+    let mut parts = suffix.split('.');
+    let Some(expert_id) = parts.next() else {
+        return false;
+    };
+    if expert_id.is_empty() || !expert_id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+
+    matches!(
+        parts.collect::<Vec<_>>().as_slice(),
+        ["w1", "weight"]
+            | ["w2", "weight"]
+            | ["w3", "weight"]
+            | ["down_proj", "weight"]
+            | ["up_proj", "weight"]
+            | ["gate_proj", "weight"]
+    )
 }
