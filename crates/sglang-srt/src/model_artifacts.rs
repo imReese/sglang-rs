@@ -226,6 +226,26 @@ impl SafetensorsManifest {
         Ok(spans)
     }
 
+    pub fn routed_expert_weight_groups(
+        &self,
+    ) -> Result<Vec<SafetensorsRoutedExpertWeightGroup>, ModelArtifactError> {
+        let mut builders = BTreeMap::new();
+        for weight in self.routed_expert_weight_spans()? {
+            let key = (weight.layer_id, weight.expert_id);
+            builders
+                .entry(key)
+                .or_insert_with(|| {
+                    RoutedExpertWeightGroupBuilder::new(weight.layer_id, weight.expert_id)
+                })
+                .insert(weight)?;
+        }
+
+        builders
+            .into_values()
+            .map(RoutedExpertWeightGroupBuilder::finish)
+            .collect()
+    }
+
     pub fn read_tensor(
         &self,
         tensor_name: &str,
@@ -391,6 +411,105 @@ pub struct SafetensorsRoutedExpertWeightSpan {
     pub expert_id: usize,
     pub projection: SafetensorsRoutedExpertProjection,
     pub span: SafetensorsTensorSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SafetensorsRoutedExpertWeightGroup {
+    pub layer_id: usize,
+    pub expert_id: usize,
+    pub gate: SafetensorsTensorSpan,
+    pub up: SafetensorsTensorSpan,
+    pub down: SafetensorsTensorSpan,
+}
+
+#[derive(Debug)]
+struct RoutedExpertWeightGroupBuilder {
+    layer_id: usize,
+    expert_id: usize,
+    gate: Option<SafetensorsTensorSpan>,
+    up: Option<SafetensorsTensorSpan>,
+    down: Option<SafetensorsTensorSpan>,
+    error_path: Option<PathBuf>,
+}
+
+impl RoutedExpertWeightGroupBuilder {
+    fn new(layer_id: usize, expert_id: usize) -> Self {
+        Self {
+            layer_id,
+            expert_id,
+            gate: None,
+            up: None,
+            down: None,
+            error_path: None,
+        }
+    }
+
+    fn insert(
+        &mut self,
+        weight: SafetensorsRoutedExpertWeightSpan,
+    ) -> Result<(), ModelArtifactError> {
+        self.error_path
+            .get_or_insert_with(|| weight.span.path.clone());
+        let slot = match weight.projection {
+            SafetensorsRoutedExpertProjection::Gate => &mut self.gate,
+            SafetensorsRoutedExpertProjection::Up => &mut self.up,
+            SafetensorsRoutedExpertProjection::Down => &mut self.down,
+        };
+        if slot.is_some() {
+            return Err(invalid_safetensors_data(
+                &weight.span.path,
+                format!(
+                    "duplicate routed expert projection for layer {} expert {}",
+                    self.layer_id, self.expert_id
+                ),
+            ));
+        }
+
+        *slot = Some(weight.span);
+        Ok(())
+    }
+
+    fn finish(self) -> Result<SafetensorsRoutedExpertWeightGroup, ModelArtifactError> {
+        let path = self
+            .error_path
+            .as_deref()
+            .unwrap_or_else(|| Path::new("<unknown>"));
+        let gate = self.gate.ok_or_else(|| {
+            invalid_safetensors_data(
+                path,
+                format!(
+                    "routed expert weight group for layer {} expert {} is missing gate projection",
+                    self.layer_id, self.expert_id
+                ),
+            )
+        })?;
+        let up = self.up.ok_or_else(|| {
+            invalid_safetensors_data(
+                path,
+                format!(
+                    "routed expert weight group for layer {} expert {} is missing up projection",
+                    self.layer_id, self.expert_id
+                ),
+            )
+        })?;
+        let down = self.down.ok_or_else(|| {
+            invalid_safetensors_data(
+                path,
+                format!(
+                    "routed expert weight group for layer {} expert {} is missing down projection",
+                    self.layer_id, self.expert_id
+                ),
+            )
+        })?;
+
+        Ok(SafetensorsRoutedExpertWeightGroup {
+            layer_id: self.layer_id,
+            expert_id: self.expert_id,
+            gate,
+            up,
+            down,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -3,8 +3,9 @@ use std::path::PathBuf;
 
 use sglang_srt::model_artifacts::{
     LocalModelArtifacts, ModelArtifactError, SafetensorsCheckpointFingerprintEntry,
-    SafetensorsRoutedExpertProjection, SafetensorsRoutedExpertWeightSpan, SafetensorsTensorData,
-    SafetensorsTensorMetadata, SafetensorsTensorSpan,
+    SafetensorsRoutedExpertProjection, SafetensorsRoutedExpertWeightGroup,
+    SafetensorsRoutedExpertWeightSpan, SafetensorsTensorData, SafetensorsTensorMetadata,
+    SafetensorsTensorSpan,
 };
 
 #[test]
@@ -614,6 +615,186 @@ fn safetensors_manifest_groups_routed_expert_weight_spans() {
                 },
             },
         ]
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn safetensors_manifest_groups_complete_routed_expert_weight_triplets() {
+    let model_dir = temp_model_dir("routed-expert-weight-triplets");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(model_dir.join("config.json"), deepseek_v4_config_json())
+        .expect("config should be written");
+    fs::write(
+        model_dir.join("model.safetensors.index.json"),
+        r#"{
+  "weight_map": {
+    "model.layers.0.ffn.experts.3.w1.weight": "model.safetensors",
+    "model.layers.0.ffn.experts.3.w2.weight": "model.safetensors",
+    "model.layers.0.ffn.experts.3.w3.weight": "model.safetensors",
+    "model.layers.1.mlp.experts.42.gate_proj.weight": "model.safetensors",
+    "model.layers.1.mlp.experts.42.up_proj.weight": "model.safetensors",
+    "model.layers.1.mlp.experts.42.down_proj.weight": "model.safetensors"
+  }
+}"#,
+    )
+    .expect("index should be written");
+    let shard = model_dir.join("model.safetensors");
+    let header_len = write_safetensors_file(
+        &shard,
+        &[
+            ("model.layers.0.ffn.experts.3.w1.weight", "U8", &[2], [0, 2]),
+            ("model.layers.0.ffn.experts.3.w2.weight", "U8", &[3], [2, 5]),
+            ("model.layers.0.ffn.experts.3.w3.weight", "U8", &[1], [5, 6]),
+            (
+                "model.layers.1.mlp.experts.42.down_proj.weight",
+                "U8",
+                &[4],
+                [6, 10],
+            ),
+            (
+                "model.layers.1.mlp.experts.42.gate_proj.weight",
+                "U8",
+                &[2],
+                [10, 12],
+            ),
+            (
+                "model.layers.1.mlp.experts.42.up_proj.weight",
+                "U8",
+                &[3],
+                [12, 15],
+            ),
+        ],
+        &[10, 11, 20, 21, 22, 30, 40, 41, 42, 43, 50, 51, 60, 61, 62],
+    )
+    .expect("shard should be written");
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("local artifacts should load");
+
+    assert_eq!(
+        artifacts
+            .safetensors()
+            .routed_expert_weight_groups()
+            .expect("routed expert groups should validate complete triplets"),
+        vec![
+            SafetensorsRoutedExpertWeightGroup {
+                layer_id: 0,
+                expert_id: 3,
+                gate: SafetensorsTensorSpan {
+                    path: shard.clone(),
+                    metadata: SafetensorsTensorMetadata {
+                        dtype: "U8".to_string(),
+                        shape: vec![2],
+                        data_offsets: [0, 2],
+                    },
+                    absolute_byte_offset: 8 + header_len as u64,
+                    byte_len: 2,
+                },
+                up: SafetensorsTensorSpan {
+                    path: shard.clone(),
+                    metadata: SafetensorsTensorMetadata {
+                        dtype: "U8".to_string(),
+                        shape: vec![1],
+                        data_offsets: [5, 6],
+                    },
+                    absolute_byte_offset: 8 + header_len as u64 + 5,
+                    byte_len: 1,
+                },
+                down: SafetensorsTensorSpan {
+                    path: shard.clone(),
+                    metadata: SafetensorsTensorMetadata {
+                        dtype: "U8".to_string(),
+                        shape: vec![3],
+                        data_offsets: [2, 5],
+                    },
+                    absolute_byte_offset: 8 + header_len as u64 + 2,
+                    byte_len: 3,
+                },
+            },
+            SafetensorsRoutedExpertWeightGroup {
+                layer_id: 1,
+                expert_id: 42,
+                gate: SafetensorsTensorSpan {
+                    path: shard.clone(),
+                    metadata: SafetensorsTensorMetadata {
+                        dtype: "U8".to_string(),
+                        shape: vec![2],
+                        data_offsets: [10, 12],
+                    },
+                    absolute_byte_offset: 8 + header_len as u64 + 10,
+                    byte_len: 2,
+                },
+                up: SafetensorsTensorSpan {
+                    path: shard.clone(),
+                    metadata: SafetensorsTensorMetadata {
+                        dtype: "U8".to_string(),
+                        shape: vec![3],
+                        data_offsets: [12, 15],
+                    },
+                    absolute_byte_offset: 8 + header_len as u64 + 12,
+                    byte_len: 3,
+                },
+                down: SafetensorsTensorSpan {
+                    path: shard,
+                    metadata: SafetensorsTensorMetadata {
+                        dtype: "U8".to_string(),
+                        shape: vec![4],
+                        data_offsets: [6, 10],
+                    },
+                    absolute_byte_offset: 8 + header_len as u64 + 6,
+                    byte_len: 4,
+                },
+            },
+        ]
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn safetensors_manifest_rejects_incomplete_routed_expert_weight_triplets() {
+    let model_dir = temp_model_dir("routed-expert-weight-triplet-missing");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(model_dir.join("config.json"), deepseek_v4_config_json())
+        .expect("config should be written");
+    fs::write(
+        model_dir.join("model.safetensors.index.json"),
+        r#"{
+  "weight_map": {
+    "model.layers.0.ffn.experts.3.w1.weight": "model.safetensors",
+    "model.layers.0.ffn.experts.3.w2.weight": "model.safetensors"
+  }
+}"#,
+    )
+    .expect("index should be written");
+    let shard = model_dir.join("model.safetensors");
+    write_safetensors_file(
+        &shard,
+        &[
+            ("model.layers.0.ffn.experts.3.w1.weight", "U8", &[2], [0, 2]),
+            ("model.layers.0.ffn.experts.3.w2.weight", "U8", &[3], [2, 5]),
+        ],
+        &[10, 11, 20, 21, 22],
+    )
+    .expect("shard should be written");
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("local artifacts should load");
+
+    let error = artifacts
+        .safetensors()
+        .routed_expert_weight_groups()
+        .expect_err("missing expert projection should fail group validation");
+
+    assert!(
+        matches!(
+            error,
+            ModelArtifactError::InvalidSafetensorsData { ref path, ref message }
+                if path == &shard
+                    && message.contains("layer 0 expert 3")
+                    && message.contains("missing up projection")
+        ),
+        "unexpected error: {error:?}"
     );
 
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
