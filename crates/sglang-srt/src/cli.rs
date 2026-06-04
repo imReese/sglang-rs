@@ -13,6 +13,8 @@ pub struct ServerArgs {
     pub port: u16,
     pub tp_size: usize,
     pub dp_size: usize,
+    pub base_gpu_id: usize,
+    pub gpu_id_step: usize,
     pub grpc_mode: bool,
     pub served_model_name: Option<String>,
     pub tokenizer_path: Option<String>,
@@ -106,6 +108,14 @@ impl ArgParser {
                 "--dp-size" | "--dp" => {
                     self.parsed.dp_size = parse_usize("--dp-size", self.take_value("--dp-size")?)?;
                 }
+                "--base-gpu-id" => {
+                    self.parsed.base_gpu_id =
+                        parse_usize("--base-gpu-id", self.take_value("--base-gpu-id")?)?;
+                }
+                "--gpu-id-step" => {
+                    self.parsed.gpu_id_step =
+                        parse_usize("--gpu-id-step", self.take_value("--gpu-id-step")?)?;
+                }
                 "--grpc-mode" => {
                     self.parsed.grpc_mode = true;
                 }
@@ -165,6 +175,8 @@ impl ArgParser {
             port: self.parsed.port,
             tp_size: self.parsed.tp_size,
             dp_size: self.parsed.dp_size,
+            base_gpu_id: self.parsed.base_gpu_id,
+            gpu_id_step: self.parsed.gpu_id_step,
             grpc_mode: self.parsed.grpc_mode,
             served_model_name: self.parsed.served_model_name.clone(),
             tokenizer_path: self.parsed.tokenizer_path.clone(),
@@ -230,6 +242,8 @@ struct PartialServerArgs {
     port: u16,
     tp_size: usize,
     dp_size: usize,
+    base_gpu_id: usize,
+    gpu_id_step: usize,
     grpc_mode: bool,
     served_model_name: Option<String>,
     tokenizer_path: Option<String>,
@@ -252,6 +266,8 @@ impl Default for PartialServerArgs {
             port: 30000,
             tp_size: 1,
             dp_size: 1,
+            base_gpu_id: 0,
+            gpu_id_step: 1,
             grpc_mode: false,
             served_model_name: None,
             tokenizer_path: None,

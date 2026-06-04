@@ -105,6 +105,30 @@ fn mooncake_engine_config_uses_tcp_when_mooncake_tcp_is_normalized() {
 }
 
 #[test]
+fn mooncake_engine_config_uses_upstream_gpu_placement_args() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--base-gpu-id",
+        "2",
+        "--gpu-id-step",
+        "3",
+        "--disaggregation-mode",
+        "decode",
+    ])
+    .expect("args should parse");
+    let pd_config = PdConfig::from_server_args(&args).expect("pd config should normalize");
+
+    let engine_config =
+        MooncakeTransferEngineConfig::from_pd_config_for_rank("127.0.0.1", 1, &pd_config);
+
+    assert_eq!(pd_config.base_gpu_id, 2);
+    assert_eq!(pd_config.gpu_id_step, 3);
+    assert_eq!(engine_config.gpu_id, 5);
+}
+
+#[test]
 fn mooncake_ffi_enums_match_upstream_c_and_sglang_poll_values() {
     assert_eq!(MooncakeOpcode::Read as i32, 0);
     assert_eq!(MooncakeOpcode::Write as i32, 1);

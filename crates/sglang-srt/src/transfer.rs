@@ -97,6 +97,8 @@ pub struct PdConfig {
     pub decode_enable_offload_kvcache: bool,
     pub num_reserved_decode_tokens: usize,
     pub decode_polling_interval: usize,
+    pub base_gpu_id: usize,
+    pub gpu_id_step: usize,
 }
 
 impl PdConfig {
@@ -122,6 +124,8 @@ impl PdConfig {
             decode_enable_offload_kvcache: args.disaggregation_decode_enable_offload_kvcache,
             num_reserved_decode_tokens: args.num_reserved_decode_tokens,
             decode_polling_interval: args.disaggregation_decode_polling_interval,
+            base_gpu_id: args.base_gpu_id,
+            gpu_id_step: args.gpu_id_step,
         })
     }
 }
@@ -229,6 +233,18 @@ impl MooncakeTransferEngineConfig {
             },
             device_name: config.ib_device.clone().unwrap_or_default(),
         }
+    }
+
+    pub fn from_pd_config_for_rank(
+        hostname: impl Into<String>,
+        local_rank: usize,
+        config: &PdConfig,
+    ) -> Self {
+        Self::from_pd_config(
+            hostname,
+            config.base_gpu_id + local_rank * config.gpu_id_step,
+            config,
+        )
     }
 }
 
