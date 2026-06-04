@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::cli::ServerArgs;
 use crate::engine::{Engine, RuntimeError};
 use crate::tokenizer::{Tokenizer, TokenizerError};
+use crate::transfer::KvTransferPoller;
 use crate::types::{
     DisaggregatedParams, RequestId, SamplingParams, TokenGenerateOutput, TokenGenerateRequest,
 };
@@ -305,6 +306,7 @@ impl RouterGenerateResponse {
     pub fn from_token_generate_output(output: TokenGenerateOutput, prompt_tokens: i32) -> Self {
         let request_id = output.request_id.as_str().to_string();
         let completion_tokens = output.output_ids.len() as i32;
+        let cached_tokens = output.cached_tokens as i32;
         let body = if output.finished {
             RouterGenerateResponseBody::Complete(RouterGenerateComplete {
                 output_ids: output.output_ids,
@@ -312,7 +314,7 @@ impl RouterGenerateResponse {
                 finish_reason: "stop".to_string(),
                 prompt_tokens,
                 completion_tokens,
-                cached_tokens: 0,
+                cached_tokens,
                 index: 0,
             })
         } else {
@@ -321,7 +323,7 @@ impl RouterGenerateResponse {
                 text: String::new(),
                 prompt_tokens,
                 completion_tokens,
-                cached_tokens: 0,
+                cached_tokens,
                 index: 0,
             })
         };
@@ -394,6 +396,12 @@ pub struct RouterFlushCacheResponse {
 pub struct RouterControlResponse {
     pub success: bool,
     pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RouterTransferPollResponse {
+    pub completed_batches: usize,
+    pub pending_batches: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -544,6 +552,19 @@ impl<T, W> RouterRuntime<T, W> {
 
 impl<T, W> RouterRuntime<T, W>
 where
+    W: KvTransferPoller,
+{
+    pub fn poll_transfers(&mut self) -> Result<RouterTransferPollResponse, RouterRuntimeError> {
+        let summary = self.engine.poll_transfers()?;
+        Ok(RouterTransferPollResponse {
+            completed_batches: summary.completed_batches(),
+            pending_batches: summary.pending_batches(),
+        })
+    }
+}
+
+impl<T, W> RouterRuntime<T, W>
+where
     T: Tokenizer,
 {
     pub fn tokenize(&self, text: &str) -> RouterTokenizeResponse {
@@ -600,6 +621,7 @@ where
             let request_id = output.request_id.as_str().to_string();
             output_ids.extend_from_slice(&output.output_ids);
             let completion_tokens = output_ids.len() as i32;
+            let cached_tokens = output.cached_tokens as i32;
 
             let body = if output.finished {
                 RouterGenerateResponseBody::Complete(RouterGenerateComplete {
@@ -608,7 +630,7 @@ where
                     finish_reason: "stop".to_string(),
                     prompt_tokens,
                     completion_tokens,
-                    cached_tokens: 0,
+                    cached_tokens,
                     index: 0,
                 })
             } else {
@@ -617,7 +639,7 @@ where
                     text: String::new(),
                     prompt_tokens,
                     completion_tokens,
-                    cached_tokens: 0,
+                    cached_tokens,
                     index: 0,
                 })
             };

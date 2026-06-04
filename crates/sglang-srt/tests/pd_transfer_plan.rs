@@ -1,0 +1,1145 @@
+use sglang_srt::cache::{CachePageAllocator, CachePageId, RadixCache};
+use sglang_srt::engine::{Engine, RuntimeError};
+use sglang_srt::model_executor::ModelWorkerBatch;
+use sglang_srt::router::{RouterRuntime, RouterTransferPollResponse};
+use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler, SchedulerError};
+use sglang_srt::tokenizer::ByteTokenizer;
+use sglang_srt::transfer::{
+    DecodeBootstrapRegistry, DecodeBootstrapSession, KvCacheTransferError, KvCacheTransferExecutor,
+    KvCacheTransferPlan, KvCacheTransferPlanError, KvCacheTransferSpan, KvPoll,
+    KvTransferModelWorker, MooncakeBatchId, MooncakeError, MooncakeKvCacheLayout,
+    MooncakeKvCacheTransferExecutor, MooncakeOpcode, MooncakeSubmittedBatch,
+    MooncakeTransferRequest, MooncakeTransferStatus, MooncakeTransferStatusCode,
+    MooncakeTransferStatusReader, MooncakeTransferSubmitter, MooncakeTransferTarget,
+    MooncakeTransferTargetResolver, build_mooncake_kv_transfer_requests,
+    execute_kv_cache_transfer_plan, is_decode_request_kv_ready, poll_mooncake_transfer_batches,
+};
+use sglang_srt::types::{DisaggregatedParams, RequestId, SamplingParams, TokenGenerateRequest};
+use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker, WorkerExecutionError};
+
+#[derive(Default)]
+struct FinishedWorker;
+
+impl ModelWorker for FinishedWorker {
+    fn generate_batch(&mut self, batch: &ScheduleBatch) -> BatchGeneratedTokens {
+        BatchGeneratedTokens::from_batch(
+            batch,
+            batch
+                .requests()
+                .iter()
+                .map(|_| GeneratedToken::finished(vec![1]))
+                .collect(),
+        )
+        .expect("output shape should match batch")
+    }
+}
+
+#[derive(Default)]
+struct UnfinishedWorker;
+
+impl ModelWorker for UnfinishedWorker {
+    fn generate_batch(&mut self, batch: &ScheduleBatch) -> BatchGeneratedTokens {
+        BatchGeneratedTokens::from_batch(
+            batch,
+            batch
+                .requests()
+                .iter()
+                .map(|_| GeneratedToken::unfinished(vec![1]))
+                .collect(),
+        )
+        .expect("output shape should match batch")
+    }
+}
+
+#[test]
+fn transfer_plan_uses_uncached_prefill_pages_as_pd_delta() {
+    let mut prefix_cache = RadixCache::default();
+    prefix_cache
+        .insert(&[10, 11], &[CachePageId::from(100), CachePageId::from(101)])
+        .expect("prefix cache should insert");
+    let mut scheduler =
+        Scheduler::with_cache_resources(FinishedWorker, prefix_cache, CachePageAllocator::new(8));
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("pd-delta"),
+            vec![10, 11, 12, 13],
+            SamplingParams { max_new_tokens: 1 },
+        )
+        .with_disaggregated_params(Some(disaggregated_params(77)))
+        .with_data_parallel_rank(3),
+    );
+
+    let batch = scheduler
+        .next_prefill_batch(1)
+        .expect("prefill batch should be available");
+    let worker_batch = ModelWorkerBatch::from_schedule_batch(&batch);
+    let transfer_plan = KvCacheTransferPlan::from_prefill_worker_batch(&worker_batch)
+        .expect("transfer plan should build from prefill batch");
+
+    assert_eq!(transfer_plan.len(), 1);
+    let span = &transfer_plan.spans()[0];
+    assert_eq!(span.request_id(), &RequestId::from("pd-delta"));
+    assert_eq!(span.disaggregated_params(), &disaggregated_params(77));
+    assert_eq!(span.bootstrap_room(), 77);
+    assert_eq!(span.data_parallel_rank(), 3);
+    assert_eq!(span.token_offset(), 2);
+    assert_eq!(span.token_count(), 2);
+    assert_eq!(
+        span.cache_pages(),
+        &[CachePageId::from(0), CachePageId::from(1)]
+    );
+    assert!(!span.is_noop());
+}
+
+#[test]
+fn transfer_plan_keeps_noop_span_when_decode_radix_cache_satisfies_full_prefix() {
+    let mut prefix_cache = RadixCache::default();
+    prefix_cache
+        .insert(
+            &[20, 21, 22],
+            &[
+                CachePageId::from(200),
+                CachePageId::from(201),
+                CachePageId::from(202),
+            ],
+        )
+        .expect("prefix cache should insert");
+    let mut scheduler =
+        Scheduler::with_cache_resources(FinishedWorker, prefix_cache, CachePageAllocator::new(2));
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("pd-noop"),
+            vec![20, 21, 22],
+            SamplingParams { max_new_tokens: 1 },
+        )
+        .with_disaggregated_params(Some(disaggregated_params(88))),
+    );
+
+    let batch = scheduler
+        .next_prefill_batch(1)
+        .expect("prefill batch should be available");
+    let worker_batch = ModelWorkerBatch::from_schedule_batch(&batch);
+    let transfer_plan = KvCacheTransferPlan::from_prefill_worker_batch(&worker_batch)
+        .expect("transfer plan should build from fully cached prefill");
+
+    assert_eq!(transfer_plan.len(), 1);
+    let span = &transfer_plan.spans()[0];
+    assert_eq!(span.token_offset(), 3);
+    assert_eq!(span.token_count(), 0);
+    assert!(span.cache_pages().is_empty());
+    assert!(span.is_noop());
+}
+
+#[test]
+fn transfer_plan_skips_non_pd_prefill_requests_but_consumes_their_cache_pages() {
+    let mut scheduler = Scheduler::with_cache_resources(
+        FinishedWorker,
+        RadixCache::default(),
+        CachePageAllocator::new(8),
+    );
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("local"),
+        vec![1, 2],
+        SamplingParams { max_new_tokens: 1 },
+    ));
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("pd"),
+            vec![3, 4, 5],
+            SamplingParams { max_new_tokens: 1 },
+        )
+        .with_disaggregated_params(Some(disaggregated_params(99))),
+    );
+
+    let batch = scheduler
+        .next_prefill_batch(2)
+        .expect("prefill batch should be available");
+    let worker_batch = ModelWorkerBatch::from_schedule_batch(&batch);
+    let transfer_plan = KvCacheTransferPlan::from_prefill_worker_batch(&worker_batch)
+        .expect("transfer plan should build");
+
+    assert_eq!(transfer_plan.len(), 1);
+    let span = &transfer_plan.spans()[0];
+    assert_eq!(span.request_id(), &RequestId::from("pd"));
+    assert_eq!(
+        span.cache_pages(),
+        &[
+            CachePageId::from(2),
+            CachePageId::from(3),
+            CachePageId::from(4)
+        ]
+    );
+}
+
+#[test]
+fn transfer_plan_rejects_decode_worker_batches() {
+    let mut scheduler = Scheduler::new(UnfinishedWorker);
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("decode"),
+        vec![1, 2],
+        SamplingParams { max_new_tokens: 2 },
+    ));
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should dispatch");
+    let decode_batch = scheduler
+        .next_decode_batch(1)
+        .expect("decode batch should be available");
+    let worker_batch = ModelWorkerBatch::from_schedule_batch(&decode_batch);
+
+    let error = KvCacheTransferPlan::from_prefill_worker_batch(&worker_batch)
+        .expect_err("decode batch should not create prefill transfer plan");
+
+    assert_eq!(error, KvCacheTransferPlanError::NonPrefillBatch);
+}
+
+#[test]
+fn executor_marks_non_noop_transfer_spans_success_after_submit() {
+    let transfer_plan = transfer_plan_for_request("pd-submit", &[10, 11, 12], Some(1), 4);
+    let mut registry = registry_with_session("pd-submit", 4);
+    let mut executor = RecordingTransferExecutor::default();
+
+    let summary = execute_kv_cache_transfer_plan(&mut registry, &mut executor, &transfer_plan)
+        .expect("transfer plan should execute");
+
+    assert_eq!(summary.submitted_spans(), 1);
+    assert_eq!(summary.noop_spans(), 0);
+    assert_eq!(executor.seen_rooms, vec![4]);
+    assert_eq!(
+        registry.get(4).expect("session should remain").status(),
+        KvPoll::Success
+    );
+}
+
+#[test]
+fn executor_marks_noop_transfer_spans_success_without_submit() {
+    let transfer_plan = transfer_plan_for_request("pd-noop-exec", &[20, 21], Some(2), 5);
+    let mut registry = registry_with_session("pd-noop-exec", 5);
+    let mut executor = RecordingTransferExecutor::default();
+
+    let summary = execute_kv_cache_transfer_plan(&mut registry, &mut executor, &transfer_plan)
+        .expect("noop transfer plan should execute");
+
+    assert_eq!(summary.submitted_spans(), 0);
+    assert_eq!(summary.noop_spans(), 1);
+    assert!(executor.seen_rooms.is_empty());
+    assert_eq!(
+        registry.get(5).expect("session should remain").status(),
+        KvPoll::Success
+    );
+}
+
+#[test]
+fn executor_reports_missing_bootstrap_room_before_submit() {
+    let transfer_plan = transfer_plan_for_request("pd-missing-room", &[30, 31], None, 6);
+    let mut registry = DecodeBootstrapRegistry::default();
+    let mut executor = RecordingTransferExecutor::default();
+
+    let error = execute_kv_cache_transfer_plan(&mut registry, &mut executor, &transfer_plan)
+        .expect_err("missing room should fail");
+
+    assert_eq!(
+        error,
+        KvCacheTransferError::Registry(
+            sglang_srt::transfer::DecodeBootstrapRegistryError::MissingBootstrapRoom(6)
+        )
+    );
+    assert!(executor.seen_rooms.is_empty());
+}
+
+#[test]
+fn executor_marks_span_failed_when_transfer_submit_fails() {
+    let transfer_plan = transfer_plan_for_request("pd-fail", &[40, 41], None, 7);
+    let mut registry = registry_with_session("pd-fail", 7);
+    let mut executor = RecordingTransferExecutor {
+        fail_room: Some(7),
+        ..Default::default()
+    };
+
+    let error = execute_kv_cache_transfer_plan(&mut registry, &mut executor, &transfer_plan)
+        .expect_err("transfer failure should propagate");
+
+    assert_eq!(
+        error,
+        KvCacheTransferError::Runtime("submit failed for room 7".to_string())
+    );
+    assert_eq!(executor.seen_rooms, vec![7]);
+    assert_eq!(
+        registry.get(7).expect("session should remain").status(),
+        KvPoll::Failed
+    );
+}
+
+#[test]
+fn transfer_model_worker_submits_pd_prefill_transfer_during_scheduler_dispatch() {
+    let worker = KvTransferModelWorker::new(
+        FinishedWorker,
+        registry_with_session("pd-dispatch", 15),
+        RecordingTransferExecutor::default(),
+    );
+    let mut scheduler =
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(4));
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("pd-dispatch"),
+            vec![1, 2, 3],
+            SamplingParams { max_new_tokens: 1 },
+        )
+        .with_disaggregated_params(Some(disaggregated_params(15))),
+    );
+
+    let outputs = scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill dispatch should transfer KV");
+
+    assert_eq!(outputs[0].token_ids, vec![1]);
+    let worker = scheduler.worker();
+    assert_eq!(
+        worker
+            .last_transfer_summary()
+            .expect("transfer summary should be recorded")
+            .submitted_spans(),
+        1
+    );
+    assert_eq!(worker.transfer_executor().seen_rooms, vec![15]);
+    assert_eq!(
+        worker
+            .registry()
+            .get(15)
+            .expect("bootstrap session should remain")
+            .status(),
+        KvPoll::Success
+    );
+}
+
+#[test]
+fn transfer_model_worker_skips_non_pd_prefill_transfer() {
+    let worker = KvTransferModelWorker::new(
+        FinishedWorker,
+        DecodeBootstrapRegistry::default(),
+        RecordingTransferExecutor::default(),
+    );
+    let mut scheduler =
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(4));
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("local-dispatch"),
+        vec![1, 2],
+        SamplingParams { max_new_tokens: 1 },
+    ));
+
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("local prefill should dispatch");
+
+    let worker = scheduler.worker();
+    assert_eq!(
+        worker
+            .last_transfer_summary()
+            .expect("empty transfer summary should be recorded")
+            .submitted_spans(),
+        0
+    );
+    assert!(worker.transfer_executor().seen_rooms.is_empty());
+}
+
+#[test]
+fn transfer_model_worker_propagates_transfer_failure_and_scheduler_releases_pages() {
+    let worker = KvTransferModelWorker::new(
+        FinishedWorker,
+        registry_with_session("pd-transfer-fail", 16),
+        RecordingTransferExecutor {
+            fail_room: Some(16),
+            ..Default::default()
+        },
+    );
+    let mut scheduler =
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(2));
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("pd-transfer-fail"),
+            vec![1, 2],
+            SamplingParams { max_new_tokens: 1 },
+        )
+        .with_disaggregated_params(Some(disaggregated_params(16))),
+    );
+
+    let error = scheduler
+        .dispatch_prefill_batch(1)
+        .expect_err("transfer failure should fail prefill dispatch");
+
+    assert_eq!(
+        error,
+        SchedulerError::Worker(WorkerExecutionError::Runtime(
+            "KV transfer execution failed: KV cache transfer runtime error: submit failed for room 16"
+                .to_string()
+        ))
+    );
+    assert_eq!(scheduler.available_cache_pages(), Some(2));
+    assert_eq!(
+        scheduler
+            .worker()
+            .registry()
+            .get(16)
+            .expect("bootstrap session should remain")
+            .status(),
+        KvPoll::Failed
+    );
+}
+
+#[test]
+fn transfer_model_worker_blocks_default_decode_dispatch_until_kv_success() {
+    let worker = KvTransferModelWorker::new(
+        UnfinishedWorker,
+        registry_with_session("pd-decode-wait", 19),
+        MooncakeKvCacheTransferExecutor::new(
+            RecordingMooncakeSubmitter::default(),
+            MooncakeKvCacheLayout {
+                source_base_addr: 0x4000,
+                page_size_bytes: 64,
+                target_base_offset: 0,
+            },
+            MooncakeTransferTarget { target_id: 9 },
+        ),
+    );
+    let mut scheduler =
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(2));
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("pd-decode-wait"),
+            vec![1, 2],
+            SamplingParams { max_new_tokens: 2 },
+        )
+        .with_disaggregated_params(Some(disaggregated_params(19))),
+    );
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should submit async KV transfer");
+
+    let error = scheduler
+        .dispatch_decode_batch(1)
+        .expect_err("decode should wait for async KV transfer");
+
+    assert_eq!(
+        error,
+        SchedulerError::DecodeNotReady {
+            request_id: RequestId::from("pd-decode-wait")
+        }
+    );
+    assert_eq!(scheduler.decode_queue_depth(), 1);
+
+    scheduler
+        .worker_mut()
+        .registry_mut()
+        .update_status(19, KvPoll::Success)
+        .expect("status should update");
+    let outputs = scheduler
+        .dispatch_decode_batch(1)
+        .expect("decode should dispatch after KV success");
+
+    assert_eq!(outputs[0].request_id, RequestId::from("pd-decode-wait"));
+    assert_eq!(outputs[0].token_ids, vec![1]);
+}
+
+#[test]
+fn transfer_model_worker_fails_default_decode_dispatch_when_kv_failed() {
+    let worker = KvTransferModelWorker::new(
+        UnfinishedWorker,
+        registry_with_session("pd-decode-failed", 20),
+        MooncakeKvCacheTransferExecutor::new(
+            RecordingMooncakeSubmitter::default(),
+            MooncakeKvCacheLayout {
+                source_base_addr: 0x5000,
+                page_size_bytes: 64,
+                target_base_offset: 0,
+            },
+            MooncakeTransferTarget { target_id: 10 },
+        ),
+    );
+    let mut scheduler =
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(2));
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("pd-decode-failed"),
+            vec![1, 2],
+            SamplingParams { max_new_tokens: 2 },
+        )
+        .with_disaggregated_params(Some(disaggregated_params(20))),
+    );
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should submit async KV transfer");
+    scheduler
+        .worker_mut()
+        .registry_mut()
+        .update_status(20, KvPoll::Failed)
+        .expect("status should update");
+
+    let error = scheduler
+        .dispatch_decode_batch(1)
+        .expect_err("failed KV transfer should fail decode dispatch");
+
+    assert_eq!(
+        error,
+        SchedulerError::Worker(WorkerExecutionError::Runtime(
+            "KV transfer failed for bootstrap room 20".to_string()
+        ))
+    );
+    assert_eq!(scheduler.decode_queue_depth(), 1);
+}
+
+#[test]
+fn engine_token_generation_waits_when_pd_decode_kv_is_not_ready() {
+    let worker = KvTransferModelWorker::new(
+        UnfinishedWorker,
+        registry_with_session("engine-pd-wait", 21),
+        MooncakeKvCacheTransferExecutor::new(
+            RecordingMooncakeSubmitter::default(),
+            MooncakeKvCacheLayout {
+                source_base_addr: 0x6000,
+                page_size_bytes: 64,
+                target_base_offset: 0,
+            },
+            MooncakeTransferTarget { target_id: 11 },
+        ),
+    );
+    let scheduler =
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(2));
+    let mut engine = Engine::new(ByteTokenizer::default(), scheduler);
+
+    let error = engine
+        .generate_tokens(TokenGenerateRequest {
+            request_id: RequestId::from("engine-pd-wait"),
+            input_ids: vec![1, 2],
+            sampling: SamplingParams { max_new_tokens: 2 },
+            disaggregated_params: Some(disaggregated_params(21)),
+            data_parallel_rank: 0,
+        })
+        .expect_err("engine should surface pending KV transfer as decode not ready");
+
+    assert!(matches!(
+        error,
+        RuntimeError::Scheduler(SchedulerError::DecodeNotReady { request_id })
+            if request_id == RequestId::from("engine-pd-wait")
+    ));
+    assert_eq!(engine.scheduler().decode_queue_depth(), 1);
+}
+
+#[test]
+fn engine_poll_transfers_updates_registry_and_unblocks_decode_dispatch() {
+    let backend = RecordingMooncakeBackend::completed();
+    let worker = KvTransferModelWorker::new(
+        UnfinishedWorker,
+        registry_with_session("engine-poll", 22),
+        MooncakeKvCacheTransferExecutor::new(
+            backend,
+            MooncakeKvCacheLayout {
+                source_base_addr: 0x7000,
+                page_size_bytes: 64,
+                target_base_offset: 0,
+            },
+            MooncakeTransferTarget { target_id: 12 },
+        ),
+    );
+    let scheduler =
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(2));
+    let mut engine = Engine::new(ByteTokenizer::default(), scheduler);
+
+    let error = engine
+        .generate_tokens(TokenGenerateRequest {
+            request_id: RequestId::from("engine-poll"),
+            input_ids: vec![1, 2],
+            sampling: SamplingParams { max_new_tokens: 2 },
+            disaggregated_params: Some(disaggregated_params(22)),
+            data_parallel_rank: 0,
+        })
+        .expect_err("engine should wait for pending transfer");
+
+    assert!(matches!(
+        error,
+        RuntimeError::Scheduler(SchedulerError::DecodeNotReady { .. })
+    ));
+
+    let summary = engine
+        .poll_transfers()
+        .expect("polling transfer should complete submitted batch");
+    assert_eq!(summary.completed_batches(), 1);
+    assert_eq!(summary.pending_batches(), 0);
+
+    let outputs = engine
+        .scheduler_mut()
+        .dispatch_decode_batch(1)
+        .expect("decode should dispatch after poll");
+    assert_eq!(outputs[0].request_id, RequestId::from("engine-poll"));
+    assert_eq!(outputs[0].token_ids, vec![1]);
+}
+
+#[test]
+fn router_runtime_poll_transfers_exposes_control_plane_counts() {
+    let backend = RecordingMooncakeBackend::completed();
+    let worker = KvTransferModelWorker::new(
+        UnfinishedWorker,
+        registry_with_session("router-poll", 23),
+        MooncakeKvCacheTransferExecutor::new(
+            backend,
+            MooncakeKvCacheLayout {
+                source_base_addr: 0x8000,
+                page_size_bytes: 64,
+                target_base_offset: 0,
+            },
+            MooncakeTransferTarget { target_id: 13 },
+        ),
+    );
+    let scheduler =
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(2));
+    let engine = Engine::new(ByteTokenizer::default(), scheduler);
+    let mut runtime = RouterRuntime::new(engine);
+
+    let error = runtime
+        .generate_stream(sglang_srt::router::RouterGenerateRequest {
+            request_id: "router-poll".to_string(),
+            tokenized: Some(sglang_srt::router::RouterTokenizedInput {
+                original_text: String::new(),
+                input_ids: vec![1, 2],
+            }),
+            sampling_params: Some(sglang_srt::router::RouterSamplingParams {
+                max_new_tokens: Some(2),
+                ..Default::default()
+            }),
+            disaggregated_params: Some(sglang_srt::router::RouterDisaggregatedParams {
+                bootstrap_host: "10.0.0.7".to_string(),
+                bootstrap_port: 8998,
+                bootstrap_room: 23,
+            }),
+            stream: true,
+            data_parallel_rank: 0,
+            trace_headers: Default::default(),
+        })
+        .expect_err("router generation should wait for pending transfer");
+
+    assert!(matches!(
+        error,
+        sglang_srt::router::RouterRuntimeError::Runtime(RuntimeError::Scheduler(
+            SchedulerError::DecodeNotReady { .. }
+        ))
+    ));
+
+    let response = runtime
+        .poll_transfers()
+        .expect("router should expose transfer polling");
+    assert_eq!(
+        response,
+        RouterTransferPollResponse {
+            completed_batches: 1,
+            pending_batches: 0,
+        }
+    );
+}
+
+#[test]
+fn decode_batch_ready_check_keeps_pd_request_queued_until_kv_success() {
+    let mut scheduler = Scheduler::new(UnfinishedWorker);
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("decode-waits"),
+            vec![1, 2],
+            SamplingParams { max_new_tokens: 2 },
+        )
+        .with_disaggregated_params(Some(disaggregated_params(17))),
+    );
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should queue decode");
+    let mut registry = registry_with_session("decode-waits", 17);
+    registry
+        .update_status(17, KvPoll::Transferring)
+        .expect("status should update");
+
+    let error = scheduler
+        .next_decode_batch_with_ready_check(1, |request| {
+            is_decode_request_kv_ready(request, &registry).expect("registry lookup should succeed")
+        })
+        .expect_err("decode should wait while KV is transferring");
+
+    assert_eq!(
+        error,
+        SchedulerError::DecodeNotReady {
+            request_id: RequestId::from("decode-waits")
+        }
+    );
+    assert_eq!(scheduler.decode_queue_depth(), 1);
+
+    registry
+        .update_status(17, KvPoll::Success)
+        .expect("status should update");
+    let outputs = scheduler
+        .dispatch_decode_batch_with_ready_check(1, |request| {
+            is_decode_request_kv_ready(request, &registry).expect("registry lookup should succeed")
+        })
+        .expect("decode should dispatch after KV success");
+
+    assert_eq!(outputs[0].request_id, RequestId::from("decode-waits"));
+    assert_eq!(outputs[0].token_ids, vec![1]);
+}
+
+#[test]
+fn decode_kv_ready_check_reports_missing_bootstrap_session() {
+    let mut scheduler = Scheduler::new(UnfinishedWorker);
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("missing-session"),
+            vec![1, 2],
+            SamplingParams { max_new_tokens: 2 },
+        )
+        .with_disaggregated_params(Some(disaggregated_params(18))),
+    );
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should queue decode");
+    let registry = DecodeBootstrapRegistry::default();
+    let mut ready_error = None;
+
+    let error = scheduler
+        .next_decode_batch_with_ready_check(1, |request| {
+            match is_decode_request_kv_ready(request, &registry) {
+                Ok(ready) => ready,
+                Err(error) => {
+                    ready_error = Some(error);
+                    false
+                }
+            }
+        })
+        .expect_err("missing bootstrap session should block decode");
+
+    assert_eq!(
+        error,
+        SchedulerError::DecodeNotReady {
+            request_id: RequestId::from("missing-session")
+        }
+    );
+    assert_eq!(
+        ready_error,
+        Some(KvCacheTransferError::Registry(
+            sglang_srt::transfer::DecodeBootstrapRegistryError::MissingBootstrapRoom(18)
+        ))
+    );
+    assert_eq!(scheduler.decode_queue_depth(), 1);
+}
+
+#[test]
+fn mooncake_request_builder_maps_cache_pages_to_source_and_target_offsets() {
+    let transfer_plan = transfer_plan_for_request("pd-mooncake", &[50, 51, 52], Some(1), 8);
+    let span = &transfer_plan.spans()[0];
+
+    let requests = build_mooncake_kv_transfer_requests(
+        span,
+        MooncakeKvCacheLayout {
+            source_base_addr: 0x1000,
+            page_size_bytes: 256,
+            target_base_offset: 0x8000,
+        },
+        MooncakeTransferTarget { target_id: 42 },
+    )
+    .expect("mooncake requests should build");
+
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].opcode, MooncakeOpcode::Write as i32);
+    assert_eq!(requests[0].source as usize, 0x1000);
+    assert_eq!(requests[0].target_id, 42);
+    assert_eq!(requests[0].target_offset, 0x8000 + 256);
+    assert_eq!(requests[0].length, 256);
+    assert_eq!(requests[1].source as usize, 0x1000 + 256);
+    assert_eq!(requests[1].target_offset, 0x8000 + 512);
+}
+
+#[test]
+fn mooncake_executor_submits_built_requests_through_transfer_submitter() {
+    let transfer_plan = transfer_plan_for_request("pd-mooncake-submit", &[60, 61], None, 9);
+    let mut registry = registry_with_session("pd-mooncake-submit", 9);
+    let mut executor = MooncakeKvCacheTransferExecutor::new(
+        RecordingMooncakeSubmitter::default(),
+        MooncakeKvCacheLayout {
+            source_base_addr: 0x2000,
+            page_size_bytes: 128,
+            target_base_offset: 0x9000,
+        },
+        MooncakeTransferTarget { target_id: 7 },
+    );
+
+    let summary = execute_kv_cache_transfer_plan(&mut registry, &mut executor, &transfer_plan)
+        .expect("mooncake executor should submit");
+
+    assert_eq!(summary.submitted_spans(), 1);
+    assert_eq!(executor.submitted_batches(), &[100]);
+    let submitted_requests = &executor.submitter().submitted_requests;
+    assert_eq!(submitted_requests.len(), 1);
+    assert_eq!(submitted_requests[0].len(), 2);
+    assert_eq!(submitted_requests[0][0].source as usize, 0x2000);
+    assert_eq!(submitted_requests[0][1].source as usize, 0x2000 + 128);
+    assert_eq!(submitted_requests[0][0].target_offset, 0x9000);
+    assert_eq!(submitted_requests[0][1].target_offset, 0x9000 + 128);
+    assert_eq!(
+        registry.get(9).expect("session should remain").status(),
+        KvPoll::Transferring
+    );
+
+    let submitted_transfers = executor.submitted_transfers().to_vec();
+    let mut reader = RecordingMooncakeStatusReader::completed();
+    let poll_summary =
+        poll_mooncake_transfer_batches(&mut registry, &mut reader, &submitted_transfers)
+            .expect("completed status should update registry");
+
+    assert_eq!(poll_summary.completed_batches(), 1);
+    assert_eq!(poll_summary.pending_batches(), 0);
+    assert_eq!(
+        registry.get(9).expect("session should remain").status(),
+        KvPoll::Success
+    );
+}
+
+#[test]
+fn mooncake_executor_maps_request_build_errors_to_transfer_runtime_errors() {
+    let transfer_plan = transfer_plan_for_request("pd-bad-layout", &[70], None, 10);
+    let mut registry = registry_with_session("pd-bad-layout", 10);
+    let mut executor = MooncakeKvCacheTransferExecutor::new(
+        RecordingMooncakeSubmitter::default(),
+        MooncakeKvCacheLayout {
+            source_base_addr: 0x2000,
+            page_size_bytes: 0,
+            target_base_offset: 0x9000,
+        },
+        MooncakeTransferTarget { target_id: 7 },
+    );
+
+    let error = execute_kv_cache_transfer_plan(&mut registry, &mut executor, &transfer_plan)
+        .expect_err("bad layout should fail before submit");
+
+    assert_eq!(
+        error,
+        KvCacheTransferError::Runtime("Mooncake KV page size must be non-zero".to_string())
+    );
+    assert!(executor.submitter().submitted_requests.is_empty());
+    assert_eq!(
+        registry.get(10).expect("session should remain").status(),
+        KvPoll::Failed
+    );
+}
+
+#[test]
+fn mooncake_executor_resolves_target_per_bootstrap_room() {
+    let mut scheduler = Scheduler::with_cache_resources(
+        FinishedWorker,
+        RadixCache::default(),
+        CachePageAllocator::new(4),
+    );
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("room-a"),
+            vec![1, 2],
+            SamplingParams { max_new_tokens: 1 },
+        )
+        .with_disaggregated_params(Some(disaggregated_params(11))),
+    );
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("room-b"),
+            vec![3, 4],
+            SamplingParams { max_new_tokens: 1 },
+        )
+        .with_disaggregated_params(Some(disaggregated_params(12))),
+    );
+    let batch = scheduler
+        .next_prefill_batch(2)
+        .expect("prefill batch should be available");
+    let worker_batch = ModelWorkerBatch::from_schedule_batch(&batch);
+    let transfer_plan =
+        KvCacheTransferPlan::from_prefill_worker_batch(&worker_batch).expect("plan should build");
+    let mut registry = DecodeBootstrapRegistry::default();
+    registry
+        .register(DecodeBootstrapSession::new(
+            RequestId::from("room-a"),
+            disaggregated_params(11),
+            0,
+        ))
+        .expect("room-a should register");
+    registry
+        .register(DecodeBootstrapSession::new(
+            RequestId::from("room-b"),
+            disaggregated_params(12),
+            0,
+        ))
+        .expect("room-b should register");
+    let mut executor = MooncakeKvCacheTransferExecutor::with_target_resolver(
+        RecordingMooncakeSubmitter::default(),
+        MooncakeKvCacheLayout {
+            source_base_addr: 0x3000,
+            page_size_bytes: 64,
+            target_base_offset: 0,
+        },
+        RoomTargetResolver {
+            targets: vec![(11, 101), (12, 202)],
+        },
+    );
+
+    let summary = execute_kv_cache_transfer_plan(&mut registry, &mut executor, &transfer_plan)
+        .expect("mooncake executor should submit both rooms");
+
+    assert_eq!(summary.submitted_spans(), 2);
+    assert_eq!(executor.submitted_transfers().len(), 2);
+    assert_eq!(
+        executor
+            .submitter()
+            .submitted_requests
+            .iter()
+            .map(|requests| requests[0].target_id)
+            .collect::<Vec<_>>(),
+        vec![101, 202]
+    );
+}
+
+#[test]
+fn poll_mooncake_transfer_batches_reports_pending_without_changing_status() {
+    let mut registry = registry_with_session("pd-pending", 13);
+    registry
+        .update_status(13, KvPoll::Transferring)
+        .expect("status should update");
+    let mut reader = RecordingMooncakeStatusReader::pending();
+    let batches = vec![MooncakeSubmittedBatch::new(13, 200, 2)];
+
+    let summary = poll_mooncake_transfer_batches(&mut registry, &mut reader, &batches)
+        .expect("pending status should not fail");
+
+    assert_eq!(summary.completed_batches(), 0);
+    assert_eq!(summary.pending_batches(), 1);
+    assert_eq!(
+        registry.get(13).expect("session should remain").status(),
+        KvPoll::Transferring
+    );
+}
+
+#[test]
+fn poll_mooncake_transfer_batches_marks_failed_status_and_returns_error() {
+    let mut registry = registry_with_session("pd-status-fail", 14);
+    registry
+        .update_status(14, KvPoll::Transferring)
+        .expect("status should update");
+    let mut reader = RecordingMooncakeStatusReader {
+        statuses: vec![
+            MooncakeTransferStatusCode::Completed,
+            MooncakeTransferStatusCode::Failed,
+        ],
+    };
+    let batches = vec![MooncakeSubmittedBatch::new(14, 201, 2)];
+
+    let error = poll_mooncake_transfer_batches(&mut registry, &mut reader, &batches)
+        .expect_err("failed status should propagate");
+
+    assert_eq!(
+        error,
+        KvCacheTransferError::Runtime(
+            "Mooncake transfer batch 201 task 1 failed with status 6".to_string()
+        )
+    );
+    assert_eq!(
+        registry.get(14).expect("session should remain").status(),
+        KvPoll::Failed
+    );
+}
+
+#[derive(Default)]
+struct RecordingTransferExecutor {
+    seen_rooms: Vec<i32>,
+    fail_room: Option<i32>,
+}
+
+impl KvCacheTransferExecutor for RecordingTransferExecutor {
+    fn transfer_span(&mut self, span: &KvCacheTransferSpan) -> Result<(), KvCacheTransferError> {
+        self.seen_rooms.push(span.bootstrap_room());
+        if self.fail_room == Some(span.bootstrap_room()) {
+            return Err(KvCacheTransferError::Runtime(format!(
+                "submit failed for room {}",
+                span.bootstrap_room()
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct RecordingMooncakeSubmitter {
+    submitted_requests: Vec<Vec<MooncakeTransferRequest>>,
+}
+
+impl MooncakeTransferSubmitter for RecordingMooncakeSubmitter {
+    fn submit_transfer(
+        &mut self,
+        requests: &mut [MooncakeTransferRequest],
+    ) -> Result<MooncakeBatchId, MooncakeError> {
+        self.submitted_requests.push(requests.to_vec());
+        Ok(100 + self.submitted_requests.len() as MooncakeBatchId - 1)
+    }
+}
+
+#[derive(Default)]
+struct RecordingMooncakeBackend {
+    submitted_requests: Vec<Vec<MooncakeTransferRequest>>,
+    statuses: Vec<MooncakeTransferStatusCode>,
+}
+
+impl RecordingMooncakeBackend {
+    fn completed() -> Self {
+        Self {
+            submitted_requests: Vec::new(),
+            statuses: vec![MooncakeTransferStatusCode::Completed],
+        }
+    }
+}
+
+impl MooncakeTransferSubmitter for RecordingMooncakeBackend {
+    fn submit_transfer(
+        &mut self,
+        requests: &mut [MooncakeTransferRequest],
+    ) -> Result<MooncakeBatchId, MooncakeError> {
+        self.submitted_requests.push(requests.to_vec());
+        Ok(300 + self.submitted_requests.len() as MooncakeBatchId - 1)
+    }
+}
+
+impl MooncakeTransferStatusReader for RecordingMooncakeBackend {
+    fn transfer_status(
+        &mut self,
+        _batch_id: MooncakeBatchId,
+        task_id: usize,
+    ) -> Result<MooncakeTransferStatus, MooncakeError> {
+        let status = self
+            .statuses
+            .get(task_id)
+            .or_else(|| self.statuses.last())
+            .copied()
+            .expect("recording Mooncake backend needs at least one status");
+        Ok(MooncakeTransferStatus {
+            status: status as i32,
+            transferred_bytes: 0,
+        })
+    }
+}
+
+struct RoomTargetResolver {
+    targets: Vec<(i32, i32)>,
+}
+
+impl MooncakeTransferTargetResolver for RoomTargetResolver {
+    fn resolve_target(
+        &mut self,
+        span: &KvCacheTransferSpan,
+    ) -> Result<MooncakeTransferTarget, KvCacheTransferError> {
+        self.targets
+            .iter()
+            .find(|(room, _)| *room == span.bootstrap_room())
+            .map(|(_, target_id)| MooncakeTransferTarget {
+                target_id: *target_id,
+            })
+            .ok_or_else(|| {
+                KvCacheTransferError::Runtime(format!(
+                    "missing target for room {}",
+                    span.bootstrap_room()
+                ))
+            })
+    }
+}
+
+struct RecordingMooncakeStatusReader {
+    statuses: Vec<MooncakeTransferStatusCode>,
+}
+
+impl RecordingMooncakeStatusReader {
+    fn completed() -> Self {
+        Self {
+            statuses: vec![MooncakeTransferStatusCode::Completed],
+        }
+    }
+
+    fn pending() -> Self {
+        Self {
+            statuses: vec![MooncakeTransferStatusCode::Pending],
+        }
+    }
+}
+
+impl MooncakeTransferStatusReader for RecordingMooncakeStatusReader {
+    fn transfer_status(
+        &mut self,
+        _batch_id: MooncakeBatchId,
+        task_id: usize,
+    ) -> Result<MooncakeTransferStatus, MooncakeError> {
+        let status = self
+            .statuses
+            .get(task_id)
+            .or_else(|| self.statuses.last())
+            .copied()
+            .expect("recording status reader needs at least one status");
+        Ok(MooncakeTransferStatus {
+            status: status as i32,
+            transferred_bytes: 0,
+        })
+    }
+}
+
+fn transfer_plan_for_request(
+    request_id: &str,
+    input_ids: &[u32],
+    cached_prefix_len: Option<usize>,
+    bootstrap_room: i32,
+) -> KvCacheTransferPlan {
+    let mut prefix_cache = RadixCache::default();
+    if let Some(cached_prefix_len) = cached_prefix_len {
+        let prefix_tokens = &input_ids[..cached_prefix_len];
+        let prefix_pages = (0..cached_prefix_len)
+            .map(|index| CachePageId::from(100 + index))
+            .collect::<Vec<_>>();
+        prefix_cache
+            .insert(prefix_tokens, &prefix_pages)
+            .expect("prefix cache should insert");
+    }
+
+    let mut scheduler = Scheduler::with_cache_resources(
+        FinishedWorker,
+        prefix_cache,
+        CachePageAllocator::new(input_ids.len()),
+    );
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from(request_id),
+            input_ids.to_vec(),
+            SamplingParams { max_new_tokens: 1 },
+        )
+        .with_disaggregated_params(Some(disaggregated_params(bootstrap_room))),
+    );
+
+    let batch = scheduler
+        .next_prefill_batch(1)
+        .expect("prefill batch should be available");
+    let worker_batch = ModelWorkerBatch::from_schedule_batch(&batch);
+    KvCacheTransferPlan::from_prefill_worker_batch(&worker_batch)
+        .expect("transfer plan should build")
+}
+
+fn registry_with_session(request_id: &str, bootstrap_room: i32) -> DecodeBootstrapRegistry {
+    let mut registry = DecodeBootstrapRegistry::default();
+    registry
+        .register(DecodeBootstrapSession::new(
+            RequestId::from(request_id),
+            disaggregated_params(bootstrap_room),
+            0,
+        ))
+        .expect("session should register");
+    registry
+}
+
+fn disaggregated_params(bootstrap_room: i32) -> DisaggregatedParams {
+    DisaggregatedParams {
+        bootstrap_host: "10.0.0.7".to_string(),
+        bootstrap_port: 8998,
+        bootstrap_room,
+    }
+}

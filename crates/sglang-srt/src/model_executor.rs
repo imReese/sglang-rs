@@ -15,6 +15,8 @@ pub struct ModelWorkerBatch {
     positions: Vec<usize>,
     sequence_lengths: Vec<usize>,
     request_offsets: Vec<usize>,
+    cached_token_counts: Vec<usize>,
+    input_token_counts: Vec<usize>,
     prefix_cache_pages: Vec<Vec<CachePageId>>,
     out_cache_pages: Vec<CachePageId>,
     disaggregated_params: Vec<Option<DisaggregatedParams>>,
@@ -30,6 +32,8 @@ impl ModelWorkerBatch {
             positions: Vec::new(),
             sequence_lengths: Vec::with_capacity(batch.batch_size()),
             request_offsets: Vec::with_capacity(batch.batch_size()),
+            cached_token_counts: Vec::with_capacity(batch.batch_size()),
+            input_token_counts: Vec::with_capacity(batch.batch_size()),
             prefix_cache_pages: Vec::with_capacity(batch.batch_size()),
             out_cache_pages: Vec::new(),
             disaggregated_params: Vec::with_capacity(batch.batch_size()),
@@ -67,6 +71,14 @@ impl ModelWorkerBatch {
         &self.request_offsets
     }
 
+    pub fn cached_token_counts(&self) -> &[usize] {
+        &self.cached_token_counts
+    }
+
+    pub fn input_token_counts(&self) -> &[usize] {
+        &self.input_token_counts
+    }
+
     pub fn prefix_cache_pages(&self) -> &[Vec<CachePageId>] {
         &self.prefix_cache_pages
     }
@@ -86,6 +98,7 @@ impl ModelWorkerBatch {
     fn push_request(&mut self, forward_mode: ForwardMode, request: &ScheduledRequest) {
         self.request_ids.push(request.request_id().clone());
         self.request_offsets.push(self.input_ids.len());
+        self.cached_token_counts.push(request.cached_token_count());
         self.prefix_cache_pages
             .push(request.prefix_cache_pages().to_vec());
         self.disaggregated_params
@@ -103,6 +116,7 @@ impl ModelWorkerBatch {
         let uncached_input_ids = request.uncached_input_ids();
 
         self.input_ids.extend_from_slice(uncached_input_ids);
+        self.input_token_counts.push(uncached_input_ids.len());
         self.out_cache_pages
             .extend_from_slice(request.allocated_cache_pages());
         self.positions
@@ -114,6 +128,7 @@ impl ModelWorkerBatch {
         let decode_token = request.output_ids().last().copied().unwrap_or_default();
 
         self.input_ids.push(decode_token);
+        self.input_token_counts.push(1);
         self.positions
             .push(request.input_ids().len() + request.output_ids().len() - 1);
         self.sequence_lengths

@@ -437,6 +437,7 @@ fn tokenized_engine_output_maps_to_router_generate_stream_chunk() {
     let output = TokenGenerateOutput {
         request_id: RequestId::from("router-rid"),
         output_ids: vec![7, 8, 9],
+        cached_tokens: 2,
         finished: false,
     };
 
@@ -450,7 +451,7 @@ fn tokenized_engine_output_maps_to_router_generate_stream_chunk() {
             text: String::new(),
             prompt_tokens: 5,
             completion_tokens: 3,
-            cached_tokens: 0,
+            cached_tokens: 2,
             index: 0,
         })
     );
@@ -461,6 +462,7 @@ fn tokenized_engine_finished_output_maps_to_router_generate_complete() {
     let output = TokenGenerateOutput {
         request_id: RequestId::from("router-rid"),
         output_ids: vec![7, 8, 9],
+        cached_tokens: 2,
         finished: true,
     };
 
@@ -474,7 +476,7 @@ fn tokenized_engine_finished_output_maps_to_router_generate_complete() {
             finish_reason: "stop".to_string(),
             prompt_tokens: 5,
             completion_tokens: 3,
-            cached_tokens: 0,
+            cached_tokens: 2,
             index: 0,
         })
     );
@@ -551,6 +553,68 @@ fn router_runtime_executes_generate_request_through_engine() {
     assert_eq!(
         runtime.engine().scheduler().worker().seen_input_ids,
         vec![9, 8, 7]
+    );
+}
+
+#[test]
+fn router_runtime_reports_prefix_cache_hits_as_cached_tokens() {
+    let tokenizer = ByteTokenizer::default();
+    let scheduler = Scheduler::with_cache_resources(
+        RouterEchoWorker::default(),
+        RadixCache::default(),
+        CachePageAllocator::new(8),
+    );
+    let engine = Engine::new(tokenizer, scheduler);
+    let mut runtime = RouterRuntime::new(engine);
+
+    let first_request = RouterGenerateRequest {
+        request_id: "cache-warmup".to_string(),
+        tokenized: Some(RouterTokenizedInput {
+            original_text: String::new(),
+            input_ids: vec![9, 8, 7],
+        }),
+        sampling_params: Some(RouterSamplingParams {
+            max_new_tokens: Some(2),
+            ..Default::default()
+        }),
+        disaggregated_params: None,
+        stream: false,
+        data_parallel_rank: 0,
+        trace_headers: Default::default(),
+    };
+    runtime
+        .generate(first_request)
+        .expect("warmup request should populate prefix cache");
+
+    let response = runtime
+        .generate(RouterGenerateRequest {
+            request_id: "cache-hit".to_string(),
+            tokenized: Some(RouterTokenizedInput {
+                original_text: String::new(),
+                input_ids: vec![9, 8, 7],
+            }),
+            sampling_params: Some(RouterSamplingParams {
+                max_new_tokens: Some(2),
+                ..Default::default()
+            }),
+            disaggregated_params: None,
+            stream: false,
+            data_parallel_rank: 0,
+            trace_headers: Default::default(),
+        })
+        .expect("cache hit request should execute");
+
+    assert_eq!(
+        response.body,
+        RouterGenerateResponseBody::Complete(RouterGenerateComplete {
+            output_ids: vec![42, 43],
+            text: String::new(),
+            finish_reason: "stop".to_string(),
+            prompt_tokens: 3,
+            completion_tokens: 2,
+            cached_tokens: 3,
+            index: 0,
+        })
     );
 }
 

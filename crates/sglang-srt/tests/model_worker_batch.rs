@@ -84,6 +84,8 @@ fn model_worker_batch_for_prefill_flattens_uncached_tokens_with_positions() {
     assert_eq!(worker_batch.positions(), &[2, 3, 0, 1]);
     assert_eq!(worker_batch.sequence_lengths(), &[4, 2]);
     assert_eq!(worker_batch.request_offsets(), &[0, 2]);
+    assert_eq!(worker_batch.cached_token_counts(), &[2, 0]);
+    assert_eq!(worker_batch.input_token_counts(), &[2, 2]);
     assert_eq!(
         worker_batch.prefix_cache_pages()[0],
         &[CachePageId::from(100), CachePageId::from(101)]
@@ -114,6 +116,8 @@ fn model_worker_batch_for_decode_uses_last_output_token_and_next_position() {
     assert_eq!(worker_batch.positions(), &[3]);
     assert_eq!(worker_batch.sequence_lengths(), &[4]);
     assert_eq!(worker_batch.request_offsets(), &[0]);
+    assert_eq!(worker_batch.cached_token_counts(), &[0]);
+    assert_eq!(worker_batch.input_token_counts(), &[1]);
 }
 
 #[test]

@@ -2,6 +2,7 @@ use std::fmt;
 
 use crate::scheduler::{ScheduledOutput, ScheduledRequest, Scheduler, SchedulerError};
 use crate::tokenizer::{Tokenizer, TokenizerError};
+use crate::transfer::{KvCacheTransferError, KvTransferPoller, MooncakeTransferPollSummary};
 use crate::types::{
     GenerateOutput, GenerateRequest, RequestId, TokenGenerateOutput, TokenGenerateRequest,
 };
@@ -11,6 +12,7 @@ use crate::worker::WorkerExecutor;
 pub enum RuntimeError {
     Scheduler(SchedulerError),
     Tokenizer(TokenizerError),
+    Transfer(KvCacheTransferError),
 }
 
 impl fmt::Display for RuntimeError {
@@ -18,6 +20,7 @@ impl fmt::Display for RuntimeError {
         match self {
             Self::Scheduler(error) => write!(formatter, "scheduler error: {error}"),
             Self::Tokenizer(error) => write!(formatter, "tokenizer error: {error}"),
+            Self::Transfer(error) => write!(formatter, "transfer error: {error}"),
         }
     }
 }
@@ -33,6 +36,12 @@ impl From<SchedulerError> for RuntimeError {
 impl From<TokenizerError> for RuntimeError {
     fn from(value: TokenizerError) -> Self {
         Self::Tokenizer(value)
+    }
+}
+
+impl From<KvCacheTransferError> for RuntimeError {
+    fn from(value: KvCacheTransferError) -> Self {
+        Self::Transfer(value)
     }
 }
 
@@ -53,12 +62,25 @@ impl<T, W> Engine<T, W> {
         &self.scheduler
     }
 
+    pub fn scheduler_mut(&mut self) -> &mut Scheduler<W> {
+        &mut self.scheduler
+    }
+
     pub fn flush_cache(&mut self) -> bool {
         self.scheduler.flush_cache()
     }
 
     pub fn abort_request(&mut self, request_id: &RequestId) -> bool {
         self.scheduler.abort_request(request_id)
+    }
+}
+
+impl<T, W> Engine<T, W>
+where
+    W: KvTransferPoller,
+{
+    pub fn poll_transfers(&mut self) -> Result<MooncakeTransferPollSummary, RuntimeError> {
+        Ok(self.scheduler.worker_mut().poll_transfers()?)
     }
 }
 
@@ -110,6 +132,7 @@ where
         Ok(TokenGenerateOutput {
             request_id: output.request_id,
             output_ids: output.token_ids,
+            cached_tokens: output.cached_tokens,
             finished: output.finished,
         })
     }
@@ -129,6 +152,7 @@ where
             .map(|output| TokenGenerateOutput {
                 request_id: output.request_id,
                 output_ids: output.token_ids,
+                cached_tokens: output.cached_tokens,
                 finished: output.finished,
             })
             .collect())
@@ -152,6 +176,7 @@ where
         Ok(ScheduledOutput {
             request_id: final_output.request_id,
             token_ids: output_ids,
+            cached_tokens: final_output.cached_tokens,
             finished: final_output.finished,
         })
     }

@@ -4,6 +4,12 @@ use std::fmt;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CachePageId(usize);
 
+impl CachePageId {
+    pub fn as_usize(&self) -> usize {
+        self.0
+    }
+}
+
 impl From<usize> for CachePageId {
     fn from(value: usize) -> Self {
         Self(value)

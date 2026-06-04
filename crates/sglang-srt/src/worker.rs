@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::scheduler::{ForwardMode, ScheduleBatch, ScheduledOutput};
+use crate::scheduler::{ForwardMode, ScheduleBatch, ScheduledOutput, ScheduledRequest};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GeneratedToken {
@@ -58,6 +58,7 @@ impl BatchGeneratedTokens {
             .into_iter()
             .zip(self.tokens)
             .map(|(request, generated)| ScheduledOutput {
+                cached_tokens: request.cached_token_count(),
                 request_id: request.into_request_id(),
                 token_ids: generated.token_ids().to_vec(),
                 finished: generated.is_finished(),
@@ -126,6 +127,13 @@ pub trait FallibleModelWorker {
         &mut self,
         batch: &ScheduleBatch,
     ) -> Result<BatchGeneratedTokens, WorkerExecutionError>;
+
+    fn decode_request_state(
+        &self,
+        _request: &ScheduledRequest,
+    ) -> Result<DecodeRequestState, WorkerExecutionError> {
+        Ok(DecodeRequestState::Ready)
+    }
 }
 
 pub trait WorkerExecutor {
@@ -133,6 +141,11 @@ pub trait WorkerExecutor {
         &mut self,
         batch: &ScheduleBatch,
     ) -> Result<BatchGeneratedTokens, WorkerExecutionError>;
+
+    fn decode_request_state(
+        &self,
+        request: &ScheduledRequest,
+    ) -> Result<DecodeRequestState, WorkerExecutionError>;
 }
 
 impl<W> FallibleModelWorker for W
@@ -157,6 +170,20 @@ where
     ) -> Result<BatchGeneratedTokens, WorkerExecutionError> {
         self.try_generate_batch(batch)
     }
+
+    fn decode_request_state(
+        &self,
+        request: &ScheduledRequest,
+    ) -> Result<DecodeRequestState, WorkerExecutionError> {
+        FallibleModelWorker::decode_request_state(self, request)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DecodeRequestState {
+    Ready,
+    Pending,
+    Failed(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

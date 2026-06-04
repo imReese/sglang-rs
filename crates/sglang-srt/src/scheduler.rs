@@ -5,7 +5,7 @@ use crate::cache::{
     CacheAllocationError, CachePageAllocator, CachePageId, PrefixMatch, RadixCache,
 };
 use crate::types::{DisaggregatedParams, FAKE_BOOTSTRAP_HOST, RequestId, SamplingParams};
-use crate::worker::{GeneratedToken, WorkerExecutionError, WorkerExecutor};
+use crate::worker::{DecodeRequestState, GeneratedToken, WorkerExecutionError, WorkerExecutor};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequestStage {
@@ -118,6 +118,10 @@ impl ScheduledRequest {
         &self.allocated_cache_pages
     }
 
+    pub fn cached_token_count(&self) -> usize {
+        self.prefix_match.matched_token_count
+    }
+
     fn apply_prefix_match(&mut self, prefix_match: PrefixMatch) {
         self.prefix_match = prefix_match;
     }
@@ -142,6 +146,7 @@ impl ScheduledRequest {
 #[derive(Debug, Eq, PartialEq)]
 pub enum SchedulerError {
     EmptyQueue,
+    DecodeNotReady { request_id: RequestId },
     CacheAllocation(CacheAllocationError),
     Worker(WorkerExecutionError),
 }
@@ -150,6 +155,13 @@ impl fmt::Display for SchedulerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyQueue => formatter.write_str("scheduler queue is empty"),
+            Self::DecodeNotReady { request_id } => {
+                write!(
+                    formatter,
+                    "decode request {} is not ready",
+                    request_id.as_str()
+                )
+            }
             Self::CacheAllocation(error) => write!(formatter, "cache allocation error: {error}"),
             Self::Worker(error) => write!(formatter, "worker execution error: {error}"),
         }
@@ -174,6 +186,7 @@ impl From<WorkerExecutionError> for SchedulerError {
 pub struct ScheduledOutput {
     pub request_id: RequestId,
     pub token_ids: Vec<u32>,
+    pub cached_tokens: usize,
     pub finished: bool,
 }
 
@@ -289,6 +302,10 @@ impl<W> Scheduler<W> {
         &self.worker
     }
 
+    pub fn worker_mut(&mut self) -> &mut W {
+        &mut self.worker
+    }
+
     pub fn flush_cache(&mut self) -> bool {
         if !self.waiting_queue.is_empty() || !self.decode_queue.is_empty() {
             return false;
@@ -396,6 +413,17 @@ impl<W> Scheduler<W> {
         &mut self,
         max_batch_size: usize,
     ) -> Result<ScheduleBatch, SchedulerError> {
+        self.next_decode_batch_with_ready_check(max_batch_size, |_| true)
+    }
+
+    pub fn next_decode_batch_with_ready_check<F>(
+        &mut self,
+        max_batch_size: usize,
+        mut is_ready: F,
+    ) -> Result<ScheduleBatch, SchedulerError>
+    where
+        F: FnMut(&ScheduledRequest) -> bool,
+    {
         if self.decode_queue.is_empty() || max_batch_size == 0 {
             return Err(SchedulerError::EmptyQueue);
         }
@@ -403,7 +431,20 @@ impl<W> Scheduler<W> {
         let batch_size = max_batch_size.min(self.decode_queue.len());
         let mut requests = Vec::with_capacity(batch_size);
 
-        for _ in 0..batch_size {
+        while requests.len() < batch_size {
+            let Some(next_request) = self.decode_queue.front() else {
+                break;
+            };
+
+            if !is_ready(next_request) {
+                if requests.is_empty() {
+                    return Err(SchedulerError::DecodeNotReady {
+                        request_id: next_request.request_id().clone(),
+                    });
+                }
+                break;
+            }
+
             let mut request = self
                 .decode_queue
                 .pop_front()
@@ -441,8 +482,64 @@ where
         &mut self,
         max_batch_size: usize,
     ) -> Result<Vec<ScheduledOutput>, SchedulerError> {
-        let batch = self.next_decode_batch(max_batch_size)?;
+        let batch = self.next_decode_batch_with_worker_ready_check(max_batch_size)?;
         self.dispatch_batch(batch)
+    }
+
+    pub fn dispatch_decode_batch_with_ready_check<F>(
+        &mut self,
+        max_batch_size: usize,
+        is_ready: F,
+    ) -> Result<Vec<ScheduledOutput>, SchedulerError>
+    where
+        F: FnMut(&ScheduledRequest) -> bool,
+    {
+        let batch = self.next_decode_batch_with_ready_check(max_batch_size, is_ready)?;
+        self.dispatch_batch(batch)
+    }
+
+    fn next_decode_batch_with_worker_ready_check(
+        &mut self,
+        max_batch_size: usize,
+    ) -> Result<ScheduleBatch, SchedulerError> {
+        if self.decode_queue.is_empty() || max_batch_size == 0 {
+            return Err(SchedulerError::EmptyQueue);
+        }
+
+        let batch_size = max_batch_size.min(self.decode_queue.len());
+        let mut requests = Vec::with_capacity(batch_size);
+
+        while requests.len() < batch_size {
+            let Some(next_request) = self.decode_queue.front() else {
+                break;
+            };
+
+            match self.worker.decode_request_state(next_request)? {
+                DecodeRequestState::Ready => {}
+                DecodeRequestState::Pending => {
+                    if requests.is_empty() {
+                        return Err(SchedulerError::DecodeNotReady {
+                            request_id: next_request.request_id().clone(),
+                        });
+                    }
+                    break;
+                }
+                DecodeRequestState::Failed(message) => {
+                    return Err(SchedulerError::Worker(WorkerExecutionError::Runtime(
+                        message,
+                    )));
+                }
+            }
+
+            let mut request = self
+                .decode_queue
+                .pop_front()
+                .ok_or(SchedulerError::EmptyQueue)?;
+            request.set_stage(RequestStage::DecodeForward);
+            requests.push(request);
+        }
+
+        Ok(ScheduleBatch::decode(requests))
     }
 
     fn dispatch_batch(
@@ -529,6 +626,7 @@ fn scheduled_output(
     finished: bool,
 ) -> ScheduledOutput {
     ScheduledOutput {
+        cached_tokens: request.cached_token_count(),
         request_id: request.into_request_id(),
         token_ids: generated.token_ids().to_vec(),
         finished,

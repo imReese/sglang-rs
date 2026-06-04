@@ -54,5 +54,6 @@ pub struct TokenGenerateRequest {
 pub struct TokenGenerateOutput {
     pub request_id: RequestId,
     pub output_ids: Vec<u32>,
+    pub cached_tokens: usize,
     pub finished: bool,
 }

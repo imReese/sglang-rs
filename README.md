@@ -76,7 +76,7 @@ This repository currently contains the first `sglang-srt` runtime crate:
   binaries so the upstream command shape works.
 - `engine`: text and tokenized request lifecycle glue that drives prefill and
   decode until completion, with a token stream path that preserves incremental
-  prefill/decode outputs for router streaming.
+  prefill/decode outputs and prefix-cache hit counts for router streaming.
 - `router`: SGLang gateway/router protocol boundary types for tokenized
   `Generate` requests/responses using the current `tokenized.input_ids: u32`
   and `chunk`/`complete` stream shape, plus health and model-info responses used
@@ -94,19 +94,33 @@ This repository currently contains the first `sglang-srt` runtime crate:
   RPCs as explicit `UNIMPLEMENTED` responses while the runtime surface grows.
 - `tokenizer`: tokenizer trait plus a temporary byte tokenizer for tests.
 - `transfer`: PD disaggregation mode/backend normalization, including
-  SGLang-compatible `mooncake_tcp` handling, plus the initial Mooncake
-  transfer-engine ABI boundary for memory registration and batch transfer.
+  SGLang-compatible `mooncake_tcp` handling, decode bootstrap session tracking,
+  KV delta transfer planning from prepared prefill worker batches, a transfer
+  executor abstraction that drives bootstrap-room status transitions,
+  bootstrap-room-aware Mooncake target resolution, Mooncake KV transfer request
+  construction, batch status polling, and a `KvTransferModelWorker` wrapper that
+  runs transfer as part of scheduler prefill dispatch. It also exposes a
+  decode-side KV-ready predicate used by scheduler decode batching to keep PD
+  decode requests queued until their bootstrap room reaches `Success`, plus
+  engine/router polling hooks for advancing asynchronous Mooncake transfer
+  completions from the control plane. The
+  module also contains the initial Mooncake transfer-engine ABI boundary for
+  memory registration and batch transfer.
 - `scheduler`: waiting queue, prefill/decode batch formation, request stages,
   uncached-token budgeted prefill batching, decode requeueing,
   `max_new_tokens` stopping, prefix-cache application, and KV cache page
-  allocation for uncached prefill tokens. Successful prefill dispatches publish
-  allocated pages back into RadixCache for future prefix reuse. The dispatch
-  path can run in local PD mode by routing prefill and decode batches to
-  separate worker executors, matching the split execution boundary used by
-  SGLang disaggregation.
+  allocation for uncached prefill tokens. Decode batching consults worker
+  readiness before dispatch so PD decode requests do not leave the decode queue
+  before KV transfer is complete. Successful prefill dispatches publish
+  allocated pages back into RadixCache for future prefix reuse. The dispatch path
+  can run in local PD mode by routing prefill and decode batches to separate
+  worker executors, matching the split execution boundary used by SGLang
+  disaggregation.
 - `model_executor`: prepared model-worker batches with flattened input ids,
   positions, sequence lengths, request offsets, and prefix cache pages for the
-  future CUDA/model executor boundary. PD bootstrap metadata is carried per
+  future CUDA/model executor boundary. The batch also exposes per-request
+  cached/input token counts so PD prefill workers can treat the uncached prefill
+  span as the future KV-transfer delta. PD bootstrap metadata is carried per
   request so the later KV transfer implementation has the same context that
   SGLang attaches to disaggregated requests.
 - `cache`: RadixCache-style token-prefix matching plus a finite KV cache page
