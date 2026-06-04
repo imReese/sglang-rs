@@ -2,8 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use sglang_srt::model_artifacts::{
-    HfModelConfig, LocalModelArtifacts, ModelArtifactError, SafetensorsCheckpointFingerprintEntry,
-    SafetensorsLayerTensorCatalog, SafetensorsLayerTensorSpan, SafetensorsRoutedExpertProjection,
+    DeepSeekLayerFeedForwardCheckpointWeights, HfModelConfig, LocalModelArtifacts,
+    ModelArtifactError, SafetensorsCheckpointFingerprintEntry, SafetensorsLayerTensorCatalog,
+    SafetensorsLayerTensorSpan, SafetensorsRoutedExpertProjection,
     SafetensorsRoutedExpertWeightCatalog, SafetensorsRoutedExpertWeightGroup,
     SafetensorsRoutedExpertWeightSpan, SafetensorsTensorData, SafetensorsTensorMetadata,
     SafetensorsTensorSpan,
@@ -475,14 +476,119 @@ fn local_model_checkpoint_catalog_exposes_deepseek_v4_moe_layer_weights() {
     assert_eq!(layer.hc_ffn_fn().suffix, "hc_ffn_fn");
     assert_eq!(layer.hc_ffn_base().suffix, "hc_ffn_base");
     assert_eq!(layer.hc_ffn_scale().suffix, "hc_ffn_scale");
-    assert_eq!(layer.mlp_gate().suffix, "mlp.gate.weight");
-    assert_eq!(
-        layer
-            .routed_experts()
-            .expect("MoE layer should expose routed experts")
-            .expert_count(),
-        1
-    );
+    match layer.feed_forward() {
+        DeepSeekLayerFeedForwardCheckpointWeights::Moe {
+            gate,
+            routed_experts,
+        } => {
+            assert_eq!(gate.suffix, "mlp.gate.weight");
+            assert_eq!(routed_experts.expert_count(), 1);
+        }
+        DeepSeekLayerFeedForwardCheckpointWeights::Dense { .. } => {
+            panic!("MoE layer should expose MoE feed-forward weights")
+        }
+    }
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn local_model_checkpoint_catalog_exposes_deepseek_v4_dense_layer_weights() {
+    let model_dir = temp_model_dir("deepseek-v4-dense-layer-weights");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "model_type": "deepseek_v4",
+  "num_hidden_layers": 2,
+  "n_routed_experts": 1,
+  "first_k_dense_replace": 1,
+  "moe_layer_freq": 1
+}"#,
+    )
+    .expect("config should be written");
+    write_safetensors_file(
+        &model_dir.join("model.safetensors"),
+        &[
+            ("model.layers.0.self_attn.wq_a.weight", "U8", &[1], [0, 1]),
+            ("model.layers.0.self_attn.wq_b.weight", "U8", &[1], [1, 2]),
+            ("model.layers.0.self_attn.wkv.weight", "U8", &[1], [2, 3]),
+            ("model.layers.0.self_attn.q_norm.weight", "U8", &[1], [3, 4]),
+            (
+                "model.layers.0.self_attn.kv_norm.weight",
+                "U8",
+                &[1],
+                [4, 5],
+            ),
+            ("model.layers.0.self_attn.wo_a.weight", "U8", &[1], [5, 6]),
+            ("model.layers.0.self_attn.wo_b.weight", "U8", &[1], [6, 7]),
+            ("model.layers.0.input_layernorm.weight", "U8", &[1], [7, 8]),
+            (
+                "model.layers.0.post_attention_layernorm.weight",
+                "U8",
+                &[1],
+                [8, 9],
+            ),
+            ("model.layers.0.hc_attn_fn", "U8", &[1], [9, 10]),
+            ("model.layers.0.hc_attn_base", "U8", &[1], [10, 11]),
+            ("model.layers.0.hc_attn_scale", "U8", &[1], [11, 12]),
+            ("model.layers.0.hc_ffn_fn", "U8", &[1], [12, 13]),
+            ("model.layers.0.hc_ffn_base", "U8", &[1], [13, 14]),
+            ("model.layers.0.hc_ffn_scale", "U8", &[1], [14, 15]),
+            (
+                "model.layers.0.mlp.gate_up_proj.weight",
+                "U8",
+                &[1],
+                [15, 16],
+            ),
+            ("model.layers.0.mlp.down_proj.weight", "U8", &[1], [16, 17]),
+            (
+                "model.layers.1.ffn.experts.0.w1.weight",
+                "U8",
+                &[1],
+                [17, 18],
+            ),
+            (
+                "model.layers.1.ffn.experts.0.w2.weight",
+                "U8",
+                &[1],
+                [18, 19],
+            ),
+            (
+                "model.layers.1.ffn.experts.0.w3.weight",
+                "U8",
+                &[1],
+                [19, 20],
+            ),
+        ],
+        &[
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+        ],
+    )
+    .expect("shard should be written");
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("local artifacts should load");
+    let checkpoint = artifacts
+        .checkpoint_catalog()
+        .expect("checkpoint catalog should build");
+
+    let layer = checkpoint
+        .deepseek_layer_weights(0)
+        .expect("DeepSeek V4 dense layer weights should be complete");
+
+    assert_eq!(layer.layer_id(), 0);
+    match layer.feed_forward() {
+        DeepSeekLayerFeedForwardCheckpointWeights::Dense {
+            gate_up_proj,
+            down_proj,
+        } => {
+            assert_eq!(gate_up_proj.suffix, "mlp.gate_up_proj.weight");
+            assert_eq!(down_proj.suffix, "mlp.down_proj.weight");
+        }
+        DeepSeekLayerFeedForwardCheckpointWeights::Moe { .. } => {
+            panic!("dense layer should expose dense feed-forward weights")
+        }
+    }
 
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }

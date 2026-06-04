@@ -193,15 +193,23 @@ impl LocalModelCheckpointCatalog {
         &self,
         layer_id: usize,
     ) -> Result<DeepSeekLayerCheckpointWeights<'_>, ModelArtifactError> {
-        let routed_experts = if self.config.is_moe_layer(layer_id) {
-            Some(self.routed_experts.layer(layer_id).ok_or_else(|| {
+        let feed_forward = if self.config.is_moe_layer(layer_id) {
+            let routed_experts = self.routed_experts.layer(layer_id).ok_or_else(|| {
                 invalid_safetensors_data(
                     &self.model_path,
                     format!("missing DeepSeek layer {layer_id} routed expert weights"),
                 )
-            })?)
+            })?;
+            DeepSeekLayerFeedForwardCheckpointWeights::Moe {
+                gate: self.required_deepseek_layer_tensor(layer_id, "mlp.gate.weight")?,
+                routed_experts,
+            }
         } else {
-            None
+            DeepSeekLayerFeedForwardCheckpointWeights::Dense {
+                gate_up_proj: self
+                    .required_deepseek_layer_tensor(layer_id, "mlp.gate_up_proj.weight")?,
+                down_proj: self.required_deepseek_layer_tensor(layer_id, "mlp.down_proj.weight")?,
+            }
         };
 
         Ok(DeepSeekLayerCheckpointWeights {
@@ -223,8 +231,7 @@ impl LocalModelCheckpointCatalog {
             hc_ffn_fn: self.required_deepseek_layer_tensor(layer_id, "hc_ffn_fn")?,
             hc_ffn_base: self.required_deepseek_layer_tensor(layer_id, "hc_ffn_base")?,
             hc_ffn_scale: self.required_deepseek_layer_tensor(layer_id, "hc_ffn_scale")?,
-            mlp_gate: self.required_deepseek_layer_tensor(layer_id, "mlp.gate.weight")?,
-            routed_experts,
+            feed_forward,
         })
     }
 
@@ -260,8 +267,19 @@ pub struct DeepSeekLayerCheckpointWeights<'a> {
     hc_ffn_fn: &'a SafetensorsLayerTensorSpan,
     hc_ffn_base: &'a SafetensorsLayerTensorSpan,
     hc_ffn_scale: &'a SafetensorsLayerTensorSpan,
-    mlp_gate: &'a SafetensorsLayerTensorSpan,
-    routed_experts: Option<SafetensorsRoutedExpertLayerWeights<'a>>,
+    feed_forward: DeepSeekLayerFeedForwardCheckpointWeights<'a>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeepSeekLayerFeedForwardCheckpointWeights<'a> {
+    Dense {
+        gate_up_proj: &'a SafetensorsLayerTensorSpan,
+        down_proj: &'a SafetensorsLayerTensorSpan,
+    },
+    Moe {
+        gate: &'a SafetensorsLayerTensorSpan,
+        routed_experts: SafetensorsRoutedExpertLayerWeights<'a>,
+    },
 }
 
 impl<'a> DeepSeekLayerCheckpointWeights<'a> {
@@ -329,12 +347,8 @@ impl<'a> DeepSeekLayerCheckpointWeights<'a> {
         self.hc_ffn_scale
     }
 
-    pub fn mlp_gate(&self) -> &'a SafetensorsLayerTensorSpan {
-        self.mlp_gate
-    }
-
-    pub fn routed_experts(&self) -> Option<&SafetensorsRoutedExpertLayerWeights<'a>> {
-        self.routed_experts.as_ref()
+    pub fn feed_forward(&self) -> &DeepSeekLayerFeedForwardCheckpointWeights<'a> {
+        &self.feed_forward
     }
 }
 
