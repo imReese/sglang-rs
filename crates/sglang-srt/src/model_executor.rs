@@ -95,6 +95,14 @@ impl ModelWorkerBatch {
         &self.data_parallel_ranks
     }
 
+    pub fn last_input_token_ids(&self) -> Vec<u32> {
+        self.request_offsets
+            .iter()
+            .zip(&self.input_token_counts)
+            .map(|(offset, token_count)| self.input_ids[offset + token_count - 1])
+            .collect()
+    }
+
     fn push_request(&mut self, forward_mode: ForwardMode, request: &ScheduledRequest) {
         self.request_ids.push(request.request_id().clone());
         self.request_offsets.push(self.input_ids.len());

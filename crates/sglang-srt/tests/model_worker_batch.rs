@@ -96,6 +96,25 @@ fn model_worker_batch_for_prefill_flattens_uncached_tokens_with_positions() {
 }
 
 #[test]
+fn model_worker_batch_exposes_last_input_token_per_prefill_request() {
+    let mut cache = RadixCache::default();
+    cache
+        .insert(&[10], &[CachePageId::from(100)])
+        .expect("insert should succeed");
+    let mut scheduler = Scheduler::with_prefix_cache(NoopWorker, cache);
+    enqueue_request(&mut scheduler, "req-a", &[10, 11, 12]);
+    enqueue_request(&mut scheduler, "req-b", &[20, 21, 22, 23]);
+
+    let batch = scheduler
+        .next_prefill_batch(8)
+        .expect("batch should be available");
+    let worker_batch = ModelWorkerBatch::from_schedule_batch(&batch);
+
+    assert_eq!(worker_batch.input_ids(), &[11, 12, 20, 21, 22, 23]);
+    assert_eq!(worker_batch.last_input_token_ids(), vec![12, 23]);
+}
+
+#[test]
 fn model_worker_batch_for_decode_uses_last_output_token_and_next_position() {
     let mut scheduler = Scheduler::new(UnfinishedPrefillWorker);
     scheduler.enqueue(ScheduledRequest::new(
@@ -120,6 +139,32 @@ fn model_worker_batch_for_decode_uses_last_output_token_and_next_position() {
     assert_eq!(worker_batch.request_offsets(), &[0]);
     assert_eq!(worker_batch.cached_token_counts(), &[0]);
     assert_eq!(worker_batch.input_token_counts(), &[1]);
+}
+
+#[test]
+fn model_worker_batch_exposes_last_input_token_per_decode_request() {
+    let mut scheduler = Scheduler::new(UnfinishedPrefillWorker);
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("decode-a"),
+        vec![1, 2],
+        SamplingParams { max_new_tokens: 4 },
+    ));
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("decode-b"),
+        vec![3],
+        SamplingParams { max_new_tokens: 4 },
+    ));
+
+    scheduler
+        .dispatch_prefill_batch(2)
+        .expect("prefill should dispatch");
+    let decode_batch = scheduler
+        .next_decode_batch(2)
+        .expect("decode batch should be available");
+    let worker_batch = ModelWorkerBatch::from_schedule_batch(&decode_batch);
+
+    assert_eq!(worker_batch.input_ids(), &[99, 99]);
+    assert_eq!(worker_batch.last_input_token_ids(), vec![99, 99]);
 }
 
 #[test]
