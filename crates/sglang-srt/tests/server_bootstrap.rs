@@ -120,6 +120,25 @@ async fn bootstrap_grpc_router_service_reports_local_moe_checkpoint_coverage() {
         model_dir.join("model.safetensors.index.json"),
         r#"{
   "weight_map": {
+    "model.embed_tokens.weight": "model.safetensors",
+    "model.norm.weight": "model.safetensors",
+    "lm_head.weight": "model.safetensors",
+    "model.layers.0.self_attn.wq_a.weight": "model.safetensors",
+    "model.layers.0.self_attn.wq_b.weight": "model.safetensors",
+    "model.layers.0.self_attn.wkv.weight": "model.safetensors",
+    "model.layers.0.self_attn.q_norm.weight": "model.safetensors",
+    "model.layers.0.self_attn.kv_norm.weight": "model.safetensors",
+    "model.layers.0.self_attn.wo_a.weight": "model.safetensors",
+    "model.layers.0.self_attn.wo_b.weight": "model.safetensors",
+    "model.layers.0.input_layernorm.weight": "model.safetensors",
+    "model.layers.0.post_attention_layernorm.weight": "model.safetensors",
+    "model.layers.0.hc_attn_fn": "model.safetensors",
+    "model.layers.0.hc_attn_base": "model.safetensors",
+    "model.layers.0.hc_attn_scale": "model.safetensors",
+    "model.layers.0.hc_ffn_fn": "model.safetensors",
+    "model.layers.0.hc_ffn_base": "model.safetensors",
+    "model.layers.0.hc_ffn_scale": "model.safetensors",
+    "model.layers.0.mlp.gate.weight": "model.safetensors",
     "model.layers.0.ffn.experts.0.w1.weight": "model.safetensors",
     "model.layers.0.ffn.experts.0.w2.weight": "model.safetensors",
     "model.layers.0.ffn.experts.0.w3.weight": "model.safetensors"
@@ -130,11 +149,62 @@ async fn bootstrap_grpc_router_service_reports_local_moe_checkpoint_coverage() {
     write_safetensors_file(
         &model_dir.join("model.safetensors"),
         &[
-            ("model.layers.0.ffn.experts.0.w1.weight", "U8", &[1], [0, 1]),
-            ("model.layers.0.ffn.experts.0.w2.weight", "U8", &[1], [1, 2]),
-            ("model.layers.0.ffn.experts.0.w3.weight", "U8", &[1], [2, 3]),
+            ("model.embed_tokens.weight", "U8", &[1], [0, 1]),
+            ("model.norm.weight", "U8", &[1], [1, 2]),
+            ("lm_head.weight", "U8", &[1], [2, 3]),
+            ("model.layers.0.self_attn.wq_a.weight", "U8", &[1], [3, 4]),
+            ("model.layers.0.self_attn.wq_b.weight", "U8", &[1], [4, 5]),
+            ("model.layers.0.self_attn.wkv.weight", "U8", &[1], [5, 6]),
+            ("model.layers.0.self_attn.q_norm.weight", "U8", &[1], [6, 7]),
+            (
+                "model.layers.0.self_attn.kv_norm.weight",
+                "U8",
+                &[1],
+                [7, 8],
+            ),
+            ("model.layers.0.self_attn.wo_a.weight", "U8", &[1], [8, 9]),
+            ("model.layers.0.self_attn.wo_b.weight", "U8", &[1], [9, 10]),
+            (
+                "model.layers.0.input_layernorm.weight",
+                "U8",
+                &[1],
+                [10, 11],
+            ),
+            (
+                "model.layers.0.post_attention_layernorm.weight",
+                "U8",
+                &[1],
+                [11, 12],
+            ),
+            ("model.layers.0.hc_attn_fn", "U8", &[1], [12, 13]),
+            ("model.layers.0.hc_attn_base", "U8", &[1], [13, 14]),
+            ("model.layers.0.hc_attn_scale", "U8", &[1], [14, 15]),
+            ("model.layers.0.hc_ffn_fn", "U8", &[1], [15, 16]),
+            ("model.layers.0.hc_ffn_base", "U8", &[1], [16, 17]),
+            ("model.layers.0.hc_ffn_scale", "U8", &[1], [17, 18]),
+            ("model.layers.0.mlp.gate.weight", "U8", &[1], [18, 19]),
+            (
+                "model.layers.0.ffn.experts.0.w1.weight",
+                "U8",
+                &[1],
+                [19, 20],
+            ),
+            (
+                "model.layers.0.ffn.experts.0.w2.weight",
+                "U8",
+                &[1],
+                [20, 21],
+            ),
+            (
+                "model.layers.0.ffn.experts.0.w3.weight",
+                "U8",
+                &[1],
+                [21, 22],
+            ),
         ],
-        &[1, 2, 3],
+        &[
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+        ],
     )
     .expect("shard should be written");
     let args = ServerArgs::parse_from([
@@ -156,6 +226,56 @@ async fn bootstrap_grpc_router_service_reports_local_moe_checkpoint_coverage() {
     assert_eq!(response.routed_expert_actual_group_count, 1);
     assert_eq!(response.routed_expert_expected_weight_count, 3);
     assert_eq!(response.routed_expert_actual_weight_count, 3);
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn bootstrap_grpc_router_service_rejects_missing_deepseek_v4_model_root_tensor() {
+    let model_dir = temp_model_dir("server-missing-deepseek-root");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "model_type": "deepseek_v4",
+  "num_hidden_layers": 0
+}"#,
+    )
+    .expect("config should be written");
+    write_safetensors_file(
+        &model_dir.join("model.safetensors"),
+        &[
+            ("model.embed_tokens.weight", "U8", &[1], [0, 1]),
+            ("model.norm.weight", "U8", &[1], [1, 2]),
+        ],
+        &[1, 2],
+    )
+    .expect("shard should be written");
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_dir.to_str().expect("temp model dir should be utf-8"),
+        "--grpc-mode",
+    ])
+    .expect("args should parse");
+
+    let error = match try_build_bootstrap_grpc_router_service(&args) {
+        Ok(_) => panic!("missing DeepSeek V4 model root tensor should fail bootstrap"),
+        Err(error) => error,
+    };
+
+    assert!(
+        matches!(
+            error,
+            ServerLaunchError::ModelArtifact(ModelArtifactError::InvalidSafetensorsData {
+                ref path,
+                ref message,
+            }) if path == &model_dir
+                && message.contains("missing DeepSeek model tensor")
+                && message.contains("lm_head.weight")
+        ),
+        "unexpected error: {error:?}"
+    );
 
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
