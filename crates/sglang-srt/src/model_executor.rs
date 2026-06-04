@@ -495,7 +495,14 @@ where
             batch,
             token_ids
                 .into_iter()
-                .map(|token_id| GeneratedToken::unfinished(vec![token_id]))
+                .zip(batch.requests())
+                .map(|(token_id, request)| {
+                    if request.sampling().stop_token_ids.contains(&token_id) {
+                        GeneratedToken::finished(vec![token_id])
+                    } else {
+                        GeneratedToken::unfinished(vec![token_id])
+                    }
+                })
                 .collect(),
         )?)
     }

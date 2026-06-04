@@ -54,6 +54,7 @@ fn generated_proto_generate_request_round_trips_with_prost() {
             max_new_tokens: Some(16),
             temperature: Some(0.7),
             top_p: Some(0.95),
+            stop_token_id: Some(2),
             ..Default::default()
         }),
         options: Some(RequestOptions {
@@ -73,13 +74,9 @@ fn generated_proto_generate_request_round_trips_with_prost() {
         GenerateRequest::decode(bytes.as_slice()).expect("generated request should decode");
 
     assert_eq!(decoded.input_ids, vec![101, 202, 303]);
-    assert_eq!(
-        decoded
-            .sampling_params
-            .expect("sampling params")
-            .max_new_tokens,
-        Some(16)
-    );
+    let sampling_params = decoded.sampling_params.expect("sampling params");
+    assert_eq!(sampling_params.max_new_tokens, Some(16));
+    assert_eq!(sampling_params.stop_token_id, Some(2));
     assert_eq!(
         decoded
             .options

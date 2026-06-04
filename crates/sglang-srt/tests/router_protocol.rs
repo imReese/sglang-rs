@@ -277,6 +277,7 @@ fn router_generate_request_accepts_valid_extended_sampling_params() {
             frequency_penalty: Some(0.0),
             presence_penalty: Some(0.0),
             repetition_penalty: Some(1.0),
+            stop_token_id: None,
             n: Some(1),
             best_of: Some(1),
         }),
@@ -295,6 +296,32 @@ fn router_generate_request_accepts_valid_extended_sampling_params() {
     assert_eq!(token_request.sampling.top_p, Some(0.95));
     assert_eq!(token_request.sampling.top_k, Some(40));
     assert_eq!(token_request.sampling.min_p, Some(0.0));
+}
+
+#[test]
+fn router_generate_request_preserves_stop_token_id_sampling_param() {
+    let request = RouterGenerateRequest {
+        request_id: "stop-token".to_string(),
+        tokenized: Some(RouterTokenizedInput {
+            original_text: String::new(),
+            input_ids: vec![1],
+        }),
+        sampling_params: Some(RouterSamplingParams {
+            max_new_tokens: Some(8),
+            stop_token_id: Some(2),
+            ..Default::default()
+        }),
+        disaggregated_params: None,
+        stream: false,
+        data_parallel_rank: 0,
+        trace_headers: Default::default(),
+    };
+
+    let token_request = request
+        .try_into_token_generate_request()
+        .expect("stop_token_id should map into runtime sampling params");
+
+    assert_eq!(token_request.sampling.stop_token_ids, vec![2]);
 }
 
 #[test]

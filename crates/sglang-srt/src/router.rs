@@ -32,6 +32,7 @@ pub struct RouterSamplingParams {
     pub frequency_penalty: Option<f32>,
     pub presence_penalty: Option<f32>,
     pub repetition_penalty: Option<f32>,
+    pub stop_token_id: Option<i32>,
     pub n: Option<i32>,
     pub best_of: Option<i32>,
 }
@@ -45,6 +46,7 @@ impl RouterSamplingParams {
         validate_optional_non_negative_float("presence_penalty", self.presence_penalty)?;
         validate_optional_positive_float("repetition_penalty", self.repetition_penalty)?;
         validate_optional_unbounded_or_positive_i32("top_k", self.top_k)?;
+        validate_optional_non_negative_i32("stop_token_id", self.stop_token_id)?;
         validate_optional_positive_i32("n", self.n)?;
         validate_optional_positive_i32("best_of", self.best_of)?;
 
@@ -66,6 +68,10 @@ impl RouterSamplingParams {
             top_p: self.top_p,
             top_k: self.top_k,
             min_p: self.min_p,
+            stop_token_ids: self
+                .stop_token_id
+                .map(|stop_token_id| vec![stop_token_id as u32])
+                .unwrap_or_default(),
         })
     }
 }
@@ -177,6 +183,24 @@ fn validate_optional_unbounded_or_positive_i32(
             field,
             value,
             expected: "-1 or positive",
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_optional_non_negative_i32(
+    field: &'static str,
+    value: Option<i32>,
+) -> Result<(), RouterProtocolError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value < 0 {
+        return Err(RouterProtocolError::InvalidIntegerSamplingParam {
+            field,
+            value,
+            expected: "non-negative",
         });
     }
 

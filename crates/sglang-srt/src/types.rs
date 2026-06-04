@@ -20,6 +20,7 @@ pub struct SamplingParams {
     pub top_p: Option<f32>,
     pub top_k: Option<i32>,
     pub min_p: Option<f32>,
+    pub stop_token_ids: Vec<u32>,
 }
 
 impl SamplingParams {
@@ -39,6 +40,7 @@ impl Default for SamplingParams {
             top_p: None,
             top_k: None,
             min_p: None,
+            stop_token_ids: Vec::new(),
         }
     }
 }

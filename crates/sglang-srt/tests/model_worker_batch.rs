@@ -348,6 +348,26 @@ fn model_runner_samples_from_temperature_scaled_logits() {
     assert_eq!(outputs[0].token_ids, vec![1]);
 }
 
+#[test]
+fn model_runner_finishes_request_when_sampled_token_matches_stop_token() {
+    let mut scheduler = Scheduler::new(ModelRunner::new(TwoStepForwardModel::default()));
+    let mut sampling = SamplingParams::new(4);
+    sampling.stop_token_ids = vec![1];
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("runner-stop-token"),
+        vec![10, 11],
+        sampling,
+    ));
+
+    let outputs = scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should dispatch through model runner");
+
+    assert_eq!(outputs[0].token_ids, vec![1]);
+    assert!(outputs[0].finished);
+    assert_eq!(scheduler.decode_queue_depth(), 0);
+}
+
 #[derive(Default)]
 struct FlattenedPrefillLogitsModel;
 
