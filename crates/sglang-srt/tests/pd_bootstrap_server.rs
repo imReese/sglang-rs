@@ -6,7 +6,9 @@ use tokio::sync::oneshot;
 use zeromq::{PushSocket, Socket, SocketSend, ZmqMessage};
 
 use sglang_srt::pd_bootstrap::{
-    PrefillBootstrapService, serve_mooncake_bootstrap_zmq_endpoints_with_shutdown,
+    MooncakeDecodeKvArgsRegistration, MooncakeDecodeTransferMetadata, PrefillBootstrapService,
+    query_prefill_route, send_mooncake_kv_args_registration, send_mooncake_transfer_metadata,
+    serve_mooncake_bootstrap_zmq_endpoints_with_shutdown,
     serve_mooncake_bootstrap_zmq_with_shutdown, serve_prefill_bootstrap_with_shutdown,
 };
 use sglang_srt::transfer::KvPoll;
@@ -333,11 +335,192 @@ async fn mooncake_bootstrap_zmq_endpoint_group_ingests_metadata_from_each_port()
         .expect("server should stop cleanly");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn decode_bootstrap_client_queries_route_and_sends_transfer_metadata() {
+    let bootstrap_addr = unused_local_addr();
+    let zmq_addr = unused_local_addr();
+    let service = PrefillBootstrapService::default();
+    let observed_service = service.clone();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        let (shutdown_tx, shutdown_rx_watch) = tokio::sync::watch::channel(false);
+        let mut http_task = tokio::spawn(serve_prefill_bootstrap_with_shutdown(
+            bootstrap_addr,
+            service.clone(),
+            watch_shutdown(shutdown_rx_watch.clone()),
+        ));
+        let mut zmq_task = tokio::spawn(serve_mooncake_bootstrap_zmq_with_shutdown(
+            format!("tcp://{}", zmq_addr),
+            service,
+            watch_shutdown(shutdown_rx_watch),
+        ));
+
+        tokio::select! {
+            _ = async move { let _ = shutdown_rx.await; } => {
+                let _ = shutdown_tx.send(true);
+                http_task.await.expect("HTTP bootstrap task should join")?;
+                zmq_task.await.expect("ZMQ bootstrap task should join")?;
+                Ok(())
+            }
+            result = &mut http_task => {
+                let _ = shutdown_tx.send(true);
+                zmq_task.await.expect("ZMQ bootstrap task should join")?;
+                result.expect("HTTP bootstrap task should join")
+            }
+            result = &mut zmq_task => {
+                let _ = shutdown_tx.send(true);
+                http_task.await.expect("HTTP bootstrap task should join")?;
+                result.expect("ZMQ bootstrap task should join")
+            }
+        }
+    });
+
+    let register_response = put_json_with_retry(
+        bootstrap_addr,
+        "/route",
+        Box::leak(format!(
+            r#"{{"attn_tp_size":1,"attn_tp_rank":0,"attn_cp_size":1,"attn_cp_rank":0,"attn_dp_size":1,"attn_dp_rank":0,"pp_size":1,"pp_rank":0,"system_dp_size":1,"system_dp_rank":0,"rank_ip":"127.0.0.1","rank_port":{},"page_size":64,"kv_cache_dtype":"auto","load_balance_method":"follow_bootstrap_room"}}"#,
+            zmq_addr.port()
+        ).into_boxed_str()),
+    )
+    .await;
+    assert!(register_response.starts_with("HTTP/1.1 200"));
+
+    let rank = query_prefill_route(&bootstrap_addr.to_string(), 0, 0, 0, 0)
+        .await
+        .expect("decode client should fetch prefill route");
+    assert_eq!(rank.rank_ip, "127.0.0.1");
+    assert_eq!(rank.rank_port, zmq_addr.port());
+
+    send_mooncake_transfer_metadata(
+        &rank.zmq_endpoint(),
+        &MooncakeDecodeTransferMetadata {
+            room: 93,
+            endpoint: "127.0.0.1".to_string(),
+            dst_port: 41005,
+            mooncake_session_id: "decode-client-session".to_string(),
+            dst_kv_indices: vec![9, 10, 11],
+            dst_aux_index: Some(14),
+            dst_state_indices: vec![vec![70, 71]],
+            required_dst_info_num: 1,
+            decode_prefix_len: Some(128),
+            is_dummy: false,
+        },
+    )
+    .await
+    .expect("decode client should send metadata over ZMQ");
+
+    wait_until(|| {
+        observed_service
+            .state()
+            .lock()
+            .expect("state lock should be held")
+            .transfer_status(93)
+            == Some(KvPoll::WaitingForInput)
+    })
+    .await;
+
+    let state = observed_service
+        .state()
+        .lock()
+        .expect("state lock should be held");
+    let transfer = &state
+        .transfer_room(93)
+        .expect("room should be tracked")
+        .transfers["decode-client-session"];
+    assert_eq!(transfer.dst_kv_indices, vec![9, 10, 11]);
+    assert_eq!(transfer.dst_aux_index, Some(14));
+    assert_eq!(transfer.decode_prefix_len, Some(128));
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("servers should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn decode_bootstrap_client_sends_kv_args_registration() {
+    let zmq_addr = unused_local_addr();
+    let service = PrefillBootstrapService::default();
+    let observed_service = service.clone();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_mooncake_bootstrap_zmq_with_shutdown(format!("tcp://{}", zmq_addr), service, async {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    send_mooncake_kv_args_registration(
+        &format!("tcp://{}", zmq_addr),
+        &MooncakeDecodeKvArgsRegistration {
+            endpoint: "127.0.0.1".to_string(),
+            dst_port: 41006,
+            mooncake_session_id: "decode-kvargs-session".to_string(),
+            dst_kv_ptrs: vec![0x1000, 0x2000],
+            dst_aux_ptrs: vec![0x3000],
+            dst_state_data_ptrs: vec![vec![0x4000, 0x5000]],
+            dst_tp_rank: 1,
+            dst_attn_tp_size: 2,
+            dst_kv_item_len: 128,
+            dst_state_item_lens: vec![vec![16, 32]],
+            dst_state_dim_per_tensor: vec![vec![4, 8]],
+        },
+    )
+    .await
+    .expect("decode client should send KV args registration over ZMQ");
+
+    wait_until(|| {
+        observed_service
+            .state()
+            .lock()
+            .expect("state lock should be held")
+            .decode_kv_args("decode-kvargs-session")
+            .is_some()
+    })
+    .await;
+
+    let state = observed_service
+        .state()
+        .lock()
+        .expect("state lock should be held");
+    let kv_args = state
+        .decode_kv_args("decode-kvargs-session")
+        .expect("decode KV args should be registered");
+    assert_eq!(kv_args.endpoint, "127.0.0.1");
+    assert_eq!(kv_args.dst_port, 41006);
+    assert_eq!(kv_args.dst_kv_ptrs, vec![0x1000, 0x2000]);
+    assert_eq!(kv_args.dst_state_data_ptrs, vec![vec![0x4000, 0x5000]]);
+    assert_eq!(kv_args.dst_tp_rank, 1);
+    assert_eq!(kv_args.dst_attn_tp_size, 2);
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
 fn unused_local_addr() -> SocketAddr {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral port should bind");
     listener
         .local_addr()
         .expect("ephemeral listener should have local addr")
+}
+
+async fn watch_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            break;
+        }
+    }
 }
 
 fn transfer_frame(room: i32, session_id: &str) -> Vec<Vec<u8>> {

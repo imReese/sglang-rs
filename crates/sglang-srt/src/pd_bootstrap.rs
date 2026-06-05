@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,7 +13,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use zeromq::{PullSocket, Socket, SocketRecv};
+use zeromq::{PullSocket, PushSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
 use crate::transfer::KvPoll;
 
@@ -219,10 +220,16 @@ pub struct PrefillServerInfo {
     pub follow_bootstrap_room: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct PrefillRankInfo {
     pub rank_ip: String,
     pub rank_port: u16,
+}
+
+impl PrefillRankInfo {
+    pub fn zmq_endpoint(&self) -> String {
+        format!("tcp://{}:{}", self.rank_ip, self.rank_port)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -453,6 +460,136 @@ impl From<MooncakeBootstrapFrameError> for PrefillBootstrapServeError {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MooncakeDecodeKvArgsRegistration {
+    pub endpoint: String,
+    pub dst_port: u16,
+    pub mooncake_session_id: String,
+    pub dst_kv_ptrs: Vec<u64>,
+    pub dst_aux_ptrs: Vec<u64>,
+    pub dst_state_data_ptrs: Vec<Vec<u64>>,
+    pub dst_tp_rank: i32,
+    pub dst_attn_tp_size: usize,
+    pub dst_kv_item_len: usize,
+    pub dst_state_item_lens: Vec<Vec<u32>>,
+    pub dst_state_dim_per_tensor: Vec<Vec<u32>>,
+}
+
+impl MooncakeDecodeKvArgsRegistration {
+    fn to_frame(&self) -> Vec<Vec<u8>> {
+        vec![
+            b"None".to_vec(),
+            self.endpoint.as_bytes().to_vec(),
+            self.dst_port.to_string().into_bytes(),
+            self.mooncake_session_id.as_bytes().to_vec(),
+            pack_u64s(&self.dst_kv_ptrs),
+            pack_u64s(&self.dst_aux_ptrs),
+            pack_u64_lists(&self.dst_state_data_ptrs),
+            self.dst_tp_rank.to_string().into_bytes(),
+            self.dst_attn_tp_size.to_string().into_bytes(),
+            self.dst_kv_item_len.to_string().into_bytes(),
+            pack_u32_lists(&self.dst_state_item_lens),
+            pack_u32_lists(&self.dst_state_dim_per_tensor),
+            Vec::new(),
+            b"0".to_vec(),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MooncakeDecodeTransferMetadata {
+    pub room: i32,
+    pub endpoint: String,
+    pub dst_port: u16,
+    pub mooncake_session_id: String,
+    pub dst_kv_indices: Vec<i32>,
+    pub dst_aux_index: Option<i32>,
+    pub dst_state_indices: Vec<Vec<i32>>,
+    pub required_dst_info_num: usize,
+    pub decode_prefix_len: Option<usize>,
+    pub is_dummy: bool,
+}
+
+impl MooncakeDecodeTransferMetadata {
+    fn to_frame(&self) -> Result<Vec<Vec<u8>>, MooncakeDecodeBootstrapError> {
+        let (dst_kv_indices, dst_aux_index, dst_state_indices) = if self.is_dummy {
+            (Vec::new(), Vec::new(), Vec::new())
+        } else {
+            let dst_aux_index =
+                self.dst_aux_index
+                    .ok_or(MooncakeDecodeBootstrapError::MissingAuxIndex {
+                        session_id: self.mooncake_session_id.clone(),
+                    })?;
+            (
+                pack_i32s(&self.dst_kv_indices),
+                dst_aux_index.to_string().into_bytes(),
+                pack_i32_lists(&self.dst_state_indices),
+            )
+        };
+
+        Ok(vec![
+            self.room.to_string().into_bytes(),
+            self.endpoint.as_bytes().to_vec(),
+            self.dst_port.to_string().into_bytes(),
+            self.mooncake_session_id.as_bytes().to_vec(),
+            dst_kv_indices,
+            dst_aux_index,
+            dst_state_indices,
+            self.required_dst_info_num.to_string().into_bytes(),
+            self.decode_prefix_len.unwrap_or(0).to_string().into_bytes(),
+        ])
+    }
+}
+
+#[derive(Debug)]
+pub enum MooncakeDecodeBootstrapError {
+    HttpStatus { status: u16, body: String },
+    InvalidHttpResponse,
+    Io(std::io::Error),
+    Json(serde_json::Error),
+    MissingAuxIndex { session_id: String },
+    TaskJoin(String),
+    Zmq(String),
+}
+
+impl fmt::Display for MooncakeDecodeBootstrapError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HttpStatus { status, body } => {
+                write!(
+                    formatter,
+                    "bootstrap route query failed with HTTP {status}: {body}"
+                )
+            }
+            Self::InvalidHttpResponse => formatter.write_str("invalid bootstrap HTTP response"),
+            Self::Io(error) => write!(formatter, "bootstrap HTTP client I/O error: {error}"),
+            Self::Json(error) => write!(formatter, "bootstrap HTTP JSON error: {error}"),
+            Self::MissingAuxIndex { session_id } => {
+                write!(
+                    formatter,
+                    "Mooncake transfer metadata for {session_id} needs aux index"
+                )
+            }
+            Self::TaskJoin(error) => write!(formatter, "bootstrap client task join error: {error}"),
+            Self::Zmq(error) => write!(formatter, "bootstrap ZMQ client error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for MooncakeDecodeBootstrapError {}
+
+impl From<std::io::Error> for MooncakeDecodeBootstrapError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<serde_json::Error> for MooncakeDecodeBootstrapError {
+    fn from(value: serde_json::Error) -> Self {
+        Self::Json(value)
+    }
+}
+
 pub async fn serve_prefill_bootstrap(
     addr: SocketAddr,
     service: PrefillBootstrapService,
@@ -559,6 +696,167 @@ where
             }
         }
     }
+}
+
+pub async fn query_prefill_route(
+    bootstrap_addr: &str,
+    prefill_dp_rank: i32,
+    prefill_cp_rank: i32,
+    target_tp_rank: i32,
+    target_pp_rank: i32,
+) -> Result<PrefillRankInfo, MooncakeDecodeBootstrapError> {
+    let bootstrap_addr = bootstrap_addr.to_string();
+    tokio::task::spawn_blocking(move || {
+        let path = format!(
+            "/route?prefill_dp_rank={prefill_dp_rank}&prefill_cp_rank={prefill_cp_rank}&target_tp_rank={target_tp_rank}&target_pp_rank={target_pp_rank}"
+        );
+        let response = http_get(&bootstrap_addr, &path)?;
+        let body = http_success_body(response)?;
+        Ok(serde_json::from_str(&body)?)
+    })
+    .await
+    .map_err(|error| MooncakeDecodeBootstrapError::TaskJoin(error.to_string()))?
+}
+
+pub async fn send_mooncake_transfer_metadata(
+    endpoint: &str,
+    metadata: &MooncakeDecodeTransferMetadata,
+) -> Result<(), MooncakeDecodeBootstrapError> {
+    send_mooncake_bootstrap_frame(endpoint, metadata.to_frame()?).await
+}
+
+pub async fn send_mooncake_kv_args_registration(
+    endpoint: &str,
+    registration: &MooncakeDecodeKvArgsRegistration,
+) -> Result<(), MooncakeDecodeBootstrapError> {
+    send_mooncake_bootstrap_frame(endpoint, registration.to_frame()).await
+}
+
+async fn send_mooncake_bootstrap_frame(
+    endpoint: &str,
+    frame: Vec<Vec<u8>>,
+) -> Result<(), MooncakeDecodeBootstrapError> {
+    let mut last_error = None;
+    for _ in 0..20 {
+        let mut socket = PushSocket::new();
+        match socket.connect(endpoint).await {
+            Ok(()) => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                match socket.send(zmq_message(frame.clone())).await {
+                    Ok(()) => return Ok(()),
+                    Err(error) => last_error = Some(error.to_string()),
+                }
+            }
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    Err(MooncakeDecodeBootstrapError::Zmq(
+        last_error.unwrap_or_else(|| "no ZMQ send attempts ran".to_string()),
+    ))
+}
+
+fn http_get(addr: &str, path: &str) -> Result<String, MooncakeDecodeBootstrapError> {
+    let mut stream = std::net::TcpStream::connect(addr)?;
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes())?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    Ok(response)
+}
+
+fn http_success_body(response: String) -> Result<String, MooncakeDecodeBootstrapError> {
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or(MooncakeDecodeBootstrapError::InvalidHttpResponse)?;
+    let status = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse::<u16>().ok())
+        .ok_or(MooncakeDecodeBootstrapError::InvalidHttpResponse)?;
+    if status != 200 {
+        return Err(MooncakeDecodeBootstrapError::HttpStatus {
+            status,
+            body: body.to_string(),
+        });
+    }
+    Ok(body.to_string())
+}
+
+fn zmq_message(frames: Vec<Vec<u8>>) -> ZmqMessage {
+    let mut frames = frames.into_iter();
+    let first = frames
+        .next()
+        .expect("Mooncake bootstrap message should have at least one frame");
+    let mut message = ZmqMessage::from(first);
+    for frame in frames {
+        message.push_back(frame.into());
+    }
+    message
+}
+
+fn pack_i32s(values: &[i32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+fn pack_u64s(values: &[u64]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+fn pack_i32_lists(values: &[Vec<i32>]) -> Vec<u8> {
+    pack_list_of_buffers(
+        &values
+            .iter()
+            .map(|values| pack_i32s(values))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn pack_u64_lists(values: &[Vec<u64>]) -> Vec<u8> {
+    pack_list_of_buffers(
+        &values
+            .iter()
+            .map(|values| pack_u64s(values))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn pack_u32_lists(values: &[Vec<u32>]) -> Vec<u8> {
+    pack_list_of_buffers(
+        &values
+            .iter()
+            .map(|values| {
+                values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn pack_list_of_buffers(buffers: &[Vec<u8>]) -> Vec<u8> {
+    if buffers.is_empty() {
+        return Vec::new();
+    }
+
+    let mut packed = Vec::new();
+    packed.extend_from_slice(&(buffers.len() as u32).to_le_bytes());
+    for buffer in buffers {
+        packed.extend_from_slice(&(buffer.len() as u32).to_le_bytes());
+    }
+    for buffer in buffers {
+        packed.extend_from_slice(buffer);
+    }
+    packed
 }
 
 async fn watch_bootstrap_shutdown(mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
