@@ -70,6 +70,7 @@ dirs = "5"
 http-body-util = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sglang-srt = { path = "../sglang-srt" }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1.42", features = ["test-util"] }
