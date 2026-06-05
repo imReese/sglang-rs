@@ -17,7 +17,7 @@ mooncake-link = []
 axum = "0.8.9"
 prost = "0.14.3"
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1.52.3", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
 tonic = "0.14.6"
 tonic-prost = "0.14.6"
 tonic-reflection = "0.14.6"
