@@ -11,7 +11,7 @@ use sglang_srt::pd_bootstrap::{
     serve_mooncake_bootstrap_zmq_endpoints_with_shutdown,
     serve_mooncake_bootstrap_zmq_with_shutdown, serve_prefill_bootstrap_with_shutdown,
 };
-use sglang_srt::transfer::KvPoll;
+use sglang_srt::transfer::{KvPoll, MooncakeRemoteKvLayout};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prefill_bootstrap_route_registers_topology_and_rank_endpoint() {
@@ -209,6 +209,58 @@ fn prefill_bootstrap_ingests_mooncake_transfer_frames_and_marks_room_waiting() {
         vec![vec![30, 31], vec![40]]
     );
     assert_eq!(room.transfers["session-b"].endpoint, "10.0.0.10");
+}
+
+#[test]
+fn prefill_bootstrap_builds_remote_kv_layouts_from_decode_metadata() {
+    let service = PrefillBootstrapService::default();
+    let kv_args_frame = vec![
+        b"None".to_vec(),
+        b"10.0.0.9".to_vec(),
+        b"41001".to_vec(),
+        b"session-a".to_vec(),
+        pack_u64s(&[0x1000, 0x2000]),
+        pack_u64s(&[]),
+        pack_u64_lists(&[]),
+        b"1".to_vec(),
+        b"8".to_vec(),
+        b"128".to_vec(),
+    ];
+    let transfer_frame = vec![
+        b"77".to_vec(),
+        b"10.0.0.9".to_vec(),
+        b"41001".to_vec(),
+        b"session-a".to_vec(),
+        pack_i32s(&[3, 4, 5]),
+        b"11".to_vec(),
+        pack_i32_lists(&[]),
+        b"1".to_vec(),
+        b"64".to_vec(),
+    ];
+
+    let mut state = service.state().lock().expect("state lock should be held");
+    state
+        .ingest_mooncake_bootstrap_frame(&kv_args_frame)
+        .expect("KVArgs registration frame should parse");
+    state
+        .ingest_mooncake_bootstrap_frame(&transfer_frame)
+        .expect("transfer frame should parse");
+
+    let layouts = state
+        .remote_kv_layouts_for_room(77)
+        .expect("remote KV layouts should build from matching metadata");
+
+    assert_eq!(
+        layouts,
+        vec![(
+            "session-a".to_string(),
+            MooncakeRemoteKvLayout {
+                dst_kv_ptrs: vec![0x1000, 0x2000],
+                dst_kv_indices: vec![3, 4, 5],
+                dst_kv_item_len: 128,
+            },
+        )]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

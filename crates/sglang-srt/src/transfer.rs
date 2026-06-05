@@ -1318,6 +1318,14 @@ pub trait MooncakeTransferTargetResolver {
         &mut self,
         span: &KvCacheTransferSpan,
     ) -> Result<MooncakeTransferTarget, KvCacheTransferError>;
+
+    fn resolve_session_target(
+        &mut self,
+        span: &KvCacheTransferSpan,
+        _session_id: &str,
+    ) -> Result<MooncakeTransferTarget, KvCacheTransferError> {
+        self.resolve_target(span)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1399,6 +1407,25 @@ where
             .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
         let target = MooncakeTransferTarget { target_id };
         self.targets_by_session.insert(session_id, target);
+        Ok(target)
+    }
+
+    fn resolve_session_target(
+        &mut self,
+        _span: &KvCacheTransferSpan,
+        session_id: &str,
+    ) -> Result<MooncakeTransferTarget, KvCacheTransferError> {
+        if let Some(target) = self.targets_by_session.get(session_id) {
+            return Ok(*target);
+        }
+
+        let target_id = self
+            .opener
+            .open_segment(session_id)
+            .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
+        let target = MooncakeTransferTarget { target_id };
+        self.targets_by_session
+            .insert(session_id.to_string(), target);
         Ok(target)
     }
 }
@@ -1777,7 +1804,7 @@ pub struct MooncakeKvCacheTransferExecutor<S, R = FixedMooncakeTransferTargetRes
     submitter: S,
     layout: MooncakeKvCacheLayout,
     target_resolver: R,
-    remote_kv_layouts: BTreeMap<i32, MooncakeRemoteKvLayout>,
+    remote_kv_layouts_by_room: BTreeMap<i32, BTreeMap<String, MooncakeRemoteKvLayout>>,
     submitted_batches: Vec<MooncakeBatchId>,
     submitted_transfers: Vec<MooncakeSubmittedBatch>,
 }
@@ -1820,7 +1847,7 @@ impl<S, R> MooncakeKvCacheTransferExecutor<S, R> {
             submitter,
             layout,
             target_resolver,
-            remote_kv_layouts: BTreeMap::new(),
+            remote_kv_layouts_by_room: BTreeMap::new(),
             submitted_batches: Vec::new(),
             submitted_transfers: Vec::new(),
         }
@@ -1832,11 +1859,43 @@ impl<S, R> MooncakeKvCacheTransferExecutor<S, R> {
         target_resolver: R,
         remote_kv_layouts: Vec<(i32, MooncakeRemoteKvLayout)>,
     ) -> Self {
+        let mut remote_kv_layouts_by_room = BTreeMap::new();
+        for (room, layout) in remote_kv_layouts {
+            remote_kv_layouts_by_room
+                .entry(room)
+                .or_insert_with(BTreeMap::new)
+                .insert(String::new(), layout);
+        }
+
         Self {
             submitter,
             layout,
             target_resolver,
-            remote_kv_layouts: remote_kv_layouts.into_iter().collect(),
+            remote_kv_layouts_by_room,
+            submitted_batches: Vec::new(),
+            submitted_transfers: Vec::new(),
+        }
+    }
+
+    pub fn with_target_resolver_and_remote_kv_session_layouts(
+        submitter: S,
+        layout: MooncakeKvCacheLayout,
+        target_resolver: R,
+        remote_kv_layouts: Vec<(i32, String, MooncakeRemoteKvLayout)>,
+    ) -> Self {
+        let mut remote_kv_layouts_by_room = BTreeMap::new();
+        for (room, session_id, layout) in remote_kv_layouts {
+            remote_kv_layouts_by_room
+                .entry(room)
+                .or_insert_with(BTreeMap::new)
+                .insert(session_id, layout);
+        }
+
+        Self {
+            submitter,
+            layout,
+            target_resolver,
+            remote_kv_layouts_by_room,
             submitted_batches: Vec::new(),
             submitted_transfers: Vec::new(),
         }
@@ -1866,12 +1925,24 @@ impl<S, R> MooncakeKvCacheTransferExecutor<S, R> {
         &self.submitted_transfers
     }
 
-    pub fn remote_kv_layouts(&self) -> &BTreeMap<i32, MooncakeRemoteKvLayout> {
-        &self.remote_kv_layouts
+    pub fn remote_kv_layouts(&self) -> &BTreeMap<i32, BTreeMap<String, MooncakeRemoteKvLayout>> {
+        &self.remote_kv_layouts_by_room
     }
 
     pub fn insert_remote_kv_layout(&mut self, bootstrap_room: i32, layout: MooncakeRemoteKvLayout) {
-        self.remote_kv_layouts.insert(bootstrap_room, layout);
+        self.insert_remote_kv_session_layout(bootstrap_room, String::new(), layout);
+    }
+
+    pub fn insert_remote_kv_session_layout(
+        &mut self,
+        bootstrap_room: i32,
+        session_id: impl Into<String>,
+        layout: MooncakeRemoteKvLayout,
+    ) {
+        self.remote_kv_layouts_by_room
+            .entry(bootstrap_room)
+            .or_default()
+            .insert(session_id.into(), layout);
     }
 }
 
@@ -1934,14 +2005,30 @@ where
     R: MooncakeTransferTargetResolver,
 {
     fn transfer_span(&mut self, span: &KvCacheTransferSpan) -> Result<(), KvCacheTransferError> {
-        let target = self.target_resolver.resolve_target(span)?;
-        let mut requests =
-            if let Some(remote_layout) = self.remote_kv_layouts.get(&span.bootstrap_room()) {
-                build_mooncake_remote_kv_transfer_requests(span, self.layout, target, remote_layout)
-            } else {
-                build_mooncake_kv_transfer_requests(span, self.layout, target)
+        let mut requests = if let Some(remote_layouts) =
+            self.remote_kv_layouts_by_room.get(&span.bootstrap_room())
+        {
+            let mut requests = Vec::new();
+            for (session_id, remote_layout) in remote_layouts {
+                let target = self
+                    .target_resolver
+                    .resolve_session_target(span, session_id)?;
+                requests.extend(
+                    build_mooncake_remote_kv_transfer_requests(
+                        span,
+                        self.layout,
+                        target,
+                        remote_layout,
+                    )
+                    .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?,
+                );
             }
-            .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
+            requests
+        } else {
+            let target = self.target_resolver.resolve_target(span)?;
+            build_mooncake_kv_transfer_requests(span, self.layout, target)
+                .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?
+        };
         if requests.is_empty() {
             return Ok(());
         }

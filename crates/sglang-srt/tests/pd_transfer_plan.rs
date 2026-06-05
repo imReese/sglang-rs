@@ -1056,6 +1056,59 @@ fn mooncake_executor_uses_remote_kv_layout_for_bootstrap_room() {
 }
 
 #[test]
+fn mooncake_executor_submits_remote_kv_layouts_for_each_session_in_room() {
+    let transfer_plan = transfer_plan_for_request("pd-mooncake-remote-multi", &[60, 61], None, 9);
+    let mut registry = registry_with_session("pd-mooncake-remote-multi", 9);
+    let mut executor =
+        MooncakeKvCacheTransferExecutor::with_target_resolver_and_remote_kv_session_layouts(
+            RecordingMooncakeSubmitter::default(),
+            MooncakeKvCacheLayout {
+                source_base_addr: 0x2000,
+                page_size_bytes: 128,
+                target_base_offset: 0xdead_0000,
+            },
+            SessionTargetResolver {
+                targets: vec![("session-a".to_string(), 7), ("session-b".to_string(), 8)],
+            },
+            vec![
+                (
+                    9,
+                    "session-a".to_string(),
+                    MooncakeRemoteKvLayout {
+                        dst_kv_ptrs: vec![0x9000],
+                        dst_kv_indices: vec![4, 5],
+                        dst_kv_item_len: 128,
+                    },
+                ),
+                (
+                    9,
+                    "session-b".to_string(),
+                    MooncakeRemoteKvLayout {
+                        dst_kv_ptrs: vec![0xa000],
+                        dst_kv_indices: vec![6, 7],
+                        dst_kv_item_len: 128,
+                    },
+                ),
+            ],
+        );
+
+    execute_kv_cache_transfer_plan(&mut registry, &mut executor, &transfer_plan)
+        .expect("mooncake executor should submit all remote session layouts");
+
+    let submitted_requests = &executor.submitter().submitted_requests;
+    assert_eq!(submitted_requests.len(), 1);
+    assert_eq!(submitted_requests[0].len(), 4);
+    assert_eq!(submitted_requests[0][0].target_id, 7);
+    assert_eq!(submitted_requests[0][0].target_offset, 0x9000 + 4 * 128);
+    assert_eq!(submitted_requests[0][1].target_id, 7);
+    assert_eq!(submitted_requests[0][1].target_offset, 0x9000 + 5 * 128);
+    assert_eq!(submitted_requests[0][2].target_id, 8);
+    assert_eq!(submitted_requests[0][2].target_offset, 0xa000 + 6 * 128);
+    assert_eq!(submitted_requests[0][3].target_id, 8);
+    assert_eq!(submitted_requests[0][3].target_offset, 0xa000 + 7 * 128);
+}
+
+#[test]
 fn mooncake_executor_clears_completed_submitted_transfers_after_poll() {
     let transfer_plan = transfer_plan_for_request("pd-mooncake-cleanup", &[61, 62], None, 28);
     let mut registry = registry_with_session("pd-mooncake-cleanup", 28);
@@ -1489,6 +1542,10 @@ struct RoomTargetResolver {
     targets: Vec<(i32, i32)>,
 }
 
+struct SessionTargetResolver {
+    targets: Vec<(String, i32)>,
+}
+
 struct RecordingSegmentOpener {
     targets: Vec<(String, i32)>,
     opened_segments: Vec<String>,
@@ -1534,6 +1591,34 @@ impl MooncakeTransferTargetResolver for RoomTargetResolver {
                     "missing target for room {}",
                     span.bootstrap_room()
                 ))
+            })
+    }
+}
+
+impl MooncakeTransferTargetResolver for SessionTargetResolver {
+    fn resolve_target(
+        &mut self,
+        span: &KvCacheTransferSpan,
+    ) -> Result<MooncakeTransferTarget, KvCacheTransferError> {
+        Err(KvCacheTransferError::Runtime(format!(
+            "room-only target resolution is not valid for room {}",
+            span.bootstrap_room()
+        )))
+    }
+
+    fn resolve_session_target(
+        &mut self,
+        _span: &KvCacheTransferSpan,
+        session_id: &str,
+    ) -> Result<MooncakeTransferTarget, KvCacheTransferError> {
+        self.targets
+            .iter()
+            .find(|(session, _)| session == session_id)
+            .map(|(_, target_id)| MooncakeTransferTarget {
+                target_id: *target_id,
+            })
+            .ok_or_else(|| {
+                KvCacheTransferError::Runtime(format!("missing target for session {session_id}"))
             })
     }
 }

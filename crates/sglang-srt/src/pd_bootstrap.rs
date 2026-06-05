@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use zeromq::{PullSocket, PushSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
-use crate::transfer::KvPoll;
+use crate::transfer::{KvPoll, MooncakeRemoteKvLayout};
 
 #[derive(Clone, Debug, Default)]
 pub struct PrefillBootstrapService {
@@ -106,6 +106,42 @@ impl PrefillBootstrapState {
 
     pub fn transfer_status(&self, room: i32) -> Option<KvPoll> {
         self.transfer_rooms.get(&room).map(|room| room.status)
+    }
+
+    pub fn remote_kv_layouts_for_room(
+        &self,
+        room: i32,
+    ) -> Result<Vec<(String, MooncakeRemoteKvLayout)>, MooncakeRemoteKvLayoutError> {
+        let room_state = self
+            .transfer_rooms
+            .get(&room)
+            .ok_or(MooncakeRemoteKvLayoutError::MissingTransferRoom(room))?;
+        let mut layouts = Vec::with_capacity(room_state.transfers.len());
+
+        for transfer in room_state.transfers.values() {
+            if transfer.is_dummy {
+                continue;
+            }
+
+            let kv_args = self
+                .decode_kv_args_table
+                .get(&transfer.mooncake_session_id)
+                .ok_or_else(|| MooncakeRemoteKvLayoutError::MissingKvArgsRegistration {
+                    room,
+                    mooncake_session_id: transfer.mooncake_session_id.clone(),
+                })?;
+
+            layouts.push((
+                transfer.mooncake_session_id.clone(),
+                MooncakeRemoteKvLayout {
+                    dst_kv_ptrs: kv_args.dst_kv_ptrs.clone(),
+                    dst_kv_indices: transfer.dst_kv_indices.clone(),
+                    dst_kv_item_len: kv_args.dst_kv_item_len,
+                },
+            ));
+        }
+
+        Ok(layouts)
     }
 
     pub(crate) fn register_route(&mut self, registration: PrefillRouteRegistration) {
@@ -319,6 +355,34 @@ pub struct MooncakeTransferRoom {
     pub decode_prefix_len: Option<usize>,
     pub transfers: BTreeMap<String, MooncakeTransferInfo>,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MooncakeRemoteKvLayoutError {
+    MissingTransferRoom(i32),
+    MissingKvArgsRegistration {
+        room: i32,
+        mooncake_session_id: String,
+    },
+}
+
+impl fmt::Display for MooncakeRemoteKvLayoutError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingTransferRoom(room) => {
+                write!(formatter, "missing Mooncake transfer room: {room}")
+            }
+            Self::MissingKvArgsRegistration {
+                room,
+                mooncake_session_id,
+            } => write!(
+                formatter,
+                "missing Mooncake KVArgs registration for room {room} session {mooncake_session_id}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MooncakeRemoteKvLayoutError {}
 
 #[derive(Clone, Debug)]
 struct RegisteredDpRank {
