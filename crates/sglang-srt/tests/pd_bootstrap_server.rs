@@ -16,7 +16,7 @@ use sglang_srt::pd_bootstrap::{
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::transfer::{
     DecodeBootstrapRegistry, FakeKvCacheTransferExecutor, KvPoll, KvTransferModelWorker,
-    MooncakeRemoteKvLayout,
+    MooncakeKvCacheLayout, MooncakeRemoteKvLayout,
 };
 use sglang_srt::types::{BootstrapRoom, DisaggregatedParams, RequestId, SamplingParams};
 use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
@@ -671,6 +671,133 @@ async fn decode_worker_publishes_bootstrap_metadata_to_prefill_zmq_route() {
     assert_eq!(transfer.dst_port, 41007);
     assert_eq!(transfer.dst_kv_indices, vec![0, 1, 2]);
     assert_eq!(transfer.decode_prefix_len, Some(3));
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("servers should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn decode_worker_registers_kv_args_before_transfer_metadata() {
+    let bootstrap_addr = unused_local_addr();
+    let zmq_addr = unused_local_addr();
+    let service = PrefillBootstrapService::default();
+    let observed_service = service.clone();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        let (shutdown_tx, shutdown_rx_watch) = tokio::sync::watch::channel(false);
+        let mut http_task = tokio::spawn(serve_prefill_bootstrap_with_shutdown(
+            bootstrap_addr,
+            service.clone(),
+            watch_shutdown(shutdown_rx_watch.clone()),
+        ));
+        let mut zmq_task = tokio::spawn(serve_mooncake_bootstrap_zmq_with_shutdown(
+            format!("tcp://{}", zmq_addr),
+            service,
+            watch_shutdown(shutdown_rx_watch),
+        ));
+
+        tokio::select! {
+            _ = async move { let _ = shutdown_rx.await; } => {
+                let _ = shutdown_tx.send(true);
+                http_task.await.expect("HTTP bootstrap task should join")?;
+                zmq_task.await.expect("ZMQ bootstrap task should join")?;
+                Ok(())
+            }
+            result = &mut http_task => {
+                let _ = shutdown_tx.send(true);
+                zmq_task.await.expect("ZMQ bootstrap task should join")?;
+                result.expect("HTTP bootstrap task should join")
+            }
+            result = &mut zmq_task => {
+                let _ = shutdown_tx.send(true);
+                http_task.await.expect("HTTP bootstrap task should join")?;
+                result.expect("ZMQ bootstrap task should join")
+            }
+        }
+    });
+
+    let register_response = put_json_with_retry(
+        bootstrap_addr,
+        "/route",
+        Box::leak(format!(
+            r#"{{"attn_tp_size":1,"attn_tp_rank":0,"attn_cp_size":1,"attn_cp_rank":0,"attn_dp_size":1,"attn_dp_rank":0,"pp_size":1,"pp_rank":0,"system_dp_size":1,"system_dp_rank":0,"rank_ip":"127.0.0.1","rank_port":{},"page_size":64,"kv_cache_dtype":"auto","load_balance_method":"follow_bootstrap_room"}}"#,
+            zmq_addr.port()
+        ).into_boxed_str()),
+    )
+    .await;
+    assert!(register_response.starts_with("HTTP/1.1 200"));
+
+    let worker = KvTransferModelWorker::new(
+        BootstrapMetadataWorker,
+        DecodeBootstrapRegistry::default(),
+        FakeKvCacheTransferExecutor::default(),
+    )
+    .with_decode_bootstrap_publisher(
+        MooncakeDecodeBootstrapPublisher::new("127.0.0.1", 41008, "decode-kvargs-session")
+            .with_kv_cache_layout(MooncakeKvCacheLayout {
+                source_base_addr: 0x9000,
+                page_size_bytes: 128,
+                target_base_offset: 0,
+            }),
+    );
+    let mut scheduler =
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(4));
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("pd-decode-kvargs"),
+            vec![1, 2],
+            SamplingParams::new(1),
+        )
+        .with_disaggregated_params(Some(DisaggregatedParams {
+            bootstrap_host: bootstrap_addr.ip().to_string(),
+            bootstrap_port: bootstrap_addr.port(),
+            bootstrap_room: 96,
+        })),
+    );
+
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("decode worker should publish KV args and metadata through ZMQ");
+
+    wait_until(|| {
+        observed_service
+            .state()
+            .lock()
+            .expect("state lock should be held")
+            .remote_kv_layouts_for_room(96)
+            .is_ok()
+    })
+    .await;
+
+    let state = observed_service
+        .state()
+        .lock()
+        .expect("state lock should be held");
+    let kv_args = state
+        .decode_kv_args("decode-kvargs-session")
+        .expect("decode KV args should be registered before metadata is consumed");
+    assert_eq!(kv_args.dst_kv_ptrs, vec![0x9000]);
+    assert_eq!(kv_args.dst_kv_item_len, 128);
+    let layouts = state
+        .remote_kv_layouts_for_room(96)
+        .expect("remote layout should include decode KV args and metadata");
+    assert_eq!(
+        layouts,
+        vec![(
+            "decode-kvargs-session".to_string(),
+            MooncakeRemoteKvLayout {
+                dst_kv_ptrs: vec![0x9000],
+                dst_kv_indices: vec![0, 1],
+                dst_kv_item_len: 128,
+            }
+        )]
+    );
 
     shutdown_tx
         .send(())

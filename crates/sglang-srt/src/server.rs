@@ -604,6 +604,7 @@ where
 
 fn launch_mooncake_decode_bootstrap_publisher(
     args: &ServerArgs,
+    kv_cache_layout: MooncakeKvCacheLayout,
 ) -> MooncakeDecodeBootstrapPublisher {
     let endpoint = prefill_mooncake_route_rank_ip(args);
     let dst_port = args
@@ -612,6 +613,7 @@ fn launch_mooncake_decode_bootstrap_publisher(
         .unwrap_or(args.port);
     let session_id = format!("{endpoint}:{dst_port}");
     MooncakeDecodeBootstrapPublisher::new(endpoint, dst_port, session_id)
+        .with_kv_cache_layout(kv_cache_layout)
 }
 
 pub fn build_bootstrap_mooncake_prefill_http_router_service<S, R>(
@@ -717,16 +719,17 @@ fn try_build_launch_mooncake_decode_http_router_service(
     >,
     ServerLaunchError,
 > {
+    let kv_cache_layout = launch_mooncake_decode_kv_layout(pd_config)?;
     let transfer_executor = MooncakeKvCacheTransferExecutor::new(
         UnlinkedMooncakeTransferEngine,
-        launch_mooncake_decode_kv_layout(pd_config)?,
+        kv_cache_layout,
         MooncakeTransferTarget { target_id: 0 },
     );
     try_build_bootstrap_pd_http_router_service_with_decode_publisher(
         args,
         DecodeBootstrapRegistry::default(),
         transfer_executor,
-        launch_mooncake_decode_bootstrap_publisher(args),
+        launch_mooncake_decode_bootstrap_publisher(args, kv_cache_layout),
     )
 }
 
@@ -786,16 +789,17 @@ fn try_build_launch_mooncake_decode_http_router_service(
     );
     let engine = SharedLinkedMooncakeTransferEngine::new(&engine_config)?;
     let target_resolver = MooncakeSessionTargetResolver::new(engine.clone(), Vec::new());
+    let kv_cache_layout = launch_mooncake_decode_kv_layout(pd_config)?;
     let transfer_executor = MooncakeKvCacheTransferExecutor::with_target_resolver(
         engine,
-        launch_mooncake_decode_kv_layout(pd_config)?,
+        kv_cache_layout,
         target_resolver,
     );
     try_build_bootstrap_pd_http_router_service_with_decode_publisher(
         args,
         DecodeBootstrapRegistry::default(),
         transfer_executor,
-        launch_mooncake_decode_bootstrap_publisher(args),
+        launch_mooncake_decode_bootstrap_publisher(args, kv_cache_layout),
     )
 }
 

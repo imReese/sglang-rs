@@ -682,6 +682,7 @@ pub struct MooncakeDecodeBootstrapPublisher {
     endpoint: String,
     dst_port: u16,
     mooncake_session_id: String,
+    kv_cache_layout: Option<crate::transfer::MooncakeKvCacheLayout>,
     target_tp_rank: i32,
     target_pp_rank: i32,
     dst_aux_index: Option<i32>,
@@ -698,11 +699,20 @@ impl MooncakeDecodeBootstrapPublisher {
             endpoint: endpoint.into(),
             dst_port,
             mooncake_session_id: mooncake_session_id.into(),
+            kv_cache_layout: None,
             target_tp_rank: 0,
             target_pp_rank: 0,
             dst_aux_index: Some(0),
             required_dst_info_num: 1,
         }
+    }
+
+    pub fn with_kv_cache_layout(
+        mut self,
+        kv_cache_layout: crate::transfer::MooncakeKvCacheLayout,
+    ) -> Self {
+        self.kv_cache_layout = Some(kv_cache_layout);
+        self
     }
 
     pub fn with_target_ranks(mut self, target_tp_rank: i32, target_pp_rank: i32) -> Self {
@@ -749,6 +759,23 @@ impl MooncakeDecodeBootstrapPublisher {
             is_dummy: false,
         })
     }
+
+    fn kv_args_registration(&self) -> Option<MooncakeDecodeKvArgsRegistration> {
+        let layout = self.kv_cache_layout?;
+        Some(MooncakeDecodeKvArgsRegistration {
+            endpoint: self.endpoint.clone(),
+            dst_port: self.dst_port,
+            mooncake_session_id: self.mooncake_session_id.clone(),
+            dst_kv_ptrs: vec![layout.source_base_addr as u64],
+            dst_aux_ptrs: Vec::new(),
+            dst_state_data_ptrs: Vec::new(),
+            dst_tp_rank: self.target_tp_rank,
+            dst_attn_tp_size: 1,
+            dst_kv_item_len: layout.page_size_bytes,
+            dst_state_item_lens: Vec::new(),
+            dst_state_dim_per_tensor: Vec::new(),
+        })
+    }
 }
 
 impl DecodeBootstrapPublisher for MooncakeDecodeBootstrapPublisher {
@@ -767,11 +794,13 @@ impl DecodeBootstrapPublisher for MooncakeDecodeBootstrapPublisher {
             let prefill_dp_rank = span.data_parallel_rank();
             let target_tp_rank = self.target_tp_rank;
             let target_pp_rank = self.target_pp_rank;
+            let kv_args_registration = self.kv_args_registration();
             publish_mooncake_decode_metadata_blocking(
                 bootstrap_addr,
                 prefill_dp_rank,
                 target_tp_rank,
                 target_pp_rank,
+                kv_args_registration,
                 metadata,
             )?;
             published_spans += 1;
@@ -977,6 +1006,7 @@ fn publish_mooncake_decode_metadata_blocking(
     prefill_dp_rank: i32,
     target_tp_rank: i32,
     target_pp_rank: i32,
+    kv_args_registration: Option<MooncakeDecodeKvArgsRegistration>,
     metadata: MooncakeDecodeTransferMetadata,
 ) -> Result<(), String> {
     let run_client = move || {
@@ -994,6 +1024,11 @@ fn publish_mooncake_decode_metadata_blocking(
             )
             .await
             .map_err(|error| error.to_string())?;
+            if let Some(kv_args_registration) = kv_args_registration.as_ref() {
+                send_mooncake_kv_args_registration(&rank.zmq_endpoint(), kv_args_registration)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
             send_mooncake_transfer_metadata(&rank.zmq_endpoint(), &metadata)
                 .await
                 .map_err(|error| error.to_string())

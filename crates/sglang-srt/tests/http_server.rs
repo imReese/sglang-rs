@@ -753,6 +753,16 @@ async fn decode_http_launch_routes_disaggregated_chat_into_mooncake_runtime() {
         ),
         "decode launch must route through the Mooncake transfer runtime instead of rejecting as unsupported: {response}"
     );
+    let layouts = bootstrap_service
+        .state()
+        .lock()
+        .expect("bootstrap state lock should be held")
+        .remote_kv_layouts_for_room(78)
+        .expect("decode launch should publish KV args before transfer metadata");
+    assert_eq!(layouts.len(), 1);
+    assert_eq!(layouts[0].1.dst_kv_ptrs, vec![0]);
+    assert_eq!(layouts[0].1.dst_kv_indices, vec![0, 1]);
+    assert_eq!(layouts[0].1.dst_kv_item_len, 64);
 
     shutdown_tx
         .send(())
