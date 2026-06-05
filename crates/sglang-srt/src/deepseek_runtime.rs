@@ -1,4 +1,6 @@
 use std::fmt;
+use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::PathBuf;
 
@@ -7,7 +9,7 @@ use crate::model_artifacts::{
     DeepSeekLayerCheckpointWeights, DeepSeekLayerFeedForwardCheckpointWeights,
     DeepSeekModelCheckpointWeights, DeepSeekModelTensorSpan, LocalModelArtifacts,
     LocalModelCheckpointCatalog, ModelArtifactError, SafetensorsLayerTensorSpan,
-    SafetensorsTensorSpan,
+    SafetensorsTensorData, SafetensorsTensorMetadata, SafetensorsTensorSpan,
 };
 use crate::model_executor::ModelWorkerBatch;
 use crate::scheduler::ForwardMode;
@@ -451,6 +453,34 @@ impl DeepSeekTensorDescriptor {
     pub fn byte_len(&self) -> usize {
         self.byte_len
     }
+
+    fn read(&self) -> Result<SafetensorsTensorData, DeepSeekV4TensorShardLoadError> {
+        let mut file =
+            fs::File::open(&self.path).map_err(|error| ModelArtifactError::ReadWeightShard {
+                path: self.path.clone(),
+                message: error.to_string(),
+            })?;
+        file.seek(SeekFrom::Start(self.absolute_byte_offset))
+            .map_err(|error| ModelArtifactError::ReadWeightShard {
+                path: self.path.clone(),
+                message: error.to_string(),
+            })?;
+        let mut bytes = vec![0_u8; self.byte_len];
+        file.read_exact(&mut bytes)
+            .map_err(|error| ModelArtifactError::ReadWeightShard {
+                path: self.path.clone(),
+                message: error.to_string(),
+            })?;
+
+        Ok(SafetensorsTensorData {
+            metadata: SafetensorsTensorMetadata {
+                dtype: self.dtype.clone(),
+                shape: self.shape.clone(),
+                data_offsets: [0, self.byte_len],
+            },
+            bytes,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -617,6 +647,21 @@ impl DeepSeekV4TensorRankShardPlan {
             .find(|shard| shard.tensor().tensor_name() == tensor_name)
             .map(|shard| shard.selection().clone())
     }
+
+    pub fn load_tensor_shard(
+        &self,
+        tensor_name: &str,
+    ) -> Result<Option<DeepSeekV4LoadedTensorShard>, DeepSeekV4TensorShardLoadError> {
+        let Some(shard) = self
+            .shards
+            .iter()
+            .find(|shard| shard.tensor().tensor_name() == tensor_name)
+        else {
+            return Ok(None);
+        };
+
+        shard.load().map(Some)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -637,6 +682,57 @@ impl DeepSeekV4TensorShard {
 
     pub fn selection(&self) -> &DeepSeekV4TensorShardSelection {
         &self.selection
+    }
+
+    pub fn load(&self) -> Result<DeepSeekV4LoadedTensorShard, DeepSeekV4TensorShardLoadError> {
+        let tensor_data = self.tensor.read()?;
+        let (shape, bytes) = materialize_tensor_shard(
+            self.tensor.tensor_name(),
+            self.tensor.path(),
+            self.tensor.shape(),
+            tensor_data.dtype_byte_width(),
+            &tensor_data.bytes,
+            &self.selection,
+        )?;
+
+        Ok(DeepSeekV4LoadedTensorShard {
+            tensor_name: self.tensor.tensor_name().to_string(),
+            dtype: self.tensor.dtype().to_string(),
+            shape,
+            selection: self.selection.clone(),
+            bytes,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeepSeekV4LoadedTensorShard {
+    tensor_name: String,
+    dtype: String,
+    shape: Vec<usize>,
+    selection: DeepSeekV4TensorShardSelection,
+    bytes: Vec<u8>,
+}
+
+impl DeepSeekV4LoadedTensorShard {
+    pub fn tensor_name(&self) -> &str {
+        &self.tensor_name
+    }
+
+    pub fn dtype(&self) -> &str {
+        &self.dtype
+    }
+
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    pub fn selection(&self) -> &DeepSeekV4TensorShardSelection {
+        &self.selection
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
     }
 }
 
@@ -692,6 +788,79 @@ impl fmt::Display for DeepSeekV4TensorShardPlanError {
 
 impl std::error::Error for DeepSeekV4TensorShardPlanError {}
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeepSeekV4TensorShardLoadError {
+    ModelArtifact(ModelArtifactError),
+    TensorRankTooHigh {
+        tensor_name: String,
+        shape: Vec<usize>,
+    },
+    TensorAxisOutOfBounds {
+        tensor_name: String,
+        axis: usize,
+        shape: Vec<usize>,
+    },
+    TensorDataLengthMismatch {
+        tensor_name: String,
+        expected_byte_len: usize,
+        actual_byte_len: usize,
+    },
+    TensorShardByteLengthOverflow {
+        tensor_name: String,
+    },
+    TensorShardOffsetOverflow {
+        tensor_name: String,
+    },
+}
+
+impl fmt::Display for DeepSeekV4TensorShardLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ModelArtifact(error) => write!(formatter, "{error}"),
+            Self::TensorRankTooHigh { tensor_name, shape } => write!(
+                formatter,
+                "tensor {tensor_name} with shape {shape:?} has unsupported rank for shard loading"
+            ),
+            Self::TensorAxisOutOfBounds {
+                tensor_name,
+                axis,
+                shape,
+            } => write!(
+                formatter,
+                "tensor {tensor_name} shard axis {axis} is out of bounds for shape {shape:?}"
+            ),
+            Self::TensorDataLengthMismatch {
+                tensor_name,
+                expected_byte_len,
+                actual_byte_len,
+            } => write!(
+                formatter,
+                "tensor {tensor_name} expected {expected_byte_len} payload bytes but loaded {actual_byte_len}"
+            ),
+            Self::TensorShardByteLengthOverflow { tensor_name } => {
+                write!(
+                    formatter,
+                    "tensor {tensor_name} shard byte length overflowed"
+                )
+            }
+            Self::TensorShardOffsetOverflow { tensor_name } => {
+                write!(
+                    formatter,
+                    "tensor {tensor_name} shard byte offset overflowed"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for DeepSeekV4TensorShardLoadError {}
+
+impl From<ModelArtifactError> for DeepSeekV4TensorShardLoadError {
+    fn from(error: ModelArtifactError) -> Self {
+        Self::ModelArtifact(error)
+    }
+}
+
 fn shard_selection_for_entry(
     entry: &DeepSeekV4TensorPlacement,
     tensor_parallel_size: usize,
@@ -730,6 +899,158 @@ fn shard_selection_for_entry(
         axis,
         range: start..start + shard_size,
     })
+}
+
+fn materialize_tensor_shard(
+    tensor_name: &str,
+    tensor_path: &PathBuf,
+    shape: &[usize],
+    dtype_byte_width: usize,
+    bytes: &[u8],
+    selection: &DeepSeekV4TensorShardSelection,
+) -> Result<(Vec<usize>, Vec<u8>), DeepSeekV4TensorShardLoadError> {
+    let expected_byte_len = shape
+        .iter()
+        .try_fold(dtype_byte_width, |accumulator, dimension| {
+            accumulator.checked_mul(*dimension)
+        })
+        .ok_or_else(
+            || DeepSeekV4TensorShardLoadError::TensorShardByteLengthOverflow {
+                tensor_name: tensor_name.to_string(),
+            },
+        )?;
+    if expected_byte_len != bytes.len() {
+        return Err(DeepSeekV4TensorShardLoadError::TensorDataLengthMismatch {
+            tensor_name: tensor_name.to_string(),
+            expected_byte_len,
+            actual_byte_len: bytes.len(),
+        });
+    }
+
+    match selection {
+        DeepSeekV4TensorShardSelection::Full => Ok((shape.to_vec(), bytes.to_vec())),
+        DeepSeekV4TensorShardSelection::Slice { axis, range } => materialize_tensor_slice(
+            tensor_name,
+            tensor_path,
+            shape,
+            dtype_byte_width,
+            bytes,
+            *axis,
+            range,
+        ),
+    }
+}
+
+fn materialize_tensor_slice(
+    tensor_name: &str,
+    _tensor_path: &PathBuf,
+    shape: &[usize],
+    dtype_byte_width: usize,
+    bytes: &[u8],
+    axis: usize,
+    range: &Range<usize>,
+) -> Result<(Vec<usize>, Vec<u8>), DeepSeekV4TensorShardLoadError> {
+    if axis >= shape.len() {
+        return Err(DeepSeekV4TensorShardLoadError::TensorAxisOutOfBounds {
+            tensor_name: tensor_name.to_string(),
+            axis,
+            shape: shape.to_vec(),
+        });
+    }
+    if shape.len() > 2 {
+        return Err(DeepSeekV4TensorShardLoadError::TensorRankTooHigh {
+            tensor_name: tensor_name.to_string(),
+            shape: shape.to_vec(),
+        });
+    }
+
+    let mut shard_shape = shape.to_vec();
+    shard_shape[axis] = range.len();
+
+    match shape {
+        [_] => {
+            let start = range.start.checked_mul(dtype_byte_width).ok_or_else(|| {
+                DeepSeekV4TensorShardLoadError::TensorShardOffsetOverflow {
+                    tensor_name: tensor_name.to_string(),
+                }
+            })?;
+            let end = range.end.checked_mul(dtype_byte_width).ok_or_else(|| {
+                DeepSeekV4TensorShardLoadError::TensorShardOffsetOverflow {
+                    tensor_name: tensor_name.to_string(),
+                }
+            })?;
+            Ok((shard_shape, bytes[start..end].to_vec()))
+        }
+        [rows, columns] if axis == 0 => {
+            let row_byte_len = columns.checked_mul(dtype_byte_width).ok_or_else(|| {
+                DeepSeekV4TensorShardLoadError::TensorShardByteLengthOverflow {
+                    tensor_name: tensor_name.to_string(),
+                }
+            })?;
+            let start = range.start.checked_mul(row_byte_len).ok_or_else(|| {
+                DeepSeekV4TensorShardLoadError::TensorShardOffsetOverflow {
+                    tensor_name: tensor_name.to_string(),
+                }
+            })?;
+            let end = range.end.checked_mul(row_byte_len).ok_or_else(|| {
+                DeepSeekV4TensorShardLoadError::TensorShardOffsetOverflow {
+                    tensor_name: tensor_name.to_string(),
+                }
+            })?;
+            debug_assert!(range.end <= *rows);
+            Ok((shard_shape, bytes[start..end].to_vec()))
+        }
+        [rows, columns] => {
+            let row_byte_len = columns.checked_mul(dtype_byte_width).ok_or_else(|| {
+                DeepSeekV4TensorShardLoadError::TensorShardByteLengthOverflow {
+                    tensor_name: tensor_name.to_string(),
+                }
+            })?;
+            let column_start = range.start.checked_mul(dtype_byte_width).ok_or_else(|| {
+                DeepSeekV4TensorShardLoadError::TensorShardOffsetOverflow {
+                    tensor_name: tensor_name.to_string(),
+                }
+            })?;
+            let column_end = range.end.checked_mul(dtype_byte_width).ok_or_else(|| {
+                DeepSeekV4TensorShardLoadError::TensorShardOffsetOverflow {
+                    tensor_name: tensor_name.to_string(),
+                }
+            })?;
+            let shard_row_byte_len = column_end.checked_sub(column_start).ok_or_else(|| {
+                DeepSeekV4TensorShardLoadError::TensorShardOffsetOverflow {
+                    tensor_name: tensor_name.to_string(),
+                }
+            })?;
+            let shard_byte_len = rows.checked_mul(shard_row_byte_len).ok_or_else(|| {
+                DeepSeekV4TensorShardLoadError::TensorShardByteLengthOverflow {
+                    tensor_name: tensor_name.to_string(),
+                }
+            })?;
+            let mut shard_bytes = Vec::with_capacity(shard_byte_len);
+            for row in 0..*rows {
+                let row_start = row.checked_mul(row_byte_len).ok_or_else(|| {
+                    DeepSeekV4TensorShardLoadError::TensorShardOffsetOverflow {
+                        tensor_name: tensor_name.to_string(),
+                    }
+                })?;
+                let start = row_start.checked_add(column_start).ok_or_else(|| {
+                    DeepSeekV4TensorShardLoadError::TensorShardOffsetOverflow {
+                        tensor_name: tensor_name.to_string(),
+                    }
+                })?;
+                let end = row_start.checked_add(column_end).ok_or_else(|| {
+                    DeepSeekV4TensorShardLoadError::TensorShardOffsetOverflow {
+                        tensor_name: tensor_name.to_string(),
+                    }
+                })?;
+                shard_bytes.extend_from_slice(&bytes[start..end]);
+            }
+
+            Ok((shard_shape, shard_bytes))
+        }
+        [] => Ok((shard_shape, Vec::new())),
+        _ => unreachable!("tensor ranks above 2 are rejected before slicing"),
+    }
 }
 
 fn push_placement(

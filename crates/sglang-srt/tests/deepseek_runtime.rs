@@ -337,6 +337,59 @@ fn deepseek_v4_tensor_parallel_rank_plan_computes_tensor_slices() {
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
 
+#[test]
+fn deepseek_v4_tensor_parallel_rank_plan_loads_sharded_tensor_bytes() {
+    let model_dir = temp_model_dir("deepseek-runtime-tp-rank-load");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_complete_deepseek_v4_checkpoint_with_shapes(
+        &model_dir,
+        &[
+            ("model.embed_tokens.weight", &[4, 2]),
+            ("lm_head.weight", &[4, 2]),
+            ("model.layers.0.self_attn.wq_b.weight", &[4, 2]),
+            ("model.layers.0.self_attn.wo_a.weight", &[4, 2]),
+            ("model.layers.0.self_attn.wo_b.weight", &[2, 4]),
+            ("model.layers.0.ffn.experts.0.w1.weight", &[4, 2]),
+            ("model.layers.0.ffn.experts.0.w2.weight", &[2, 4]),
+            ("model.layers.0.ffn.experts.0.w3.weight", &[4, 2]),
+        ],
+    );
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("artifacts should load");
+    let runtime =
+        DeepSeekV4Runtime::from_local_model_artifacts(&artifacts).expect("runtime should build");
+
+    let rank_plan = runtime
+        .tensor_parallel_placement_plan(2)
+        .rank_shard_plan(1)
+        .expect("rank 1 shard plan should build");
+
+    let embeddings = rank_plan
+        .load_tensor_shard("model.embed_tokens.weight")
+        .expect("embedding shard should load")
+        .expect("embedding tensor should be planned");
+    assert_eq!(embeddings.tensor_name(), "model.embed_tokens.weight");
+    assert_eq!(embeddings.dtype(), "U8");
+    assert_eq!(embeddings.shape(), &[2, 2]);
+    assert_eq!(embeddings.bytes(), &[4, 5, 6, 7]);
+
+    let final_norm = rank_plan
+        .load_tensor_shard("model.norm.weight")
+        .expect("replicated tensor should load")
+        .expect("replicated tensor should be planned");
+    assert_eq!(final_norm.shape(), &[1]);
+    assert_eq!(final_norm.bytes(), &[8]);
+
+    let row_parallel = rank_plan
+        .load_tensor_shard("model.layers.0.self_attn.wo_b.weight")
+        .expect("row-parallel tensor should load")
+        .expect("row-parallel tensor should be planned");
+    assert_eq!(row_parallel.shape(), &[2, 2]);
+    assert_eq!(row_parallel.bytes(), &[42, 43, 46, 47]);
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
 fn write_complete_deepseek_v4_checkpoint(model_dir: &Path) {
     write_complete_deepseek_v4_checkpoint_with_shapes(model_dir, &[]);
 }
