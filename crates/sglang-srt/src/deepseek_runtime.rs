@@ -835,6 +835,12 @@ impl DeepSeekV4LoadedTensorParallelRuntime {
             .map(DeepSeekV4LoadedTensorRank::loaded_byte_len)
             .sum()
     }
+
+    pub fn decode_f32_tensor_parallel_shards(
+        &self,
+    ) -> Result<DeepSeekV4F32TensorParallelRuntime, SafetensorsTensorDecodeError> {
+        DeepSeekV4F32TensorParallelRuntime::from_loaded_runtime(self)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -879,6 +885,125 @@ impl DeepSeekV4LoadedTensorRank {
         self.shards
             .iter()
             .find(|shard| shard.tensor_name() == tensor_name)
+    }
+
+    fn decode_f32_shards(&self) -> Result<DeepSeekV4F32TensorRank, SafetensorsTensorDecodeError> {
+        let shards = self
+            .shards
+            .iter()
+            .map(DeepSeekV4F32TensorShard::from_loaded_shard)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(DeepSeekV4F32TensorRank {
+            tensor_parallel_rank: self.tensor_parallel_rank,
+            shards,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeepSeekV4F32TensorParallelRuntime {
+    tensor_parallel_size: usize,
+    layer_count: usize,
+    ranks: Vec<DeepSeekV4F32TensorRank>,
+}
+
+impl DeepSeekV4F32TensorParallelRuntime {
+    fn from_loaded_runtime(
+        runtime: &DeepSeekV4LoadedTensorParallelRuntime,
+    ) -> Result<Self, SafetensorsTensorDecodeError> {
+        let ranks = runtime
+            .ranks()
+            .iter()
+            .map(DeepSeekV4LoadedTensorRank::decode_f32_shards)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            tensor_parallel_size: runtime.tensor_parallel_size(),
+            layer_count: runtime.layer_count(),
+            ranks,
+        })
+    }
+
+    pub fn tensor_parallel_size(&self) -> usize {
+        self.tensor_parallel_size
+    }
+
+    pub fn rank_count(&self) -> usize {
+        self.ranks.len()
+    }
+
+    pub fn layer_count(&self) -> usize {
+        self.layer_count
+    }
+
+    pub fn ranks(&self) -> &[DeepSeekV4F32TensorRank] {
+        &self.ranks
+    }
+
+    pub fn rank(&self, tensor_parallel_rank: usize) -> Option<&DeepSeekV4F32TensorRank> {
+        self.ranks
+            .iter()
+            .find(|rank| rank.tensor_parallel_rank() == tensor_parallel_rank)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeepSeekV4F32TensorRank {
+    tensor_parallel_rank: usize,
+    shards: Vec<DeepSeekV4F32TensorShard>,
+}
+
+impl DeepSeekV4F32TensorRank {
+    pub fn tensor_parallel_rank(&self) -> usize {
+        self.tensor_parallel_rank
+    }
+
+    pub fn shards(&self) -> &[DeepSeekV4F32TensorShard] {
+        &self.shards
+    }
+
+    pub fn tensor_shard(&self, tensor_name: &str) -> Option<&DeepSeekV4F32TensorShard> {
+        self.shards
+            .iter()
+            .find(|shard| shard.tensor_name() == tensor_name)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeepSeekV4F32TensorShard {
+    tensor_name: String,
+    shape: Vec<usize>,
+    selection: DeepSeekV4TensorShardSelection,
+    values: Vec<f32>,
+}
+
+impl DeepSeekV4F32TensorShard {
+    fn from_loaded_shard(
+        shard: &DeepSeekV4LoadedTensorShard,
+    ) -> Result<Self, SafetensorsTensorDecodeError> {
+        Ok(Self {
+            tensor_name: shard.tensor_name().to_string(),
+            shape: shard.shape().to_vec(),
+            selection: shard.selection().clone(),
+            values: shard.decode_f32_values()?,
+        })
+    }
+
+    pub fn tensor_name(&self) -> &str {
+        &self.tensor_name
+    }
+
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    pub fn selection(&self) -> &DeepSeekV4TensorShardSelection {
+        &self.selection
+    }
+
+    pub fn values(&self) -> &[f32] {
+        &self.values
     }
 }
 

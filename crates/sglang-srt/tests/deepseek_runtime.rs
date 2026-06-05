@@ -444,6 +444,86 @@ fn deepseek_v4_loaded_tensor_shards_decode_f32_values_after_slicing() {
 }
 
 #[test]
+fn deepseek_v4_loaded_runtime_decodes_tensor_parallel_shards_into_f32_cache() {
+    let model_dir = temp_model_dir("deepseek-runtime-tp-f32-cache");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    let shape_overrides: &[(&str, &[usize])] = &[
+        ("model.embed_tokens.weight", &[4, 2]),
+        ("lm_head.weight", &[4, 2]),
+        ("model.layers.0.self_attn.wq_b.weight", &[4, 2]),
+        ("model.layers.0.self_attn.wo_a.weight", &[4, 2]),
+        ("model.layers.0.self_attn.wo_b.weight", &[2, 4]),
+        ("model.layers.0.ffn.experts.0.w1.weight", &[4, 2]),
+        ("model.layers.0.ffn.experts.0.w2.weight", &[2, 4]),
+        ("model.layers.0.ffn.experts.0.w3.weight", &[4, 2]),
+    ];
+    write_complete_deepseek_v4_checkpoint_with_shapes(&model_dir, shape_overrides);
+    write_deepseek_v4_safetensors_with_shapes_and_dtype(&model_dir, shape_overrides, "F32");
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("artifacts should load");
+    let runtime =
+        DeepSeekV4Runtime::from_local_model_artifacts(&artifacts).expect("runtime should build");
+    let loaded = runtime
+        .load_tensor_parallel_shards(2)
+        .expect("all TP rank shards should load");
+
+    let f32_runtime = loaded
+        .decode_f32_tensor_parallel_shards()
+        .expect("F32 cache should decode");
+
+    assert_eq!(f32_runtime.tensor_parallel_size(), 2);
+    assert_eq!(f32_runtime.rank_count(), 2);
+    assert_eq!(f32_runtime.layer_count(), 1);
+    assert_eq!(
+        f32_runtime
+            .rank(1)
+            .expect("rank 1 cache should exist")
+            .tensor_shard("model.embed_tokens.weight")
+            .expect("rank 1 embedding cache should exist")
+            .values(),
+        &[4.0, 5.0, 6.0, 7.0]
+    );
+    assert_eq!(
+        f32_runtime
+            .rank(1)
+            .expect("rank 1 cache should exist")
+            .tensor_shard("model.layers.0.self_attn.wo_b.weight")
+            .expect("rank 1 row-parallel cache should exist")
+            .values(),
+        &[42.0, 43.0, 46.0, 47.0]
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn deepseek_v4_loaded_runtime_reports_unsupported_dtype_when_decoding_f32_cache() {
+    let model_dir = temp_model_dir("deepseek-runtime-tp-f32-cache-u8");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_complete_deepseek_v4_checkpoint(&model_dir);
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("artifacts should load");
+    let runtime =
+        DeepSeekV4Runtime::from_local_model_artifacts(&artifacts).expect("runtime should build");
+    let loaded = runtime
+        .load_tensor_parallel_shards(1)
+        .expect("TP rank shards should load");
+
+    let error = loaded
+        .decode_f32_tensor_parallel_shards()
+        .expect_err("U8 runtime should not decode into f32 cache");
+
+    assert_eq!(
+        error,
+        SafetensorsTensorDecodeError::UnsupportedDtype {
+            dtype: "U8".to_string()
+        }
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
 fn deepseek_v4_runtime_loads_all_tensor_parallel_rank_shards() {
     let model_dir = temp_model_dir("deepseek-runtime-load-all-tp-ranks");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");
