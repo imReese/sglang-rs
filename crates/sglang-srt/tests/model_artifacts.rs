@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use sglang_srt::model_artifacts::{
     DeepSeekLayerFeedForwardCheckpointWeights, HfModelConfig, LocalModelArtifacts,
     ModelArtifactError, SafetensorsCheckpointFingerprintEntry, SafetensorsLayerTensorCatalog,
-    SafetensorsLayerTensorSpan, SafetensorsRoutedExpertProjection,
+    SafetensorsLayerTensorSpan, SafetensorsQuantizedLinearScaleKind,
+    SafetensorsQuantizedLinearWeightSpan, SafetensorsRoutedExpertProjection,
     SafetensorsRoutedExpertWeightCatalog, SafetensorsRoutedExpertWeightGroup,
     SafetensorsRoutedExpertWeightSpan, SafetensorsTensorData, SafetensorsTensorMetadata,
     SafetensorsTensorSpan,
@@ -1928,6 +1929,173 @@ fn safetensors_manifest_builds_stable_checkpoint_fingerprint_entries() {
                 fnv1a64: fnv1a64(&[40, 41, 42, 43]),
             },
         ]
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn safetensors_manifest_pairs_quantized_linear_weights_with_scale_tensors() {
+    let model_dir = temp_model_dir("quantized-linear-weight-pairs");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "model_type": "llama"
+}"#,
+    )
+    .expect("config should be written");
+    fs::write(
+        model_dir.join("model.safetensors.index.json"),
+        r#"{
+  "weight_map": {
+    "lm_head.weight": "model.safetensors",
+    "lm_head.weight_scale_inv": "model.safetensors",
+    "model.layers.0.self_attn.wq_a.weight": "model.safetensors",
+    "model.layers.0.self_attn.wq_a.weight_scale_inv": "model.safetensors",
+    "model.layers.0.self_attn.wq_b.weight": "model.safetensors",
+    "model.layers.0.self_attn.wq_b.weight_scale": "model.safetensors",
+    "model.layers.0.self_attn.wkv.weight_scale_inv": "model.safetensors"
+  }
+}"#,
+    )
+    .expect("index should be written");
+    let shard = model_dir.join("model.safetensors");
+    let header_len = write_safetensors_file(
+        &shard,
+        &[
+            ("lm_head.weight", "F8_E4M3", &[2, 2], [0, 4]),
+            ("lm_head.weight_scale_inv", "F32", &[1, 1], [4, 8]),
+            (
+                "model.layers.0.self_attn.wq_a.weight",
+                "F8_E4M3",
+                &[2, 2],
+                [8, 12],
+            ),
+            (
+                "model.layers.0.self_attn.wq_a.weight_scale_inv",
+                "F32",
+                &[1, 1],
+                [12, 16],
+            ),
+            (
+                "model.layers.0.self_attn.wq_b.weight",
+                "F8_E4M3",
+                &[2, 2],
+                [16, 20],
+            ),
+            (
+                "model.layers.0.self_attn.wq_b.weight_scale",
+                "F32",
+                &[1],
+                [20, 24],
+            ),
+            (
+                "model.layers.0.self_attn.wkv.weight_scale_inv",
+                "F32",
+                &[1, 1],
+                [24, 28],
+            ),
+        ],
+        &[0; 28],
+    )
+    .expect("shard should be written");
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("local artifacts should load");
+
+    assert_eq!(
+        artifacts
+            .safetensors()
+            .quantized_linear_weight_spans()
+            .expect("quantized linear weights should pair with scale tensors"),
+        vec![
+            SafetensorsQuantizedLinearWeightSpan {
+                tensor_name: "lm_head.weight".to_string(),
+                scale_tensor_name: "lm_head.weight_scale_inv".to_string(),
+                scale_kind: SafetensorsQuantizedLinearScaleKind::WeightScaleInv,
+                weight: SafetensorsTensorSpan {
+                    path: shard.clone(),
+                    metadata: SafetensorsTensorMetadata {
+                        dtype: "F8_E4M3".to_string(),
+                        shape: vec![2, 2],
+                        data_offsets: [0, 4],
+                    },
+                    absolute_byte_offset: 8 + header_len as u64,
+                    byte_len: 4,
+                },
+                scale: SafetensorsTensorSpan {
+                    path: shard.clone(),
+                    metadata: SafetensorsTensorMetadata {
+                        dtype: "F32".to_string(),
+                        shape: vec![1, 1],
+                        data_offsets: [4, 8],
+                    },
+                    absolute_byte_offset: 8 + header_len as u64 + 4,
+                    byte_len: 4,
+                },
+            },
+            SafetensorsQuantizedLinearWeightSpan {
+                tensor_name: "model.layers.0.self_attn.wq_a.weight".to_string(),
+                scale_tensor_name: "model.layers.0.self_attn.wq_a.weight_scale_inv".to_string(),
+                scale_kind: SafetensorsQuantizedLinearScaleKind::WeightScaleInv,
+                weight: SafetensorsTensorSpan {
+                    path: shard.clone(),
+                    metadata: SafetensorsTensorMetadata {
+                        dtype: "F8_E4M3".to_string(),
+                        shape: vec![2, 2],
+                        data_offsets: [8, 12],
+                    },
+                    absolute_byte_offset: 8 + header_len as u64 + 8,
+                    byte_len: 4,
+                },
+                scale: SafetensorsTensorSpan {
+                    path: shard.clone(),
+                    metadata: SafetensorsTensorMetadata {
+                        dtype: "F32".to_string(),
+                        shape: vec![1, 1],
+                        data_offsets: [12, 16],
+                    },
+                    absolute_byte_offset: 8 + header_len as u64 + 12,
+                    byte_len: 4,
+                },
+            },
+            SafetensorsQuantizedLinearWeightSpan {
+                tensor_name: "model.layers.0.self_attn.wq_b.weight".to_string(),
+                scale_tensor_name: "model.layers.0.self_attn.wq_b.weight_scale".to_string(),
+                scale_kind: SafetensorsQuantizedLinearScaleKind::WeightScale,
+                weight: SafetensorsTensorSpan {
+                    path: shard.clone(),
+                    metadata: SafetensorsTensorMetadata {
+                        dtype: "F8_E4M3".to_string(),
+                        shape: vec![2, 2],
+                        data_offsets: [16, 20],
+                    },
+                    absolute_byte_offset: 8 + header_len as u64 + 16,
+                    byte_len: 4,
+                },
+                scale: SafetensorsTensorSpan {
+                    path: shard,
+                    metadata: SafetensorsTensorMetadata {
+                        dtype: "F32".to_string(),
+                        shape: vec![1],
+                        data_offsets: [20, 24],
+                    },
+                    absolute_byte_offset: 8 + header_len as u64 + 20,
+                    byte_len: 4,
+                },
+            },
+        ]
+    );
+    let checkpoint = artifacts
+        .checkpoint_catalog()
+        .expect("checkpoint catalog should build");
+    assert_eq!(
+        checkpoint
+            .quantized_linear_weights()
+            .span("model.layers.0.self_attn.wq_a.weight")
+            .expect("checkpoint catalog should expose quantized linear pair")
+            .scale_tensor_name,
+        "model.layers.0.self_attn.wq_a.weight_scale_inv"
     );
 
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");

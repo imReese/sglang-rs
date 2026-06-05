@@ -254,6 +254,7 @@ pub struct LocalModelCheckpointCatalog {
     config: HfModelConfig,
     safetensors: SafetensorsManifest,
     layer_tensors: SafetensorsLayerTensorCatalog,
+    quantized_linears: SafetensorsQuantizedLinearWeightCatalog,
     routed_experts: SafetensorsRoutedExpertWeightCatalog,
 }
 
@@ -262,6 +263,9 @@ impl LocalModelCheckpointCatalog {
         artifacts: &LocalModelArtifacts,
     ) -> Result<Self, ModelArtifactError> {
         let layer_tensors = artifacts.safetensors().layer_tensor_catalog()?;
+        let quantized_linears = SafetensorsQuantizedLinearWeightCatalog::from_safetensors_manifest(
+            artifacts.safetensors(),
+        )?;
         let routed_experts = artifacts.routed_expert_weight_catalog()?;
 
         Ok(Self {
@@ -269,12 +273,17 @@ impl LocalModelCheckpointCatalog {
             config: artifacts.config().clone(),
             safetensors: artifacts.safetensors().clone(),
             layer_tensors,
+            quantized_linears,
             routed_experts,
         })
     }
 
     pub fn layer_tensors(&self) -> &SafetensorsLayerTensorCatalog {
         &self.layer_tensors
+    }
+
+    pub fn quantized_linear_weights(&self) -> &SafetensorsQuantizedLinearWeightCatalog {
+        &self.quantized_linears
     }
 
     pub fn routed_experts(&self) -> &SafetensorsRoutedExpertWeightCatalog {
@@ -1112,6 +1121,37 @@ impl SafetensorsManifest {
             .collect()
     }
 
+    pub fn quantized_linear_weight_spans(
+        &self,
+    ) -> Result<Vec<SafetensorsQuantizedLinearWeightSpan>, ModelArtifactError> {
+        let entries = self
+            .tensor_span_entries()?
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let mut spans = Vec::new();
+
+        for (tensor_name, weight) in &entries {
+            if !is_quantized_linear_weight_tensor(tensor_name, weight) {
+                continue;
+            }
+
+            let Some((scale_tensor_name, scale_kind, scale)) =
+                quantized_linear_scale_tensor(tensor_name, &entries)
+            else {
+                continue;
+            };
+            spans.push(SafetensorsQuantizedLinearWeightSpan {
+                tensor_name: tensor_name.clone(),
+                scale_tensor_name,
+                scale_kind,
+                weight: weight.clone(),
+                scale,
+            });
+        }
+
+        Ok(spans)
+    }
+
     pub fn routed_expert_weight_spans(
         &self,
     ) -> Result<Vec<SafetensorsRoutedExpertWeightSpan>, ModelArtifactError> {
@@ -1413,6 +1453,48 @@ impl SafetensorsCheckpointFingerprintEntry {
             byte_len: span.byte_len,
             fnv1a64,
         })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SafetensorsQuantizedLinearScaleKind {
+    WeightScaleInv,
+    WeightScale,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SafetensorsQuantizedLinearWeightSpan {
+    pub tensor_name: String,
+    pub scale_tensor_name: String,
+    pub scale_kind: SafetensorsQuantizedLinearScaleKind,
+    pub weight: SafetensorsTensorSpan,
+    pub scale: SafetensorsTensorSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SafetensorsQuantizedLinearWeightCatalog {
+    weights: BTreeMap<String, SafetensorsQuantizedLinearWeightSpan>,
+}
+
+impl SafetensorsQuantizedLinearWeightCatalog {
+    pub fn from_safetensors_manifest(
+        manifest: &SafetensorsManifest,
+    ) -> Result<Self, ModelArtifactError> {
+        Ok(Self {
+            weights: manifest
+                .quantized_linear_weight_spans()?
+                .into_iter()
+                .map(|span| (span.tensor_name.clone(), span))
+                .collect(),
+        })
+    }
+
+    pub fn weight_count(&self) -> usize {
+        self.weights.len()
+    }
+
+    pub fn span(&self, tensor_name: &str) -> Option<&SafetensorsQuantizedLinearWeightSpan> {
+        self.weights.get(tensor_name)
     }
 }
 
@@ -2335,6 +2417,39 @@ fn parse_layer_tensor_name(tensor_name: &str) -> Option<(usize, String)> {
     }
 
     Some((layer_id, suffix.to_string()))
+}
+
+fn is_quantized_linear_weight_tensor(tensor_name: &str, span: &SafetensorsTensorSpan) -> bool {
+    tensor_name.ends_with(".weight")
+        && matches!(span.metadata.dtype.as_str(), "F8_E4M3" | "F8_E5M2" | "U8")
+}
+
+fn quantized_linear_scale_tensor(
+    tensor_name: &str,
+    entries: &BTreeMap<String, SafetensorsTensorSpan>,
+) -> Option<(
+    String,
+    SafetensorsQuantizedLinearScaleKind,
+    SafetensorsTensorSpan,
+)> {
+    let base_name = tensor_name.strip_suffix(".weight")?;
+    let scale_inv_name = format!("{base_name}.weight_scale_inv");
+    if let Some(scale) = entries.get(&scale_inv_name) {
+        return Some((
+            scale_inv_name,
+            SafetensorsQuantizedLinearScaleKind::WeightScaleInv,
+            scale.clone(),
+        ));
+    }
+
+    let scale_name = format!("{base_name}.weight_scale");
+    entries.get(&scale_name).map(|scale| {
+        (
+            scale_name,
+            SafetensorsQuantizedLinearScaleKind::WeightScale,
+            scale.clone(),
+        )
+    })
 }
 
 fn parse_routed_expert_weight_name(
