@@ -638,6 +638,17 @@ fn launch_mooncake_prefill_kv_layout(
     }
 }
 
+fn launch_mooncake_decode_kv_layout(
+    pd_config: &PdConfig,
+) -> Result<MooncakeKvCacheLayout, ServerLaunchError> {
+    let model_layout = pd_config
+        .kv_cache_model_layout
+        .as_ref()
+        .ok_or(PdConfigError::MissingMooncakeKvCacheModelLayout)?;
+    MooncakeKvCacheLayout::from_pd_config_model_layout(0, 0, pd_config, model_layout)
+        .map_err(Into::into)
+}
+
 #[cfg(not(feature = "mooncake-link"))]
 fn try_build_launch_mooncake_prefill_http_router_service(
     args: &ServerArgs,
@@ -659,6 +670,26 @@ fn try_build_launch_mooncake_prefill_http_router_service(
     try_build_bootstrap_mooncake_prefill_http_router_service(
         args,
         bootstrap_service,
+        transfer_executor,
+    )
+}
+
+#[cfg(not(feature = "mooncake-link"))]
+fn try_build_launch_mooncake_decode_http_router_service(
+    args: &ServerArgs,
+    pd_config: &PdConfig,
+) -> Result<
+    BootstrapPdHttpRouterService<MooncakeKvCacheTransferExecutor<UnlinkedMooncakeTransferEngine>>,
+    ServerLaunchError,
+> {
+    let transfer_executor = MooncakeKvCacheTransferExecutor::new(
+        UnlinkedMooncakeTransferEngine,
+        launch_mooncake_decode_kv_layout(pd_config)?,
+        MooncakeTransferTarget { target_id: 0 },
+    );
+    try_build_bootstrap_pd_http_router_service(
+        args,
+        DecodeBootstrapRegistry::default(),
         transfer_executor,
     )
 }
@@ -694,6 +725,38 @@ fn try_build_launch_mooncake_prefill_http_router_service(
     try_build_bootstrap_mooncake_prefill_http_router_service(
         args,
         bootstrap_service,
+        transfer_executor,
+    )
+}
+
+#[cfg(feature = "mooncake-link")]
+fn try_build_launch_mooncake_decode_http_router_service(
+    args: &ServerArgs,
+    pd_config: &PdConfig,
+) -> Result<
+    BootstrapPdHttpRouterService<
+        MooncakeKvCacheTransferExecutor<
+            SharedLinkedMooncakeTransferEngine,
+            MooncakeSessionTargetResolver<SharedLinkedMooncakeTransferEngine>,
+        >,
+    >,
+    ServerLaunchError,
+> {
+    let engine_config = MooncakeTransferEngineConfig::from_pd_config_for_rank(
+        prefill_mooncake_route_rank_ip(args),
+        0,
+        pd_config,
+    );
+    let engine = SharedLinkedMooncakeTransferEngine::new(&engine_config)?;
+    let target_resolver = MooncakeSessionTargetResolver::new(engine.clone(), Vec::new());
+    let transfer_executor = MooncakeKvCacheTransferExecutor::with_target_resolver(
+        engine,
+        launch_mooncake_decode_kv_layout(pd_config)?,
+        target_resolver,
+    );
+    try_build_bootstrap_pd_http_router_service(
+        args,
+        DecodeBootstrapRegistry::default(),
         transfer_executor,
     )
 }
@@ -819,6 +882,14 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let pd_config = PdConfig::from_server_args(&args)?;
+    if pd_config.mode == DisaggregationMode::Decode
+        && pd_config.transfer_backend == TransferBackend::Mooncake
+        && pd_config.kv_cache_model_layout.is_none()
+    {
+        return Err(ServerLaunchError::PdConfig(
+            PdConfigError::MissingMooncakeKvCacheModelLayout,
+        ));
+    }
     let addr = http_listen_addr(&args)?;
     match pd_config.mode {
         DisaggregationMode::Null => {
@@ -844,6 +915,10 @@ where
                 shutdown,
             )
             .await?;
+        }
+        DisaggregationMode::Decode if pd_config.transfer_backend == TransferBackend::Mooncake => {
+            let service = try_build_launch_mooncake_decode_http_router_service(&args, &pd_config)?;
+            serve_http_router_with_shutdown(addr, service, shutdown).await?;
         }
         _ => {
             return Err(ServerLaunchError::UnsupportedBootstrapPdRuntime {
