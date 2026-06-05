@@ -112,6 +112,12 @@ pub struct KvCacheWorkerId {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KvCacheWorkerSnapshot {
+    pub id: KvCacheWorkerId,
+    pub active_load: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KvBlockPrefixMatch {
     pub matched_blocks: usize,
     pub workers: BTreeSet<KvCacheWorkerId>,
@@ -157,6 +163,39 @@ impl KvBlockPrefixIndex {
             matched_blocks,
             workers,
         }
+    }
+
+    pub fn select_cache_aware_worker(
+        &self,
+        candidates: &[KvCacheWorkerSnapshot],
+        block_hashes: &[i64],
+        cache_threshold: f32,
+    ) -> Option<KvCacheWorkerId> {
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let matched = self.match_prefix(block_hashes);
+        let match_rate = if block_hashes.is_empty() {
+            0.0
+        } else {
+            matched.matched_blocks as f32 / block_hashes.len() as f32
+        };
+
+        if match_rate > cache_threshold && !matched.workers.is_empty() {
+            if let Some(worker) = candidates
+                .iter()
+                .filter(|candidate| matched.workers.contains(&candidate.id))
+                .min_by_key(|candidate| candidate.active_load)
+            {
+                return Some(worker.id.clone());
+            }
+        }
+
+        candidates
+            .iter()
+            .min_by_key(|candidate| candidate.active_load)
+            .map(|worker| worker.id.clone())
     }
 }
 

@@ -1,5 +1,6 @@
 use sglang_srt::cache::{
-    KvBlockPrefixIndex, KvCacheWorkerId, compute_sglang_block_hashes, sglang_sha256_digest_to_i64,
+    KvBlockPrefixIndex, KvCacheWorkerId, KvCacheWorkerSnapshot, compute_sglang_block_hashes,
+    sglang_sha256_digest_to_i64,
 };
 
 #[test]
@@ -124,9 +125,79 @@ fn kv_block_prefix_index_clear_worker_drops_all_worker_prefixes() {
     );
 }
 
+#[test]
+fn kv_block_prefix_index_selects_lowest_load_worker_among_cache_matches() {
+    let mut index = KvBlockPrefixIndex::default();
+    let worker_a = worker("http://prefill-a:30000", 0);
+    let worker_b = worker("http://prefill-b:30000", 0);
+    let worker_c = worker("http://prefill-c:30000", 0);
+    let block_hashes = compute_sglang_block_hashes(&[1, 2, 3, 4, 5, 6], 2);
+    index.insert(&worker_a, &block_hashes);
+    index.insert(&worker_b, &block_hashes);
+
+    let selected = index
+        .select_cache_aware_worker(
+            &workers_with_loads([(&worker_a, 7), (&worker_b, 2), (&worker_c, 0)]),
+            &block_hashes,
+            0.5,
+        )
+        .expect("cache-aware selector should choose a candidate");
+
+    assert_eq!(selected, worker_b);
+}
+
+#[test]
+fn kv_block_prefix_index_selects_lowest_load_worker_when_cache_misses() {
+    let index = KvBlockPrefixIndex::default();
+    let worker_a = worker("http://prefill-a:30000", 0);
+    let worker_b = worker("http://prefill-b:30000", 0);
+    let block_hashes = compute_sglang_block_hashes(&[1, 2, 3, 4], 2);
+
+    let selected = index
+        .select_cache_aware_worker(
+            &workers_with_loads([(&worker_a, 7), (&worker_b, 2)]),
+            &block_hashes,
+            0.5,
+        )
+        .expect("cache-aware selector should fall back to load");
+
+    assert_eq!(selected, worker_b);
+}
+
+#[test]
+fn kv_block_prefix_index_selects_lowest_load_worker_below_match_threshold() {
+    let mut index = KvBlockPrefixIndex::default();
+    let worker_a = worker("http://prefill-a:30000", 0);
+    let worker_b = worker("http://prefill-b:30000", 0);
+    let block_hashes = compute_sglang_block_hashes(&[1, 2, 3, 4, 5, 6], 2);
+    index.insert(&worker_a, &block_hashes[..1]);
+
+    let selected = index
+        .select_cache_aware_worker(
+            &workers_with_loads([(&worker_a, 7), (&worker_b, 2)]),
+            &block_hashes,
+            0.5,
+        )
+        .expect("cache-aware selector should fall back to load");
+
+    assert_eq!(selected, worker_b);
+}
+
 fn worker(endpoint: &str, dp_rank: u32) -> KvCacheWorkerId {
     KvCacheWorkerId {
         endpoint: endpoint.to_string(),
         dp_rank,
     }
+}
+
+fn workers_with_loads<const N: usize>(
+    workers: [(&KvCacheWorkerId, usize); N],
+) -> Vec<KvCacheWorkerSnapshot> {
+    workers
+        .into_iter()
+        .map(|(id, active_load)| KvCacheWorkerSnapshot {
+            id: id.clone(),
+            active_load,
+        })
+        .collect()
 }
