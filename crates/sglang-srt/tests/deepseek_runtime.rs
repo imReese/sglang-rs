@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use sglang_srt::cache::{CachePageAllocator, CachePageId, RadixCache};
 use sglang_srt::deepseek_runtime::{
     DeepSeekV4FeedForwardTensorDescriptors, DeepSeekV4Runtime, DeepSeekV4TensorPlacementKind,
+    DeepSeekV4TensorShardSelection,
 };
 use sglang_srt::model_artifacts::LocalModelArtifacts;
 use sglang_srt::model_executor::ModelWorkerBatch;
@@ -271,7 +272,79 @@ fn deepseek_v4_runtime_builds_tensor_parallel_placement_plan() {
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
 
+#[test]
+fn deepseek_v4_tensor_parallel_rank_plan_computes_tensor_slices() {
+    let model_dir = temp_model_dir("deepseek-runtime-tp-rank-shards");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_complete_deepseek_v4_checkpoint_with_shapes(
+        &model_dir,
+        &[
+            ("model.embed_tokens.weight", &[4, 2]),
+            ("lm_head.weight", &[4, 2]),
+            ("model.layers.0.self_attn.wq_b.weight", &[4, 2]),
+            ("model.layers.0.self_attn.wo_a.weight", &[4, 2]),
+            ("model.layers.0.self_attn.wo_b.weight", &[2, 4]),
+            ("model.layers.0.ffn.experts.0.w1.weight", &[4, 2]),
+            ("model.layers.0.ffn.experts.0.w2.weight", &[2, 4]),
+            ("model.layers.0.ffn.experts.0.w3.weight", &[4, 2]),
+        ],
+    );
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("artifacts should load");
+    let runtime =
+        DeepSeekV4Runtime::from_local_model_artifacts(&artifacts).expect("runtime should build");
+
+    let rank_plan = runtime
+        .tensor_parallel_placement_plan(2)
+        .rank_shard_plan(1)
+        .expect("rank 1 shard plan should build");
+
+    assert_eq!(rank_plan.tensor_parallel_size(), 2);
+    assert_eq!(rank_plan.tensor_parallel_rank(), 1);
+    assert_eq!(
+        rank_plan.selection_for("model.norm.weight"),
+        Some(DeepSeekV4TensorShardSelection::Full)
+    );
+    assert_eq!(
+        rank_plan.selection_for("model.embed_tokens.weight"),
+        Some(DeepSeekV4TensorShardSelection::Slice {
+            axis: 0,
+            range: 2..4
+        })
+    );
+    assert_eq!(
+        rank_plan.selection_for("model.layers.0.self_attn.wq_b.weight"),
+        Some(DeepSeekV4TensorShardSelection::Slice {
+            axis: 0,
+            range: 2..4
+        })
+    );
+    assert_eq!(
+        rank_plan.selection_for("model.layers.0.self_attn.wo_b.weight"),
+        Some(DeepSeekV4TensorShardSelection::Slice {
+            axis: 1,
+            range: 2..4
+        })
+    );
+    assert_eq!(
+        rank_plan.selection_for("model.layers.0.ffn.experts.0.w2.weight"),
+        Some(DeepSeekV4TensorShardSelection::Slice {
+            axis: 1,
+            range: 2..4
+        })
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
 fn write_complete_deepseek_v4_checkpoint(model_dir: &Path) {
+    write_complete_deepseek_v4_checkpoint_with_shapes(model_dir, &[]);
+}
+
+fn write_complete_deepseek_v4_checkpoint_with_shapes(
+    model_dir: &Path,
+    shape_overrides: &[(&str, &[usize])],
+) {
     fs::write(
         model_dir.join("config.json"),
         r#"{
@@ -392,6 +465,77 @@ fn write_complete_deepseek_v4_checkpoint(model_dir: &Path) {
         ],
     )
     .expect("shard should be written");
+    if !shape_overrides.is_empty() {
+        write_deepseek_v4_safetensors_with_shapes(model_dir, shape_overrides);
+    }
+}
+
+fn write_deepseek_v4_safetensors_with_shapes(model_dir: &Path, overrides: &[(&str, &[usize])]) {
+    let tensor_shapes = complete_deepseek_v4_tensor_shapes(overrides);
+    let mut offset = 0;
+    let tensors = tensor_shapes
+        .iter()
+        .map(|(name, shape)| {
+            let len = shape.iter().product::<usize>();
+            let tensor = (*name, "U8", shape.as_slice(), [offset, offset + len]);
+            offset += len;
+            tensor
+        })
+        .collect::<Vec<_>>();
+    let payload = (0..offset)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    write_safetensors_file(&model_dir.join("model.safetensors"), &tensors, &payload)
+        .expect("shardable safetensors should be written");
+}
+
+fn complete_deepseek_v4_tensor_shapes(
+    overrides: &[(&str, &[usize])],
+) -> Vec<(&'static str, Vec<usize>)> {
+    let names = [
+        "model.embed_tokens.weight",
+        "model.norm.weight",
+        "lm_head.weight",
+        "model.hc_head_fn",
+        "model.hc_head_base",
+        "model.hc_head_scale",
+        "model.layers.0.self_attn.wq_a.weight",
+        "model.layers.0.self_attn.wq_b.weight",
+        "model.layers.0.self_attn.wkv.weight",
+        "model.layers.0.self_attn.q_norm.weight",
+        "model.layers.0.self_attn.kv_norm.weight",
+        "model.layers.0.self_attn.wo_a.weight",
+        "model.layers.0.self_attn.wo_b.weight",
+        "model.layers.0.input_layernorm.weight",
+        "model.layers.0.post_attention_layernorm.weight",
+        "model.layers.0.hc_attn_fn",
+        "model.layers.0.hc_attn_base",
+        "model.layers.0.hc_attn_scale",
+        "model.layers.0.hc_ffn_fn",
+        "model.layers.0.hc_ffn_base",
+        "model.layers.0.hc_ffn_scale",
+        "model.layers.0.mlp.gate.weight",
+        "model.layers.0.ffn.experts.0.w1.weight",
+        "model.layers.0.ffn.experts.0.w2.weight",
+        "model.layers.0.ffn.experts.0.w3.weight",
+    ];
+    names
+        .into_iter()
+        .map(|name| {
+            let shape = overrides
+                .iter()
+                .find(|(override_name, _)| *override_name == name)
+                .map(|(_, shape)| shape.to_vec())
+                .unwrap_or_else(|| {
+                    if name.ends_with("_fn") {
+                        vec![1, 1]
+                    } else {
+                        vec![1]
+                    }
+                });
+            (name, shape)
+        })
+        .collect()
 }
 
 fn write_safetensors_file(

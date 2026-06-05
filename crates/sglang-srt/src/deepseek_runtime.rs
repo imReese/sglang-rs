@@ -525,6 +525,13 @@ impl DeepSeekV4TensorPlacementPlan {
             .find(|entry| entry.tensor().tensor_name() == tensor_name)
             .map(DeepSeekV4TensorPlacement::kind)
     }
+
+    pub fn rank_shard_plan(
+        &self,
+        tensor_parallel_rank: usize,
+    ) -> Result<DeepSeekV4TensorRankShardPlan, DeepSeekV4TensorShardPlanError> {
+        DeepSeekV4TensorRankShardPlan::from_placement_plan(self, tensor_parallel_rank)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -541,6 +548,188 @@ impl DeepSeekV4TensorPlacement {
     pub fn kind(&self) -> DeepSeekV4TensorPlacementKind {
         self.kind
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeepSeekV4TensorShardSelection {
+    Full,
+    Slice { axis: usize, range: Range<usize> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeepSeekV4TensorRankShardPlan {
+    tensor_parallel_size: usize,
+    tensor_parallel_rank: usize,
+    shards: Vec<DeepSeekV4TensorShard>,
+}
+
+impl DeepSeekV4TensorRankShardPlan {
+    fn from_placement_plan(
+        plan: &DeepSeekV4TensorPlacementPlan,
+        tensor_parallel_rank: usize,
+    ) -> Result<Self, DeepSeekV4TensorShardPlanError> {
+        if tensor_parallel_rank >= plan.tensor_parallel_size {
+            return Err(DeepSeekV4TensorShardPlanError::RankOutOfBounds {
+                tensor_parallel_rank,
+                tensor_parallel_size: plan.tensor_parallel_size,
+            });
+        }
+
+        let shards = plan
+            .entries()
+            .iter()
+            .map(|entry| {
+                let selection = shard_selection_for_entry(
+                    entry,
+                    plan.tensor_parallel_size,
+                    tensor_parallel_rank,
+                )?;
+                Ok(DeepSeekV4TensorShard {
+                    tensor: entry.tensor().clone(),
+                    kind: entry.kind(),
+                    selection,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            tensor_parallel_size: plan.tensor_parallel_size,
+            tensor_parallel_rank,
+            shards,
+        })
+    }
+
+    pub fn tensor_parallel_size(&self) -> usize {
+        self.tensor_parallel_size
+    }
+
+    pub fn tensor_parallel_rank(&self) -> usize {
+        self.tensor_parallel_rank
+    }
+
+    pub fn shards(&self) -> &[DeepSeekV4TensorShard] {
+        &self.shards
+    }
+
+    pub fn selection_for(&self, tensor_name: &str) -> Option<DeepSeekV4TensorShardSelection> {
+        self.shards
+            .iter()
+            .find(|shard| shard.tensor().tensor_name() == tensor_name)
+            .map(|shard| shard.selection().clone())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeepSeekV4TensorShard {
+    tensor: DeepSeekTensorDescriptor,
+    kind: DeepSeekV4TensorPlacementKind,
+    selection: DeepSeekV4TensorShardSelection,
+}
+
+impl DeepSeekV4TensorShard {
+    pub fn tensor(&self) -> &DeepSeekTensorDescriptor {
+        &self.tensor
+    }
+
+    pub fn kind(&self) -> DeepSeekV4TensorPlacementKind {
+        self.kind
+    }
+
+    pub fn selection(&self) -> &DeepSeekV4TensorShardSelection {
+        &self.selection
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeepSeekV4TensorShardPlanError {
+    RankOutOfBounds {
+        tensor_parallel_rank: usize,
+        tensor_parallel_size: usize,
+    },
+    TensorAxisOutOfBounds {
+        tensor_name: String,
+        axis: usize,
+        shape: Vec<usize>,
+    },
+    TensorDimensionNotDivisible {
+        tensor_name: String,
+        axis: usize,
+        dimension: usize,
+        tensor_parallel_size: usize,
+    },
+}
+
+impl fmt::Display for DeepSeekV4TensorShardPlanError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RankOutOfBounds {
+                tensor_parallel_rank,
+                tensor_parallel_size,
+            } => write!(
+                formatter,
+                "tensor parallel rank {tensor_parallel_rank} must be < tensor parallel size {tensor_parallel_size}"
+            ),
+            Self::TensorAxisOutOfBounds {
+                tensor_name,
+                axis,
+                shape,
+            } => write!(
+                formatter,
+                "tensor {tensor_name} placement axis {axis} is out of bounds for shape {shape:?}"
+            ),
+            Self::TensorDimensionNotDivisible {
+                tensor_name,
+                axis,
+                dimension,
+                tensor_parallel_size,
+            } => write!(
+                formatter,
+                "tensor {tensor_name} axis {axis} dimension {dimension} is not divisible by tensor parallel size {tensor_parallel_size}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DeepSeekV4TensorShardPlanError {}
+
+fn shard_selection_for_entry(
+    entry: &DeepSeekV4TensorPlacement,
+    tensor_parallel_size: usize,
+    tensor_parallel_rank: usize,
+) -> Result<DeepSeekV4TensorShardSelection, DeepSeekV4TensorShardPlanError> {
+    let axis = match entry.kind() {
+        DeepSeekV4TensorPlacementKind::Replicated => {
+            return Ok(DeepSeekV4TensorShardSelection::Full);
+        }
+        DeepSeekV4TensorPlacementKind::VocabParallel { axis }
+        | DeepSeekV4TensorPlacementKind::ColumnParallel { axis }
+        | DeepSeekV4TensorPlacementKind::RowParallel { axis } => axis,
+    };
+    let shape = entry.tensor().shape();
+    let Some(&dimension) = shape.get(axis) else {
+        return Err(DeepSeekV4TensorShardPlanError::TensorAxisOutOfBounds {
+            tensor_name: entry.tensor().tensor_name().to_string(),
+            axis,
+            shape: shape.to_vec(),
+        });
+    };
+    if dimension % tensor_parallel_size != 0 {
+        return Err(
+            DeepSeekV4TensorShardPlanError::TensorDimensionNotDivisible {
+                tensor_name: entry.tensor().tensor_name().to_string(),
+                axis,
+                dimension,
+                tensor_parallel_size,
+            },
+        );
+    }
+    let shard_size = dimension / tensor_parallel_size;
+    let start = tensor_parallel_rank * shard_size;
+
+    Ok(DeepSeekV4TensorShardSelection::Slice {
+        axis,
+        range: start..start + shard_size,
+    })
 }
 
 fn push_placement(
