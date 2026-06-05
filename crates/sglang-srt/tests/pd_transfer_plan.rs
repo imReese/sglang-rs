@@ -1,6 +1,7 @@
 use sglang_srt::cache::{CachePageAllocator, CachePageId, RadixCache};
 use sglang_srt::engine::{Engine, RuntimeError};
 use sglang_srt::model_executor::ModelWorkerBatch;
+use sglang_srt::pd_bootstrap::{MooncakeBootstrapKvCacheTransferExecutor, PrefillBootstrapService};
 use sglang_srt::router::{RouterRuntime, RouterTransferPollResponse};
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler, SchedulerError};
 use sglang_srt::tokenizer::ByteTokenizer;
@@ -1109,6 +1110,49 @@ fn mooncake_executor_submits_remote_kv_layouts_for_each_session_in_room() {
 }
 
 #[test]
+fn mooncake_bootstrap_executor_refreshes_remote_layouts_before_submit() {
+    let transfer_plan =
+        transfer_plan_for_request("pd-mooncake-bootstrap-refresh", &[60, 61], None, 34);
+    let mut registry = registry_with_session("pd-mooncake-bootstrap-refresh", 34);
+    let bootstrap_service = PrefillBootstrapService::default();
+    {
+        let mut state = bootstrap_service
+            .state()
+            .lock()
+            .expect("bootstrap state lock should be held");
+        state
+            .ingest_mooncake_bootstrap_frame(&kv_args_frame("session-a", &[0x9000], 128))
+            .expect("KVArgs frame should parse");
+        state
+            .ingest_mooncake_bootstrap_frame(&transfer_metadata_frame(34, "session-a", &[4, 5]))
+            .expect("transfer metadata frame should parse");
+    }
+    let inner = MooncakeKvCacheTransferExecutor::with_target_resolver(
+        RecordingMooncakeSubmitter::default(),
+        MooncakeKvCacheLayout {
+            source_base_addr: 0x2000,
+            page_size_bytes: 128,
+            target_base_offset: 0xdead_0000,
+        },
+        SessionTargetResolver {
+            targets: vec![("session-a".to_string(), 7)],
+        },
+    );
+    let mut executor = MooncakeBootstrapKvCacheTransferExecutor::new(bootstrap_service, inner);
+
+    execute_kv_cache_transfer_plan(&mut registry, &mut executor, &transfer_plan)
+        .expect("bootstrap-backed Mooncake executor should submit");
+
+    let submitted_requests = &executor.inner().submitter().submitted_requests;
+    assert_eq!(submitted_requests.len(), 1);
+    assert_eq!(submitted_requests[0].len(), 2);
+    assert_eq!(submitted_requests[0][0].target_id, 7);
+    assert_eq!(submitted_requests[0][0].target_offset, 0x9000 + 4 * 128);
+    assert_eq!(submitted_requests[0][1].target_id, 7);
+    assert_eq!(submitted_requests[0][1].target_offset, 0x9000 + 5 * 128);
+}
+
+#[test]
 fn mooncake_executor_clears_completed_submitted_transfers_after_poll() {
     let transfer_plan = transfer_plan_for_request("pd-mooncake-cleanup", &[61, 62], None, 28);
     let mut registry = registry_with_session("pd-mooncake-cleanup", 28);
@@ -1709,6 +1753,59 @@ fn registry_with_session(request_id: &str, bootstrap_room: i32) -> DecodeBootstr
         ))
         .expect("session should register");
     registry
+}
+
+fn kv_args_frame(session_id: &str, dst_kv_ptrs: &[u64], dst_kv_item_len: usize) -> Vec<Vec<u8>> {
+    vec![
+        b"None".to_vec(),
+        b"10.0.0.9".to_vec(),
+        b"41001".to_vec(),
+        session_id.as_bytes().to_vec(),
+        pack_u64s(dst_kv_ptrs),
+        pack_u64s(&[]),
+        pack_list_of_buffers(&[]),
+        b"1".to_vec(),
+        b"8".to_vec(),
+        dst_kv_item_len.to_string().into_bytes(),
+    ]
+}
+
+fn transfer_metadata_frame(room: i32, session_id: &str, dst_kv_indices: &[i32]) -> Vec<Vec<u8>> {
+    vec![
+        room.to_string().into_bytes(),
+        b"10.0.0.9".to_vec(),
+        b"41001".to_vec(),
+        session_id.as_bytes().to_vec(),
+        pack_i32s(dst_kv_indices),
+        b"11".to_vec(),
+        pack_list_of_buffers(&[]),
+        b"1".to_vec(),
+        b"64".to_vec(),
+    ]
+}
+
+fn pack_u64s(values: &[u64]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+fn pack_i32s(values: &[i32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+fn pack_list_of_buffers(buffers: &[Vec<u8>]) -> Vec<u8> {
+    let mut packed = Vec::new();
+    packed.extend_from_slice(&(buffers.len() as u32).to_le_bytes());
+    for buffer in buffers {
+        packed.extend_from_slice(&(buffer.len() as u32).to_le_bytes());
+        packed.extend_from_slice(buffer);
+    }
+    packed
 }
 
 fn disaggregated_params(bootstrap_room: i32) -> DisaggregatedParams {

@@ -15,7 +15,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use zeromq::{PullSocket, PushSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
-use crate::transfer::{KvPoll, MooncakeRemoteKvLayout};
+use crate::transfer::{
+    DecodeBootstrapRegistry, KvCacheTransferError, KvCacheTransferExecutor, KvPoll,
+    MooncakeBatchReleaser, MooncakeKvCacheTransferExecutor, MooncakeRemoteKvLayout,
+    MooncakeTransferPollSummary, MooncakeTransferStatusReader, MooncakeTransferSubmitter,
+    MooncakeTransferTargetResolver,
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct PrefillBootstrapService {
@@ -34,6 +39,71 @@ impl PrefillBootstrapService {
             .route("/register_dp_rank", post(register_dp_rank))
             .route("/query_dp_ranks", post(query_dp_ranks))
             .with_state(self)
+    }
+}
+
+pub struct MooncakeBootstrapKvCacheTransferExecutor<E> {
+    bootstrap_service: PrefillBootstrapService,
+    inner: E,
+}
+
+impl<E> MooncakeBootstrapKvCacheTransferExecutor<E> {
+    pub fn new(bootstrap_service: PrefillBootstrapService, inner: E) -> Self {
+        Self {
+            bootstrap_service,
+            inner,
+        }
+    }
+
+    pub fn bootstrap_service(&self) -> &PrefillBootstrapService {
+        &self.bootstrap_service
+    }
+
+    pub fn inner(&self) -> &E {
+        &self.inner
+    }
+
+    pub fn inner_mut(&mut self) -> &mut E {
+        &mut self.inner
+    }
+}
+
+impl<S, R> KvCacheTransferExecutor
+    for MooncakeBootstrapKvCacheTransferExecutor<MooncakeKvCacheTransferExecutor<S, R>>
+where
+    S: MooncakeTransferSubmitter + MooncakeTransferStatusReader + MooncakeBatchReleaser,
+    R: MooncakeTransferTargetResolver,
+{
+    fn transfer_span(
+        &mut self,
+        span: &crate::transfer::KvCacheTransferSpan,
+    ) -> Result<(), KvCacheTransferError> {
+        let remote_layouts = {
+            let state = self
+                .bootstrap_service
+                .state()
+                .lock()
+                .expect("prefill bootstrap state lock should be held");
+            state
+                .remote_kv_layouts_for_room(span.bootstrap_room())
+                .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?
+        };
+        for (session_id, layout) in remote_layouts {
+            self.inner
+                .insert_remote_kv_session_layout(span.bootstrap_room(), session_id, layout);
+        }
+        self.inner.transfer_span(span)
+    }
+
+    fn completes_inline(&self) -> bool {
+        self.inner.completes_inline()
+    }
+
+    fn poll_transfers(
+        &mut self,
+        registry: &mut DecodeBootstrapRegistry,
+    ) -> Result<MooncakeTransferPollSummary, KvCacheTransferError> {
+        self.inner.poll_transfers(registry)
     }
 }
 
