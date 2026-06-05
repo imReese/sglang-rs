@@ -33,6 +33,7 @@ reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls"], defau
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+sglang-srt = { path = "../sglang-srt" }
 # `humantime-serde` lets `WorkerConfig.request_timeout` accept human-readable
 # durations like `"60s"` / `"500ms"` / `"2m"` in YAML / TOML, rather than
 # forcing operators to write raw milliseconds.
@@ -48,6 +49,7 @@ futures = "0.3"
 bytes = "1"
 rand = "0.8"
 tokio-stream = "0.1"
+tonic = "0.14.6"
 dashmap = "6"
 serde_yaml = "0.9"
 toml = "0.8"
@@ -70,7 +72,6 @@ dirs = "5"
 http-body-util = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sglang-srt = { path = "../sglang-srt" }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1.42", features = ["test-util"] }

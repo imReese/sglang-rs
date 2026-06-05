@@ -9,14 +9,15 @@
 //!
 //! Each emitted [`WorkerSpec`] uses the URL itself as the `WorkerId` and
 //! seeds `mode = Plain` with empty `model_ids` and `bootstrap_port = None`.
-//! The worker manager fills those in from each worker's `/server_info`
-//! response (see [`crate::workers::introspect`]) and overrides the seeded
+//! The worker manager fills those in from each worker's server-info
+//! response (HTTP `/server_info` or gRPC `GetServerInfo`; see
+//! [`crate::workers::introspect`]) and overrides the seeded
 //! mode/bootstrap when the worker self-discloses a PD role — so prefill,
 //! decode, and plain workers can all appear in the same `urls` list and
 //! end up classified correctly.
 //!
 //! Requires modern SGLang that exposes `disaggregation_mode` in
-//! `/server_info`. Workers on older SGLang versions that predate that
+//! server-info. Workers on older SGLang versions that predate that
 //! field stay seeded as `Plain` because the manager has no signal to
 //! override with — operators running PD with such a worker should use
 //! the K8s backend (which can still classify via pod labels).

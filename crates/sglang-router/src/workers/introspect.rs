@@ -1,11 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Single-shot `/server_info` introspection for newly-discovered workers.
+//! Single-shot server-info introspection for newly-discovered workers.
 //!
 //! Combines what used to be two separate round-trips (the worker
 //! manager's `served_model_name` fetch and `KvEventIndex::add_worker`'s
-//! `fetch_event_config`) into one HTTP request. The result is dispatched
+//! `fetch_event_config`) into one worker-info request. HTTP workers use
+//! `GET /server_info`; gRPC workers use `SglangService/GetServerInfo`.
+//! The result is dispatched
 //! by the manager: registry consumes `served_model_name`, the optional
 //! `KvEventIndex` consumes the resolved `EventConfig`.
 //!
@@ -19,9 +21,13 @@
 //! directly (it returns `Result<Option<EventConfig>>`); the manager
 //! intentionally doesn't.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use serde::Deserialize;
+use sglang_srt::proto::sglang::runtime::v1::sglang_service_client::SglangServiceClient;
+use sglang_srt::proto::sglang::runtime::v1::GetServerInfoRequest;
+use tonic::Request;
 use tracing::warn;
 use url::Url;
 
@@ -68,7 +74,7 @@ pub enum DisaggregationRole {
     Decode,
 }
 
-/// Performs the single `/server_info` round-trip and projects the
+/// Performs the single server-info round-trip and projects the
 /// response into both halves of `ServerInfo`. Cheap to clone — wraps a
 /// `reqwest::Client` (which is internally `Arc`-backed).
 #[derive(Clone)]
@@ -95,7 +101,7 @@ impl WorkerIntrospector {
         Self { client }
     }
 
-    /// Fetch `/server_info` for the worker.  Never returns an error:
+    /// Fetch server-info for the worker.  Never returns an error:
     /// any failure is logged at `warn!` and yields a default
     /// `ServerInfo` with both halves `None`. Callers register the
     /// worker with empty model IDs and no event subscription on the
@@ -106,6 +112,10 @@ impl WorkerIntrospector {
     /// responses and JSON-parse errors short-circuit immediately —
     /// the worker answered authoritatively, retrying won't help.
     pub async fn fetch(&self, worker_url: &str) -> ServerInfo {
+        if is_grpc_worker_url(worker_url) {
+            return self.fetch_grpc(worker_url).await;
+        }
+
         let server_info_url = format!("{}/server_info", worker_url.trim_end_matches('/'));
         let parsed = match Self::fetch_with_retry(&self.client, &server_info_url, worker_url).await
         {
@@ -113,33 +123,16 @@ impl WorkerIntrospector {
             None => return ServerInfo::default(),
         };
 
-        let served_model_name = match parsed.served_model_name {
-            Some(name) if !name.is_empty() => Some(name),
-            Some(_) => {
-                warn!(
-                    worker_url = %worker_url,
-                    "introspect: /server_info has empty `served_model_name`; registering worker with empty model_ids"
-                );
-                None
-            }
-            None => None,
+        server_info_from_body(parsed, worker_url)
+    }
+
+    async fn fetch_grpc(&self, worker_url: &str) -> ServerInfo {
+        let parsed = match Self::fetch_grpc_with_retry(worker_url).await {
+            Some(p) => p,
+            None => return ServerInfo::default(),
         };
 
-        let event_config = parsed
-            .kv_events
-            .map(|block| resolve_event_config(block, worker_url));
-
-        let disaggregation_role = resolve_disaggregation_role(
-            parsed.disaggregation_mode.as_deref(),
-            parsed.disaggregation_bootstrap_port,
-            worker_url,
-        );
-
-        ServerInfo {
-            served_model_name,
-            event_config,
-            disaggregation_role,
-        }
+        server_info_from_body(parsed, worker_url)
     }
 
     /// Issue the `/server_info` GET with bounded retry on transient
@@ -200,6 +193,106 @@ impl WorkerIntrospector {
             "introspect: /server_info failed after retries; registering worker with empty model_ids"
         );
         None
+    }
+
+    async fn fetch_grpc_with_retry(worker_url: &str) -> Option<ServerInfoBody> {
+        let endpoint = match grpc_endpoint_url(worker_url) {
+            Some(endpoint) => endpoint,
+            None => {
+                warn!(
+                    worker_url = %worker_url,
+                    "introspect: invalid gRPC worker URL; registering worker with empty model_ids"
+                );
+                return None;
+            }
+        };
+
+        let mut delay = FETCH_BACKOFF_BASE;
+        for attempt in 1..=FETCH_MAX_ATTEMPTS {
+            match fetch_grpc_server_info_once(&endpoint).await {
+                Ok(body) => return Some(body),
+                Err(e) => {
+                    warn!(
+                        worker_url = %worker_url,
+                        attempt,
+                        error = %e,
+                        "introspect: gRPC GetServerInfo request failed; will retry"
+                    );
+                }
+            }
+            if attempt < FETCH_MAX_ATTEMPTS {
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+        }
+        warn!(
+            worker_url = %worker_url,
+            attempts = FETCH_MAX_ATTEMPTS,
+            "introspect: gRPC GetServerInfo failed after retries; registering worker with empty model_ids"
+        );
+        None
+    }
+}
+
+async fn fetch_grpc_server_info_once(endpoint: &str) -> Result<ServerInfoBody, String> {
+    let channel = tonic::transport::Endpoint::from_shared(endpoint.to_string())
+        .map_err(|e| format!("invalid endpoint: {e}"))?
+        .connect_timeout(SERVER_INFO_TIMEOUT)
+        .timeout(SERVER_INFO_TIMEOUT)
+        .connect()
+        .await
+        .map_err(|e| format!("connect failed: {e}"))?;
+    let mut client = SglangServiceClient::new(channel);
+    let response = client
+        .get_server_info(Request::new(GetServerInfoRequest {}))
+        .await
+        .map_err(|e| format!("GetServerInfo failed: {e}"))?
+        .into_inner();
+
+    Ok(ServerInfoBody::from_grpc_attributes(response.attributes))
+}
+
+fn is_grpc_worker_url(worker_url: &str) -> bool {
+    worker_url.starts_with("grpc://") || worker_url.starts_with("grpcs://")
+}
+
+fn grpc_endpoint_url(worker_url: &str) -> Option<String> {
+    if let Some(rest) = worker_url.strip_prefix("grpc://") {
+        return Some(format!("http://{rest}"));
+    }
+    if let Some(rest) = worker_url.strip_prefix("grpcs://") {
+        return Some(format!("https://{rest}"));
+    }
+    None
+}
+
+fn server_info_from_body(parsed: ServerInfoBody, worker_url: &str) -> ServerInfo {
+    let served_model_name = match parsed.served_model_name {
+        Some(name) if !name.is_empty() => Some(name),
+        Some(_) => {
+            warn!(
+                worker_url = %worker_url,
+                "introspect: server info has empty `served_model_name`; registering worker with empty model_ids"
+            );
+            None
+        }
+        None => None,
+    };
+
+    let event_config = parsed
+        .kv_events
+        .map(|block| resolve_event_config(block, worker_url));
+
+    let disaggregation_role = resolve_disaggregation_role(
+        parsed.disaggregation_mode.as_deref(),
+        parsed.disaggregation_bootstrap_port,
+        worker_url,
+    );
+
+    ServerInfo {
+        served_model_name,
+        event_config,
+        disaggregation_role,
     }
 }
 
@@ -314,6 +407,62 @@ struct ServerInfoBody {
     /// bootstrap server binds to exactly this port (no internal offset).
     #[serde(default)]
     disaggregation_bootstrap_port: Option<u16>,
+}
+
+impl ServerInfoBody {
+    fn from_grpc_attributes(attributes: HashMap<String, String>) -> Self {
+        let served_model_name = non_empty_attribute(&attributes, "served_model_name");
+        let disaggregation_mode = non_empty_attribute(&attributes, "disaggregation_mode");
+        let disaggregation_bootstrap_port =
+            parse_u16_attribute(&attributes, "disaggregation_bootstrap_port");
+        let kv_events = kv_events_block_from_attributes(&attributes);
+
+        Self {
+            served_model_name,
+            kv_events,
+            disaggregation_mode,
+            disaggregation_bootstrap_port,
+        }
+    }
+}
+
+fn non_empty_attribute(attributes: &HashMap<String, String>, key: &str) -> Option<String> {
+    attributes
+        .get(key)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn parse_u16_attribute(attributes: &HashMap<String, String>, key: &str) -> Option<u16> {
+    attributes
+        .get(key)
+        .and_then(|value| value.parse::<u16>().ok())
+}
+
+fn parse_u32_attribute(attributes: &HashMap<String, String>, key: &str) -> Option<u32> {
+    attributes
+        .get(key)
+        .and_then(|value| value.parse::<u32>().ok())
+}
+
+fn kv_events_block_from_attributes(attributes: &HashMap<String, String>) -> Option<KvEventsBlock> {
+    let endpoint_host = non_empty_attribute(attributes, "kv_events.endpoint_host")?;
+    let endpoint_port_base = parse_u16_attribute(attributes, "kv_events.endpoint_port_base")?;
+    let block_size = parse_u32_attribute(attributes, "kv_events.block_size")?;
+    let dp_size = parse_u32_attribute(attributes, "kv_events.dp_size")?;
+
+    Some(KvEventsBlock {
+        publisher: non_empty_attribute(attributes, "kv_events.publisher"),
+        endpoint_host,
+        endpoint_port_base,
+        topic: attributes
+            .get("kv_events.topic")
+            .cloned()
+            .unwrap_or_default(),
+        block_size,
+        dp_size,
+    })
 }
 
 #[derive(Debug, Deserialize)]

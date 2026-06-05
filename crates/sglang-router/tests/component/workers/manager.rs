@@ -5,6 +5,9 @@ use axum::{routing::get, Json, Router};
 use serde_json::{json, Value};
 use sgl_router::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::workers::{manager, WorkerRegistry};
+use sglang_srt::cli::ServerArgs;
+use sglang_srt::server::launch_grpc_server_with_shutdown;
+use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -46,6 +49,13 @@ fn spec_for(id: &str, url: &str, mode: WorkerMode) -> WorkerSpec {
         model_ids: Vec::new(),
         bootstrap_port: None,
     }
+}
+
+fn unused_local_addr() -> SocketAddr {
+    let listener = StdTcpListener::bind(("127.0.0.1", 0)).expect("ephemeral port should bind");
+    listener
+        .local_addr()
+        .expect("ephemeral listener should have local addr")
 }
 
 #[tokio::test]
@@ -133,6 +143,72 @@ async fn manager_handles_mode_changed() {
 
     drop(tx);
     h.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manager_resolves_pd_role_from_real_srt_grpc_server_info() {
+    let grpc_addr = unused_local_addr();
+    let bootstrap_addr = unused_local_addr();
+    let zmq_addr = unused_local_addr();
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "tiny",
+        "--host",
+        &grpc_addr.ip().to_string(),
+        "--port",
+        &grpc_addr.port().to_string(),
+        "--grpc-mode",
+        "--disaggregation-mode",
+        "prefill",
+        "--disaggregation-transfer-backend",
+        "mooncake",
+        "--disaggregation-bootstrap-port",
+        &bootstrap_addr.port().to_string(),
+        "--disaggregation-zmq-ports",
+        &format!("{}-{}", zmq_addr.port(), zmq_addr.port()),
+        "--page-size",
+        "64",
+    ])
+    .expect("gRPC SRT args should parse");
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(launch_grpc_server_with_shutdown(args, async move {
+        let _ = shutdown_rx.await;
+    }));
+
+    let (tx, rx) = mpsc::channel(8);
+    let registry = Arc::new(WorkerRegistry::default());
+    let manager = tokio::spawn(manager::run(rx, Arc::clone(&registry)));
+    tx.send(DiscoveryEvent::Added(spec_for(
+        "grpc-prefill",
+        &format!("grpc://{grpc_addr}"),
+        WorkerMode::Plain,
+    )))
+    .await
+    .expect("worker discovery event should send");
+    drop(tx);
+    manager
+        .await
+        .expect("worker manager should finish after discovery sender closes");
+
+    let workers = registry.workers_for_mode(&ModelId("tiny".into()), WorkerMode::Prefill);
+    assert_eq!(
+        workers.len(),
+        1,
+        "manager should classify real Rust SRT gRPC prefill worker from GetServerInfo"
+    );
+    assert_eq!(workers[0].bootstrap_port(), Some(bootstrap_addr.port()));
+
+    shutdown_tx
+        .send(())
+        .expect("gRPC worker should still be running");
+    server
+        .await
+        .expect("gRPC server task should join")
+        .expect("gRPC server should stop cleanly");
 }
 
 #[tokio::test]

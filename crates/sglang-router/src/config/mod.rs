@@ -62,10 +62,10 @@ impl Config {
                         anyhow!("discovery.static_urls.urls entry {raw:?} is not a valid URL: {e}")
                     })?;
                     match parsed.scheme() {
-                        "http" | "https" => {}
+                        "http" | "https" | "grpc" | "grpcs" => {}
                         other => {
                             return Err(anyhow!(
-                                "discovery.static_urls.urls entry {raw:?} has unsupported scheme {other:?}; only http and https are supported"
+                                "discovery.static_urls.urls entry {raw:?} has unsupported scheme {other:?}; only http, https, grpc, and grpcs are supported"
                             ));
                         }
                     }
@@ -215,6 +215,38 @@ urls = ["http://10.0.0.1:30000", "http://10.0.0.2:30000"]
     }
 
     #[test]
+    fn loads_static_urls_discovery_with_grpc_worker_urls() {
+        let c = load(
+            "toml",
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8090
+[[models]]
+id = "qwen3-0.6b"
+tokenizer_path = "/tmp/qwen.json"
+[discovery]
+backend = "static_urls"
+[discovery.static_urls]
+urls = ["grpc://127.0.0.1:30001", "grpcs://worker.example.com:30002"]
+"#,
+        )
+        .unwrap();
+        match &c.discovery.backend {
+            DiscoveryBackend::StaticUrls(s) => {
+                assert_eq!(
+                    s.urls,
+                    vec![
+                        "grpc://127.0.0.1:30001".to_string(),
+                        "grpcs://worker.example.com:30002".to_string(),
+                    ],
+                );
+            }
+            _ => panic!("expected static_urls backend"),
+        }
+    }
+
+    #[test]
     fn rejects_static_urls_with_empty_list() {
         let err = load(
             "toml",
@@ -334,11 +366,10 @@ urls = ["10.0.0.1:30000"]
         );
     }
 
-    /// Non-http(s) schemes are rejected. The router speaks HTTP to
-    /// workers; a `tcp://` or `ws://` entry is almost certainly an
-    /// operator typo.
+    /// Schemes outside the router's worker transports are rejected; a
+    /// `tcp://` or `ws://` entry is almost certainly an operator typo.
     #[test]
-    fn rejects_static_urls_with_non_http_scheme() {
+    fn rejects_static_urls_with_unsupported_scheme() {
         let err = load(
             "toml",
             r#"
