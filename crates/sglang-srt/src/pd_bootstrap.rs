@@ -13,6 +13,8 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::transfer::KvPoll;
+
 #[derive(Clone, Debug, Default)]
 pub struct PrefillBootstrapService {
     state: Arc<Mutex<PrefillBootstrapState>>,
@@ -46,9 +48,64 @@ pub struct PrefillBootstrapState {
     prefill_port_table:
         BTreeMap<usize, BTreeMap<usize, BTreeMap<usize, BTreeMap<usize, PrefillRankInfo>>>>,
     room_to_dp_rank: BTreeMap<i32, RegisteredDpRank>,
+    decode_kv_args_table: BTreeMap<String, MooncakeKvArgsRegisterInfo>,
+    transfer_rooms: BTreeMap<i32, MooncakeTransferRoom>,
 }
 
 impl PrefillBootstrapState {
+    pub fn ingest_mooncake_bootstrap_frame(
+        &mut self,
+        frame: &[Vec<u8>],
+    ) -> Result<(), MooncakeBootstrapFrameError> {
+        let room = ascii_field(frame, 0, "room")?;
+        match room {
+            "WATERMARK" | "STAGING_RSP" => Ok(()),
+            "None" => {
+                let register = MooncakeKvArgsRegisterInfo::from_frame(frame)?;
+                self.decode_kv_args_table
+                    .insert(register.mooncake_session_id.clone(), register);
+                Ok(())
+            }
+            _ => {
+                let transfer = MooncakeTransferInfo::from_frame(frame)?;
+                let room = transfer.room;
+                let session = transfer.mooncake_session_id.clone();
+                let required_dst_info_num = transfer.required_dst_info_num;
+                let decode_prefix_len = transfer.decode_prefix_len;
+                let room_state =
+                    self.transfer_rooms
+                        .entry(room)
+                        .or_insert_with(|| MooncakeTransferRoom {
+                            required_dst_info_num,
+                            status: KvPoll::Bootstrapping,
+                            decode_prefix_len: None,
+                            transfers: BTreeMap::new(),
+                        });
+                room_state.required_dst_info_num = required_dst_info_num;
+                if room_state.decode_prefix_len.is_none() && decode_prefix_len.is_some() {
+                    room_state.decode_prefix_len = decode_prefix_len;
+                }
+                room_state.transfers.insert(session, transfer);
+                if room_state.transfers.len() == room_state.required_dst_info_num {
+                    room_state.status = KvPoll::WaitingForInput;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub fn decode_kv_args(&self, session_id: &str) -> Option<&MooncakeKvArgsRegisterInfo> {
+        self.decode_kv_args_table.get(session_id)
+    }
+
+    pub fn transfer_room(&self, room: i32) -> Option<&MooncakeTransferRoom> {
+        self.transfer_rooms.get(&room)
+    }
+
+    pub fn transfer_status(&self, room: i32) -> Option<KvPoll> {
+        self.transfer_rooms.get(&room).map(|room| room.status)
+    }
+
     fn register_route(&mut self, registration: PrefillRouteRegistration) {
         self.attn_tp_size.get_or_insert(registration.attn_tp_size);
         self.attn_cp_size.get_or_insert(registration.attn_cp_size);
@@ -167,6 +224,94 @@ pub struct PrefillRankInfo {
     pub rank_port: u16,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MooncakeKvArgsRegisterInfo {
+    pub room: String,
+    pub endpoint: String,
+    pub dst_port: u16,
+    pub mooncake_session_id: String,
+    pub dst_kv_ptrs: Vec<u64>,
+    pub dst_aux_ptrs: Vec<u64>,
+    pub dst_state_data_ptrs: Vec<Vec<u64>>,
+    pub dst_tp_rank: i32,
+    pub dst_attn_tp_size: usize,
+    pub dst_kv_item_len: usize,
+    pub dst_state_item_lens: Vec<Vec<u32>>,
+    pub dst_state_dim_per_tensor: Vec<Vec<u32>>,
+}
+
+impl MooncakeKvArgsRegisterInfo {
+    fn from_frame(frame: &[Vec<u8>]) -> Result<Self, MooncakeBootstrapFrameError> {
+        require_min_fields(frame, 10, "Mooncake KVArgs registration")?;
+        Ok(Self {
+            room: ascii_field(frame, 0, "room")?.to_string(),
+            endpoint: ascii_field(frame, 1, "endpoint")?.to_string(),
+            dst_port: parse_u16(frame, 2, "dst_port")?,
+            mooncake_session_id: ascii_field(frame, 3, "mooncake_session_id")?.to_string(),
+            dst_kv_ptrs: unpack_u64s(field(frame, 4, "dst_kv_ptrs")?)?,
+            dst_aux_ptrs: unpack_u64s(field(frame, 5, "dst_aux_ptrs")?)?,
+            dst_state_data_ptrs: unpack_u64_lists(field(frame, 6, "dst_state_data_ptrs")?)?,
+            dst_tp_rank: parse_i32(frame, 7, "dst_tp_rank")?,
+            dst_attn_tp_size: parse_usize(frame, 8, "dst_attn_tp_size")?,
+            dst_kv_item_len: parse_usize(frame, 9, "dst_kv_item_len")?,
+            dst_state_item_lens: optional_u32_lists(frame, 10)?,
+            dst_state_dim_per_tensor: optional_u32_lists(frame, 11)?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MooncakeTransferInfo {
+    pub room: i32,
+    pub endpoint: String,
+    pub dst_port: u16,
+    pub mooncake_session_id: String,
+    pub dst_kv_indices: Vec<i32>,
+    pub dst_aux_index: Option<i32>,
+    pub dst_state_indices: Vec<Vec<i32>>,
+    pub required_dst_info_num: usize,
+    pub is_dummy: bool,
+    pub decode_prefix_len: Option<usize>,
+}
+
+impl MooncakeTransferInfo {
+    fn from_frame(frame: &[Vec<u8>]) -> Result<Self, MooncakeBootstrapFrameError> {
+        require_min_fields(frame, 8, "Mooncake transfer metadata")?;
+        let is_dummy = field(frame, 4, "dst_kv_indices")?.is_empty()
+            && field(frame, 5, "dst_aux_index")?.is_empty();
+        let (dst_kv_indices, dst_aux_index, dst_state_indices) = if is_dummy {
+            (Vec::new(), None, Vec::new())
+        } else {
+            (
+                unpack_i32s(field(frame, 4, "dst_kv_indices")?)?,
+                Some(parse_i32(frame, 5, "dst_aux_index")?),
+                unpack_i32_lists(field(frame, 6, "dst_state_indices")?)?,
+            )
+        };
+
+        Ok(Self {
+            room: parse_i32(frame, 0, "room")?,
+            endpoint: ascii_field(frame, 1, "endpoint")?.to_string(),
+            dst_port: parse_u16(frame, 2, "dst_port")?,
+            mooncake_session_id: ascii_field(frame, 3, "mooncake_session_id")?.to_string(),
+            dst_kv_indices,
+            dst_aux_index,
+            dst_state_indices,
+            required_dst_info_num: parse_usize(frame, 7, "required_dst_info_num")?,
+            is_dummy,
+            decode_prefix_len: optional_usize(frame, 8, "decode_prefix_len")?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MooncakeTransferRoom {
+    pub required_dst_info_num: usize,
+    pub status: KvPoll,
+    pub decode_prefix_len: Option<usize>,
+    pub transfers: BTreeMap<String, MooncakeTransferInfo>,
+}
+
 #[derive(Clone, Debug)]
 struct RegisteredDpRank {
     dp_rank: i32,
@@ -211,6 +356,68 @@ struct RegisterDpRankRequest {
 struct QueryDpRanksRequest {
     bootstrap_rooms: Vec<i32>,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MooncakeBootstrapFrameError {
+    MissingField {
+        frame: &'static str,
+        expected: usize,
+        actual: usize,
+    },
+    Utf8Field {
+        field: &'static str,
+    },
+    IntegerField {
+        field: &'static str,
+        value: String,
+    },
+    BinaryLength {
+        field: &'static str,
+        width: usize,
+        actual: usize,
+    },
+    PackedListHeader {
+        field: &'static str,
+    },
+    PackedListLength {
+        field: &'static str,
+    },
+}
+
+impl fmt::Display for MooncakeBootstrapFrameError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingField {
+                frame,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "{frame} frame requires at least {expected} fields, got {actual}"
+            ),
+            Self::Utf8Field { field } => write!(formatter, "{field} must be ASCII/UTF-8"),
+            Self::IntegerField { field, value } => {
+                write!(formatter, "{field} must be an integer, got {value}")
+            }
+            Self::BinaryLength {
+                field,
+                width,
+                actual,
+            } => write!(
+                formatter,
+                "{field} byte length {actual} must be divisible by {width}"
+            ),
+            Self::PackedListHeader { field } => {
+                write!(formatter, "{field} packed list header is incomplete")
+            }
+            Self::PackedListLength { field } => {
+                write!(formatter, "{field} packed list payload is incomplete")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MooncakeBootstrapFrameError {}
 
 #[derive(Debug)]
 pub enum PrefillBootstrapServeError {
@@ -385,4 +592,204 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default()
+}
+
+fn require_min_fields(
+    frame: &[Vec<u8>],
+    expected: usize,
+    frame_name: &'static str,
+) -> Result<(), MooncakeBootstrapFrameError> {
+    if frame.len() < expected {
+        return Err(MooncakeBootstrapFrameError::MissingField {
+            frame: frame_name,
+            expected,
+            actual: frame.len(),
+        });
+    }
+    Ok(())
+}
+
+fn field<'a>(
+    frame: &'a [Vec<u8>],
+    index: usize,
+    field: &'static str,
+) -> Result<&'a [u8], MooncakeBootstrapFrameError> {
+    frame
+        .get(index)
+        .map(Vec::as_slice)
+        .ok_or(MooncakeBootstrapFrameError::MissingField {
+            frame: field,
+            expected: index + 1,
+            actual: frame.len(),
+        })
+}
+
+fn ascii_field<'a>(
+    frame: &'a [Vec<u8>],
+    index: usize,
+    name: &'static str,
+) -> Result<&'a str, MooncakeBootstrapFrameError> {
+    std::str::from_utf8(field(frame, index, name)?)
+        .map_err(|_| MooncakeBootstrapFrameError::Utf8Field { field: name })
+}
+
+fn parse_i32(
+    frame: &[Vec<u8>],
+    index: usize,
+    name: &'static str,
+) -> Result<i32, MooncakeBootstrapFrameError> {
+    let value = ascii_field(frame, index, name)?;
+    value
+        .parse()
+        .map_err(|_| MooncakeBootstrapFrameError::IntegerField {
+            field: name,
+            value: value.to_string(),
+        })
+}
+
+fn parse_u16(
+    frame: &[Vec<u8>],
+    index: usize,
+    name: &'static str,
+) -> Result<u16, MooncakeBootstrapFrameError> {
+    let value = ascii_field(frame, index, name)?;
+    value
+        .parse()
+        .map_err(|_| MooncakeBootstrapFrameError::IntegerField {
+            field: name,
+            value: value.to_string(),
+        })
+}
+
+fn parse_usize(
+    frame: &[Vec<u8>],
+    index: usize,
+    name: &'static str,
+) -> Result<usize, MooncakeBootstrapFrameError> {
+    let value = ascii_field(frame, index, name)?;
+    value
+        .parse()
+        .map_err(|_| MooncakeBootstrapFrameError::IntegerField {
+            field: name,
+            value: value.to_string(),
+        })
+}
+
+fn optional_usize(
+    frame: &[Vec<u8>],
+    index: usize,
+    name: &'static str,
+) -> Result<Option<usize>, MooncakeBootstrapFrameError> {
+    let Some(value) = frame.get(index) else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    parse_usize(frame, index, name).map(Some)
+}
+
+fn optional_u32_lists(
+    frame: &[Vec<u8>],
+    index: usize,
+) -> Result<Vec<Vec<u32>>, MooncakeBootstrapFrameError> {
+    let Some(value) = frame.get(index) else {
+        return Ok(Vec::new());
+    };
+    unpack_u32_lists(value)
+}
+
+fn unpack_u64s(bytes: &[u8]) -> Result<Vec<u64>, MooncakeBootstrapFrameError> {
+    unpack_fixed_width(bytes, 8, "u64 values", |chunk| {
+        u64::from_le_bytes(chunk.try_into().expect("chunk width is checked"))
+    })
+}
+
+fn unpack_i32s(bytes: &[u8]) -> Result<Vec<i32>, MooncakeBootstrapFrameError> {
+    unpack_fixed_width(bytes, 4, "i32 values", |chunk| {
+        i32::from_le_bytes(chunk.try_into().expect("chunk width is checked"))
+    })
+}
+
+fn unpack_u64_lists(bytes: &[u8]) -> Result<Vec<Vec<u64>>, MooncakeBootstrapFrameError> {
+    unpack_list_of_buffers(bytes, "u64 lists")?
+        .into_iter()
+        .map(unpack_u64s)
+        .collect()
+}
+
+fn unpack_u32_lists(bytes: &[u8]) -> Result<Vec<Vec<u32>>, MooncakeBootstrapFrameError> {
+    unpack_list_of_buffers(bytes, "u32 lists")?
+        .into_iter()
+        .map(|bytes| {
+            unpack_fixed_width(bytes, 4, "u32 values", |chunk| {
+                u32::from_le_bytes(chunk.try_into().expect("chunk width is checked"))
+            })
+        })
+        .collect()
+}
+
+fn unpack_i32_lists(bytes: &[u8]) -> Result<Vec<Vec<i32>>, MooncakeBootstrapFrameError> {
+    unpack_list_of_buffers(bytes, "i32 lists")?
+        .into_iter()
+        .map(unpack_i32s)
+        .collect()
+}
+
+fn unpack_fixed_width<T, F>(
+    bytes: &[u8],
+    width: usize,
+    field: &'static str,
+    decode: F,
+) -> Result<Vec<T>, MooncakeBootstrapFrameError>
+where
+    F: Fn(&[u8]) -> T,
+{
+    if bytes.len() % width != 0 {
+        return Err(MooncakeBootstrapFrameError::BinaryLength {
+            field,
+            width,
+            actual: bytes.len(),
+        });
+    }
+    Ok(bytes.chunks_exact(width).map(decode).collect())
+}
+
+fn unpack_list_of_buffers<'a>(
+    bytes: &'a [u8],
+    field: &'static str,
+) -> Result<Vec<&'a [u8]>, MooncakeBootstrapFrameError> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if bytes.len() < 4 {
+        return Err(MooncakeBootstrapFrameError::PackedListHeader { field });
+    }
+    let count = u32::from_le_bytes(bytes[0..4].try_into().expect("slice has length 4")) as usize;
+    let header_len = 4 + count * 4;
+    if bytes.len() < header_len {
+        return Err(MooncakeBootstrapFrameError::PackedListHeader { field });
+    }
+
+    let mut lengths = Vec::with_capacity(count);
+    for index in 0..count {
+        let offset = 4 + index * 4;
+        lengths.push(u32::from_le_bytes(
+            bytes[offset..offset + 4]
+                .try_into()
+                .expect("slice has length 4"),
+        ) as usize);
+    }
+
+    let mut offset = header_len;
+    let mut buffers = Vec::with_capacity(count);
+    for length in lengths {
+        let end = offset + length;
+        if bytes.len() < end {
+            return Err(MooncakeBootstrapFrameError::PackedListLength { field });
+        }
+        buffers.push(&bytes[offset..end]);
+        offset = end;
+    }
+    Ok(buffers)
 }

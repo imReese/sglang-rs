@@ -5,6 +5,7 @@ use serde_json::Value;
 use tokio::sync::oneshot;
 
 use sglang_srt::pd_bootstrap::{PrefillBootstrapService, serve_prefill_bootstrap_with_shutdown};
+use sglang_srt::transfer::KvPoll;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prefill_bootstrap_route_registers_topology_and_rank_endpoint() {
@@ -106,6 +107,104 @@ async fn prefill_bootstrap_tracks_room_dp_rank_queries() {
         .expect("server should stop cleanly");
 }
 
+#[test]
+fn prefill_bootstrap_ingests_mooncake_kv_args_register_frame() {
+    let service = PrefillBootstrapService::default();
+    let frame = vec![
+        b"None".to_vec(),
+        b"10.0.0.9".to_vec(),
+        b"41001".to_vec(),
+        b"session-a".to_vec(),
+        pack_u64s(&[0x1000, 0x2000]),
+        pack_u64s(&[0x3000]),
+        pack_u64_lists(&[vec![0x4000, 0x5000], vec![0x6000]]),
+        b"1".to_vec(),
+        b"8".to_vec(),
+        b"128".to_vec(),
+        pack_u32_lists(&[vec![16, 32]]),
+        pack_u32_lists(&[vec![4, 8]]),
+    ];
+
+    service
+        .state()
+        .lock()
+        .expect("state lock should be held")
+        .ingest_mooncake_bootstrap_frame(&frame)
+        .expect("KVArgs registration frame should parse");
+
+    let state = service.state().lock().expect("state lock should be held");
+    let kv_args = state
+        .decode_kv_args("session-a")
+        .expect("decode KV args should be registered");
+    assert_eq!(kv_args.endpoint, "10.0.0.9");
+    assert_eq!(kv_args.dst_port, 41001);
+    assert_eq!(kv_args.dst_kv_ptrs, vec![0x1000, 0x2000]);
+    assert_eq!(kv_args.dst_aux_ptrs, vec![0x3000]);
+    assert_eq!(
+        kv_args.dst_state_data_ptrs,
+        vec![vec![0x4000, 0x5000], vec![0x6000]]
+    );
+    assert_eq!(kv_args.dst_tp_rank, 1);
+    assert_eq!(kv_args.dst_attn_tp_size, 8);
+    assert_eq!(kv_args.dst_kv_item_len, 128);
+    assert_eq!(kv_args.dst_state_item_lens, vec![vec![16, 32]]);
+    assert_eq!(kv_args.dst_state_dim_per_tensor, vec![vec![4, 8]]);
+}
+
+#[test]
+fn prefill_bootstrap_ingests_mooncake_transfer_frames_and_marks_room_waiting() {
+    let service = PrefillBootstrapService::default();
+    let first = vec![
+        b"77".to_vec(),
+        b"10.0.0.9".to_vec(),
+        b"41001".to_vec(),
+        b"session-a".to_vec(),
+        pack_i32s(&[3, 4, 5]),
+        b"11".to_vec(),
+        pack_i32_lists(&[vec![30, 31], vec![40]]),
+        b"2".to_vec(),
+        b"64".to_vec(),
+    ];
+    let second = vec![
+        b"77".to_vec(),
+        b"10.0.0.10".to_vec(),
+        b"41002".to_vec(),
+        b"session-b".to_vec(),
+        pack_i32s(&[6, 7]),
+        b"12".to_vec(),
+        pack_i32_lists(&[vec![50]]),
+        b"2".to_vec(),
+        b"0".to_vec(),
+    ];
+
+    {
+        let mut state = service.state().lock().expect("state lock should be held");
+        state
+            .ingest_mooncake_bootstrap_frame(&first)
+            .expect("first transfer frame should parse");
+        assert_eq!(state.transfer_status(77), Some(KvPoll::Bootstrapping));
+        state
+            .ingest_mooncake_bootstrap_frame(&second)
+            .expect("second transfer frame should parse");
+        assert_eq!(state.transfer_status(77), Some(KvPoll::WaitingForInput));
+    }
+
+    let state = service.state().lock().expect("state lock should be held");
+    let room = state
+        .transfer_room(77)
+        .expect("transfer room should be tracked");
+    assert_eq!(room.required_dst_info_num, 2);
+    assert_eq!(room.decode_prefix_len, Some(64));
+    assert_eq!(room.transfers.len(), 2);
+    assert_eq!(room.transfers["session-a"].dst_kv_indices, vec![3, 4, 5]);
+    assert_eq!(room.transfers["session-a"].dst_aux_index, Some(11));
+    assert_eq!(
+        room.transfers["session-a"].dst_state_indices,
+        vec![vec![30, 31], vec![40]]
+    );
+    assert_eq!(room.transfers["session-b"].endpoint, "10.0.0.10");
+}
+
 fn unused_local_addr() -> SocketAddr {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral port should bind");
     listener
@@ -188,4 +287,66 @@ fn response_body_json(response: String) -> Value {
         .split_once("\r\n\r\n")
         .expect("HTTP response should include headers");
     serde_json::from_str(body).expect("HTTP response body should be JSON")
+}
+
+fn pack_u64s(values: &[u64]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+fn pack_i32s(values: &[i32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+fn pack_u64_lists(values: &[Vec<u64>]) -> Vec<u8> {
+    pack_list_of_buffers(
+        &values
+            .iter()
+            .map(|values| pack_u64s(values))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn pack_u32_lists(values: &[Vec<u32>]) -> Vec<u8> {
+    pack_list_of_buffers(
+        &values
+            .iter()
+            .map(|values| {
+                values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn pack_i32_lists(values: &[Vec<i32>]) -> Vec<u8> {
+    pack_list_of_buffers(
+        &values
+            .iter()
+            .map(|values| pack_i32s(values))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn pack_list_of_buffers(buffers: &[Vec<u8>]) -> Vec<u8> {
+    if buffers.is_empty() {
+        return Vec::new();
+    }
+
+    let mut packed = Vec::new();
+    packed.extend_from_slice(&(buffers.len() as u32).to_le_bytes());
+    for buffer in buffers {
+        packed.extend_from_slice(&(buffer.len() as u32).to_le_bytes());
+    }
+    for buffer in buffers {
+        packed.extend_from_slice(buffer);
+    }
+    packed
 }
