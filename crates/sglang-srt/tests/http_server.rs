@@ -6,11 +6,11 @@ use tokio::sync::oneshot;
 
 use sglang_srt::cli::ServerArgs;
 use sglang_srt::http::serve_http_router_with_shutdown;
-use sglang_srt::pd_bootstrap::PrefillBootstrapService;
+use sglang_srt::pd_bootstrap::{PrefillBootstrapService, serve_prefill_bootstrap_with_shutdown};
 use sglang_srt::server::{
     build_bootstrap_http_router_service, build_bootstrap_mooncake_prefill_http_router_service,
     build_bootstrap_pd_http_router_service, build_bootstrap_prefill_http_router_service,
-    launch_http_server_with_shutdown,
+    launch_http_server_with_shutdown, register_prefill_mooncake_routes_from_args,
 };
 use sglang_srt::transfer::{
     DecodeBootstrapRegistry, MooncakeBatchId, MooncakeBatchReleaser, MooncakeError,
@@ -387,18 +387,14 @@ async fn prefill_http_launch_starts_main_and_bootstrap_listeners() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prefill_http_launch_registers_mooncake_zmq_routes() {
-    let http_addr = unused_local_addr();
-    let bootstrap_addr = unused_local_addr_excluding(&[http_addr.port()]);
-    let zmq_ports =
-        unused_contiguous_local_ports_excluding(2, &[http_addr.port(), bootstrap_addr.port()]);
+    let bootstrap_addr = unused_local_addr();
+    let zmq_ports = unused_contiguous_local_ports_excluding(2, &[bootstrap_addr.port()]);
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
         "dummy",
         "--host",
         "127.0.0.1",
-        "--port",
-        &http_addr.port().to_string(),
         "--tp-size",
         "2",
         "--disaggregation-mode",
@@ -411,10 +407,13 @@ async fn prefill_http_launch_registers_mooncake_zmq_routes() {
         &format!("{}-{}", zmq_ports[0], zmq_ports[1]),
     ])
     .expect("args should parse");
+    let service = PrefillBootstrapService::default();
+    register_prefill_mooncake_routes_from_args(&service, &args)
+        .expect("prefill ZMQ routes should register");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
-        launch_http_server_with_shutdown(args, async move {
+        serve_prefill_bootstrap_with_shutdown(bootstrap_addr, service, async move {
             let _ = shutdown_rx.await;
         })
         .await
@@ -514,16 +513,6 @@ fn unused_local_addr() -> SocketAddr {
     listener
         .local_addr()
         .expect("ephemeral listener should have local addr")
-}
-
-fn unused_local_addr_excluding(excluded_ports: &[u16]) -> SocketAddr {
-    for _ in 0..100 {
-        let addr = unused_local_addr();
-        if !excluded_ports.contains(&addr.port()) {
-            return addr;
-        }
-    }
-    panic!("distinct ephemeral port should be available");
 }
 
 fn unused_contiguous_local_ports_excluding(count: u16, excluded_ports: &[u16]) -> Vec<u16> {

@@ -1,6 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
+use sha2::{Digest, Sha256};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CachePageId(usize);
 
@@ -67,6 +69,41 @@ impl fmt::Display for CacheAllocationError {
 }
 
 impl std::error::Error for CacheAllocationError {}
+
+pub fn compute_sglang_block_hashes(input_ids: &[u32], block_size: usize) -> Vec<i64> {
+    assert!(block_size > 0, "block_size must be positive");
+    if input_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let mut hashes = Vec::with_capacity(input_ids.len().div_ceil(block_size));
+    let mut parent_digest = None;
+
+    for block in input_ids.chunks(block_size) {
+        let digest = sglang_hash_block(parent_digest.as_ref(), block);
+        hashes.push(sglang_sha256_digest_to_i64(&digest));
+        parent_digest = Some(digest);
+    }
+
+    hashes
+}
+
+pub fn sglang_sha256_digest_to_i64(digest: &[u8; 32]) -> i64 {
+    let mut top_bytes = [0u8; 8];
+    top_bytes.copy_from_slice(&digest[..8]);
+    i64::from_be_bytes(top_bytes)
+}
+
+fn sglang_hash_block(parent_digest: Option<&[u8; 32]>, input_ids: &[u32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    if let Some(parent_digest) = parent_digest {
+        hasher.update(parent_digest);
+    }
+    for input_id in input_ids {
+        hasher.update(input_id.to_le_bytes());
+    }
+    hasher.finalize().into()
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CachePageAllocator {
