@@ -13,7 +13,7 @@ use sglang_srt::proto::sglang::runtime::v1::{
 use sglang_srt::server::{
     ServerLaunchError, build_bootstrap_fake_pd_grpc_router_service,
     build_bootstrap_grpc_router_service, build_bootstrap_pd_grpc_router_service, grpc_listen_addr,
-    launch_grpc_server, try_build_bootstrap_grpc_router_service,
+    launch_grpc_server, prefill_mooncake_zmq_endpoints, try_build_bootstrap_grpc_router_service,
 };
 use sglang_srt::tokenizer::TokenizerError;
 use sglang_srt::transfer::{
@@ -1005,6 +1005,33 @@ async fn launch_grpc_server_requires_kv_model_layout_for_mooncake_decode() {
     assert!(message.contains("--kv-cache-num-layers"));
     assert!(message.contains("--kv-cache-kv-heads"));
     assert!(message.contains("--kv-cache-head-dim"));
+}
+
+#[test]
+fn prefill_mooncake_zmq_endpoints_follow_launch_host_and_port_range() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--host",
+        "0.0.0.0",
+        "--disaggregation-mode",
+        "prefill",
+        "--disaggregation-transfer-backend",
+        "mooncake",
+        "--disaggregation-zmq-ports",
+        "7000-7002",
+    ])
+    .expect("args should parse");
+
+    assert_eq!(
+        prefill_mooncake_zmq_endpoints(&args),
+        vec![
+            "tcp://0.0.0.0:7000".to_string(),
+            "tcp://0.0.0.0:7001".to_string(),
+            "tcp://0.0.0.0:7002".to_string(),
+        ]
+    );
 }
 
 #[derive(Default)]

@@ -3,8 +3,12 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 
 use serde_json::Value;
 use tokio::sync::oneshot;
+use zeromq::{PushSocket, Socket, SocketSend, ZmqMessage};
 
-use sglang_srt::pd_bootstrap::{PrefillBootstrapService, serve_prefill_bootstrap_with_shutdown};
+use sglang_srt::pd_bootstrap::{
+    PrefillBootstrapService, serve_mooncake_bootstrap_zmq_endpoints_with_shutdown,
+    serve_mooncake_bootstrap_zmq_with_shutdown, serve_prefill_bootstrap_with_shutdown,
+};
 use sglang_srt::transfer::KvPoll;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -205,11 +209,196 @@ fn prefill_bootstrap_ingests_mooncake_transfer_frames_and_marks_room_waiting() {
     assert_eq!(room.transfers["session-b"].endpoint, "10.0.0.10");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mooncake_bootstrap_zmq_listener_ingests_multipart_transfer_metadata() {
+    let addr = unused_local_addr();
+    let endpoint = format!("tcp://{}", addr);
+    let service = PrefillBootstrapService::default();
+    let observed_service = service.clone();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_mooncake_bootstrap_zmq_with_shutdown(endpoint, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    send_zmq_multipart_with_retry(
+        addr,
+        vec![
+            b"81".to_vec(),
+            b"10.0.0.11".to_vec(),
+            b"41003".to_vec(),
+            b"session-zmq".to_vec(),
+            pack_i32s(&[7, 8, 9]),
+            b"13".to_vec(),
+            pack_i32_lists(&[vec![60, 61]]),
+            b"1".to_vec(),
+            b"96".to_vec(),
+        ],
+    )
+    .await;
+
+    wait_until(|| {
+        observed_service
+            .state()
+            .lock()
+            .expect("state lock should be held")
+            .transfer_status(81)
+            == Some(KvPoll::WaitingForInput)
+    })
+    .await;
+
+    let state = observed_service
+        .state()
+        .lock()
+        .expect("state lock should be held");
+    let room = state
+        .transfer_room(81)
+        .expect("transfer room should be tracked");
+    assert_eq!(room.decode_prefix_len, Some(96));
+    assert_eq!(room.transfers["session-zmq"].endpoint, "10.0.0.11");
+    assert_eq!(room.transfers["session-zmq"].dst_kv_indices, vec![7, 8, 9]);
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mooncake_bootstrap_zmq_endpoint_group_ingests_metadata_from_each_port() {
+    let first_addr = unused_local_addr();
+    let second_addr = unused_local_addr();
+    let service = PrefillBootstrapService::default();
+    let observed_service = service.clone();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_mooncake_bootstrap_zmq_endpoints_with_shutdown(
+            vec![
+                format!("tcp://{}", first_addr),
+                format!("tcp://{}", second_addr),
+            ],
+            service,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+        )
+        .await
+    });
+
+    send_zmq_multipart_with_retry(first_addr, transfer_frame(91, "first-port-session")).await;
+    send_zmq_multipart_with_retry(second_addr, transfer_frame(92, "second-port-session")).await;
+
+    wait_until(|| {
+        let state = observed_service
+            .state()
+            .lock()
+            .expect("state lock should be held");
+        state.transfer_status(91) == Some(KvPoll::WaitingForInput)
+            && state.transfer_status(92) == Some(KvPoll::WaitingForInput)
+    })
+    .await;
+
+    let state = observed_service
+        .state()
+        .lock()
+        .expect("state lock should be held");
+    assert!(
+        state
+            .transfer_room(91)
+            .expect("first room should be tracked")
+            .transfers
+            .contains_key("first-port-session")
+    );
+    assert!(
+        state
+            .transfer_room(92)
+            .expect("second room should be tracked")
+            .transfers
+            .contains_key("second-port-session")
+    );
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
 fn unused_local_addr() -> SocketAddr {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral port should bind");
     listener
         .local_addr()
         .expect("ephemeral listener should have local addr")
+}
+
+fn transfer_frame(room: i32, session_id: &str) -> Vec<Vec<u8>> {
+    vec![
+        room.to_string().into_bytes(),
+        b"10.0.0.12".to_vec(),
+        b"41004".to_vec(),
+        session_id.as_bytes().to_vec(),
+        pack_i32s(&[1, 2]),
+        b"3".to_vec(),
+        pack_i32_lists(&[vec![4]]),
+        b"1".to_vec(),
+        b"0".to_vec(),
+    ]
+}
+
+async fn send_zmq_multipart_with_retry(addr: SocketAddr, frames: Vec<Vec<u8>>) {
+    let endpoint = format!("tcp://{}", addr);
+    let mut last_error = None;
+
+    for _ in 0..20 {
+        let mut socket = PushSocket::new();
+        match socket.connect(&endpoint).await {
+            Ok(()) => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                match socket.send(zmq_message(frames.clone())).await {
+                    Ok(()) => return,
+                    Err(error) => last_error = Some(error.to_string()),
+                }
+            }
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    panic!(
+        "ZMQ client should send multipart frame: {}",
+        last_error.unwrap_or_else(|| "no attempts ran".to_string())
+    );
+}
+
+fn zmq_message(frames: Vec<Vec<u8>>) -> ZmqMessage {
+    let mut frames = frames.into_iter();
+    let first = frames
+        .next()
+        .expect("ZMQ multipart message should have at least one frame");
+    let mut message = ZmqMessage::from(first);
+    for frame in frames {
+        message.push_back(frame.into());
+    }
+    message
+}
+
+async fn wait_until(mut predicate: impl FnMut() -> bool) {
+    for _ in 0..50 {
+        if predicate() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("condition should become true");
 }
 
 async fn get_json_with_retry(addr: SocketAddr, path: &'static str) -> Value {

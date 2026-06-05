@@ -14,7 +14,8 @@ use crate::model_executor::{
     ModelWorkerBatch,
 };
 use crate::pd_bootstrap::{
-    PrefillBootstrapServeError, PrefillBootstrapService, serve_prefill_bootstrap_with_shutdown,
+    PrefillBootstrapServeError, PrefillBootstrapService,
+    serve_mooncake_bootstrap_zmq_endpoints_with_shutdown, serve_prefill_bootstrap_with_shutdown,
 };
 use crate::router::{RouterGetModelInfoResponse, RouterRuntime};
 use crate::scheduler::Scheduler;
@@ -233,6 +234,16 @@ pub fn prefill_bootstrap_listen_addr(args: &ServerArgs) -> Result<SocketAddr, Se
         })
 }
 
+pub fn prefill_mooncake_zmq_endpoints(args: &ServerArgs) -> Vec<String> {
+    let Some(ports) = args.disaggregation_zmq_ports else {
+        return Vec::new();
+    };
+
+    (ports.start..=ports.end)
+        .map(|port| format!("tcp://{}:{port}", args.host))
+        .collect()
+}
+
 pub fn build_bootstrap_grpc_router_service(args: &ServerArgs) -> BootstrapGrpcRouterService {
     try_build_bootstrap_grpc_router_service(args).expect("bootstrap tokenizer should load")
 }
@@ -443,6 +454,7 @@ where
         }
         DisaggregationMode::Prefill if pd_config.transfer_backend == TransferBackend::Mooncake => {
             let bootstrap_addr = prefill_bootstrap_listen_addr(&args)?;
+            let zmq_endpoints = prefill_mooncake_zmq_endpoints(&args);
             let service = try_build_bootstrap_http_router_service(&args)?;
             let bootstrap_service = PrefillBootstrapService::default();
             serve_prefill_http_and_bootstrap(
@@ -450,6 +462,7 @@ where
                 service,
                 bootstrap_addr,
                 bootstrap_service,
+                zmq_endpoints,
                 shutdown,
             )
             .await?;
@@ -469,6 +482,7 @@ async fn serve_prefill_http_and_bootstrap<F>(
     http_service: BootstrapHttpRouterService,
     bootstrap_addr: SocketAddr,
     bootstrap_service: PrefillBootstrapService,
+    zmq_endpoints: Vec<String>,
     shutdown: F,
 ) -> Result<(), ServerLaunchError>
 where
@@ -480,30 +494,45 @@ where
         http_service,
         watch_shutdown(shutdown_rx.clone()),
     ));
-    let mut bootstrap_task = tokio::spawn(serve_prefill_bootstrap_with_shutdown(
+    let mut bootstrap_tasks = tokio::task::JoinSet::new();
+    bootstrap_tasks.spawn(serve_prefill_bootstrap_with_shutdown(
         bootstrap_addr,
-        bootstrap_service,
-        watch_shutdown(shutdown_rx),
+        bootstrap_service.clone(),
+        watch_shutdown(shutdown_rx.clone()),
     ));
+    if !zmq_endpoints.is_empty() {
+        bootstrap_tasks.spawn(serve_mooncake_bootstrap_zmq_endpoints_with_shutdown(
+            zmq_endpoints,
+            bootstrap_service,
+            watch_shutdown(shutdown_rx),
+        ));
+    }
 
     tokio::select! {
         _ = shutdown => {
             let _ = shutdown_tx.send(true);
             join_http_task(http_task).await?;
-            join_bootstrap_task(bootstrap_task).await?;
+            join_bootstrap_tasks(bootstrap_tasks).await?;
             Ok(())
         }
         result = &mut http_task => {
             let _ = shutdown_tx.send(true);
-            join_bootstrap_task(bootstrap_task).await?;
+            join_bootstrap_tasks(bootstrap_tasks).await?;
             result.map_err(|error| ServerLaunchError::ServerTaskJoin(error.to_string()))??;
             Ok(())
         }
-        result = &mut bootstrap_task => {
+        result = bootstrap_tasks.join_next() => {
             let _ = shutdown_tx.send(true);
             join_http_task(http_task).await?;
-            result.map_err(|error| ServerLaunchError::ServerTaskJoin(error.to_string()))??;
-            Ok(())
+            match result {
+                Some(Ok(Ok(()))) => {
+                    join_bootstrap_tasks(bootstrap_tasks).await?;
+                    Ok(())
+                }
+                Some(Ok(Err(error))) => Err(error.into()),
+                Some(Err(error)) => Err(ServerLaunchError::ServerTaskJoin(error.to_string())),
+                None => Ok(()),
+            }
         }
     }
 }
@@ -516,11 +545,16 @@ async fn join_http_task(
     Ok(())
 }
 
-async fn join_bootstrap_task(
-    task: tokio::task::JoinHandle<Result<(), PrefillBootstrapServeError>>,
+async fn join_bootstrap_tasks(
+    mut tasks: tokio::task::JoinSet<Result<(), PrefillBootstrapServeError>>,
 ) -> Result<(), ServerLaunchError> {
-    task.await
-        .map_err(|error| ServerLaunchError::ServerTaskJoin(error.to_string()))??;
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error.into()),
+            Err(error) => return Err(ServerLaunchError::ServerTaskJoin(error.to_string())),
+        }
+    }
     Ok(())
 }
 

@@ -12,6 +12,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use zeromq::{PullSocket, Socket, SocketRecv};
 
 use crate::transfer::KvPoll;
 
@@ -422,12 +423,18 @@ impl std::error::Error for MooncakeBootstrapFrameError {}
 #[derive(Debug)]
 pub enum PrefillBootstrapServeError {
     Io(std::io::Error),
+    MooncakeFrame(MooncakeBootstrapFrameError),
+    Zmq(String),
 }
 
 impl fmt::Display for PrefillBootstrapServeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "prefill bootstrap server error: {error}"),
+            Self::MooncakeFrame(error) => {
+                write!(formatter, "prefill bootstrap Mooncake frame error: {error}")
+            }
+            Self::Zmq(error) => write!(formatter, "prefill bootstrap ZMQ error: {error}"),
         }
     }
 }
@@ -437,6 +444,12 @@ impl std::error::Error for PrefillBootstrapServeError {}
 impl From<std::io::Error> for PrefillBootstrapServeError {
     fn from(value: std::io::Error) -> Self {
         Self::Io(value)
+    }
+}
+
+impl From<MooncakeBootstrapFrameError> for PrefillBootstrapServeError {
+    fn from(value: MooncakeBootstrapFrameError) -> Self {
+        Self::MooncakeFrame(value)
     }
 }
 
@@ -459,6 +472,116 @@ where
     axum::serve(listener, service.into_router())
         .with_graceful_shutdown(shutdown)
         .await?;
+    Ok(())
+}
+
+pub async fn serve_mooncake_bootstrap_zmq_with_shutdown<F>(
+    endpoint: impl Into<String>,
+    service: PrefillBootstrapService,
+    shutdown: F,
+) -> Result<(), PrefillBootstrapServeError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let endpoint = endpoint.into();
+    let mut socket = PullSocket::new();
+    socket
+        .bind(&endpoint)
+        .await
+        .map_err(|error| PrefillBootstrapServeError::Zmq(error.to_string()))?;
+
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => return Ok(()),
+            message = socket.recv() => {
+                let message = message
+                    .map_err(|error| PrefillBootstrapServeError::Zmq(error.to_string()))?;
+                let frames = message
+                    .into_vec()
+                    .into_iter()
+                    .map(|frame| frame.to_vec())
+                    .collect::<Vec<_>>();
+                service
+                    .state
+                    .lock()
+                    .expect("prefill bootstrap state lock should be held")
+                    .ingest_mooncake_bootstrap_frame(&frames)?;
+            }
+        }
+    }
+}
+
+pub async fn serve_mooncake_bootstrap_zmq_endpoints_with_shutdown<F>(
+    endpoints: Vec<String>,
+    service: PrefillBootstrapService,
+    shutdown: F,
+) -> Result<(), PrefillBootstrapServeError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    if endpoints.is_empty() {
+        shutdown.await;
+        return Ok(());
+    }
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut tasks = tokio::task::JoinSet::new();
+    for endpoint in endpoints {
+        let service = service.clone();
+        let shutdown_rx = shutdown_rx.clone();
+        tasks.spawn(serve_mooncake_bootstrap_zmq_with_shutdown(
+            endpoint,
+            service,
+            watch_bootstrap_shutdown(shutdown_rx),
+        ));
+    }
+
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => {
+                let _ = shutdown_tx.send(true);
+                join_mooncake_zmq_tasks(tasks).await?;
+                return Ok(());
+            }
+            result = tasks.join_next(), if !tasks.is_empty() => {
+                let _ = shutdown_tx.send(true);
+                join_mooncake_zmq_tasks(tasks).await?;
+                match result {
+                    Some(Ok(Ok(()))) => return Ok(()),
+                    Some(Ok(Err(error))) => return Err(error),
+                    Some(Err(error)) => {
+                        return Err(PrefillBootstrapServeError::Zmq(error.to_string()));
+                    }
+                    None => return Ok(()),
+                }
+            }
+        }
+    }
+}
+
+async fn watch_bootstrap_shutdown(mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+        if shutdown_rx.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn join_mooncake_zmq_tasks(
+    mut tasks: tokio::task::JoinSet<Result<(), PrefillBootstrapServeError>>,
+) -> Result<(), PrefillBootstrapServeError> {
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error),
+            Err(error) => return Err(PrefillBootstrapServeError::Zmq(error.to_string())),
+        }
+    }
     Ok(())
 }
 
