@@ -13,7 +13,8 @@ pub struct LocalModelArtifacts {
 
 impl LocalModelArtifacts {
     pub fn from_model_path(path: impl AsRef<Path>) -> Result<Self, ModelArtifactError> {
-        let model_path = path.as_ref();
+        let model_path = resolve_model_path(path.as_ref());
+        let model_path = model_path.as_path();
         if !model_path.is_dir() {
             return Err(ModelArtifactError::ModelPathNotLocalDirectory {
                 path: model_path.to_path_buf(),
@@ -159,6 +160,64 @@ impl LocalModelArtifacts {
             actual_weight_count,
         })
     }
+}
+
+pub fn resolve_model_path(path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
+    if path.is_dir() {
+        return path.to_path_buf();
+    }
+
+    path.to_str()
+        .and_then(|model_id| {
+            default_hf_hub_cache().and_then(|hub| resolve_model_path_from_hf_cache(model_id, hub))
+        })
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+pub fn resolve_model_path_from_hf_cache(
+    model_id: &str,
+    hub_cache: impl AsRef<Path>,
+) -> Option<PathBuf> {
+    if model_id.starts_with('-') || model_id.starts_with('/') || model_id.contains('\\') {
+        return None;
+    }
+
+    let repo_cache = hub_cache
+        .as_ref()
+        .join(format!("models--{}", model_id.replace('/', "--")));
+    let refs_main = repo_cache.join("refs").join("main");
+    if let Ok(commit) = fs::read_to_string(refs_main) {
+        let snapshot = repo_cache.join("snapshots").join(commit.trim());
+        if snapshot.join("config.json").is_file() {
+            return Some(snapshot);
+        }
+    }
+
+    let snapshots = repo_cache.join("snapshots");
+    let mut candidates = fs::read_dir(snapshots)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.join("config.json").is_file())
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.pop()
+}
+
+fn default_hf_hub_cache() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("HUGGINGFACE_HUB_CACHE") {
+        return Some(PathBuf::from(path));
+    }
+    if let Some(path) = std::env::var_os("HF_HOME") {
+        return Some(PathBuf::from(path).join("hub"));
+    }
+    std::env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join(".cache")
+            .join("huggingface")
+            .join("hub")
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -777,7 +836,21 @@ pub struct HfModelConfig {
 
 impl HfModelConfig {
     pub fn from_model_path(path: impl AsRef<Path>) -> Result<Self, ModelArtifactError> {
-        let config_path = path.as_ref().join("config.json");
+        let model_path = resolve_model_path(path.as_ref());
+        Self::from_resolved_model_path(&model_path)
+    }
+
+    pub fn from_model_path_with_hf_cache(
+        model_path: &str,
+        hub_cache: impl AsRef<Path>,
+    ) -> Result<Self, ModelArtifactError> {
+        let model_path = resolve_model_path_from_hf_cache(model_path, hub_cache)
+            .unwrap_or_else(|| PathBuf::from(model_path));
+        Self::from_resolved_model_path(&model_path)
+    }
+
+    fn from_resolved_model_path(path: &Path) -> Result<Self, ModelArtifactError> {
+        let config_path = path.join("config.json");
         let raw = fs::read_to_string(&config_path).map_err(|error| {
             ModelArtifactError::ReadModelConfig {
                 path: config_path.clone(),

@@ -297,6 +297,45 @@ fn pd_config_derives_deepseek_v4_kv_layout_from_model_config() {
 }
 
 #[test]
+fn kv_cache_model_layout_loads_repo_id_from_huggingface_cache_snapshot() {
+    let hub_dir = temp_model_dir("pd-hf-cache-hub");
+    let snapshot_dir = hub_dir
+        .join("models--zai-org--GLM-5-FP8")
+        .join("snapshots")
+        .join("abc123");
+    fs::create_dir_all(&snapshot_dir).expect("snapshot dir should be created");
+    fs::create_dir_all(hub_dir.join("models--zai-org--GLM-5-FP8").join("refs"))
+        .expect("refs dir should be created");
+    fs::write(
+        hub_dir
+            .join("models--zai-org--GLM-5-FP8")
+            .join("refs")
+            .join("main"),
+        "abc123\n",
+    )
+    .expect("main ref should be written");
+    fs::write(
+        snapshot_dir.join("config.json"),
+        r#"{
+  "model_type": "glm",
+  "num_hidden_layers": 48,
+  "num_attention_heads": 64,
+  "num_key_value_heads": 8,
+  "head_dim": 128
+}"#,
+    )
+    .expect("config should be written");
+
+    let layout = KvCacheModelLayout::from_model_path_with_hf_cache("zai-org/GLM-5-FP8", &hub_dir)
+        .expect("cached repo config should parse")
+        .expect("cached repo config should provide KV layout");
+
+    assert_eq!(layout, KvCacheModelLayout::multi_tensor(48, 8, 128, 2));
+
+    fs::remove_dir_all(hub_dir).expect("temp hub dir should be removed");
+}
+
+#[test]
 fn pd_config_rejects_partial_cli_kv_model_geometry() {
     let args = ServerArgs::parse_from([
         "serve",

@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 
 use tokenizers::Tokenizer as HfTokenizerImpl;
 
+use crate::model_artifacts::resolve_model_path;
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum TokenizerError {
     InvalidUtf8,
@@ -130,8 +132,11 @@ impl RuntimeTokenizer {
             return Ok(Self::Byte(ByteTokenizer));
         }
 
-        if resolve_tokenizer_json(Path::new(model_path)).is_some() {
-            return Ok(Self::Hf(HfTokenizer::from_tokenizer_path(model_path)?));
+        let resolved_model_path = resolve_model_path(Path::new(model_path));
+        if resolve_tokenizer_json(&resolved_model_path).is_some() {
+            return Ok(Self::Hf(HfTokenizer::from_tokenizer_path(
+                resolved_model_path,
+            )?));
         }
 
         Ok(Self::Byte(ByteTokenizer))

@@ -1269,6 +1269,46 @@ fn hf_model_config_treats_null_optional_moe_fields_as_absent() {
 }
 
 #[test]
+fn hf_model_config_loads_repo_id_from_huggingface_cache_snapshot() {
+    let hub_dir = temp_model_dir("hf-cache-hub");
+    let snapshot_dir = hub_dir
+        .join("models--zai-org--GLM-5-FP8")
+        .join("snapshots")
+        .join("abc123");
+    fs::create_dir_all(&snapshot_dir).expect("snapshot dir should be created");
+    fs::create_dir_all(hub_dir.join("models--zai-org--GLM-5-FP8").join("refs"))
+        .expect("refs dir should be created");
+    fs::write(
+        hub_dir
+            .join("models--zai-org--GLM-5-FP8")
+            .join("refs")
+            .join("main"),
+        "abc123\n",
+    )
+    .expect("main ref should be written");
+    fs::write(
+        snapshot_dir.join("config.json"),
+        r#"{
+  "model_type": "glm",
+  "vocab_size": 151552,
+  "num_hidden_layers": 48,
+  "num_key_value_heads": 8,
+  "head_dim": 128
+}"#,
+    )
+    .expect("config should be written");
+
+    let config = HfModelConfig::from_model_path_with_hf_cache("zai-org/GLM-5-FP8", &hub_dir)
+        .expect("repo id should resolve through HF cache");
+
+    assert_eq!(config.model_type.as_deref(), Some("glm"));
+    assert_eq!(config.vocab_size, Some(151_552));
+    assert_eq!(config.num_hidden_layers, Some(48));
+
+    fs::remove_dir_all(hub_dir).expect("temp hub dir should be removed");
+}
+
+#[test]
 fn safetensors_manifest_describes_indexed_tensor_byte_span_without_loading_bytes() {
     let model_dir = temp_model_dir("tensor-span");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");

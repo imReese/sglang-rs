@@ -8,6 +8,7 @@ use std::path::Path;
 
 use crate::cache::CachePageId;
 use crate::cli::ServerArgs;
+use crate::model_artifacts::resolve_model_path;
 use crate::model_executor::ModelWorkerBatch;
 use crate::scheduler::{ForwardMode, ScheduleBatch, ScheduledRequest};
 use crate::types::{DisaggregatedParams, RequestId};
@@ -182,7 +183,21 @@ impl KvCacheModelLayout {
     }
 
     fn from_model_path(model_path: &str) -> Result<Option<Self>, PdConfigError> {
-        let model_path = Path::new(model_path);
+        let model_path = resolve_model_path(Path::new(model_path));
+        Self::from_resolved_model_path(&model_path)
+    }
+
+    pub fn from_model_path_with_hf_cache(
+        model_path: &str,
+        hub_cache: impl AsRef<Path>,
+    ) -> Result<Option<Self>, PdConfigError> {
+        let model_path =
+            crate::model_artifacts::resolve_model_path_from_hf_cache(model_path, hub_cache)
+                .unwrap_or_else(|| Path::new(model_path).to_path_buf());
+        Self::from_resolved_model_path(&model_path)
+    }
+
+    fn from_resolved_model_path(model_path: &Path) -> Result<Option<Self>, PdConfigError> {
         if !model_path.is_dir() {
             return Ok(None);
         }
