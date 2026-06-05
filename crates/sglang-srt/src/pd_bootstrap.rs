@@ -16,8 +16,9 @@ use serde_json::json;
 use zeromq::{PullSocket, PushSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
 use crate::transfer::{
-    DecodeBootstrapRegistry, KvCacheTransferError, KvCacheTransferExecutor, KvPoll,
-    MooncakeBatchReleaser, MooncakeKvCacheTransferExecutor, MooncakeRemoteKvLayout,
+    DecodeBootstrapMetadataPublishSummary, DecodeBootstrapPublisher, DecodeBootstrapRegistry,
+    KvCacheTransferError, KvCacheTransferExecutor, KvCacheTransferPlan, KvCacheTransferSpan,
+    KvPoll, MooncakeBatchReleaser, MooncakeKvCacheTransferExecutor, MooncakeRemoteKvLayout,
     MooncakeTransferPollSummary, MooncakeTransferStatusReader, MooncakeTransferSubmitter,
     MooncakeTransferTargetResolver,
 };
@@ -676,6 +677,110 @@ impl MooncakeDecodeTransferMetadata {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MooncakeDecodeBootstrapPublisher {
+    endpoint: String,
+    dst_port: u16,
+    mooncake_session_id: String,
+    target_tp_rank: i32,
+    target_pp_rank: i32,
+    dst_aux_index: Option<i32>,
+    required_dst_info_num: usize,
+}
+
+impl MooncakeDecodeBootstrapPublisher {
+    pub fn new(
+        endpoint: impl Into<String>,
+        dst_port: u16,
+        mooncake_session_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            dst_port,
+            mooncake_session_id: mooncake_session_id.into(),
+            target_tp_rank: 0,
+            target_pp_rank: 0,
+            dst_aux_index: Some(0),
+            required_dst_info_num: 1,
+        }
+    }
+
+    pub fn with_target_ranks(mut self, target_tp_rank: i32, target_pp_rank: i32) -> Self {
+        self.target_tp_rank = target_tp_rank;
+        self.target_pp_rank = target_pp_rank;
+        self
+    }
+
+    pub fn with_required_dst_info_num(mut self, required_dst_info_num: usize) -> Self {
+        self.required_dst_info_num = required_dst_info_num;
+        self
+    }
+
+    pub fn with_dst_aux_index(mut self, dst_aux_index: Option<i32>) -> Self {
+        self.dst_aux_index = dst_aux_index;
+        self
+    }
+
+    fn metadata_for_span(
+        &self,
+        span: &KvCacheTransferSpan,
+    ) -> Result<MooncakeDecodeTransferMetadata, String> {
+        Ok(MooncakeDecodeTransferMetadata {
+            room: span.bootstrap_room(),
+            endpoint: self.endpoint.clone(),
+            dst_port: self.dst_port,
+            mooncake_session_id: self.mooncake_session_id.clone(),
+            dst_kv_indices: span
+                .cache_pages()
+                .iter()
+                .map(|page| {
+                    i32::try_from(page.as_usize()).map_err(|_| {
+                        format!(
+                            "cache page {} cannot fit into Mooncake metadata i32 index",
+                            page.as_usize()
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            dst_aux_index: self.dst_aux_index,
+            dst_state_indices: Vec::new(),
+            required_dst_info_num: self.required_dst_info_num,
+            decode_prefix_len: Some(span.token_offset() + span.token_count()),
+            is_dummy: false,
+        })
+    }
+}
+
+impl DecodeBootstrapPublisher for MooncakeDecodeBootstrapPublisher {
+    fn publish_decode_bootstrap_metadata(
+        &mut self,
+        plan: &KvCacheTransferPlan,
+    ) -> Result<DecodeBootstrapMetadataPublishSummary, String> {
+        let mut published_spans = 0;
+        for span in plan.spans() {
+            let metadata = self.metadata_for_span(span)?;
+            let bootstrap_addr = format!(
+                "{}:{}",
+                span.disaggregated_params().bootstrap_host,
+                span.disaggregated_params().bootstrap_port
+            );
+            let prefill_dp_rank = span.data_parallel_rank();
+            let target_tp_rank = self.target_tp_rank;
+            let target_pp_rank = self.target_pp_rank;
+            publish_mooncake_decode_metadata_blocking(
+                bootstrap_addr,
+                prefill_dp_rank,
+                target_tp_rank,
+                target_pp_rank,
+                metadata,
+            )?;
+            published_spans += 1;
+        }
+
+        Ok(DecodeBootstrapMetadataPublishSummary { published_spans })
+    }
+}
+
 #[derive(Debug)]
 pub enum MooncakeDecodeBootstrapError {
     HttpStatus { status: u16, body: String },
@@ -865,6 +970,41 @@ pub async fn send_mooncake_kv_args_registration(
     registration: &MooncakeDecodeKvArgsRegistration,
 ) -> Result<(), MooncakeDecodeBootstrapError> {
     send_mooncake_bootstrap_frame(endpoint, registration.to_frame()).await
+}
+
+fn publish_mooncake_decode_metadata_blocking(
+    bootstrap_addr: String,
+    prefill_dp_rank: i32,
+    target_tp_rank: i32,
+    target_pp_rank: i32,
+    metadata: MooncakeDecodeTransferMetadata,
+) -> Result<(), String> {
+    let run_client = move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?;
+        runtime.block_on(async move {
+            let rank = query_prefill_route(
+                &bootstrap_addr,
+                prefill_dp_rank,
+                0,
+                target_tp_rank,
+                target_pp_rank,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            send_mooncake_transfer_metadata(&rank.zmq_endpoint(), &metadata)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    };
+
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::block_in_place(run_client)
+    } else {
+        run_client()
+    }
 }
 
 async fn send_mooncake_bootstrap_frame(

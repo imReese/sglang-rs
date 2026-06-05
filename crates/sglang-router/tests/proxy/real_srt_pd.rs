@@ -111,6 +111,7 @@ async fn register_real_srt_workers_with_manager(
 async fn router_pd_chat_reaches_real_rust_srt_mooncake_workers() {
     let prefill_addr = unused_local_addr();
     let bootstrap_addr = unused_local_addr();
+    let prefill_zmq_addr = unused_local_addr();
     let decode_addr = unused_local_addr();
 
     let prefill_args = ServerArgs::parse_from([
@@ -129,6 +130,8 @@ async fn router_pd_chat_reaches_real_rust_srt_mooncake_workers() {
         "mooncake",
         "--disaggregation-bootstrap-port",
         &bootstrap_addr.port().to_string(),
+        "--disaggregation-zmq-ports",
+        &prefill_zmq_addr.port().to_string(),
         "--num-reserved-decode-tokens",
         "8",
     ])

@@ -6,16 +6,16 @@ use sglang_srt::router::{RouterRuntime, RouterTransferPollResponse};
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler, SchedulerError};
 use sglang_srt::tokenizer::ByteTokenizer;
 use sglang_srt::transfer::{
-    DecodeBootstrapRegistry, DecodeBootstrapSession, FakeKvCacheTransferExecutor,
-    KvCacheTransferError, KvCacheTransferExecutor, KvCacheTransferPlan, KvCacheTransferPlanError,
-    KvCacheTransferSpan, KvPoll, KvTransferModelWorker, MooncakeBatchId, MooncakeBatchReleaser,
-    MooncakeError, MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeOpcode,
-    MooncakeRemoteKvLayout, MooncakeSessionTargetResolver, MooncakeSubmittedBatch,
-    MooncakeTransferRequest, MooncakeTransferStatus, MooncakeTransferStatusCode,
-    MooncakeTransferStatusReader, MooncakeTransferSubmitter, MooncakeTransferTarget,
-    MooncakeTransferTargetResolver, build_mooncake_kv_transfer_requests,
-    build_mooncake_remote_kv_transfer_requests, execute_kv_cache_transfer_plan,
-    is_decode_request_kv_ready, poll_mooncake_transfer_batches,
+    DecodeBootstrapMetadataPublishSummary, DecodeBootstrapPublisher, DecodeBootstrapRegistry,
+    DecodeBootstrapSession, FakeKvCacheTransferExecutor, KvCacheTransferError,
+    KvCacheTransferExecutor, KvCacheTransferPlan, KvCacheTransferPlanError, KvCacheTransferSpan,
+    KvPoll, KvTransferModelWorker, MooncakeBatchId, MooncakeBatchReleaser, MooncakeError,
+    MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeOpcode, MooncakeRemoteKvLayout,
+    MooncakeSessionTargetResolver, MooncakeSubmittedBatch, MooncakeTransferRequest,
+    MooncakeTransferStatus, MooncakeTransferStatusCode, MooncakeTransferStatusReader,
+    MooncakeTransferSubmitter, MooncakeTransferTarget, MooncakeTransferTargetResolver,
+    build_mooncake_kv_transfer_requests, build_mooncake_remote_kv_transfer_requests,
+    execute_kv_cache_transfer_plan, is_decode_request_kv_ready, poll_mooncake_transfer_batches,
 };
 use sglang_srt::types::{
     BootstrapRoom, DisaggregatedParams, RequestId, SamplingParams, TokenGenerateRequest,
@@ -355,6 +355,51 @@ fn transfer_model_worker_registers_pd_prefill_session_before_transfer() {
     assert_eq!(session.data_parallel_rank(), 2);
     assert_eq!(session.status(), KvPoll::Success);
     assert_eq!(worker.transfer_executor().seen_rooms, vec![26]);
+}
+
+#[test]
+fn transfer_model_worker_publishes_decode_bootstrap_metadata_from_allocated_pages() {
+    let worker = KvTransferModelWorker::new(
+        UnfinishedWorker,
+        DecodeBootstrapRegistry::default(),
+        RecordingTransferExecutor::default(),
+    )
+    .with_decode_bootstrap_publisher(RecordingDecodeBootstrapPublisher::default());
+    let mut scheduler =
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(4));
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("pd-decode-publish"),
+            vec![1, 2, 3],
+            SamplingParams::new(2),
+        )
+        .with_disaggregated_params(Some(DisaggregatedParams {
+            bootstrap_host: "10.0.0.8".to_string(),
+            bootstrap_port: 8200,
+            bootstrap_room: 84,
+        }))
+        .with_data_parallel_rank(3),
+    );
+
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill dispatch should publish decode bootstrap metadata");
+
+    let worker = scheduler.worker();
+    let publisher = worker.decode_bootstrap_publisher();
+    assert_eq!(publisher.published.len(), 1);
+    assert_eq!(
+        publisher.published[0],
+        PublishedDecodeBootstrapSpan {
+            request_id: RequestId::from("pd-decode-publish"),
+            bootstrap_addr: "10.0.0.8:8200".to_string(),
+            bootstrap_room: 84,
+            prefill_dp_rank: 3,
+            dst_kv_indices: vec![0, 1, 2],
+            decode_prefix_len: Some(3),
+        }
+    );
+    assert_eq!(worker.transfer_executor().seen_rooms, vec![84]);
 }
 
 #[test]
@@ -1463,6 +1508,51 @@ fn poll_mooncake_transfer_batches_marks_failed_status_and_returns_error() {
 struct RecordingTransferExecutor {
     seen_rooms: Vec<BootstrapRoom>,
     fail_room: Option<BootstrapRoom>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PublishedDecodeBootstrapSpan {
+    request_id: RequestId,
+    bootstrap_addr: String,
+    bootstrap_room: BootstrapRoom,
+    prefill_dp_rank: i32,
+    dst_kv_indices: Vec<i32>,
+    decode_prefix_len: Option<usize>,
+}
+
+#[derive(Default)]
+struct RecordingDecodeBootstrapPublisher {
+    published: Vec<PublishedDecodeBootstrapSpan>,
+}
+
+impl DecodeBootstrapPublisher for RecordingDecodeBootstrapPublisher {
+    fn publish_decode_bootstrap_metadata(
+        &mut self,
+        plan: &KvCacheTransferPlan,
+    ) -> Result<DecodeBootstrapMetadataPublishSummary, String> {
+        for span in plan.spans() {
+            self.published.push(PublishedDecodeBootstrapSpan {
+                request_id: span.request_id().clone(),
+                bootstrap_addr: format!(
+                    "{}:{}",
+                    span.disaggregated_params().bootstrap_host,
+                    span.disaggregated_params().bootstrap_port
+                ),
+                bootstrap_room: span.bootstrap_room(),
+                prefill_dp_rank: span.data_parallel_rank(),
+                dst_kv_indices: span
+                    .cache_pages()
+                    .iter()
+                    .map(|page| page.as_usize() as i32)
+                    .collect(),
+                decode_prefix_len: Some(span.token_offset() + span.token_count()),
+            });
+        }
+
+        Ok(DecodeBootstrapMetadataPublishSummary {
+            published_spans: plan.len(),
+        })
+    }
 }
 
 impl KvCacheTransferExecutor for RecordingTransferExecutor {

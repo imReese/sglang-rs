@@ -972,6 +972,30 @@ impl KvCacheTransferSummary {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DecodeBootstrapMetadataPublishSummary {
+    pub published_spans: usize,
+}
+
+pub trait DecodeBootstrapPublisher {
+    fn publish_decode_bootstrap_metadata(
+        &mut self,
+        plan: &KvCacheTransferPlan,
+    ) -> Result<DecodeBootstrapMetadataPublishSummary, String>;
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct NoopDecodeBootstrapPublisher;
+
+impl DecodeBootstrapPublisher for NoopDecodeBootstrapPublisher {
+    fn publish_decode_bootstrap_metadata(
+        &mut self,
+        _plan: &KvCacheTransferPlan,
+    ) -> Result<DecodeBootstrapMetadataPublishSummary, String> {
+        Ok(DecodeBootstrapMetadataPublishSummary::default())
+    }
+}
+
 pub trait KvCacheTransferExecutor {
     fn transfer_span(&mut self, span: &KvCacheTransferSpan) -> Result<(), KvCacheTransferError>;
 
@@ -1074,10 +1098,11 @@ pub fn is_decode_request_kv_ready(
     Ok(session.status() == KvPoll::Success)
 }
 
-pub struct KvTransferModelWorker<W, E> {
+pub struct KvTransferModelWorker<W, E, P = NoopDecodeBootstrapPublisher> {
     worker: W,
     registry: DecodeBootstrapRegistry,
     transfer_executor: E,
+    decode_bootstrap_publisher: P,
     last_transfer_summary: Option<KvCacheTransferSummary>,
 }
 
@@ -1087,10 +1112,13 @@ impl<W, E> KvTransferModelWorker<W, E> {
             worker,
             registry,
             transfer_executor,
+            decode_bootstrap_publisher: NoopDecodeBootstrapPublisher,
             last_transfer_summary: None,
         }
     }
+}
 
+impl<W, E, P> KvTransferModelWorker<W, E, P> {
     pub fn worker(&self) -> &W {
         &self.worker
     }
@@ -1115,33 +1143,68 @@ impl<W, E> KvTransferModelWorker<W, E> {
         &mut self.transfer_executor
     }
 
+    pub fn decode_bootstrap_publisher(&self) -> &P {
+        &self.decode_bootstrap_publisher
+    }
+
+    pub fn decode_bootstrap_publisher_mut(&mut self) -> &mut P {
+        &mut self.decode_bootstrap_publisher
+    }
+
+    pub fn with_decode_bootstrap_publisher<NextP>(
+        self,
+        decode_bootstrap_publisher: NextP,
+    ) -> KvTransferModelWorker<W, E, NextP> {
+        KvTransferModelWorker {
+            worker: self.worker,
+            registry: self.registry,
+            transfer_executor: self.transfer_executor,
+            decode_bootstrap_publisher,
+            last_transfer_summary: self.last_transfer_summary,
+        }
+    }
+
     pub fn last_transfer_summary(&self) -> Option<&KvCacheTransferSummary> {
         self.last_transfer_summary.as_ref()
     }
 }
 
-impl<W, E> FallibleModelWorker for KvTransferModelWorker<W, E>
+impl<W, E, P> FallibleModelWorker for KvTransferModelWorker<W, E, P>
 where
     W: FallibleModelWorker,
     E: KvCacheTransferExecutor,
+    P: DecodeBootstrapPublisher,
 {
     fn try_generate_batch(
         &mut self,
         batch: &ScheduleBatch,
     ) -> Result<BatchGeneratedTokens, WorkerExecutionError> {
+        let transfer_plan = if batch.forward_mode() == ForwardMode::Prefill {
+            let worker_batch = ModelWorkerBatch::from_schedule_batch(batch);
+            let transfer_plan = KvCacheTransferPlan::from_prefill_worker_batch(&worker_batch)
+                .map_err(|error| {
+                    WorkerExecutionError::Runtime(format!("KV transfer planning failed: {error}"))
+                })?;
+            self.decode_bootstrap_publisher
+                .publish_decode_bootstrap_metadata(&transfer_plan)
+                .map_err(|error| {
+                    WorkerExecutionError::Runtime(format!(
+                        "decode bootstrap metadata publish failed: {error}"
+                    ))
+                })?;
+            Some(transfer_plan)
+        } else {
+            None
+        };
+
         let output = self.worker.try_generate_batch(batch)?;
 
-        if batch.forward_mode() == ForwardMode::Prefill {
+        if let Some(transfer_plan) = transfer_plan {
             self.register_prefill_bootstrap_sessions(batch)
                 .map_err(|error| {
                     WorkerExecutionError::Runtime(format!(
                         "KV transfer bootstrap registration failed: {error}"
                     ))
-                })?;
-            let worker_batch = ModelWorkerBatch::from_schedule_batch(batch);
-            let transfer_plan = KvCacheTransferPlan::from_prefill_worker_batch(&worker_batch)
-                .map_err(|error| {
-                    WorkerExecutionError::Runtime(format!("KV transfer planning failed: {error}"))
                 })?;
             let transfer_summary = execute_kv_cache_transfer_plan(
                 &mut self.registry,
@@ -1193,7 +1256,7 @@ where
     }
 }
 
-impl<W, E> KvTransferModelWorker<W, E> {
+impl<W, E, P> KvTransferModelWorker<W, E, P> {
     fn register_prefill_bootstrap_sessions(
         &mut self,
         batch: &ScheduleBatch,

@@ -5,14 +5,21 @@ use serde_json::Value;
 use tokio::sync::oneshot;
 use zeromq::{PushSocket, Socket, SocketSend, ZmqMessage};
 
+use sglang_srt::cache::{CachePageAllocator, RadixCache};
 use sglang_srt::pd_bootstrap::{
-    MooncakeDecodeKvArgsRegistration, MooncakeDecodeTransferMetadata, PrefillBootstrapService,
-    query_prefill_route, send_mooncake_kv_args_registration, send_mooncake_transfer_metadata,
+    MooncakeDecodeBootstrapPublisher, MooncakeDecodeKvArgsRegistration,
+    MooncakeDecodeTransferMetadata, PrefillBootstrapService, query_prefill_route,
+    send_mooncake_kv_args_registration, send_mooncake_transfer_metadata,
     serve_mooncake_bootstrap_zmq_endpoints_with_shutdown,
     serve_mooncake_bootstrap_zmq_with_shutdown, serve_prefill_bootstrap_with_shutdown,
 };
-use sglang_srt::transfer::{KvPoll, MooncakeRemoteKvLayout};
-use sglang_srt::types::BootstrapRoom;
+use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
+use sglang_srt::transfer::{
+    DecodeBootstrapRegistry, FakeKvCacheTransferExecutor, KvPoll, KvTransferModelWorker,
+    MooncakeRemoteKvLayout,
+};
+use sglang_srt::types::{BootstrapRoom, DisaggregatedParams, RequestId, SamplingParams};
+use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prefill_bootstrap_route_registers_topology_and_rank_endpoint() {
@@ -559,6 +566,135 @@ async fn decode_bootstrap_client_sends_kv_args_registration() {
         .await
         .expect("server task should join")
         .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn decode_worker_publishes_bootstrap_metadata_to_prefill_zmq_route() {
+    let bootstrap_addr = unused_local_addr();
+    let zmq_addr = unused_local_addr();
+    let service = PrefillBootstrapService::default();
+    let observed_service = service.clone();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        let (shutdown_tx, shutdown_rx_watch) = tokio::sync::watch::channel(false);
+        let mut http_task = tokio::spawn(serve_prefill_bootstrap_with_shutdown(
+            bootstrap_addr,
+            service.clone(),
+            watch_shutdown(shutdown_rx_watch.clone()),
+        ));
+        let mut zmq_task = tokio::spawn(serve_mooncake_bootstrap_zmq_with_shutdown(
+            format!("tcp://{}", zmq_addr),
+            service,
+            watch_shutdown(shutdown_rx_watch),
+        ));
+
+        tokio::select! {
+            _ = async move { let _ = shutdown_rx.await; } => {
+                let _ = shutdown_tx.send(true);
+                http_task.await.expect("HTTP bootstrap task should join")?;
+                zmq_task.await.expect("ZMQ bootstrap task should join")?;
+                Ok(())
+            }
+            result = &mut http_task => {
+                let _ = shutdown_tx.send(true);
+                zmq_task.await.expect("ZMQ bootstrap task should join")?;
+                result.expect("HTTP bootstrap task should join")
+            }
+            result = &mut zmq_task => {
+                let _ = shutdown_tx.send(true);
+                http_task.await.expect("HTTP bootstrap task should join")?;
+                result.expect("ZMQ bootstrap task should join")
+            }
+        }
+    });
+
+    let register_response = put_json_with_retry(
+        bootstrap_addr,
+        "/route",
+        Box::leak(format!(
+            r#"{{"attn_tp_size":1,"attn_tp_rank":0,"attn_cp_size":1,"attn_cp_rank":0,"attn_dp_size":1,"attn_dp_rank":0,"pp_size":1,"pp_rank":0,"system_dp_size":1,"system_dp_rank":0,"rank_ip":"127.0.0.1","rank_port":{},"page_size":64,"kv_cache_dtype":"auto","load_balance_method":"follow_bootstrap_room"}}"#,
+            zmq_addr.port()
+        ).into_boxed_str()),
+    )
+    .await;
+    assert!(register_response.starts_with("HTTP/1.1 200"));
+
+    let worker = KvTransferModelWorker::new(
+        BootstrapMetadataWorker,
+        DecodeBootstrapRegistry::default(),
+        FakeKvCacheTransferExecutor::default(),
+    )
+    .with_decode_bootstrap_publisher(MooncakeDecodeBootstrapPublisher::new(
+        "127.0.0.1",
+        41007,
+        "decode-worker-session",
+    ));
+    let mut scheduler =
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(4));
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("pd-decode-zmq-publish"),
+            vec![1, 2, 3],
+            SamplingParams::new(1),
+        )
+        .with_disaggregated_params(Some(DisaggregatedParams {
+            bootstrap_host: bootstrap_addr.ip().to_string(),
+            bootstrap_port: bootstrap_addr.port(),
+            bootstrap_room: 95,
+        })),
+    );
+
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("decode worker should publish bootstrap metadata through ZMQ");
+
+    wait_until(|| {
+        observed_service
+            .state()
+            .lock()
+            .expect("state lock should be held")
+            .transfer_status(95)
+            == Some(KvPoll::WaitingForInput)
+    })
+    .await;
+
+    let state = observed_service
+        .state()
+        .lock()
+        .expect("state lock should be held");
+    let transfer = &state
+        .transfer_room(95)
+        .expect("room should be tracked")
+        .transfers["decode-worker-session"];
+    assert_eq!(transfer.endpoint, "127.0.0.1");
+    assert_eq!(transfer.dst_port, 41007);
+    assert_eq!(transfer.dst_kv_indices, vec![0, 1, 2]);
+    assert_eq!(transfer.decode_prefix_len, Some(3));
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("servers should stop cleanly");
+}
+
+struct BootstrapMetadataWorker;
+
+impl ModelWorker for BootstrapMetadataWorker {
+    fn generate_batch(&mut self, batch: &ScheduleBatch) -> BatchGeneratedTokens {
+        BatchGeneratedTokens::from_batch(
+            batch,
+            batch
+                .requests()
+                .iter()
+                .map(|_| GeneratedToken::unfinished(vec![1]))
+                .collect(),
+        )
+        .expect("output shape should match batch")
+    }
 }
 
 fn unused_local_addr() -> SocketAddr {
