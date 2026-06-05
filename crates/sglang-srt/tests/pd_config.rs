@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::PathBuf;
 
+use serde_json::json;
 use sglang_srt::cli::ServerArgs;
+use sglang_srt::cli::ZmqPortRange;
 use sglang_srt::transfer::{
     DisaggregationMode, KvCacheDtype, KvCacheModelLayout, KvPoll, MooncakeKvCacheLayout,
     MooncakeOpcode, MooncakeTransferEngineConfig, MooncakeTransferStatusCode, PdConfig,
@@ -492,6 +494,143 @@ fn pd_config_carries_deepseek_distributed_runtime_args() {
     assert_eq!(config.moe_a2a_backend.as_deref(), Some("deepep"));
     assert_eq!(config.mem_fraction_static, Some(0.8));
     assert_eq!(config.max_running_requests, Some(128));
+}
+
+#[test]
+fn pd_config_carries_glm5_prefill_production_runtime_args() {
+    let deepep_config = r#"{"normal_dispatch":{"num_sms":24},"normal_combine":{"num_sms":24}}"#;
+    let loader_config = r#"{"enable_multithread_load":true,"num_threads":8}"#;
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "/GLM-5-0212-FP8",
+        "--disaggregation-mode",
+        "prefill",
+        "--disaggregation-bootstrap-port",
+        "8200",
+        "--disaggregation-ib-device",
+        "mlx5_bond_0",
+        "--disaggregation-zmq-ports",
+        "7000-7007",
+        "--dist-init-addr",
+        "10.95.250.21:6676",
+        "--tp-size",
+        "8",
+        "--dp-size",
+        "1",
+        "--enable-dp-attention",
+        "--enable-dp-lm-head",
+        "--disable-cuda-graph",
+        "--max-prefill-tokens",
+        "196608",
+        "--max-running-requests",
+        "256",
+        "--max-total-tokens",
+        "512000",
+        "--mem-fraction-static",
+        "0.835",
+        "--page-size",
+        "64",
+        "--deepep-config",
+        deepep_config,
+        "--deepep-mode",
+        "normal",
+        "--moe-a2a-backend",
+        "deepep",
+        "--moe-dense-tp-size",
+        "1",
+        "--attention-backend",
+        "nsa",
+        "--enable-nsa-prefill-context-parallel",
+        "--nsa-prefill-backend",
+        "flashmla_sparse",
+        "--nsa-prefill-cp-mode",
+        "round-robin-split",
+        "--speculative-algorithm",
+        "EAGLE",
+        "--speculative-eagle-topk",
+        "1",
+        "--speculative-num-draft-tokens",
+        "4",
+        "--speculative-num-steps",
+        "3",
+        "--chunked-prefill-size",
+        "65536",
+        "--decode-log-interval",
+        "1",
+        "--disable-overlap-schedule",
+        "--model-loader-extra-config",
+        loader_config,
+        "--tokenizer-worker-num",
+        "32",
+        "--allow-auto-truncate",
+        "--collect-tokens-histogram",
+        "--enable-cache-report",
+        "--enable-metrics",
+        "--disable-radix-cache",
+        "--tool-call-parser",
+        "glm47",
+    ])
+    .expect("GLM-5 prefill launch args should parse");
+
+    let config = PdConfig::from_server_args(&args).expect("pd config should normalize");
+
+    assert_eq!(config.mode, DisaggregationMode::Prefill);
+    assert_eq!(config.bootstrap_port, 8200);
+    assert_eq!(config.ib_device.as_deref(), Some("mlx5_bond_0"));
+    assert_eq!(
+        config.disaggregation_zmq_ports,
+        Some(ZmqPortRange {
+            start: 7000,
+            end: 7007
+        })
+    );
+    assert_eq!(config.dist_init_addr.as_deref(), Some("10.95.250.21:6676"));
+    assert_eq!(config.tp_size, 8);
+    assert_eq!(config.dp_size, 1);
+    assert!(config.enable_dp_attention);
+    assert!(config.enable_dp_lm_head);
+    assert!(config.disable_cuda_graph);
+    assert_eq!(config.max_prefill_tokens, Some(196608));
+    assert_eq!(config.max_running_requests, Some(256));
+    assert_eq!(config.max_total_tokens, Some(512000));
+    assert_eq!(config.mem_fraction_static, Some(0.835));
+    assert_eq!(config.page_size, 64);
+    assert_eq!(
+        config.deepep_config,
+        Some(json!({"normal_dispatch": {"num_sms": 24}, "normal_combine": {"num_sms": 24}}))
+    );
+    assert_eq!(config.deepep_mode.as_deref(), Some("normal"));
+    assert_eq!(config.moe_a2a_backend.as_deref(), Some("deepep"));
+    assert_eq!(config.moe_dense_tp_size, Some(1));
+    assert_eq!(config.attention_backend.as_deref(), Some("nsa"));
+    assert!(config.enable_nsa_prefill_context_parallel);
+    assert_eq!(
+        config.nsa_prefill_backend.as_deref(),
+        Some("flashmla_sparse")
+    );
+    assert_eq!(
+        config.nsa_prefill_cp_mode.as_deref(),
+        Some("round-robin-split")
+    );
+    assert_eq!(config.speculative_algorithm.as_deref(), Some("EAGLE"));
+    assert_eq!(config.speculative_eagle_topk, Some(1));
+    assert_eq!(config.speculative_num_draft_tokens, Some(4));
+    assert_eq!(config.speculative_num_steps, Some(3));
+    assert_eq!(config.chunked_prefill_size, Some(65536));
+    assert_eq!(config.decode_log_interval, Some(1));
+    assert!(config.disable_overlap_schedule);
+    assert_eq!(
+        config.model_loader_extra_config,
+        Some(json!({"enable_multithread_load": true, "num_threads": 8}))
+    );
+    assert_eq!(config.tokenizer_worker_num, Some(32));
+    assert!(config.allow_auto_truncate);
+    assert!(config.collect_tokens_histogram);
+    assert!(config.enable_cache_report);
+    assert!(config.enable_metrics);
+    assert!(config.disable_radix_cache);
+    assert_eq!(config.tool_call_parser.as_deref(), Some("glm47"));
 }
 
 #[test]
