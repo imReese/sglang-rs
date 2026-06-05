@@ -1750,6 +1750,56 @@ fn safetensors_manifest_reads_indexed_tensor_payload_bytes() {
 }
 
 #[test]
+fn safetensors_tensor_data_decodes_common_float_dtypes_to_f32() {
+    let cases = [
+        (
+            "F32",
+            vec![2],
+            [1.0_f32, -2.0]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>(),
+            vec![1.0, -2.0],
+        ),
+        (
+            "BF16",
+            vec![2],
+            vec![0x80, 0x3f, 0x00, 0xc0],
+            vec![1.0, -2.0],
+        ),
+        (
+            "F16",
+            vec![3],
+            vec![0x00, 0x3c, 0x00, 0xc0, 0x00, 0x38],
+            vec![1.0, -2.0, 0.5],
+        ),
+        (
+            "F8_E4M3",
+            vec![5],
+            vec![0x00, 0x38, 0x40, 0xb8, 0x30],
+            vec![0.0, 1.0, 2.0, -1.0, 0.5],
+        ),
+    ];
+
+    for (dtype, shape, bytes, expected) in cases {
+        let tensor = SafetensorsTensorData {
+            metadata: SafetensorsTensorMetadata {
+                dtype: dtype.to_string(),
+                shape,
+                data_offsets: [0, bytes.len()],
+            },
+            bytes,
+        };
+
+        let decoded = tensor
+            .decode_f32_values()
+            .expect("supported float dtype should decode");
+
+        assert_eq!(decoded, expected, "dtype {dtype} should decode");
+    }
+}
+
+#[test]
 fn safetensors_tensor_span_computes_checksum_over_payload_slice() {
     let model_dir = temp_model_dir("tensor-span-checksum");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");

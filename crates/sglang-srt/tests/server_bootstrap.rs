@@ -348,7 +348,7 @@ async fn bootstrap_grpc_router_service_generates_through_model_runner() {
 }
 
 #[tokio::test]
-async fn bootstrap_grpc_router_service_generates_from_local_safetensors_weights() {
+async fn bootstrap_grpc_router_service_generates_from_local_fp8_safetensors_weights() {
     let model_dir = temp_model_dir("server-weight-backed-forward");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");
     fs::write(
@@ -368,20 +368,17 @@ async fn bootstrap_grpc_router_service_generates_from_local_safetensors_weights(
     write_safetensors_file(
         &model_dir.join("model.safetensors"),
         &[
-            ("model.embed_tokens.weight", "F32", &[3, 2], [0, 24]),
-            ("lm_head.weight", "F32", &[3, 2], [24, 48]),
+            ("model.embed_tokens.weight", "F8_E4M3", &[3, 2], [0, 6]),
+            ("lm_head.weight", "F8_E4M3", &[3, 2], [6, 12]),
         ],
         &[
-            0.0, 0.0, // [UNK]
-            1.0, 0.0, // hello
-            0.0, 1.0, // world
-            0.0, 0.0, // [UNK] logits
-            0.0, 0.0, // hello logits
-            2.0, 0.0, // world logits
-        ]
-        .into_iter()
-        .flat_map(f32::to_le_bytes)
-        .collect::<Vec<_>>(),
+            0x00, 0x00, // [UNK]
+            0x38, 0x00, // hello
+            0x00, 0x38, // world
+            0x00, 0x00, // [UNK] logits
+            0x00, 0x00, // hello logits
+            0x40, 0x00, // world logits
+        ],
     )
     .expect("weights should be written");
     let args = ServerArgs::parse_from([

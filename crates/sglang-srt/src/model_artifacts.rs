@@ -1273,6 +1273,118 @@ impl SafetensorsTensorData {
             .dtype_byte_width()
             .expect("loaded safetensors tensor dtype should be validated")
     }
+
+    pub fn decode_f32_values(&self) -> Result<Vec<f32>, SafetensorsTensorDecodeError> {
+        match self.metadata.dtype.as_str() {
+            "F32" => decode_f32_bytes(&self.bytes),
+            "BF16" => decode_u16_float_bytes("BF16", &self.bytes, bf16_to_f32),
+            "F16" => decode_u16_float_bytes("F16", &self.bytes, f16_to_f32),
+            "F8_E4M3" => Ok(self.bytes.iter().copied().map(f8_e4m3fn_to_f32).collect()),
+            dtype => Err(SafetensorsTensorDecodeError::UnsupportedDtype {
+                dtype: dtype.to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum SafetensorsTensorDecodeError {
+    UnsupportedDtype { dtype: String },
+    InvalidByteLength { dtype: String, byte_len: usize },
+}
+
+impl fmt::Display for SafetensorsTensorDecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedDtype { dtype } => {
+                write!(formatter, "cannot decode safetensors dtype {dtype} as f32")
+            }
+            Self::InvalidByteLength { dtype, byte_len } => write!(
+                formatter,
+                "cannot decode safetensors dtype {dtype} from {byte_len} bytes"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SafetensorsTensorDecodeError {}
+
+fn decode_f32_bytes(bytes: &[u8]) -> Result<Vec<f32>, SafetensorsTensorDecodeError> {
+    let chunks = bytes.chunks_exact(4);
+    if !chunks.remainder().is_empty() {
+        return Err(SafetensorsTensorDecodeError::InvalidByteLength {
+            dtype: "F32".to_string(),
+            byte_len: bytes.len(),
+        });
+    }
+
+    Ok(chunks
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
+}
+
+fn decode_u16_float_bytes(
+    dtype: &str,
+    bytes: &[u8],
+    decode: impl Fn(u16) -> f32,
+) -> Result<Vec<f32>, SafetensorsTensorDecodeError> {
+    let chunks = bytes.chunks_exact(2);
+    if !chunks.remainder().is_empty() {
+        return Err(SafetensorsTensorDecodeError::InvalidByteLength {
+            dtype: dtype.to_string(),
+            byte_len: bytes.len(),
+        });
+    }
+
+    Ok(chunks
+        .map(|chunk| decode(u16::from_le_bytes([chunk[0], chunk[1]])))
+        .collect())
+}
+
+fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits(u32::from(bits) << 16)
+}
+
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
+    let exponent = (bits >> 10) & 0x1f;
+    let mantissa = bits & 0x03ff;
+
+    match exponent {
+        0 => {
+            if mantissa == 0 {
+                sign * 0.0
+            } else {
+                sign * 2_f32.powi(-14) * (f32::from(mantissa) / 1024.0)
+            }
+        }
+        0x1f => {
+            if mantissa == 0 {
+                sign * f32::INFINITY
+            } else {
+                f32::NAN
+            }
+        }
+        _ => sign * 2_f32.powi(i32::from(exponent) - 15) * (1.0 + f32::from(mantissa) / 1024.0),
+    }
+}
+
+fn f8_e4m3fn_to_f32(bits: u8) -> f32 {
+    let sign = if bits & 0x80 == 0 { 1.0 } else { -1.0 };
+    let exponent = (bits >> 3) & 0x0f;
+    let mantissa = bits & 0x07;
+
+    match exponent {
+        0 => {
+            if mantissa == 0 {
+                sign * 0.0
+            } else {
+                sign * 2_f32.powi(-6) * (f32::from(mantissa) / 8.0)
+            }
+        }
+        0x0f if mantissa == 0x07 => f32::NAN,
+        _ => sign * 2_f32.powi(i32::from(exponent) - 7) * (1.0 + f32::from(mantissa) / 8.0),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

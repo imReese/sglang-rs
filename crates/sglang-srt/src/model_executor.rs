@@ -175,13 +175,13 @@ impl CpuEmbeddingLmModel {
         let hidden_size = artifacts.config().hidden_size.ok_or_else(|| {
             invalid_cpu_lm_artifact(artifacts, "missing hidden_size for CPU embedding LM")
         })?;
-        let token_embeddings = required_f32_matrix(
+        let token_embeddings = required_float_matrix(
             artifacts,
             "model.embed_tokens.weight",
             vocab_size,
             hidden_size,
         )?;
-        let lm_head = required_f32_matrix(artifacts, "lm_head.weight", vocab_size, hidden_size)?;
+        let lm_head = required_float_matrix(artifacts, "lm_head.weight", vocab_size, hidden_size)?;
 
         Ok(Some(Self {
             token_embeddings,
@@ -228,7 +228,7 @@ impl ForwardModel for CpuEmbeddingLmModel {
     }
 }
 
-fn required_f32_matrix(
+fn required_float_matrix(
     artifacts: &LocalModelArtifacts,
     tensor_name: &str,
     rows: usize,
@@ -245,7 +245,12 @@ fn required_f32_matrix(
         })?;
 
     validate_cpu_lm_tensor_shape(artifacts, tensor_name, &tensor, rows, columns)?;
-    f32_values_from_tensor(artifacts, tensor_name, &tensor)
+    tensor.decode_f32_values().map_err(|error| {
+        invalid_cpu_lm_artifact(
+            artifacts,
+            format!("failed to decode CPU embedding LM tensor {tensor_name}: {error}"),
+        )
+    })
 }
 
 fn validate_cpu_lm_tensor_shape(
@@ -255,15 +260,6 @@ fn validate_cpu_lm_tensor_shape(
     rows: usize,
     columns: usize,
 ) -> Result<(), ModelArtifactError> {
-    if tensor.metadata.dtype != "F32" {
-        return Err(invalid_cpu_lm_artifact(
-            artifacts,
-            format!(
-                "CPU embedding LM tensor {tensor_name} has unsupported dtype {}; expected F32",
-                tensor.metadata.dtype
-            ),
-        ));
-    }
     if tensor.metadata.shape != [rows, columns] {
         return Err(invalid_cpu_lm_artifact(
             artifacts,
@@ -274,25 +270,6 @@ fn validate_cpu_lm_tensor_shape(
         ));
     }
     Ok(())
-}
-
-fn f32_values_from_tensor(
-    artifacts: &LocalModelArtifacts,
-    tensor_name: &str,
-    tensor: &SafetensorsTensorData,
-) -> Result<Vec<f32>, ModelArtifactError> {
-    let mut chunks = tensor.bytes.chunks_exact(4);
-    let values = chunks
-        .by_ref()
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect::<Vec<_>>();
-    if !chunks.remainder().is_empty() {
-        return Err(invalid_cpu_lm_artifact(
-            artifacts,
-            format!("CPU embedding LM tensor {tensor_name} byte length is not divisible by 4"),
-        ));
-    }
-    Ok(values)
 }
 
 fn dot_product(left: &[f32], right: &[f32]) -> f32 {
