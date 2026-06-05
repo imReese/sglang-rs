@@ -14,7 +14,7 @@ use crate::model_executor::{
     ModelWorkerBatch,
 };
 use crate::pd_bootstrap::{
-    PrefillBootstrapServeError, PrefillBootstrapService,
+    PrefillBootstrapServeError, PrefillBootstrapService, PrefillRouteRegistration,
     serve_mooncake_bootstrap_zmq_endpoints_with_shutdown, serve_prefill_bootstrap_with_shutdown,
 };
 use crate::router::{RouterGetModelInfoResponse, RouterRuntime};
@@ -106,6 +106,10 @@ pub enum ServerLaunchError {
     Http(HttpServeError),
     PrefillBootstrap(PrefillBootstrapServeError),
     ServerTaskJoin(String),
+    ZmqRoutePortCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
 }
 
 impl PartialEq for ServerLaunchError {
@@ -134,6 +138,16 @@ impl PartialEq for ServerLaunchError {
             ) => left_mode == right_mode && left_backend == right_backend,
             (Self::Tokenizer(left), Self::Tokenizer(right)) => left == right,
             (Self::ModelArtifact(left), Self::ModelArtifact(right)) => left == right,
+            (
+                Self::ZmqRoutePortCountMismatch {
+                    expected: left_expected,
+                    actual: left_actual,
+                },
+                Self::ZmqRoutePortCountMismatch {
+                    expected: right_expected,
+                    actual: right_actual,
+                },
+            ) => left_expected == right_expected && left_actual == right_actual,
             _ => false,
         }
     }
@@ -162,6 +176,10 @@ impl fmt::Display for ServerLaunchError {
             Self::Http(error) => write!(formatter, "{error}"),
             Self::PrefillBootstrap(error) => write!(formatter, "{error}"),
             Self::ServerTaskJoin(error) => write!(formatter, "server task failed to join: {error}"),
+            Self::ZmqRoutePortCountMismatch { expected, actual } => write!(
+                formatter,
+                "prefill Mooncake ZMQ route port count mismatch: expected {expected}, got {actual}"
+            ),
         }
     }
 }
@@ -242,6 +260,81 @@ pub fn prefill_mooncake_zmq_endpoints(args: &ServerArgs) -> Vec<String> {
     (ports.start..=ports.end)
         .map(|port| format!("tcp://{}:{port}", args.host))
         .collect()
+}
+
+pub fn register_prefill_mooncake_routes_from_args(
+    service: &PrefillBootstrapService,
+    args: &ServerArgs,
+) -> Result<(), ServerLaunchError> {
+    let Some(ports) = args.disaggregation_zmq_ports else {
+        return Ok(());
+    };
+
+    let port_count = usize::from(ports.end - ports.start + 1);
+    let expected = args.dp_size * args.tp_size;
+    if port_count != expected {
+        return Err(ServerLaunchError::ZmqRoutePortCountMismatch {
+            expected,
+            actual: port_count,
+        });
+    }
+
+    let system_dp_size = if args.enable_dp_attention {
+        1
+    } else {
+        args.dp_size
+    };
+    let rank_ip = prefill_mooncake_route_rank_ip(args);
+    let mut state = service
+        .state()
+        .lock()
+        .expect("prefill bootstrap state lock should be held");
+    for dp_rank in 0..args.dp_size {
+        for tp_rank in 0..args.tp_size {
+            let port = ports.start + (dp_rank * args.tp_size + tp_rank) as u16;
+            state.register_route(PrefillRouteRegistration {
+                attn_tp_size: args.tp_size,
+                attn_tp_rank: tp_rank,
+                attn_cp_size: 1,
+                attn_cp_rank: 0,
+                attn_dp_size: args.dp_size,
+                attn_dp_rank: dp_rank,
+                pp_size: 1,
+                pp_rank: 0,
+                system_dp_size,
+                system_dp_rank: if args.enable_dp_attention { 0 } else { dp_rank },
+                rank_ip: rank_ip.clone(),
+                rank_port: port,
+                page_size: Some(args.page_size),
+                kv_cache_dtype: Some(args.kv_cache_dtype.clone()),
+                load_balance_method: None,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn prefill_mooncake_route_rank_ip(args: &ServerArgs) -> String {
+    if is_wildcard_host(&args.host) {
+        if let Some(dist_init_host) = args.dist_init_addr.as_deref().and_then(host_from_addr) {
+            return dist_init_host.to_string();
+        }
+    }
+    args.host.clone()
+}
+
+fn is_wildcard_host(host: &str) -> bool {
+    matches!(host, "0.0.0.0" | "::" | "[::]")
+}
+
+fn host_from_addr(addr: &str) -> Option<&str> {
+    if let Some(rest) = addr.strip_prefix('[') {
+        let (host, _) = rest.split_once(']')?;
+        return Some(host);
+    }
+    addr.rsplit_once(':')
+        .map(|(host, _)| host)
+        .filter(|host| !host.is_empty())
 }
 
 pub fn build_bootstrap_grpc_router_service(args: &ServerArgs) -> BootstrapGrpcRouterService {
@@ -457,6 +550,7 @@ where
             let zmq_endpoints = prefill_mooncake_zmq_endpoints(&args);
             let service = try_build_bootstrap_http_router_service(&args)?;
             let bootstrap_service = PrefillBootstrapService::default();
+            register_prefill_mooncake_routes_from_args(&bootstrap_service, &args)?;
             serve_prefill_http_and_bootstrap(
                 addr,
                 service,

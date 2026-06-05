@@ -107,7 +107,7 @@ impl PrefillBootstrapState {
         self.transfer_rooms.get(&room).map(|room| room.status)
     }
 
-    fn register_route(&mut self, registration: PrefillRouteRegistration) {
+    pub(crate) fn register_route(&mut self, registration: PrefillRouteRegistration) {
         self.attn_tp_size.get_or_insert(registration.attn_tp_size);
         self.attn_cp_size.get_or_insert(registration.attn_cp_size);
         self.dp_size
@@ -167,7 +167,7 @@ impl PrefillBootstrapState {
         self.registered_count >= dp_size * attn_cp_size * attn_tp_size * pp_size
     }
 
-    fn server_info(&self) -> Option<PrefillServerInfo> {
+    pub fn server_info(&self) -> Option<PrefillServerInfo> {
         if !self.is_ready() {
             return None;
         }
@@ -182,7 +182,7 @@ impl PrefillBootstrapState {
         })
     }
 
-    fn rank_info(
+    pub fn rank_info(
         &self,
         prefill_dp_rank: usize,
         prefill_cp_rank: usize,

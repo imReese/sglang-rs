@@ -5,6 +5,7 @@ use tonic::Request;
 
 use sglang_srt::cli::ServerArgs;
 use sglang_srt::model_artifacts::ModelArtifactError;
+use sglang_srt::pd_bootstrap::PrefillBootstrapService;
 use sglang_srt::proto::sglang::runtime::v1::generate_response::Body;
 use sglang_srt::proto::sglang::runtime::v1::sglang_service_server::SglangService;
 use sglang_srt::proto::sglang::runtime::v1::{
@@ -13,7 +14,8 @@ use sglang_srt::proto::sglang::runtime::v1::{
 use sglang_srt::server::{
     ServerLaunchError, build_bootstrap_fake_pd_grpc_router_service,
     build_bootstrap_grpc_router_service, build_bootstrap_pd_grpc_router_service, grpc_listen_addr,
-    launch_grpc_server, prefill_mooncake_zmq_endpoints, try_build_bootstrap_grpc_router_service,
+    launch_grpc_server, prefill_mooncake_zmq_endpoints, register_prefill_mooncake_routes_from_args,
+    try_build_bootstrap_grpc_router_service,
 };
 use sglang_srt::tokenizer::TokenizerError;
 use sglang_srt::transfer::{
@@ -1031,6 +1033,124 @@ fn prefill_mooncake_zmq_endpoints_follow_launch_host_and_port_range() {
             "tcp://0.0.0.0:7001".to_string(),
             "tcp://0.0.0.0:7002".to_string(),
         ]
+    );
+}
+
+#[test]
+fn prefill_mooncake_route_registration_maps_tp_ranks_to_zmq_ports() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--host",
+        "10.0.0.9",
+        "--tp-size",
+        "2",
+        "--dp-size",
+        "1",
+        "--page-size",
+        "64",
+        "--kv-cache-dtype",
+        "bfloat16",
+        "--disaggregation-mode",
+        "prefill",
+        "--disaggregation-transfer-backend",
+        "mooncake",
+        "--disaggregation-zmq-ports",
+        "7000-7001",
+    ])
+    .expect("args should parse");
+    let service = PrefillBootstrapService::default();
+
+    register_prefill_mooncake_routes_from_args(&service, &args)
+        .expect("prefill ZMQ routes should register");
+
+    let state = service.state().lock().expect("state lock should be held");
+    let topology = state
+        .server_info()
+        .expect("registered prefill routes should make topology ready");
+    assert_eq!(topology.attn_tp_size, 2);
+    assert_eq!(topology.dp_size, 1);
+    assert_eq!(topology.page_size, Some(64));
+    assert_eq!(topology.kv_cache_dtype.as_deref(), Some("bfloat16"));
+    assert_eq!(
+        state
+            .rank_info(0, 0, 0, 0)
+            .expect("TP0 endpoint should be registered")
+            .rank_port,
+        7000
+    );
+    assert_eq!(
+        state
+            .rank_info(0, 0, 1, 0)
+            .expect("TP1 endpoint should be registered")
+            .rank_port,
+        7001
+    );
+}
+
+#[test]
+fn prefill_mooncake_route_registration_uses_dist_init_host_for_wildcard_bind_host() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--host",
+        "0.0.0.0",
+        "--dist-init-addr",
+        "10.95.250.21:6676",
+        "--tp-size",
+        "1",
+        "--disaggregation-mode",
+        "prefill",
+        "--disaggregation-transfer-backend",
+        "mooncake",
+        "--disaggregation-zmq-ports",
+        "7000-7000",
+    ])
+    .expect("args should parse");
+    let service = PrefillBootstrapService::default();
+
+    register_prefill_mooncake_routes_from_args(&service, &args)
+        .expect("prefill ZMQ routes should register");
+
+    let state = service.state().lock().expect("state lock should be held");
+    assert_eq!(
+        state
+            .rank_info(0, 0, 0, 0)
+            .expect("rank endpoint should be registered")
+            .rank_ip,
+        "10.95.250.21"
+    );
+}
+
+#[test]
+fn prefill_mooncake_route_registration_rejects_incomplete_zmq_port_range() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--tp-size",
+        "2",
+        "--disaggregation-mode",
+        "prefill",
+        "--disaggregation-transfer-backend",
+        "mooncake",
+        "--disaggregation-zmq-ports",
+        "7000-7000",
+    ])
+    .expect("args should parse");
+    let service = PrefillBootstrapService::default();
+
+    let error = register_prefill_mooncake_routes_from_args(&service, &args)
+        .expect_err("incomplete ZMQ port range should fail route registration");
+
+    assert_eq!(
+        error,
+        ServerLaunchError::ZmqRoutePortCountMismatch {
+            expected: 2,
+            actual: 1,
+        }
     );
 }
 
