@@ -44,6 +44,7 @@ message SamplingParams {
   optional int32 n = 11;
   optional int32 best_of = 12;
   optional int64 seed = 13;
+  repeated uint32 stop_token_ids = 14;
 }
 
 message DisaggregatedParams {

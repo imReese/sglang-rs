@@ -563,6 +563,11 @@ fn proto_sampling_params_to_router(params: ProtoSamplingParams) -> RouterSamplin
         presence_penalty: params.presence_penalty,
         repetition_penalty: params.repetition_penalty,
         stop_token_id: params.stop_token_id,
+        stop_token_ids: params
+            .stop_token_ids
+            .into_iter()
+            .map(|stop_token_id| stop_token_id as i32)
+            .collect(),
         n: params.n,
         best_of: params.best_of,
     }

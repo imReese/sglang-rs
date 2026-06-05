@@ -33,6 +33,7 @@ pub struct RouterSamplingParams {
     pub presence_penalty: Option<f32>,
     pub repetition_penalty: Option<f32>,
     pub stop_token_id: Option<i32>,
+    pub stop_token_ids: Vec<i32>,
     pub n: Option<i32>,
     pub best_of: Option<i32>,
 }
@@ -47,6 +48,7 @@ impl RouterSamplingParams {
         validate_optional_positive_float("repetition_penalty", self.repetition_penalty)?;
         validate_optional_unbounded_or_positive_i32("top_k", self.top_k)?;
         validate_optional_non_negative_i32("stop_token_id", self.stop_token_id)?;
+        validate_non_negative_i32s("stop_token_ids", &self.stop_token_ids)?;
         validate_optional_positive_i32("n", self.n)?;
         validate_optional_positive_i32("best_of", self.best_of)?;
 
@@ -68,12 +70,23 @@ impl RouterSamplingParams {
             top_p: self.top_p,
             top_k: self.top_k,
             min_p: self.min_p,
-            stop_token_ids: self
-                .stop_token_id
-                .map(|stop_token_id| vec![stop_token_id as u32])
-                .unwrap_or_default(),
+            stop_token_ids: merged_stop_token_ids(self.stop_token_id, self.stop_token_ids),
         })
     }
+}
+
+fn merged_stop_token_ids(stop_token_id: Option<i32>, stop_token_ids: Vec<i32>) -> Vec<u32> {
+    let mut merged = stop_token_id
+        .map(|stop_token_id| vec![stop_token_id as u32])
+        .unwrap_or_default();
+    merged.extend(
+        stop_token_ids
+            .into_iter()
+            .map(|stop_token_id| stop_token_id as u32),
+    );
+    merged.sort_unstable();
+    merged.dedup();
+    merged
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -197,6 +210,21 @@ fn validate_optional_non_negative_i32(
         return Ok(());
     };
     if value < 0 {
+        return Err(RouterProtocolError::InvalidIntegerSamplingParam {
+            field,
+            value,
+            expected: "non-negative",
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_non_negative_i32s(
+    field: &'static str,
+    values: &[i32],
+) -> Result<(), RouterProtocolError> {
+    if let Some(value) = values.iter().copied().find(|value| *value < 0) {
         return Err(RouterProtocolError::InvalidIntegerSamplingParam {
             field,
             value,

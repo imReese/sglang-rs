@@ -305,7 +305,7 @@ async fn bootstrap_grpc_router_service_generates_through_model_runner() {
             text: "hello".to_string(),
             sampling_params: Some(SamplingParams {
                 max_new_tokens: Some(4),
-                stop_token_id: Some(b' ' as i32),
+                stop_token_ids: vec![b' ' as u32],
                 ..Default::default()
             }),
             options: Some(RequestOptions {
