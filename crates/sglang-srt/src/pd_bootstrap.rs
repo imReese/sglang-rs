@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
 use std::io::{Read, Write};
@@ -123,6 +123,7 @@ pub struct PrefillBootstrapState {
         BTreeMap<usize, BTreeMap<usize, BTreeMap<usize, BTreeMap<usize, PrefillRankInfo>>>>,
     room_to_dp_rank: BTreeMap<BootstrapRoom, RegisteredDpRank>,
     decode_kv_args_table: BTreeMap<String, MooncakeKvArgsRegisterInfo>,
+    decode_kv_args_registration_count: usize,
     transfer_rooms: BTreeMap<BootstrapRoom, MooncakeTransferRoom>,
 }
 
@@ -138,6 +139,7 @@ impl PrefillBootstrapState {
                 let register = MooncakeKvArgsRegisterInfo::from_frame(frame)?;
                 self.decode_kv_args_table
                     .insert(register.mooncake_session_id.clone(), register);
+                self.decode_kv_args_registration_count += 1;
                 Ok(())
             }
             _ => {
@@ -170,6 +172,10 @@ impl PrefillBootstrapState {
 
     pub fn decode_kv_args(&self, session_id: &str) -> Option<&MooncakeKvArgsRegisterInfo> {
         self.decode_kv_args_table.get(session_id)
+    }
+
+    pub fn decode_kv_args_registration_count(&self) -> usize {
+        self.decode_kv_args_registration_count
     }
 
     pub fn transfer_room(&self, room: BootstrapRoom) -> Option<&MooncakeTransferRoom> {
@@ -687,6 +693,7 @@ pub struct MooncakeDecodeBootstrapPublisher {
     target_pp_rank: i32,
     dst_aux_index: Option<i32>,
     required_dst_info_num: usize,
+    registered_kv_args_endpoints: BTreeSet<String>,
 }
 
 impl MooncakeDecodeBootstrapPublisher {
@@ -704,6 +711,7 @@ impl MooncakeDecodeBootstrapPublisher {
             target_pp_rank: 0,
             dst_aux_index: Some(0),
             required_dst_info_num: 1,
+            registered_kv_args_endpoints: BTreeSet::new(),
         }
     }
 
@@ -794,7 +802,23 @@ impl DecodeBootstrapPublisher for MooncakeDecodeBootstrapPublisher {
             let prefill_dp_rank = span.data_parallel_rank();
             let target_tp_rank = self.target_tp_rank;
             let target_pp_rank = self.target_pp_rank;
-            let kv_args_registration = self.kv_args_registration();
+            let kv_args_registration_key = format!(
+                "{}|{}|{}|{}|{}",
+                bootstrap_addr,
+                prefill_dp_rank,
+                target_tp_rank,
+                target_pp_rank,
+                self.mooncake_session_id
+            );
+            let kv_args_registration = if self
+                .registered_kv_args_endpoints
+                .contains(&kv_args_registration_key)
+            {
+                None
+            } else {
+                self.kv_args_registration()
+            };
+            let mark_kv_args_registered = kv_args_registration.is_some();
             publish_mooncake_decode_metadata_blocking(
                 bootstrap_addr,
                 prefill_dp_rank,
@@ -803,6 +827,10 @@ impl DecodeBootstrapPublisher for MooncakeDecodeBootstrapPublisher {
                 kv_args_registration,
                 metadata,
             )?;
+            if mark_kv_args_registered {
+                self.registered_kv_args_endpoints
+                    .insert(kv_args_registration_key);
+            }
             published_spans += 1;
         }
 
