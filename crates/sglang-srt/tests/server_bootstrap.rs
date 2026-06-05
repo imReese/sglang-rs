@@ -246,6 +246,52 @@ async fn bootstrap_grpc_router_service_reports_local_moe_checkpoint_coverage() {
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
 
+#[tokio::test]
+async fn bootstrap_grpc_router_service_rejects_generation_for_unsupported_local_model_runtime() {
+    let model_dir = temp_model_dir("server-unsupported-local-forward");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_complete_deepseek_v4_checkpoint(&model_dir);
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_dir.to_str().expect("temp model dir should be utf-8"),
+        "--grpc-mode",
+    ])
+    .expect("args should parse");
+    let service = build_bootstrap_grpc_router_service(&args);
+
+    let error = match service
+        .text_generate(Request::new(TextGenerateRequest {
+            text: "hello".to_string(),
+            sampling_params: Some(SamplingParams {
+                max_new_tokens: Some(1),
+                ..Default::default()
+            }),
+            options: Some(RequestOptions {
+                request_id: Some("unsupported-local-forward".to_string()),
+                stream: true,
+                data_parallel_rank: 0,
+                trace_headers: Default::default(),
+            }),
+            disaggregated_params: None,
+        }))
+        .await
+    {
+        Ok(_) => panic!("unsupported local model runtime should not generate fake output"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), tonic::Code::Internal);
+    assert!(
+        error.message().contains(
+            "local model type deepseek_v4 has checkpoint metadata but no Rust forward runtime"
+        ),
+        "unexpected error: {error:?}"
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
 #[test]
 fn bootstrap_grpc_router_service_rejects_missing_deepseek_v4_model_root_tensor() {
     let model_dir = temp_model_dir("server-missing-deepseek-root");
@@ -1239,6 +1285,125 @@ fn deepseek_v4_model_config_json() -> &'static str {
   "max_position_embeddings": 163840,
   "num_hidden_layers": 43
 }"#
+}
+
+fn write_complete_deepseek_v4_checkpoint(model_dir: &std::path::Path) {
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "model_type": "deepseek_v4",
+  "num_hidden_layers": 1,
+  "hidden_size": 1,
+  "hc_mult": 1,
+  "n_routed_experts": 1,
+  "first_k_dense_replace": 0,
+  "moe_layer_freq": 1
+}"#,
+    )
+    .expect("config should be written");
+    fs::write(
+        model_dir.join("model.safetensors.index.json"),
+        r#"{
+  "weight_map": {
+    "model.embed_tokens.weight": "model.safetensors",
+    "model.norm.weight": "model.safetensors",
+    "lm_head.weight": "model.safetensors",
+    "model.hc_head_fn": "model.safetensors",
+    "model.hc_head_base": "model.safetensors",
+    "model.hc_head_scale": "model.safetensors",
+    "model.layers.0.self_attn.wq_a.weight": "model.safetensors",
+    "model.layers.0.self_attn.wq_b.weight": "model.safetensors",
+    "model.layers.0.self_attn.wkv.weight": "model.safetensors",
+    "model.layers.0.self_attn.q_norm.weight": "model.safetensors",
+    "model.layers.0.self_attn.kv_norm.weight": "model.safetensors",
+    "model.layers.0.self_attn.wo_a.weight": "model.safetensors",
+    "model.layers.0.self_attn.wo_b.weight": "model.safetensors",
+    "model.layers.0.input_layernorm.weight": "model.safetensors",
+    "model.layers.0.post_attention_layernorm.weight": "model.safetensors",
+    "model.layers.0.hc_attn_fn": "model.safetensors",
+    "model.layers.0.hc_attn_base": "model.safetensors",
+    "model.layers.0.hc_attn_scale": "model.safetensors",
+    "model.layers.0.hc_ffn_fn": "model.safetensors",
+    "model.layers.0.hc_ffn_base": "model.safetensors",
+    "model.layers.0.hc_ffn_scale": "model.safetensors",
+    "model.layers.0.mlp.gate.weight": "model.safetensors",
+    "model.layers.0.ffn.experts.0.w1.weight": "model.safetensors",
+    "model.layers.0.ffn.experts.0.w2.weight": "model.safetensors",
+    "model.layers.0.ffn.experts.0.w3.weight": "model.safetensors"
+  }
+}"#,
+    )
+    .expect("index should be written");
+    write_safetensors_file(
+        &model_dir.join("model.safetensors"),
+        &[
+            ("model.embed_tokens.weight", "U8", &[1], [0, 1]),
+            ("model.norm.weight", "U8", &[1], [1, 2]),
+            ("lm_head.weight", "U8", &[1], [2, 3]),
+            ("model.hc_head_fn", "U8", &[1, 1], [3, 4]),
+            ("model.hc_head_base", "U8", &[1], [4, 5]),
+            ("model.hc_head_scale", "U8", &[1], [5, 6]),
+            ("model.layers.0.self_attn.wq_a.weight", "U8", &[1], [6, 7]),
+            ("model.layers.0.self_attn.wq_b.weight", "U8", &[1], [7, 8]),
+            ("model.layers.0.self_attn.wkv.weight", "U8", &[1], [8, 9]),
+            (
+                "model.layers.0.self_attn.q_norm.weight",
+                "U8",
+                &[1],
+                [9, 10],
+            ),
+            (
+                "model.layers.0.self_attn.kv_norm.weight",
+                "U8",
+                &[1],
+                [10, 11],
+            ),
+            ("model.layers.0.self_attn.wo_a.weight", "U8", &[1], [11, 12]),
+            ("model.layers.0.self_attn.wo_b.weight", "U8", &[1], [12, 13]),
+            (
+                "model.layers.0.input_layernorm.weight",
+                "U8",
+                &[1],
+                [13, 14],
+            ),
+            (
+                "model.layers.0.post_attention_layernorm.weight",
+                "U8",
+                &[1],
+                [14, 15],
+            ),
+            ("model.layers.0.hc_attn_fn", "U8", &[1], [15, 16]),
+            ("model.layers.0.hc_attn_base", "U8", &[1], [16, 17]),
+            ("model.layers.0.hc_attn_scale", "U8", &[1], [17, 18]),
+            ("model.layers.0.hc_ffn_fn", "U8", &[1], [18, 19]),
+            ("model.layers.0.hc_ffn_base", "U8", &[1], [19, 20]),
+            ("model.layers.0.hc_ffn_scale", "U8", &[1], [20, 21]),
+            ("model.layers.0.mlp.gate.weight", "U8", &[1], [21, 22]),
+            (
+                "model.layers.0.ffn.experts.0.w1.weight",
+                "U8",
+                &[1],
+                [22, 23],
+            ),
+            (
+                "model.layers.0.ffn.experts.0.w2.weight",
+                "U8",
+                &[1],
+                [23, 24],
+            ),
+            (
+                "model.layers.0.ffn.experts.0.w3.weight",
+                "U8",
+                &[1],
+                [24, 25],
+            ),
+        ],
+        &[
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25,
+        ],
+    )
+    .expect("shard should be written");
 }
 
 fn write_safetensors_file(

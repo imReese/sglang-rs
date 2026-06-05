@@ -1,7 +1,7 @@
 use std::fmt;
 use std::future::Future;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::cache::{CachePageAllocator, RadixCache};
 use crate::cli::ServerArgs;
@@ -33,6 +33,10 @@ pub enum BootstrapForwardModel {
     #[default]
     Space,
     CpuEmbeddingLm(CpuEmbeddingLmModel),
+    UnsupportedLocalModelRuntime {
+        model_path: PathBuf,
+        model_type: Option<String>,
+    },
 }
 
 impl BootstrapForwardModel {
@@ -49,9 +53,15 @@ impl BootstrapForwardModel {
             Err(error) => return Err(error.into()),
         };
 
-        Ok(CpuEmbeddingLmModel::from_local_model_artifacts(&artifacts)?
-            .map(Self::CpuEmbeddingLm)
-            .unwrap_or(Self::Space))
+        Ok(
+            match CpuEmbeddingLmModel::from_local_model_artifacts(&artifacts)? {
+                Some(model) => Self::CpuEmbeddingLm(model),
+                None => Self::UnsupportedLocalModelRuntime {
+                    model_path: artifacts.model_path().to_path_buf(),
+                    model_type: artifacts.config().model_type.clone(),
+                },
+            },
+        )
     }
 }
 
@@ -72,6 +82,14 @@ impl ForwardModel for BootstrapForwardModel {
                 ModelForwardOutput::new(logits)
             }
             Self::CpuEmbeddingLm(model) => model.forward(batch),
+            Self::UnsupportedLocalModelRuntime {
+                model_path,
+                model_type,
+            } => Err(ModelForwardError::Runtime(format!(
+                "local model type {} has checkpoint metadata but no Rust forward runtime: {}",
+                model_type.as_deref().unwrap_or("<unknown>"),
+                model_path.display()
+            ))),
         }
     }
 }
