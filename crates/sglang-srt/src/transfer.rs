@@ -1302,6 +1302,13 @@ pub struct MooncakeTransferTarget {
     pub target_id: i32,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MooncakeRemoteKvLayout {
+    pub dst_kv_ptrs: Vec<u64>,
+    pub dst_kv_indices: Vec<i32>,
+    pub dst_kv_item_len: usize,
+}
+
 pub trait MooncakeSegmentOpener {
     fn open_segment(&mut self, segment: &str) -> Result<i32, MooncakeError>;
 }
@@ -1449,13 +1456,116 @@ pub fn build_mooncake_kv_transfer_requests(
     Ok(requests)
 }
 
+pub fn build_mooncake_remote_kv_transfer_requests(
+    span: &KvCacheTransferSpan,
+    layout: MooncakeKvCacheLayout,
+    target: MooncakeTransferTarget,
+    remote_layout: &MooncakeRemoteKvLayout,
+) -> Result<Vec<MooncakeTransferRequest>, MooncakeRequestBuildError> {
+    if layout.page_size_bytes == 0 {
+        return Err(MooncakeRequestBuildError::ZeroPageSize);
+    }
+
+    if remote_layout.dst_kv_item_len == 0 {
+        return Err(MooncakeRequestBuildError::ZeroRemoteKvItemSize);
+    }
+
+    if remote_layout.dst_kv_ptrs.is_empty() {
+        return Err(MooncakeRequestBuildError::MissingRemoteKvPointers);
+    }
+
+    if span.token_count() != span.cache_pages().len() {
+        return Err(MooncakeRequestBuildError::SpanPageCountMismatch {
+            token_count: span.token_count(),
+            cache_page_count: span.cache_pages().len(),
+        });
+    }
+
+    if span.token_count() != remote_layout.dst_kv_indices.len() {
+        return Err(MooncakeRequestBuildError::RemoteKvIndexCountMismatch {
+            token_count: span.token_count(),
+            dst_kv_index_count: remote_layout.dst_kv_indices.len(),
+        });
+    }
+
+    let item_len = remote_layout.dst_kv_item_len;
+    let split_page_size = item_len
+        .checked_mul(remote_layout.dst_kv_ptrs.len())
+        .ok_or(MooncakeRequestBuildError::AddressOverflow)?;
+    if split_page_size != layout.page_size_bytes {
+        return Err(MooncakeRequestBuildError::RemoteKvItemLayoutMismatch {
+            page_size_bytes: layout.page_size_bytes,
+            split_page_size,
+        });
+    }
+
+    let mut requests =
+        Vec::with_capacity(span.cache_pages().len() * remote_layout.dst_kv_ptrs.len());
+
+    for (page_index, cache_page) in span.cache_pages().iter().enumerate() {
+        let dst_kv_index = remote_layout.dst_kv_indices[page_index];
+        if dst_kv_index < 0 {
+            return Err(MooncakeRequestBuildError::NegativeRemoteKvIndex(
+                dst_kv_index,
+            ));
+        }
+
+        let source_offset = cache_page
+            .as_usize()
+            .checked_mul(layout.page_size_bytes)
+            .ok_or(MooncakeRequestBuildError::AddressOverflow)?;
+        let source_page_addr = layout
+            .source_base_addr
+            .checked_add(source_offset)
+            .ok_or(MooncakeRequestBuildError::AddressOverflow)?;
+
+        for (ptr_index, dst_kv_ptr) in remote_layout.dst_kv_ptrs.iter().enumerate() {
+            let source_addr = source_page_addr
+                .checked_add(
+                    ptr_index
+                        .checked_mul(item_len)
+                        .ok_or(MooncakeRequestBuildError::AddressOverflow)?,
+                )
+                .ok_or(MooncakeRequestBuildError::AddressOverflow)?;
+            let target_offset = dst_kv_ptr
+                .checked_add(
+                    (dst_kv_index as u64)
+                        .checked_mul(item_len as u64)
+                        .ok_or(MooncakeRequestBuildError::OffsetOverflow)?,
+                )
+                .ok_or(MooncakeRequestBuildError::OffsetOverflow)?;
+
+            requests.push(MooncakeTransferRequest {
+                opcode: MooncakeOpcode::Write as c_int,
+                source: source_addr as *mut c_void,
+                target_id: target.target_id,
+                target_offset,
+                length: item_len as u64,
+            });
+        }
+    }
+
+    Ok(requests)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MooncakeRequestBuildError {
     ZeroPageSize,
+    ZeroRemoteKvItemSize,
+    MissingRemoteKvPointers,
     SpanPageCountMismatch {
         token_count: usize,
         cache_page_count: usize,
     },
+    RemoteKvIndexCountMismatch {
+        token_count: usize,
+        dst_kv_index_count: usize,
+    },
+    RemoteKvItemLayoutMismatch {
+        page_size_bytes: usize,
+        split_page_size: usize,
+    },
+    NegativeRemoteKvIndex(i32),
     AddressOverflow,
     OffsetOverflow,
 }
@@ -1464,6 +1574,12 @@ impl fmt::Display for MooncakeRequestBuildError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ZeroPageSize => formatter.write_str("Mooncake KV page size must be non-zero"),
+            Self::ZeroRemoteKvItemSize => {
+                formatter.write_str("Mooncake remote KV item size must be non-zero")
+            }
+            Self::MissingRemoteKvPointers => {
+                formatter.write_str("Mooncake remote KV pointers must not be empty")
+            }
             Self::SpanPageCountMismatch {
                 token_count,
                 cache_page_count,
@@ -1471,6 +1587,26 @@ impl fmt::Display for MooncakeRequestBuildError {
                 formatter,
                 "KV transfer span has {token_count} tokens but {cache_page_count} cache pages"
             ),
+            Self::RemoteKvIndexCountMismatch {
+                token_count,
+                dst_kv_index_count,
+            } => write!(
+                formatter,
+                "KV transfer span has {token_count} tokens but {dst_kv_index_count} remote KV indices"
+            ),
+            Self::RemoteKvItemLayoutMismatch {
+                page_size_bytes,
+                split_page_size,
+            } => write!(
+                formatter,
+                "Mooncake remote KV item layout requires exactly {page_size_bytes} bytes but has {split_page_size} bytes"
+            ),
+            Self::NegativeRemoteKvIndex(index) => {
+                write!(
+                    formatter,
+                    "Mooncake remote KV index must be non-negative: {index}"
+                )
+            }
             Self::AddressOverflow => formatter.write_str("Mooncake source address overflow"),
             Self::OffsetOverflow => formatter.write_str("Mooncake target offset overflow"),
         }
@@ -1641,6 +1777,7 @@ pub struct MooncakeKvCacheTransferExecutor<S, R = FixedMooncakeTransferTargetRes
     submitter: S,
     layout: MooncakeKvCacheLayout,
     target_resolver: R,
+    remote_kv_layouts: BTreeMap<i32, MooncakeRemoteKvLayout>,
     submitted_batches: Vec<MooncakeBatchId>,
     submitted_transfers: Vec<MooncakeSubmittedBatch>,
 }
@@ -1657,6 +1794,20 @@ impl<S> MooncakeKvCacheTransferExecutor<S> {
             FixedMooncakeTransferTargetResolver::new(target),
         )
     }
+
+    pub fn with_remote_kv_layouts(
+        submitter: S,
+        layout: MooncakeKvCacheLayout,
+        target: MooncakeTransferTarget,
+        remote_kv_layouts: Vec<(i32, MooncakeRemoteKvLayout)>,
+    ) -> Self {
+        Self::with_target_resolver_and_remote_kv_layouts(
+            submitter,
+            layout,
+            FixedMooncakeTransferTargetResolver::new(target),
+            remote_kv_layouts,
+        )
+    }
 }
 
 impl<S, R> MooncakeKvCacheTransferExecutor<S, R> {
@@ -1669,6 +1820,23 @@ impl<S, R> MooncakeKvCacheTransferExecutor<S, R> {
             submitter,
             layout,
             target_resolver,
+            remote_kv_layouts: BTreeMap::new(),
+            submitted_batches: Vec::new(),
+            submitted_transfers: Vec::new(),
+        }
+    }
+
+    pub fn with_target_resolver_and_remote_kv_layouts(
+        submitter: S,
+        layout: MooncakeKvCacheLayout,
+        target_resolver: R,
+        remote_kv_layouts: Vec<(i32, MooncakeRemoteKvLayout)>,
+    ) -> Self {
+        Self {
+            submitter,
+            layout,
+            target_resolver,
+            remote_kv_layouts: remote_kv_layouts.into_iter().collect(),
             submitted_batches: Vec::new(),
             submitted_transfers: Vec::new(),
         }
@@ -1696,6 +1864,14 @@ impl<S, R> MooncakeKvCacheTransferExecutor<S, R> {
 
     pub fn submitted_transfers(&self) -> &[MooncakeSubmittedBatch] {
         &self.submitted_transfers
+    }
+
+    pub fn remote_kv_layouts(&self) -> &BTreeMap<i32, MooncakeRemoteKvLayout> {
+        &self.remote_kv_layouts
+    }
+
+    pub fn insert_remote_kv_layout(&mut self, bootstrap_room: i32, layout: MooncakeRemoteKvLayout) {
+        self.remote_kv_layouts.insert(bootstrap_room, layout);
     }
 }
 
@@ -1759,7 +1935,12 @@ where
 {
     fn transfer_span(&mut self, span: &KvCacheTransferSpan) -> Result<(), KvCacheTransferError> {
         let target = self.target_resolver.resolve_target(span)?;
-        let mut requests = build_mooncake_kv_transfer_requests(span, self.layout, target)
+        let mut requests =
+            if let Some(remote_layout) = self.remote_kv_layouts.get(&span.bootstrap_room()) {
+                build_mooncake_remote_kv_transfer_requests(span, self.layout, target, remote_layout)
+            } else {
+                build_mooncake_kv_transfer_requests(span, self.layout, target)
+            }
             .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
         if requests.is_empty() {
             return Ok(());

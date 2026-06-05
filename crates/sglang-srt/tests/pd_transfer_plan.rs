@@ -9,10 +9,11 @@ use sglang_srt::transfer::{
     KvCacheTransferError, KvCacheTransferExecutor, KvCacheTransferPlan, KvCacheTransferPlanError,
     KvCacheTransferSpan, KvPoll, KvTransferModelWorker, MooncakeBatchId, MooncakeBatchReleaser,
     MooncakeError, MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeOpcode,
-    MooncakeSessionTargetResolver, MooncakeSubmittedBatch, MooncakeTransferRequest,
-    MooncakeTransferStatus, MooncakeTransferStatusCode, MooncakeTransferStatusReader,
-    MooncakeTransferSubmitter, MooncakeTransferTarget, MooncakeTransferTargetResolver,
-    build_mooncake_kv_transfer_requests, execute_kv_cache_transfer_plan,
+    MooncakeRemoteKvLayout, MooncakeSessionTargetResolver, MooncakeSubmittedBatch,
+    MooncakeTransferRequest, MooncakeTransferStatus, MooncakeTransferStatusCode,
+    MooncakeTransferStatusReader, MooncakeTransferSubmitter, MooncakeTransferTarget,
+    MooncakeTransferTargetResolver, build_mooncake_kv_transfer_requests,
+    build_mooncake_remote_kv_transfer_requests, execute_kv_cache_transfer_plan,
     is_decode_request_kv_ready, poll_mooncake_transfer_batches,
 };
 use sglang_srt::types::{DisaggregatedParams, RequestId, SamplingParams, TokenGenerateRequest};
@@ -918,6 +919,63 @@ fn mooncake_request_builder_maps_cache_pages_to_source_and_target_offsets() {
 }
 
 #[test]
+fn mooncake_remote_request_builder_uses_decode_kv_ptrs_and_indices() {
+    let transfer_plan = transfer_plan_for_request("pd-mooncake-remote", &[50, 51, 52], Some(1), 8);
+    let span = &transfer_plan.spans()[0];
+
+    let requests = build_mooncake_remote_kv_transfer_requests(
+        span,
+        MooncakeKvCacheLayout {
+            source_base_addr: 0x1000,
+            page_size_bytes: 256,
+            target_base_offset: 0,
+        },
+        MooncakeTransferTarget { target_id: 42 },
+        &MooncakeRemoteKvLayout {
+            dst_kv_ptrs: vec![0x9000],
+            dst_kv_indices: vec![7, 8],
+            dst_kv_item_len: 256,
+        },
+    )
+    .expect("mooncake remote requests should build");
+
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].source as usize, 0x1000);
+    assert_eq!(requests[0].target_id, 42);
+    assert_eq!(requests[0].target_offset, 0x9000 + 7 * 256);
+    assert_eq!(requests[0].length, 256);
+    assert_eq!(requests[1].source as usize, 0x1000 + 256);
+    assert_eq!(requests[1].target_offset, 0x9000 + 8 * 256);
+}
+
+#[test]
+fn mooncake_remote_request_builder_rejects_partial_page_layout() {
+    let transfer_plan = transfer_plan_for_request("pd-mooncake-partial", &[50], None, 8);
+    let span = &transfer_plan.spans()[0];
+
+    let error = build_mooncake_remote_kv_transfer_requests(
+        span,
+        MooncakeKvCacheLayout {
+            source_base_addr: 0x1000,
+            page_size_bytes: 256,
+            target_base_offset: 0,
+        },
+        MooncakeTransferTarget { target_id: 42 },
+        &MooncakeRemoteKvLayout {
+            dst_kv_ptrs: vec![0x9000],
+            dst_kv_indices: vec![7],
+            dst_kv_item_len: 128,
+        },
+    )
+    .expect_err("partial remote KV layout should be rejected");
+
+    assert_eq!(
+        error.to_string(),
+        "Mooncake remote KV item layout requires exactly 256 bytes but has 128 bytes"
+    );
+}
+
+#[test]
 fn mooncake_executor_submits_built_requests_through_transfer_submitter() {
     let transfer_plan = transfer_plan_for_request("pd-mooncake-submit", &[60, 61], None, 9);
     let mut registry = registry_with_session("pd-mooncake-submit", 9);
@@ -960,6 +1018,41 @@ fn mooncake_executor_submits_built_requests_through_transfer_submitter() {
         registry.get(9).expect("session should remain").status(),
         KvPoll::Success
     );
+}
+
+#[test]
+fn mooncake_executor_uses_remote_kv_layout_for_bootstrap_room() {
+    let transfer_plan =
+        transfer_plan_for_request("pd-mooncake-remote-submit", &[60, 61, 62], Some(1), 9);
+    let mut registry = registry_with_session("pd-mooncake-remote-submit", 9);
+    let mut executor = MooncakeKvCacheTransferExecutor::with_remote_kv_layouts(
+        RecordingMooncakeSubmitter::default(),
+        MooncakeKvCacheLayout {
+            source_base_addr: 0x2000,
+            page_size_bytes: 128,
+            target_base_offset: 0xdead_0000,
+        },
+        MooncakeTransferTarget { target_id: 7 },
+        vec![(
+            9,
+            MooncakeRemoteKvLayout {
+                dst_kv_ptrs: vec![0x9000],
+                dst_kv_indices: vec![4, 5],
+                dst_kv_item_len: 128,
+            },
+        )],
+    );
+
+    execute_kv_cache_transfer_plan(&mut registry, &mut executor, &transfer_plan)
+        .expect("mooncake executor should submit with remote layout");
+
+    let submitted_requests = &executor.submitter().submitted_requests;
+    assert_eq!(submitted_requests.len(), 1);
+    assert_eq!(submitted_requests[0].len(), 2);
+    assert_eq!(submitted_requests[0][0].source as usize, 0x2000);
+    assert_eq!(submitted_requests[0][0].target_offset, 0x9000 + 4 * 128);
+    assert_eq!(submitted_requests[0][1].source as usize, 0x2000 + 128);
+    assert_eq!(submitted_requests[0][1].target_offset, 0x9000 + 5 * 128);
 }
 
 #[test]
