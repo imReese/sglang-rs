@@ -81,6 +81,13 @@ impl DeepSeekV4Runtime {
     ) -> DeepSeekV4TensorPlacementPlan {
         DeepSeekV4TensorPlacementPlan::from_runtime(self, tensor_parallel_size)
     }
+
+    pub fn load_tensor_parallel_shards(
+        &self,
+        tensor_parallel_size: usize,
+    ) -> Result<DeepSeekV4LoadedTensorParallelRuntime, DeepSeekV4TensorShardLoadError> {
+        DeepSeekV4LoadedTensorParallelRuntime::from_runtime(self, tensor_parallel_size)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -737,6 +744,132 @@ impl DeepSeekV4LoadedTensorShard {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeepSeekV4LoadedTensorParallelRuntime {
+    runtime: DeepSeekV4Runtime,
+    tensor_parallel_size: usize,
+    ranks: Vec<DeepSeekV4LoadedTensorRank>,
+}
+
+impl DeepSeekV4LoadedTensorParallelRuntime {
+    fn from_runtime(
+        runtime: &DeepSeekV4Runtime,
+        tensor_parallel_size: usize,
+    ) -> Result<Self, DeepSeekV4TensorShardLoadError> {
+        if tensor_parallel_size == 0 {
+            return Err(DeepSeekV4TensorShardLoadError::ShardPlan(
+                DeepSeekV4TensorShardPlanError::RankOutOfBounds {
+                    tensor_parallel_rank: 0,
+                    tensor_parallel_size,
+                },
+            ));
+        }
+
+        let placement_plan = runtime.tensor_parallel_placement_plan(tensor_parallel_size);
+        let ranks = (0..tensor_parallel_size)
+            .map(|rank| {
+                let rank_plan = placement_plan.rank_shard_plan(rank)?;
+                DeepSeekV4LoadedTensorRank::from_rank_shard_plan(&rank_plan)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            runtime: runtime.clone(),
+            tensor_parallel_size,
+            ranks,
+        })
+    }
+
+    pub fn tensor_parallel_size(&self) -> usize {
+        self.tensor_parallel_size
+    }
+
+    pub fn rank_count(&self) -> usize {
+        self.ranks.len()
+    }
+
+    pub fn ranks(&self) -> &[DeepSeekV4LoadedTensorRank] {
+        &self.ranks
+    }
+
+    pub fn rank(&self, tensor_parallel_rank: usize) -> Option<&DeepSeekV4LoadedTensorRank> {
+        self.ranks
+            .iter()
+            .find(|rank| rank.tensor_parallel_rank() == tensor_parallel_rank)
+    }
+
+    pub fn layer_count(&self) -> usize {
+        self.runtime.layer_count()
+    }
+
+    pub fn kv_cache_layout(&self) -> KvCacheModelLayout {
+        self.runtime.kv_cache_layout()
+    }
+
+    pub fn forward_plan(&self, batch: &ModelWorkerBatch) -> DeepSeekV4ForwardPlan {
+        self.runtime.forward_plan(batch)
+    }
+
+    pub fn loaded_shard_count(&self) -> usize {
+        self.ranks
+            .iter()
+            .map(DeepSeekV4LoadedTensorRank::shard_count)
+            .sum()
+    }
+
+    pub fn loaded_byte_len(&self) -> usize {
+        self.ranks
+            .iter()
+            .map(DeepSeekV4LoadedTensorRank::loaded_byte_len)
+            .sum()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeepSeekV4LoadedTensorRank {
+    tensor_parallel_rank: usize,
+    shards: Vec<DeepSeekV4LoadedTensorShard>,
+}
+
+impl DeepSeekV4LoadedTensorRank {
+    fn from_rank_shard_plan(
+        rank_plan: &DeepSeekV4TensorRankShardPlan,
+    ) -> Result<Self, DeepSeekV4TensorShardLoadError> {
+        let shards = rank_plan
+            .shards()
+            .iter()
+            .map(DeepSeekV4TensorShard::load)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            tensor_parallel_rank: rank_plan.tensor_parallel_rank(),
+            shards,
+        })
+    }
+
+    pub fn tensor_parallel_rank(&self) -> usize {
+        self.tensor_parallel_rank
+    }
+
+    pub fn shards(&self) -> &[DeepSeekV4LoadedTensorShard] {
+        &self.shards
+    }
+
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    pub fn loaded_byte_len(&self) -> usize {
+        self.shards.iter().map(|shard| shard.bytes().len()).sum()
+    }
+
+    pub fn tensor_shard(&self, tensor_name: &str) -> Option<&DeepSeekV4LoadedTensorShard> {
+        self.shards
+            .iter()
+            .find(|shard| shard.tensor_name() == tensor_name)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DeepSeekV4TensorShardPlanError {
     RankOutOfBounds {
         tensor_parallel_rank: usize,
@@ -790,6 +923,7 @@ impl std::error::Error for DeepSeekV4TensorShardPlanError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DeepSeekV4TensorShardLoadError {
+    ShardPlan(DeepSeekV4TensorShardPlanError),
     ModelArtifact(ModelArtifactError),
     TensorRankTooHigh {
         tensor_name: String,
@@ -816,6 +950,7 @@ pub enum DeepSeekV4TensorShardLoadError {
 impl fmt::Display for DeepSeekV4TensorShardLoadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ShardPlan(error) => write!(formatter, "{error}"),
             Self::ModelArtifact(error) => write!(formatter, "{error}"),
             Self::TensorRankTooHigh { tensor_name, shape } => write!(
                 formatter,
@@ -855,6 +990,12 @@ impl fmt::Display for DeepSeekV4TensorShardLoadError {
 
 impl std::error::Error for DeepSeekV4TensorShardLoadError {}
 
+impl From<DeepSeekV4TensorShardPlanError> for DeepSeekV4TensorShardLoadError {
+    fn from(error: DeepSeekV4TensorShardPlanError) -> Self {
+        Self::ShardPlan(error)
+    }
+}
+
 impl From<ModelArtifactError> for DeepSeekV4TensorShardLoadError {
     fn from(error: ModelArtifactError) -> Self {
         Self::ModelArtifact(error)
@@ -866,6 +1007,10 @@ fn shard_selection_for_entry(
     tensor_parallel_size: usize,
     tensor_parallel_rank: usize,
 ) -> Result<DeepSeekV4TensorShardSelection, DeepSeekV4TensorShardPlanError> {
+    if tensor_parallel_size == 1 {
+        return Ok(DeepSeekV4TensorShardSelection::Full);
+    }
+
     let axis = match entry.kind() {
         DeepSeekV4TensorPlacementKind::Replicated => {
             return Ok(DeepSeekV4TensorShardSelection::Full);

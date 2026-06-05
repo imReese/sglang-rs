@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 
 use crate::cache::{CachePageAllocator, RadixCache};
 use crate::cli::ServerArgs;
-use crate::deepseek_runtime::{DeepSeekRuntimeError, DeepSeekV4Runtime};
+use crate::deepseek_runtime::{
+    DeepSeekRuntimeError, DeepSeekV4LoadedTensorParallelRuntime, DeepSeekV4Runtime,
+    DeepSeekV4TensorShardLoadError,
+};
 use crate::engine::Engine;
 use crate::grpc::{GrpcRouterService, GrpcServeError, serve_grpc_router};
 use crate::http::{HttpRouterService, HttpServeError, serve_http_router_with_shutdown};
@@ -34,7 +37,7 @@ pub enum BootstrapForwardModel {
     #[default]
     Space,
     CpuEmbeddingLm(CpuEmbeddingLmModel),
-    DeepSeekV4(DeepSeekV4Runtime),
+    DeepSeekV4(DeepSeekV4LoadedTensorParallelRuntime),
     UnsupportedLocalModelRuntime {
         model_path: PathBuf,
         model_type: Option<String>,
@@ -59,7 +62,8 @@ impl BootstrapForwardModel {
             match CpuEmbeddingLmModel::from_local_model_artifacts(&artifacts)? {
                 Some(model) => Self::CpuEmbeddingLm(model),
                 None if artifacts.config().model_type.as_deref() == Some("deepseek_v4") => {
-                    Self::DeepSeekV4(DeepSeekV4Runtime::from_local_model_artifacts(&artifacts)?)
+                    let runtime = DeepSeekV4Runtime::from_local_model_artifacts(&artifacts)?;
+                    Self::DeepSeekV4(runtime.load_tensor_parallel_shards(args.tp_size)?)
                 }
                 None => Self::UnsupportedLocalModelRuntime {
                     model_path: artifacts.model_path().to_path_buf(),
@@ -90,7 +94,10 @@ impl ForwardModel for BootstrapForwardModel {
             Self::DeepSeekV4(runtime) => {
                 let plan = runtime.forward_plan(batch);
                 Err(ModelForwardError::Runtime(format!(
-                    "DeepSeek V4 Rust forward kernels are not implemented; runtime descriptor loaded {} layer(s), planning {} request(s) and {} token(s)",
+                    "DeepSeek V4 Rust forward kernels are not implemented; loaded {} tensor-parallel rank(s), {} tensor shard(s), and {} byte(s) across {} layer(s), planning {} request(s) and {} token(s)",
+                    runtime.rank_count(),
+                    runtime.loaded_shard_count(),
+                    runtime.loaded_byte_len(),
                     runtime.layer_count(),
                     plan.request_ids().len(),
                     plan.input_ids().len()
@@ -145,6 +152,7 @@ pub enum ServerLaunchError {
     Http(HttpServeError),
     PrefillBootstrap(PrefillBootstrapServeError),
     DeepSeekRuntime(DeepSeekRuntimeError),
+    DeepSeekTensorShardLoad(DeepSeekV4TensorShardLoadError),
     ServerTaskJoin(String),
     ZmqRoutePortCountMismatch {
         expected: usize,
@@ -179,6 +187,9 @@ impl PartialEq for ServerLaunchError {
             (Self::Tokenizer(left), Self::Tokenizer(right)) => left == right,
             (Self::ModelArtifact(left), Self::ModelArtifact(right)) => left == right,
             (Self::DeepSeekRuntime(left), Self::DeepSeekRuntime(right)) => left == right,
+            (Self::DeepSeekTensorShardLoad(left), Self::DeepSeekTensorShardLoad(right)) => {
+                left == right
+            }
             (
                 Self::ZmqRoutePortCountMismatch {
                     expected: left_expected,
@@ -217,6 +228,9 @@ impl fmt::Display for ServerLaunchError {
             Self::Http(error) => write!(formatter, "{error}"),
             Self::PrefillBootstrap(error) => write!(formatter, "{error}"),
             Self::DeepSeekRuntime(error) => write!(formatter, "DeepSeek runtime error: {error}"),
+            Self::DeepSeekTensorShardLoad(error) => {
+                write!(formatter, "DeepSeek tensor shard load error: {error}")
+            }
             Self::ServerTaskJoin(error) => write!(formatter, "server task failed to join: {error}"),
             Self::ZmqRoutePortCountMismatch { expected, actual } => write!(
                 formatter,
@@ -267,6 +281,12 @@ impl From<TokenizerError> for ServerLaunchError {
 impl From<DeepSeekRuntimeError> for ServerLaunchError {
     fn from(value: DeepSeekRuntimeError) -> Self {
         Self::DeepSeekRuntime(value)
+    }
+}
+
+impl From<DeepSeekV4TensorShardLoadError> for ServerLaunchError {
+    fn from(value: DeepSeekV4TensorShardLoadError) -> Self {
+        Self::DeepSeekTensorShardLoad(value)
     }
 }
 

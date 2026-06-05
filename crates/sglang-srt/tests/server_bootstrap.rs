@@ -292,6 +292,10 @@ async fn bootstrap_grpc_router_service_rejects_generation_for_unsupported_local_
             .contains("DeepSeek V4 Rust forward kernels are not implemented"),
         "unexpected error: {error:?}"
     );
+    assert!(
+        error.message().contains("loaded 1 tensor-parallel rank(s)"),
+        "unexpected error: {error:?}"
+    );
 
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }

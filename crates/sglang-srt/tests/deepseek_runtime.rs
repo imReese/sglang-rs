@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use sglang_srt::cache::{CachePageAllocator, CachePageId, RadixCache};
 use sglang_srt::deepseek_runtime::{
     DeepSeekV4FeedForwardTensorDescriptors, DeepSeekV4Runtime, DeepSeekV4TensorPlacementKind,
-    DeepSeekV4TensorShardSelection,
+    DeepSeekV4TensorShardLoadError, DeepSeekV4TensorShardPlanError, DeepSeekV4TensorShardSelection,
 };
 use sglang_srt::model_artifacts::LocalModelArtifacts;
 use sglang_srt::model_executor::ModelWorkerBatch;
@@ -386,6 +386,102 @@ fn deepseek_v4_tensor_parallel_rank_plan_loads_sharded_tensor_bytes() {
         .expect("row-parallel tensor should be planned");
     assert_eq!(row_parallel.shape(), &[2, 2]);
     assert_eq!(row_parallel.bytes(), &[42, 43, 46, 47]);
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn deepseek_v4_runtime_loads_all_tensor_parallel_rank_shards() {
+    let model_dir = temp_model_dir("deepseek-runtime-load-all-tp-ranks");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_complete_deepseek_v4_checkpoint_with_shapes(
+        &model_dir,
+        &[
+            ("model.embed_tokens.weight", &[4, 2]),
+            ("lm_head.weight", &[4, 2]),
+            ("model.layers.0.self_attn.wq_b.weight", &[4, 2]),
+            ("model.layers.0.self_attn.wo_a.weight", &[4, 2]),
+            ("model.layers.0.self_attn.wo_b.weight", &[2, 4]),
+            ("model.layers.0.ffn.experts.0.w1.weight", &[4, 2]),
+            ("model.layers.0.ffn.experts.0.w2.weight", &[2, 4]),
+            ("model.layers.0.ffn.experts.0.w3.weight", &[4, 2]),
+        ],
+    );
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("artifacts should load");
+    let runtime =
+        DeepSeekV4Runtime::from_local_model_artifacts(&artifacts).expect("runtime should build");
+
+    let loaded = runtime
+        .load_tensor_parallel_shards(2)
+        .expect("all TP rank shards should load");
+
+    assert_eq!(loaded.tensor_parallel_size(), 2);
+    assert_eq!(loaded.rank_count(), 2);
+    assert_eq!(loaded.layer_count(), 1);
+    assert_eq!(
+        loaded
+            .rank(0)
+            .expect("rank 0 should load")
+            .tensor_shard("model.embed_tokens.weight")
+            .expect("rank 0 embedding shard should exist")
+            .bytes(),
+        &[0, 1, 2, 3]
+    );
+    assert_eq!(
+        loaded
+            .rank(1)
+            .expect("rank 1 should load")
+            .tensor_shard("model.embed_tokens.weight")
+            .expect("rank 1 embedding shard should exist")
+            .bytes(),
+        &[4, 5, 6, 7]
+    );
+    assert_eq!(
+        loaded
+            .rank(0)
+            .expect("rank 0 should load")
+            .tensor_shard("model.layers.0.self_attn.wo_b.weight")
+            .expect("rank 0 row-parallel shard should exist")
+            .bytes(),
+        &[40, 41, 44, 45]
+    );
+    assert_eq!(
+        loaded
+            .rank(1)
+            .expect("rank 1 should load")
+            .tensor_shard("model.layers.0.self_attn.wo_b.weight")
+            .expect("rank 1 row-parallel shard should exist")
+            .bytes(),
+        &[42, 43, 46, 47]
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn deepseek_v4_runtime_rejects_zero_tensor_parallel_size_for_loaded_shards() {
+    let model_dir = temp_model_dir("deepseek-runtime-load-zero-tp");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_complete_deepseek_v4_checkpoint(&model_dir);
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("artifacts should load");
+    let runtime =
+        DeepSeekV4Runtime::from_local_model_artifacts(&artifacts).expect("runtime should build");
+
+    let error = runtime
+        .load_tensor_parallel_shards(0)
+        .expect_err("zero TP size should be rejected");
+
+    assert_eq!(
+        error,
+        DeepSeekV4TensorShardLoadError::ShardPlan(
+            DeepSeekV4TensorShardPlanError::RankOutOfBounds {
+                tensor_parallel_rank: 0,
+                tensor_parallel_size: 0,
+            }
+        )
+    );
 
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
