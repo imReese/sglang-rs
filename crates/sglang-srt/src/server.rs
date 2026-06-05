@@ -27,13 +27,21 @@ use crate::pd_bootstrap::{
 };
 use crate::router::{RouterGetModelInfoResponse, RouterRuntime};
 use crate::scheduler::Scheduler;
-use crate::tokenizer::{RuntimeTokenizer, TokenizerError};
+use crate::tokenizer::{RuntimeTokenizer, Tokenizer, TokenizerError};
+#[cfg(not(feature = "mooncake-link"))]
+use crate::transfer::UnlinkedMooncakeTransferEngine;
 use crate::transfer::{
     DecodeBootstrapRegistry, DisaggregationMode, FakeKvCacheTransferExecutor,
-    KvCacheTransferExecutor, KvTransferModelWorker, MooncakeBatchReleaser,
-    MooncakeKvCacheTransferExecutor, MooncakeTransferStatusReader, MooncakeTransferSubmitter,
-    MooncakeTransferTargetResolver, PdConfig, PdConfigError, TransferBackend,
+    KvCacheTransferExecutor, KvTransferModelWorker, MooncakeBatchReleaser, MooncakeError,
+    MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeTransferStatusReader,
+    MooncakeTransferSubmitter, MooncakeTransferTarget, MooncakeTransferTargetResolver, PdConfig,
+    PdConfigError, TransferBackend,
 };
+#[cfg(feature = "mooncake-link")]
+use crate::transfer::{
+    MooncakeSessionTargetResolver, MooncakeTransferEngineConfig, SharedLinkedMooncakeTransferEngine,
+};
+use crate::worker::WorkerExecutor;
 
 #[derive(Clone, Debug, Default)]
 pub enum BootstrapForwardModel {
@@ -154,6 +162,7 @@ pub enum ServerLaunchError {
     Grpc(GrpcServeError),
     Http(HttpServeError),
     PrefillBootstrap(PrefillBootstrapServeError),
+    MooncakeTransfer(MooncakeError),
     DeepSeekRuntime(DeepSeekRuntimeError),
     DeepSeekTensorShardLoad(DeepSeekV4TensorShardLoadError),
     ServerTaskJoin(String),
@@ -230,6 +239,7 @@ impl fmt::Display for ServerLaunchError {
             Self::Grpc(error) => write!(formatter, "{error}"),
             Self::Http(error) => write!(formatter, "{error}"),
             Self::PrefillBootstrap(error) => write!(formatter, "{error}"),
+            Self::MooncakeTransfer(error) => write!(formatter, "{error}"),
             Self::DeepSeekRuntime(error) => write!(formatter, "DeepSeek runtime error: {error}"),
             Self::DeepSeekTensorShardLoad(error) => {
                 write!(formatter, "DeepSeek tensor shard load error: {error}")
@@ -260,6 +270,12 @@ impl From<HttpServeError> for ServerLaunchError {
 impl From<PrefillBootstrapServeError> for ServerLaunchError {
     fn from(value: PrefillBootstrapServeError) -> Self {
         Self::PrefillBootstrap(value)
+    }
+}
+
+impl From<MooncakeError> for ServerLaunchError {
+    fn from(value: MooncakeError) -> Self {
+        Self::MooncakeTransfer(value)
     }
 }
 
@@ -606,6 +622,82 @@ where
     )
 }
 
+fn launch_mooncake_prefill_kv_layout(
+    pd_config: &PdConfig,
+) -> Result<MooncakeKvCacheLayout, ServerLaunchError> {
+    match pd_config.kv_cache_model_layout.as_ref() {
+        Some(model_layout) => {
+            MooncakeKvCacheLayout::from_pd_config_model_layout(0, 0, pd_config, model_layout)
+                .map_err(Into::into)
+        }
+        None => Ok(MooncakeKvCacheLayout {
+            source_base_addr: 0,
+            page_size_bytes: pd_config.page_size.max(1),
+            target_base_offset: 0,
+        }),
+    }
+}
+
+#[cfg(not(feature = "mooncake-link"))]
+fn try_build_launch_mooncake_prefill_http_router_service(
+    args: &ServerArgs,
+    pd_config: &PdConfig,
+    bootstrap_service: PrefillBootstrapService,
+) -> Result<
+    BootstrapPdHttpRouterService<
+        MooncakeBootstrapKvCacheTransferExecutor<
+            MooncakeKvCacheTransferExecutor<UnlinkedMooncakeTransferEngine>,
+        >,
+    >,
+    ServerLaunchError,
+> {
+    let transfer_executor = MooncakeKvCacheTransferExecutor::new(
+        UnlinkedMooncakeTransferEngine,
+        launch_mooncake_prefill_kv_layout(pd_config)?,
+        MooncakeTransferTarget { target_id: 0 },
+    );
+    try_build_bootstrap_mooncake_prefill_http_router_service(
+        args,
+        bootstrap_service,
+        transfer_executor,
+    )
+}
+
+#[cfg(feature = "mooncake-link")]
+fn try_build_launch_mooncake_prefill_http_router_service(
+    args: &ServerArgs,
+    pd_config: &PdConfig,
+    bootstrap_service: PrefillBootstrapService,
+) -> Result<
+    BootstrapPdHttpRouterService<
+        MooncakeBootstrapKvCacheTransferExecutor<
+            MooncakeKvCacheTransferExecutor<
+                SharedLinkedMooncakeTransferEngine,
+                MooncakeSessionTargetResolver<SharedLinkedMooncakeTransferEngine>,
+            >,
+        >,
+    >,
+    ServerLaunchError,
+> {
+    let engine_config = MooncakeTransferEngineConfig::from_pd_config_for_rank(
+        prefill_mooncake_route_rank_ip(args),
+        0,
+        pd_config,
+    );
+    let engine = SharedLinkedMooncakeTransferEngine::new(&engine_config)?;
+    let target_resolver = MooncakeSessionTargetResolver::new(engine.clone(), Vec::new());
+    let transfer_executor = MooncakeKvCacheTransferExecutor::with_target_resolver(
+        engine,
+        launch_mooncake_prefill_kv_layout(pd_config)?,
+        target_resolver,
+    );
+    try_build_bootstrap_mooncake_prefill_http_router_service(
+        args,
+        bootstrap_service,
+        transfer_executor,
+    )
+}
+
 pub fn build_bootstrap_pd_grpc_router_service<E>(
     args: &ServerArgs,
     registry: DecodeBootstrapRegistry,
@@ -736,9 +828,13 @@ where
         DisaggregationMode::Prefill if pd_config.transfer_backend == TransferBackend::Mooncake => {
             let bootstrap_addr = prefill_bootstrap_listen_addr(&args)?;
             let zmq_endpoints = prefill_mooncake_zmq_endpoints(&args);
-            let service = try_build_bootstrap_http_router_service(&args)?;
             let bootstrap_service = PrefillBootstrapService::default();
             register_prefill_mooncake_routes_from_args(&bootstrap_service, &args)?;
+            let service = try_build_launch_mooncake_prefill_http_router_service(
+                &args,
+                &pd_config,
+                bootstrap_service.clone(),
+            )?;
             serve_prefill_http_and_bootstrap(
                 addr,
                 service,
@@ -759,15 +855,17 @@ where
     Ok(())
 }
 
-async fn serve_prefill_http_and_bootstrap<F>(
+async fn serve_prefill_http_and_bootstrap<T, W, F>(
     http_addr: SocketAddr,
-    http_service: BootstrapHttpRouterService,
+    http_service: HttpRouterService<T, W>,
     bootstrap_addr: SocketAddr,
     bootstrap_service: PrefillBootstrapService,
     zmq_endpoints: Vec<String>,
     shutdown: F,
 ) -> Result<(), ServerLaunchError>
 where
+    T: Tokenizer + Send + 'static,
+    W: WorkerExecutor + Send + 'static,
     F: Future<Output = ()> + Send + 'static,
 {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

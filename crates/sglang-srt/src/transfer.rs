@@ -5,6 +5,8 @@ use std::ffi::{NulError, c_char, c_int, c_void};
 use std::fmt;
 use std::fs;
 use std::path::Path;
+#[cfg(feature = "mooncake-link")]
+use std::sync::{Arc, Mutex};
 
 use crate::cache::CachePageId;
 use crate::cli::{ServerArgs, ZmqPortRange};
@@ -581,6 +583,7 @@ impl std::error::Error for PdConfigError {}
 #[derive(Debug, Eq, PartialEq)]
 pub enum MooncakeError {
     InteriorNul,
+    UnavailableWithoutLink,
     EngineCreateFailed,
     TransportInstallFailed(String),
     RegisterMemoryFailed(i32),
@@ -601,6 +604,9 @@ impl fmt::Display for MooncakeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InteriorNul => formatter.write_str("mooncake string contains interior nul byte"),
+            Self::UnavailableWithoutLink => formatter.write_str(
+                "mooncake transfer engine requires building sglang-srt with the mooncake-link feature",
+            ),
             Self::EngineCreateFailed => {
                 formatter.write_str("mooncake transfer engine create failed")
             }
@@ -1719,6 +1725,38 @@ pub trait MooncakeBatchReleaser {
     fn free_batch(&mut self, batch_id: MooncakeBatchId) -> Result<(), MooncakeError>;
 }
 
+#[cfg(not(feature = "mooncake-link"))]
+#[derive(Clone, Debug, Default)]
+pub struct UnlinkedMooncakeTransferEngine;
+
+#[cfg(not(feature = "mooncake-link"))]
+impl MooncakeTransferSubmitter for UnlinkedMooncakeTransferEngine {
+    fn submit_transfer(
+        &mut self,
+        _requests: &mut [MooncakeTransferRequest],
+    ) -> Result<MooncakeBatchId, MooncakeError> {
+        Err(MooncakeError::UnavailableWithoutLink)
+    }
+}
+
+#[cfg(not(feature = "mooncake-link"))]
+impl MooncakeTransferStatusReader for UnlinkedMooncakeTransferEngine {
+    fn transfer_status(
+        &mut self,
+        _batch_id: MooncakeBatchId,
+        _task_id: usize,
+    ) -> Result<MooncakeTransferStatus, MooncakeError> {
+        Err(MooncakeError::UnavailableWithoutLink)
+    }
+}
+
+#[cfg(not(feature = "mooncake-link"))]
+impl MooncakeBatchReleaser for UnlinkedMooncakeTransferEngine {
+    fn free_batch(&mut self, _batch_id: MooncakeBatchId) -> Result<(), MooncakeError> {
+        Err(MooncakeError::UnavailableWithoutLink)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MooncakeSubmittedBatch {
     bootstrap_room: BootstrapRoom,
@@ -2286,6 +2324,68 @@ impl MooncakeTransferStatusReader for LinkedMooncakeTransferEngine {
 impl MooncakeBatchReleaser for LinkedMooncakeTransferEngine {
     fn free_batch(&mut self, batch_id: MooncakeBatchId) -> Result<(), MooncakeError> {
         LinkedMooncakeTransferEngine::free_batch(self, batch_id)
+    }
+}
+
+#[cfg(feature = "mooncake-link")]
+#[derive(Clone)]
+pub struct SharedLinkedMooncakeTransferEngine {
+    inner: Arc<Mutex<LinkedMooncakeTransferEngine>>,
+}
+
+#[cfg(feature = "mooncake-link")]
+impl SharedLinkedMooncakeTransferEngine {
+    pub fn new(config: &MooncakeTransferEngineConfig) -> Result<Self, MooncakeError> {
+        Ok(Self {
+            inner: Arc::new(Mutex::new(LinkedMooncakeTransferEngine::new(config)?)),
+        })
+    }
+}
+
+#[cfg(feature = "mooncake-link")]
+impl MooncakeTransferSubmitter for SharedLinkedMooncakeTransferEngine {
+    fn submit_transfer(
+        &mut self,
+        requests: &mut [MooncakeTransferRequest],
+    ) -> Result<MooncakeBatchId, MooncakeError> {
+        self.inner
+            .lock()
+            .expect("linked Mooncake engine lock should be held")
+            .submit_transfer(requests)
+    }
+}
+
+#[cfg(feature = "mooncake-link")]
+impl MooncakeSegmentOpener for SharedLinkedMooncakeTransferEngine {
+    fn open_segment(&mut self, segment: &str) -> Result<i32, MooncakeError> {
+        self.inner
+            .lock()
+            .expect("linked Mooncake engine lock should be held")
+            .open_segment(segment)
+    }
+}
+
+#[cfg(feature = "mooncake-link")]
+impl MooncakeTransferStatusReader for SharedLinkedMooncakeTransferEngine {
+    fn transfer_status(
+        &mut self,
+        batch_id: MooncakeBatchId,
+        task_id: usize,
+    ) -> Result<MooncakeTransferStatus, MooncakeError> {
+        self.inner
+            .lock()
+            .expect("linked Mooncake engine lock should be held")
+            .transfer_status(batch_id, task_id)
+    }
+}
+
+#[cfg(feature = "mooncake-link")]
+impl MooncakeBatchReleaser for SharedLinkedMooncakeTransferEngine {
+    fn free_batch(&mut self, batch_id: MooncakeBatchId) -> Result<(), MooncakeError> {
+        self.inner
+            .lock()
+            .expect("linked Mooncake engine lock should be held")
+            .free_batch(batch_id)
     }
 }
 
