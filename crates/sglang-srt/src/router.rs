@@ -3,6 +3,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::cache::{KvBlockPrefixIndex, KvCacheWorkerId, KvCacheWorkerSnapshot};
 use crate::cli::ServerArgs;
 use crate::engine::{Engine, RuntimeError};
 use crate::model_artifacts::{HfModelConfig, LocalModelArtifacts, RoutedExpertCheckpointCoverage};
@@ -268,6 +269,29 @@ pub struct RouterGenerateRequest {
 }
 
 impl RouterGenerateRequest {
+    pub fn select_cache_aware_prefill_worker(
+        &self,
+        index: &KvBlockPrefixIndex,
+        candidates: &[KvCacheWorkerSnapshot],
+        block_size: usize,
+        cache_threshold: f32,
+    ) -> Result<Option<KvCacheWorkerId>, RouterProtocolError> {
+        let tokenized = self
+            .tokenized
+            .as_ref()
+            .ok_or(RouterProtocolError::MissingTokenizedInput)?;
+        if tokenized.input_ids.is_empty() {
+            return Err(RouterProtocolError::EmptyTokenizedInput);
+        }
+
+        Ok(index.select_cache_aware_worker_for_tokens(
+            candidates,
+            &tokenized.input_ids,
+            block_size,
+            cache_threshold,
+        ))
+    }
+
     pub fn try_into_token_generate_request(
         self,
     ) -> Result<TokenGenerateRequest, RouterProtocolError> {

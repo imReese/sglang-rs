@@ -1,4 +1,7 @@
-use sglang_srt::cache::{CachePageAllocator, RadixCache};
+use sglang_srt::cache::{
+    CachePageAllocator, KvBlockPrefixIndex, KvCacheWorkerId, KvCacheWorkerSnapshot, RadixCache,
+    compute_sglang_block_hashes,
+};
 use sglang_srt::cli::ServerArgs;
 use sglang_srt::engine::Engine;
 use sglang_srt::router::{
@@ -216,6 +219,59 @@ fn router_sampling_params_default_to_sglang_max_new_tokens() {
         token_request.sampling,
         SamplingParams::new(DEFAULT_MAX_NEW_TOKENS)
     );
+}
+
+#[test]
+fn router_generate_request_selects_cache_aware_prefill_worker_from_tokens() {
+    let mut index = KvBlockPrefixIndex::default();
+    let worker_a = kv_worker("http://prefill-a:30000", 0);
+    let worker_b = kv_worker("http://prefill-b:30000", 0);
+    let input_ids = vec![101, 202, 303, 404];
+    let block_hashes = compute_sglang_block_hashes(&input_ids, 2);
+    index.insert(&worker_b, &block_hashes);
+    let request = RouterGenerateRequest {
+        request_id: "router-cache-aware".to_string(),
+        tokenized: Some(RouterTokenizedInput {
+            original_text: "hello".to_string(),
+            input_ids,
+        }),
+        sampling_params: None,
+        disaggregated_params: None,
+        stream: false,
+        data_parallel_rank: 0,
+        trace_headers: Default::default(),
+    };
+
+    let selected = request
+        .select_cache_aware_prefill_worker(
+            &index,
+            &kv_workers_with_loads([(&worker_a, 0), (&worker_b, 9)]),
+            2,
+            0.5,
+        )
+        .expect("router request should be valid")
+        .expect("selector should choose a worker");
+
+    assert_eq!(selected, worker_b);
+}
+
+#[test]
+fn router_generate_request_cache_aware_selection_rejects_missing_tokenized_input() {
+    let request = RouterGenerateRequest {
+        request_id: "router-cache-aware-missing".to_string(),
+        tokenized: None,
+        sampling_params: None,
+        disaggregated_params: None,
+        stream: false,
+        data_parallel_rank: 0,
+        trace_headers: Default::default(),
+    };
+
+    let error = request
+        .select_cache_aware_prefill_worker(&KvBlockPrefixIndex::default(), &[], 2, 0.5)
+        .expect_err("missing tokenized input should be rejected");
+
+    assert_eq!(error, RouterProtocolError::MissingTokenizedInput);
 }
 
 #[test]
@@ -1245,4 +1301,23 @@ fn router_runtime_flush_cache_reports_failure_when_decode_requests_are_active() 
         runtime.engine().scheduler().available_cache_pages(),
         Some(2)
     );
+}
+
+fn kv_worker(endpoint: &str, dp_rank: u32) -> KvCacheWorkerId {
+    KvCacheWorkerId {
+        endpoint: endpoint.to_string(),
+        dp_rank,
+    }
+}
+
+fn kv_workers_with_loads<const N: usize>(
+    workers: [(&KvCacheWorkerId, usize); N],
+) -> Vec<KvCacheWorkerSnapshot> {
+    workers
+        .into_iter()
+        .map(|(id, active_load)| KvCacheWorkerSnapshot {
+            id: id.clone(),
+            active_load,
+        })
+        .collect()
 }
