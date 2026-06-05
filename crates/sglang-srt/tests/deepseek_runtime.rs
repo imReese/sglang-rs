@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 
 use sglang_srt::cache::{CachePageAllocator, CachePageId, RadixCache};
 use sglang_srt::deepseek_runtime::{
-    DeepSeekV4FeedForwardTensorDescriptors, DeepSeekV4Runtime, DeepSeekV4TensorPlacementKind,
-    DeepSeekV4TensorShardLoadError, DeepSeekV4TensorShardPlanError, DeepSeekV4TensorShardSelection,
+    DeepSeekV4F32KernelError, DeepSeekV4FeedForwardTensorDescriptors, DeepSeekV4Runtime,
+    DeepSeekV4TensorPlacementKind, DeepSeekV4TensorShardLoadError, DeepSeekV4TensorShardPlanError,
+    DeepSeekV4TensorShardSelection,
 };
 use sglang_srt::model_artifacts::{LocalModelArtifacts, SafetensorsTensorDecodeError};
 use sglang_srt::model_executor::ModelWorkerBatch;
@@ -491,6 +492,87 @@ fn deepseek_v4_loaded_runtime_decodes_tensor_parallel_shards_into_f32_cache() {
             .expect("rank 1 row-parallel cache should exist")
             .values(),
         &[42.0, 43.0, 46.0, 47.0]
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn deepseek_v4_f32_rank_computes_vocab_parallel_lm_head_partial_logits() {
+    let model_dir = temp_model_dir("deepseek-runtime-tp-lm-head-logits");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    let shape_overrides: &[(&str, &[usize])] = &[
+        ("model.embed_tokens.weight", &[4, 2]),
+        ("lm_head.weight", &[4, 2]),
+        ("model.layers.0.self_attn.wq_b.weight", &[4, 2]),
+        ("model.layers.0.self_attn.wo_a.weight", &[4, 2]),
+        ("model.layers.0.self_attn.wo_b.weight", &[2, 4]),
+        ("model.layers.0.ffn.experts.0.w1.weight", &[4, 2]),
+        ("model.layers.0.ffn.experts.0.w2.weight", &[2, 4]),
+        ("model.layers.0.ffn.experts.0.w3.weight", &[4, 2]),
+    ];
+    write_complete_deepseek_v4_checkpoint_with_shapes(&model_dir, shape_overrides);
+    write_deepseek_v4_safetensors_with_shapes_and_dtype(&model_dir, shape_overrides, "F32");
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("artifacts should load");
+    let runtime =
+        DeepSeekV4Runtime::from_local_model_artifacts(&artifacts).expect("runtime should build");
+    let f32_runtime = runtime
+        .load_tensor_parallel_shards(2)
+        .expect("all TP rank shards should load")
+        .decode_f32_tensor_parallel_shards()
+        .expect("F32 cache should decode");
+
+    let rank1_logits = f32_runtime
+        .rank(1)
+        .expect("rank 1 cache should exist")
+        .lm_head_partial_logits(&[1.0, 0.5])
+        .expect("rank 1 lm head logits should compute");
+
+    assert_eq!(rank1_logits, vec![(2, 20.0), (3, 23.0)]);
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn deepseek_v4_f32_rank_rejects_lm_head_hidden_size_mismatch() {
+    let model_dir = temp_model_dir("deepseek-runtime-tp-lm-head-hidden-mismatch");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    let shape_overrides: &[(&str, &[usize])] = &[
+        ("model.embed_tokens.weight", &[4, 2]),
+        ("lm_head.weight", &[4, 2]),
+        ("model.layers.0.self_attn.wq_b.weight", &[4, 2]),
+        ("model.layers.0.self_attn.wo_a.weight", &[4, 2]),
+        ("model.layers.0.self_attn.wo_b.weight", &[2, 4]),
+        ("model.layers.0.ffn.experts.0.w1.weight", &[4, 2]),
+        ("model.layers.0.ffn.experts.0.w2.weight", &[2, 4]),
+        ("model.layers.0.ffn.experts.0.w3.weight", &[4, 2]),
+    ];
+    write_complete_deepseek_v4_checkpoint_with_shapes(&model_dir, shape_overrides);
+    write_deepseek_v4_safetensors_with_shapes_and_dtype(&model_dir, shape_overrides, "F32");
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("artifacts should load");
+    let runtime =
+        DeepSeekV4Runtime::from_local_model_artifacts(&artifacts).expect("runtime should build");
+    let f32_runtime = runtime
+        .load_tensor_parallel_shards(2)
+        .expect("all TP rank shards should load")
+        .decode_f32_tensor_parallel_shards()
+        .expect("F32 cache should decode");
+
+    let error = f32_runtime
+        .rank(1)
+        .expect("rank 1 cache should exist")
+        .lm_head_partial_logits(&[1.0])
+        .expect_err("hidden size mismatch should be rejected");
+
+    assert_eq!(
+        error,
+        DeepSeekV4F32KernelError::HiddenSizeMismatch {
+            tensor_name: "lm_head.weight".to_string(),
+            expected: 2,
+            actual: 1
+        }
     );
 
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");

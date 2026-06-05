@@ -968,6 +968,18 @@ impl DeepSeekV4F32TensorRank {
             .iter()
             .find(|shard| shard.tensor_name() == tensor_name)
     }
+
+    pub fn lm_head_partial_logits(
+        &self,
+        hidden: &[f32],
+    ) -> Result<Vec<(usize, f32)>, DeepSeekV4F32KernelError> {
+        let lm_head = self.tensor_shard("lm_head.weight").ok_or_else(|| {
+            DeepSeekV4F32KernelError::MissingTensor {
+                tensor_name: "lm_head.weight".to_string(),
+            }
+        })?;
+        lm_head.vocab_parallel_matvec(hidden)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1004,6 +1016,53 @@ impl DeepSeekV4F32TensorShard {
 
     pub fn values(&self) -> &[f32] {
         &self.values
+    }
+
+    fn vocab_parallel_matvec(
+        &self,
+        hidden: &[f32],
+    ) -> Result<Vec<(usize, f32)>, DeepSeekV4F32KernelError> {
+        let [rows, columns] = self.shape.as_slice() else {
+            return Err(DeepSeekV4F32KernelError::TensorRankMismatch {
+                tensor_name: self.tensor_name.clone(),
+                expected_rank: 2,
+                shape: self.shape.clone(),
+            });
+        };
+        if *columns != hidden.len() {
+            return Err(DeepSeekV4F32KernelError::HiddenSizeMismatch {
+                tensor_name: self.tensor_name.clone(),
+                expected: *columns,
+                actual: hidden.len(),
+            });
+        }
+
+        let global_row_start = match &self.selection {
+            DeepSeekV4TensorShardSelection::Full => 0,
+            DeepSeekV4TensorShardSelection::Slice { axis: 0, range } => range.start,
+            DeepSeekV4TensorShardSelection::Slice { axis, .. } => {
+                return Err(DeepSeekV4F32KernelError::TensorSelectionMismatch {
+                    tensor_name: self.tensor_name.clone(),
+                    expected_axis: 0,
+                    actual_axis: *axis,
+                });
+            }
+        };
+
+        Ok(self
+            .values
+            .chunks_exact(*columns)
+            .take(*rows)
+            .enumerate()
+            .map(|(row_index, row)| {
+                let logit = row
+                    .iter()
+                    .zip(hidden)
+                    .map(|(weight, value)| weight * value)
+                    .sum();
+                (global_row_start + row_index, logit)
+            })
+            .collect())
     }
 }
 
@@ -1139,6 +1198,64 @@ impl From<ModelArtifactError> for DeepSeekV4TensorShardLoadError {
         Self::ModelArtifact(error)
     }
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DeepSeekV4F32KernelError {
+    MissingTensor {
+        tensor_name: String,
+    },
+    TensorRankMismatch {
+        tensor_name: String,
+        expected_rank: usize,
+        shape: Vec<usize>,
+    },
+    HiddenSizeMismatch {
+        tensor_name: String,
+        expected: usize,
+        actual: usize,
+    },
+    TensorSelectionMismatch {
+        tensor_name: String,
+        expected_axis: usize,
+        actual_axis: usize,
+    },
+}
+
+impl fmt::Display for DeepSeekV4F32KernelError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingTensor { tensor_name } => {
+                write!(formatter, "missing f32 tensor {tensor_name}")
+            }
+            Self::TensorRankMismatch {
+                tensor_name,
+                expected_rank,
+                shape,
+            } => write!(
+                formatter,
+                "f32 tensor {tensor_name} expected rank {expected_rank} but shape is {shape:?}"
+            ),
+            Self::HiddenSizeMismatch {
+                tensor_name,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "f32 tensor {tensor_name} expected hidden size {expected} but got {actual}"
+            ),
+            Self::TensorSelectionMismatch {
+                tensor_name,
+                expected_axis,
+                actual_axis,
+            } => write!(
+                formatter,
+                "f32 tensor {tensor_name} expected selection axis {expected_axis} but got {actual_axis}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DeepSeekV4F32KernelError {}
 
 fn shard_selection_for_entry(
     entry: &DeepSeekV4TensorPlacement,
