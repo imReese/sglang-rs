@@ -5,6 +5,7 @@ pub mod grpc;
 pub mod http;
 pub mod model_artifacts;
 pub mod model_executor;
+pub mod pd_bootstrap;
 pub mod proto;
 pub mod router;
 pub mod scheduler;

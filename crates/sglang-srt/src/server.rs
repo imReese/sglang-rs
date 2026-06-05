@@ -1,4 +1,5 @@
 use std::fmt;
+use std::future::Future;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
 
@@ -6,11 +7,14 @@ use crate::cache::{CachePageAllocator, RadixCache};
 use crate::cli::ServerArgs;
 use crate::engine::Engine;
 use crate::grpc::{GrpcRouterService, GrpcServeError, serve_grpc_router};
-use crate::http::{HttpRouterService, HttpServeError, serve_http_router};
+use crate::http::{HttpRouterService, HttpServeError, serve_http_router_with_shutdown};
 use crate::model_artifacts::{HfModelConfig, LocalModelArtifacts, ModelArtifactError};
 use crate::model_executor::{
     CpuEmbeddingLmModel, ForwardModel, ModelForwardError, ModelForwardOutput, ModelRunner,
     ModelWorkerBatch,
+};
+use crate::pd_bootstrap::{
+    PrefillBootstrapServeError, PrefillBootstrapService, serve_prefill_bootstrap_with_shutdown,
 };
 use crate::router::{RouterGetModelInfoResponse, RouterRuntime};
 use crate::scheduler::Scheduler;
@@ -99,6 +103,8 @@ pub enum ServerLaunchError {
     Tokenizer(TokenizerError),
     Grpc(GrpcServeError),
     Http(HttpServeError),
+    PrefillBootstrap(PrefillBootstrapServeError),
+    ServerTaskJoin(String),
 }
 
 impl PartialEq for ServerLaunchError {
@@ -153,6 +159,8 @@ impl fmt::Display for ServerLaunchError {
             Self::Tokenizer(error) => write!(formatter, "tokenizer error: {error}"),
             Self::Grpc(error) => write!(formatter, "{error}"),
             Self::Http(error) => write!(formatter, "{error}"),
+            Self::PrefillBootstrap(error) => write!(formatter, "{error}"),
+            Self::ServerTaskJoin(error) => write!(formatter, "server task failed to join: {error}"),
         }
     }
 }
@@ -168,6 +176,12 @@ impl From<GrpcServeError> for ServerLaunchError {
 impl From<HttpServeError> for ServerLaunchError {
     fn from(value: HttpServeError) -> Self {
         Self::Http(value)
+    }
+}
+
+impl From<PrefillBootstrapServeError> for ServerLaunchError {
+    fn from(value: PrefillBootstrapServeError) -> Self {
+        Self::PrefillBootstrap(value)
     }
 }
 
@@ -204,6 +218,19 @@ pub fn grpc_listen_addr(args: &ServerArgs) -> Result<SocketAddr, ServerLaunchErr
 
 pub fn http_listen_addr(args: &ServerArgs) -> Result<SocketAddr, ServerLaunchError> {
     grpc_listen_addr(args)
+}
+
+pub fn prefill_bootstrap_listen_addr(args: &ServerArgs) -> Result<SocketAddr, ServerLaunchError> {
+    let mut addresses = (args.host.as_str(), args.disaggregation_bootstrap_port)
+        .to_socket_addrs()
+        .map_err(ServerLaunchError::AddressResolve)?;
+
+    addresses
+        .next()
+        .ok_or_else(|| ServerLaunchError::NoSocketAddress {
+            host: args.host.clone(),
+            port: args.disaggregation_bootstrap_port,
+        })
 }
 
 pub fn build_bootstrap_grpc_router_service(args: &ServerArgs) -> BootstrapGrpcRouterService {
@@ -281,10 +308,10 @@ pub fn try_build_bootstrap_prefill_http_router_service(
     let engine = Engine::new(tokenizer, scheduler);
     let runtime = RouterRuntime::new(engine)
         .with_default_stop_token_ids(model_config_eos_token_ids(&args.model_path));
-    Ok(HttpRouterService::new(
-        runtime,
-        RouterGetModelInfoResponse::from_server_args(args),
-    ))
+    Ok(
+        HttpRouterService::new(runtime, RouterGetModelInfoResponse::from_server_args(args))
+            .with_disaggregated_requests(),
+    )
 }
 
 pub fn build_bootstrap_pd_grpc_router_service<E>(
@@ -397,16 +424,35 @@ pub async fn launch_grpc_server(args: ServerArgs) -> Result<(), ServerLaunchErro
 }
 
 pub async fn launch_http_server(args: ServerArgs) -> Result<(), ServerLaunchError> {
+    launch_http_server_with_shutdown(args, std::future::pending::<()>()).await
+}
+
+pub async fn launch_http_server_with_shutdown<F>(
+    args: ServerArgs,
+    shutdown: F,
+) -> Result<(), ServerLaunchError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     let pd_config = PdConfig::from_server_args(&args)?;
     let addr = http_listen_addr(&args)?;
     match pd_config.mode {
         DisaggregationMode::Null => {
             let service = try_build_bootstrap_http_router_service(&args)?;
-            serve_http_router(addr, service).await?;
+            serve_http_router_with_shutdown(addr, service, shutdown).await?;
         }
-        DisaggregationMode::Prefill if pd_config.transfer_backend == TransferBackend::Fake => {
-            let service = try_build_bootstrap_prefill_http_router_service(&args)?;
-            serve_http_router(addr, service).await?;
+        DisaggregationMode::Prefill if pd_config.transfer_backend == TransferBackend::Mooncake => {
+            let bootstrap_addr = prefill_bootstrap_listen_addr(&args)?;
+            let service = try_build_bootstrap_http_router_service(&args)?;
+            let bootstrap_service = PrefillBootstrapService::default();
+            serve_prefill_http_and_bootstrap(
+                addr,
+                service,
+                bootstrap_addr,
+                bootstrap_service,
+                shutdown,
+            )
+            .await?;
         }
         _ => {
             return Err(ServerLaunchError::UnsupportedBootstrapPdRuntime {
@@ -416,4 +462,72 @@ pub async fn launch_http_server(args: ServerArgs) -> Result<(), ServerLaunchErro
         }
     }
     Ok(())
+}
+
+async fn serve_prefill_http_and_bootstrap<F>(
+    http_addr: SocketAddr,
+    http_service: BootstrapHttpRouterService,
+    bootstrap_addr: SocketAddr,
+    bootstrap_service: PrefillBootstrapService,
+    shutdown: F,
+) -> Result<(), ServerLaunchError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut http_task = tokio::spawn(serve_http_router_with_shutdown(
+        http_addr,
+        http_service,
+        watch_shutdown(shutdown_rx.clone()),
+    ));
+    let mut bootstrap_task = tokio::spawn(serve_prefill_bootstrap_with_shutdown(
+        bootstrap_addr,
+        bootstrap_service,
+        watch_shutdown(shutdown_rx),
+    ));
+
+    tokio::select! {
+        _ = shutdown => {
+            let _ = shutdown_tx.send(true);
+            join_http_task(http_task).await?;
+            join_bootstrap_task(bootstrap_task).await?;
+            Ok(())
+        }
+        result = &mut http_task => {
+            let _ = shutdown_tx.send(true);
+            join_bootstrap_task(bootstrap_task).await?;
+            result.map_err(|error| ServerLaunchError::ServerTaskJoin(error.to_string()))??;
+            Ok(())
+        }
+        result = &mut bootstrap_task => {
+            let _ = shutdown_tx.send(true);
+            join_http_task(http_task).await?;
+            result.map_err(|error| ServerLaunchError::ServerTaskJoin(error.to_string()))??;
+            Ok(())
+        }
+    }
+}
+
+async fn join_http_task(
+    task: tokio::task::JoinHandle<Result<(), HttpServeError>>,
+) -> Result<(), ServerLaunchError> {
+    task.await
+        .map_err(|error| ServerLaunchError::ServerTaskJoin(error.to_string()))??;
+    Ok(())
+}
+
+async fn join_bootstrap_task(
+    task: tokio::task::JoinHandle<Result<(), PrefillBootstrapServeError>>,
+) -> Result<(), ServerLaunchError> {
+    task.await
+        .map_err(|error| ServerLaunchError::ServerTaskJoin(error.to_string()))??;
+    Ok(())
+}
+
+async fn watch_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            break;
+        }
+    }
 }

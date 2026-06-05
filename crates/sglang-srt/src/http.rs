@@ -20,6 +20,7 @@ use crate::worker::WorkerExecutor;
 pub struct HttpRouterService<T, W> {
     runtime: Arc<Mutex<RouterRuntime<T, W>>>,
     model_info: RouterGetModelInfoResponse,
+    allow_disaggregated_requests: bool,
 }
 
 impl<T, W> Clone for HttpRouterService<T, W> {
@@ -27,6 +28,7 @@ impl<T, W> Clone for HttpRouterService<T, W> {
         Self {
             runtime: Arc::clone(&self.runtime),
             model_info: self.model_info.clone(),
+            allow_disaggregated_requests: self.allow_disaggregated_requests,
         }
     }
 }
@@ -36,11 +38,17 @@ impl<T, W> HttpRouterService<T, W> {
         Self {
             runtime: Arc::new(Mutex::new(runtime)),
             model_info,
+            allow_disaggregated_requests: false,
         }
     }
 
     pub fn runtime(&self) -> &Arc<Mutex<RouterRuntime<T, W>>> {
         &self.runtime
+    }
+
+    pub fn with_disaggregated_requests(mut self) -> Self {
+        self.allow_disaggregated_requests = true;
+        self
     }
 }
 
@@ -147,6 +155,16 @@ where
             );
         }
     };
+    if request.disaggregated_params.is_some() && !service.allow_disaggregated_requests {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({
+                "error": {
+                    "message": "disaggregated HTTP generate requires a PD transfer-enabled runtime"
+                }
+            })),
+        );
+    }
 
     let response = {
         let mut runtime = service
