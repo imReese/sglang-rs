@@ -1309,6 +1309,81 @@ fn hf_model_config_loads_repo_id_from_huggingface_cache_snapshot() {
 }
 
 #[test]
+fn local_model_artifacts_load_repo_id_from_huggingface_cache_snapshot() {
+    let hub_dir = temp_model_dir("hf-cache-artifacts-hub");
+    let snapshot_dir = hub_dir
+        .join("models--zai-org--GLM-5-FP8")
+        .join("snapshots")
+        .join("abc123");
+    fs::create_dir_all(&snapshot_dir).expect("snapshot dir should be created");
+    fs::create_dir_all(hub_dir.join("models--zai-org--GLM-5-FP8").join("refs"))
+        .expect("refs dir should be created");
+    fs::write(
+        hub_dir
+            .join("models--zai-org--GLM-5-FP8")
+            .join("refs")
+            .join("main"),
+        "abc123\n",
+    )
+    .expect("main ref should be written");
+    fs::write(snapshot_dir.join("config.json"), deepseek_v4_config_json())
+        .expect("config should be written");
+    fs::write(
+        snapshot_dir.join("model.safetensors.index.json"),
+        safetensors_index_json(),
+    )
+    .expect("index should be written");
+    write_safetensors_file(
+        &snapshot_dir.join("model-00001-of-00002.safetensors"),
+        &[
+            ("model.embed_tokens.weight", "U8", &[4], [0, 4]),
+            ("model.layers.0.ffn.experts.3.w1.weight", "U8", &[4], [4, 8]),
+            (
+                "model.layers.0.self_attn.q_a_proj.weight",
+                "U8",
+                &[4],
+                [8, 12],
+            ),
+        ],
+        &[0; 12],
+    )
+    .expect("first shard should be written");
+    write_safetensors_file(
+        &snapshot_dir.join("model-00002-of-00002.safetensors"),
+        &[(
+            "model.layers.0.self_attn.q_b_proj.weight",
+            "U8",
+            &[4],
+            [0, 4],
+        )],
+        &[0; 4],
+    )
+    .expect("second shard should be written");
+
+    let artifacts =
+        LocalModelArtifacts::from_model_path_with_hf_cache("zai-org/GLM-5-FP8", &hub_dir)
+            .expect("repo id should resolve to cached HF snapshot artifacts");
+
+    assert_eq!(artifacts.model_path(), snapshot_dir.as_path());
+    assert_eq!(
+        artifacts.config().model_type.as_deref(),
+        Some("deepseek_v4")
+    );
+    assert_eq!(
+        artifacts
+            .safetensors()
+            .shard_for_tensor("model.layers.0.self_attn.q_b_proj.weight"),
+        Some(
+            snapshot_dir
+                .join("model-00002-of-00002.safetensors")
+                .as_path()
+        )
+    );
+
+    fs::remove_dir_all(hub_dir).expect("temp hub dir should be removed");
+}
+
+#[test]
 fn safetensors_manifest_describes_indexed_tensor_byte_span_without_loading_bytes() {
     let model_dir = temp_model_dir("tensor-span");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");

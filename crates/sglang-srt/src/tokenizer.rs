@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 
 use tokenizers::Tokenizer as HfTokenizerImpl;
 
-use crate::model_artifacts::resolve_model_path;
+use crate::model_artifacts::{
+    resolve_model_path, resolve_model_path_from_hf_cache_with_required_file,
+};
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum TokenizerError {
@@ -120,6 +122,33 @@ impl RuntimeTokenizer {
         model_path: &str,
         tokenizer_path: Option<&str>,
     ) -> Result<Self, TokenizerError> {
+        Self::from_model_or_tokenizer_path_with_resolved_model_path(
+            resolve_model_path(Path::new(model_path)),
+            tokenizer_path,
+        )
+    }
+
+    pub fn from_model_or_tokenizer_path_with_hf_cache(
+        model_path: &str,
+        tokenizer_path: Option<&str>,
+        hub_cache: impl AsRef<Path>,
+    ) -> Result<Self, TokenizerError> {
+        let resolved_model_path = resolve_model_path_from_hf_cache_with_required_file(
+            model_path,
+            hub_cache,
+            "tokenizer.json",
+        )
+        .unwrap_or_else(|| PathBuf::from(model_path));
+        Self::from_model_or_tokenizer_path_with_resolved_model_path(
+            resolved_model_path,
+            tokenizer_path,
+        )
+    }
+
+    fn from_model_or_tokenizer_path_with_resolved_model_path(
+        resolved_model_path: PathBuf,
+        tokenizer_path: Option<&str>,
+    ) -> Result<Self, TokenizerError> {
         if let Some(tokenizer_path) = tokenizer_path {
             let path = Path::new(tokenizer_path);
             if resolve_tokenizer_json(path).is_some() {
@@ -132,7 +161,6 @@ impl RuntimeTokenizer {
             return Ok(Self::Byte(ByteTokenizer));
         }
 
-        let resolved_model_path = resolve_model_path(Path::new(model_path));
         if resolve_tokenizer_json(&resolved_model_path).is_some() {
             return Ok(Self::Hf(HfTokenizer::from_tokenizer_path(
                 resolved_model_path,

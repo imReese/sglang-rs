@@ -14,7 +14,19 @@ pub struct LocalModelArtifacts {
 impl LocalModelArtifacts {
     pub fn from_model_path(path: impl AsRef<Path>) -> Result<Self, ModelArtifactError> {
         let model_path = resolve_model_path(path.as_ref());
-        let model_path = model_path.as_path();
+        Self::from_resolved_model_path(&model_path)
+    }
+
+    pub fn from_model_path_with_hf_cache(
+        model_path: &str,
+        hub_cache: impl AsRef<Path>,
+    ) -> Result<Self, ModelArtifactError> {
+        let model_path = resolve_model_path_from_hf_cache(model_path, hub_cache)
+            .unwrap_or_else(|| PathBuf::from(model_path));
+        Self::from_resolved_model_path(&model_path)
+    }
+
+    fn from_resolved_model_path(model_path: &Path) -> Result<Self, ModelArtifactError> {
         if !model_path.is_dir() {
             return Err(ModelArtifactError::ModelPathNotLocalDirectory {
                 path: model_path.to_path_buf(),
@@ -179,6 +191,14 @@ pub fn resolve_model_path_from_hf_cache(
     model_id: &str,
     hub_cache: impl AsRef<Path>,
 ) -> Option<PathBuf> {
+    resolve_model_path_from_hf_cache_with_required_file(model_id, hub_cache, "config.json")
+}
+
+pub fn resolve_model_path_from_hf_cache_with_required_file(
+    model_id: &str,
+    hub_cache: impl AsRef<Path>,
+    required_file: &str,
+) -> Option<PathBuf> {
     if model_id.starts_with('-') || model_id.starts_with('/') || model_id.contains('\\') {
         return None;
     }
@@ -189,7 +209,7 @@ pub fn resolve_model_path_from_hf_cache(
     let refs_main = repo_cache.join("refs").join("main");
     if let Ok(commit) = fs::read_to_string(refs_main) {
         let snapshot = repo_cache.join("snapshots").join(commit.trim());
-        if snapshot.join("config.json").is_file() {
+        if snapshot.join(required_file).is_file() {
             return Some(snapshot);
         }
     }
@@ -199,7 +219,7 @@ pub fn resolve_model_path_from_hf_cache(
         .ok()?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.join("config.json").is_file())
+        .filter(|path| path.join(required_file).is_file())
         .collect::<Vec<_>>();
     candidates.sort();
     candidates.pop()
