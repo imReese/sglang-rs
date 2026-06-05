@@ -57,6 +57,26 @@ fn parse_model_alias_and_default_network_args() {
 }
 
 #[test]
+fn parse_accepts_equals_style_sglang_args() {
+    let parsed = ServerArgs::parse_from([
+        "serve",
+        "--model-path=zai-org/GLM-5-FP8",
+        "--port=8000",
+        "--tp-size=8",
+        "--dp-size=1",
+        "--grpc-mode",
+    ])
+    .expect("equals style args should parse");
+
+    assert_eq!(parsed.model_path, "zai-org/GLM-5-FP8");
+    assert_eq!(parsed.port, 8000);
+    assert_eq!(parsed.tp_size, 8);
+    assert_eq!(parsed.dp_size, 1);
+    assert!(parsed.grpc_mode);
+    assert!(parsed.extra_args.is_empty());
+}
+
+#[test]
 fn parse_preserves_unknown_server_args_for_future_compatibility() {
     let parsed = ServerArgs::parse_from([
         "serve",

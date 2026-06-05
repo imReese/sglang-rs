@@ -90,8 +90,19 @@ impl ArgParser {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        let mut parsed_args = Vec::new();
+        for arg in args {
+            let arg = arg.into();
+            if let Some((flag, value)) = split_equals_arg(&arg) {
+                parsed_args.push(flag.to_string());
+                parsed_args.push(value.to_string());
+            } else {
+                parsed_args.push(arg);
+            }
+        }
+
         Self {
-            args: args.into_iter().map(Into::into).collect(),
+            args: parsed_args,
             index: 0,
             parsed: PartialServerArgs::default(),
         }
@@ -392,6 +403,11 @@ impl Default for PartialServerArgs {
             extra_args: Vec::new(),
         }
     }
+}
+
+fn split_equals_arg(arg: &str) -> Option<(&str, &str)> {
+    let (flag, value) = arg.split_once('=')?;
+    flag.starts_with("--").then_some((flag, value))
 }
 
 fn parse_usize(flag: &'static str, value: String) -> Result<usize, CliParseError> {

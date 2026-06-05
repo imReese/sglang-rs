@@ -398,9 +398,11 @@ impl fmt::Display for PdConfigError {
             }
             Self::IncompleteKvCacheModelLayout => formatter
                 .write_str("kv cache model layout requires num layers, KV heads, and head dim"),
-            Self::MissingMooncakeKvCacheModelLayout => {
-                formatter.write_str("mooncake decode requires kv cache model layout")
-            }
+            Self::MissingMooncakeKvCacheModelLayout => formatter.write_str(
+                "mooncake decode requires kv cache model layout; provide \
+                     --kv-cache-num-layers, --kv-cache-kv-heads, and --kv-cache-head-dim, \
+                     or use a local model path with config.json metadata",
+            ),
             Self::KvCacheDtypeRequiresModelMetadata(dtype) => {
                 write!(
                     formatter,

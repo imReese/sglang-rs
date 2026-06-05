@@ -910,6 +910,10 @@ async fn launch_grpc_server_requires_kv_model_layout_for_mooncake_decode() {
         error,
         ServerLaunchError::PdConfig(PdConfigError::MissingMooncakeKvCacheModelLayout)
     );
+    let message = error.to_string();
+    assert!(message.contains("--kv-cache-num-layers"));
+    assert!(message.contains("--kv-cache-kv-heads"));
+    assert!(message.contains("--kv-cache-head-dim"));
 }
 
 #[derive(Default)]
