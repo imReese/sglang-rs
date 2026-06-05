@@ -330,20 +330,54 @@ pub struct PdConfig {
 
 impl PdConfig {
     pub fn from_server_args(args: &ServerArgs) -> Result<Self, PdConfigError> {
-        let mode = DisaggregationMode::parse(&args.disaggregation_mode)?;
-        let backend = TransferBackend::parse(&args.disaggregation_transfer_backend)?;
-        let kv_cache_dtype = KvCacheDtype::parse(&args.kv_cache_dtype)?;
+        let kv_cache_model_layout = Self::model_layout_from_server_args(args)?;
+        Self::from_server_args_with_model_layout(args, kv_cache_model_layout)
+    }
+
+    pub fn from_server_args_with_hf_cache(
+        args: &ServerArgs,
+        hub_cache: impl AsRef<Path>,
+    ) -> Result<Self, PdConfigError> {
         let kv_cache_model_layout = match (
             args.kv_cache_num_layers,
             args.kv_cache_kv_heads,
             args.kv_cache_head_dim,
         ) {
-            (None, None, None) => KvCacheModelLayout::from_model_path(&args.model_path)?,
+            (None, None, None) => {
+                KvCacheModelLayout::from_model_path_with_hf_cache(&args.model_path, hub_cache)?
+            }
             (Some(num_layers), Some(kv_heads), Some(head_dim)) => Some(
                 KvCacheModelLayout::multi_tensor(num_layers, kv_heads, head_dim, 2),
             ),
             _ => return Err(PdConfigError::IncompleteKvCacheModelLayout),
         };
+
+        Self::from_server_args_with_model_layout(args, kv_cache_model_layout)
+    }
+
+    fn model_layout_from_server_args(
+        args: &ServerArgs,
+    ) -> Result<Option<KvCacheModelLayout>, PdConfigError> {
+        match (
+            args.kv_cache_num_layers,
+            args.kv_cache_kv_heads,
+            args.kv_cache_head_dim,
+        ) {
+            (None, None, None) => KvCacheModelLayout::from_model_path(&args.model_path),
+            (Some(num_layers), Some(kv_heads), Some(head_dim)) => Ok(Some(
+                KvCacheModelLayout::multi_tensor(num_layers, kv_heads, head_dim, 2),
+            )),
+            _ => Err(PdConfigError::IncompleteKvCacheModelLayout),
+        }
+    }
+
+    fn from_server_args_with_model_layout(
+        args: &ServerArgs,
+        kv_cache_model_layout: Option<KvCacheModelLayout>,
+    ) -> Result<Self, PdConfigError> {
+        let mode = DisaggregationMode::parse(&args.disaggregation_mode)?;
+        let backend = TransferBackend::parse(&args.disaggregation_transfer_backend)?;
+        let kv_cache_dtype = KvCacheDtype::parse(&args.kv_cache_dtype)?;
 
         if mode == DisaggregationMode::Prefill && backend.backend == TransferBackend::Fake {
             return Err(PdConfigError::FakePrefillUnsupported);
@@ -416,7 +450,7 @@ impl fmt::Display for PdConfigError {
             Self::MissingMooncakeKvCacheModelLayout => formatter.write_str(
                 "mooncake decode requires kv cache model layout; provide \
                      --kv-cache-num-layers, --kv-cache-kv-heads, and --kv-cache-head-dim, \
-                     or use a local model path with config.json metadata",
+                     or use a local model path / Hugging Face cache snapshot with config.json metadata",
             ),
             Self::KvCacheDtypeRequiresModelMetadata(dtype) => {
                 write!(

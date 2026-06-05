@@ -370,15 +370,20 @@ async fn bootstrap_grpc_router_service_generates_from_local_fp8_safetensors_weig
         &[
             ("model.embed_tokens.weight", "F8_E4M3", &[3, 2], [0, 6]),
             ("lm_head.weight", "F8_E4M3", &[3, 2], [6, 12]),
+            ("lm_head.weight_scale_inv", "F32", &[3], [12, 24]),
         ],
         &[
             0x00, 0x00, // [UNK]
             0x38, 0x00, // hello
             0x00, 0x38, // world
             0x00, 0x00, // [UNK] logits
-            0x00, 0x00, // hello logits
-            0x40, 0x00, // world logits
-        ],
+            0x38, 0x00, // hello logits
+            0x30, 0x00, // world logits before scale
+        ]
+        .into_iter()
+        .chain([1.0_f32, 1.0, 4.0].into_iter().flat_map(f32::to_le_bytes))
+        .collect::<Vec<_>>()
+        .as_slice(),
     )
     .expect("weights should be written");
     let args = ServerArgs::parse_from([

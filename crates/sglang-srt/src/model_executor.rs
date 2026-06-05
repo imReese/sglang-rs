@@ -4,7 +4,11 @@ use crate::types::{DisaggregatedParams, RequestId, SamplingParams};
 use rand::RngExt as _;
 use std::fmt;
 
-use crate::model_artifacts::{LocalModelArtifacts, ModelArtifactError, SafetensorsTensorData};
+use crate::model_artifacts::{
+    LocalModelArtifacts, LocalModelCheckpointCatalog, ModelArtifactError,
+    SafetensorsQuantizedLinearWeightCatalog, SafetensorsQuantizedLinearWeightSpan,
+    SafetensorsTensorData,
+};
 use crate::worker::{
     BatchGeneratedTokens, FallibleModelWorker, GeneratedToken, WorkerExecutionError,
 };
@@ -175,13 +179,22 @@ impl CpuEmbeddingLmModel {
         let hidden_size = artifacts.config().hidden_size.ok_or_else(|| {
             invalid_cpu_lm_artifact(artifacts, "missing hidden_size for CPU embedding LM")
         })?;
+        let checkpoint = LocalModelCheckpointCatalog::from_local_model_artifacts(artifacts)?;
+        let quantized_linears = checkpoint.quantized_linear_weights();
         let token_embeddings = required_float_matrix(
             artifacts,
+            quantized_linears,
             "model.embed_tokens.weight",
             vocab_size,
             hidden_size,
         )?;
-        let lm_head = required_float_matrix(artifacts, "lm_head.weight", vocab_size, hidden_size)?;
+        let lm_head = required_float_matrix(
+            artifacts,
+            quantized_linears,
+            "lm_head.weight",
+            vocab_size,
+            hidden_size,
+        )?;
 
         Ok(Some(Self {
             token_embeddings,
@@ -230,6 +243,26 @@ impl ForwardModel for CpuEmbeddingLmModel {
 
 fn required_float_matrix(
     artifacts: &LocalModelArtifacts,
+    quantized_linears: &SafetensorsQuantizedLinearWeightCatalog,
+    tensor_name: &str,
+    rows: usize,
+    columns: usize,
+) -> Result<Vec<f32>, ModelArtifactError> {
+    if let Some(weight_span) = quantized_linears.span(tensor_name) {
+        return required_scaled_quantized_float_matrix(
+            artifacts,
+            tensor_name,
+            weight_span,
+            rows,
+            columns,
+        );
+    }
+
+    required_unscaled_float_matrix(artifacts, tensor_name, rows, columns)
+}
+
+fn required_unscaled_float_matrix(
+    artifacts: &LocalModelArtifacts,
     tensor_name: &str,
     rows: usize,
     columns: usize,
@@ -251,6 +284,148 @@ fn required_float_matrix(
             format!("failed to decode CPU embedding LM tensor {tensor_name}: {error}"),
         )
     })
+}
+
+fn required_scaled_quantized_float_matrix(
+    artifacts: &LocalModelArtifacts,
+    tensor_name: &str,
+    weight_span: &SafetensorsQuantizedLinearWeightSpan,
+    rows: usize,
+    columns: usize,
+) -> Result<Vec<f32>, ModelArtifactError> {
+    let weight = artifacts
+        .safetensors()
+        .read_tensor(&weight_span.tensor_name)?
+        .ok_or_else(|| {
+            invalid_cpu_lm_artifact(
+                artifacts,
+                format!(
+                    "missing CPU embedding LM quantized weight tensor {}",
+                    weight_span.tensor_name
+                ),
+            )
+        })?;
+    validate_cpu_lm_tensor_shape(artifacts, tensor_name, &weight, rows, columns)?;
+    let mut values = decode_cpu_lm_tensor_values(artifacts, &weight_span.tensor_name, &weight)?;
+
+    let scale = artifacts
+        .safetensors()
+        .read_tensor(&weight_span.scale_tensor_name)?
+        .ok_or_else(|| {
+            invalid_cpu_lm_artifact(
+                artifacts,
+                format!(
+                    "missing CPU embedding LM quantized scale tensor {}",
+                    weight_span.scale_tensor_name
+                ),
+            )
+        })?;
+    let scale_values =
+        decode_cpu_lm_tensor_values(artifacts, &weight_span.scale_tensor_name, &scale)?;
+    apply_cpu_lm_matrix_scale(
+        artifacts,
+        tensor_name,
+        &mut values,
+        rows,
+        columns,
+        &scale.metadata.shape,
+        &scale_values,
+    )?;
+
+    Ok(values)
+}
+
+fn decode_cpu_lm_tensor_values(
+    artifacts: &LocalModelArtifacts,
+    tensor_name: &str,
+    tensor: &SafetensorsTensorData,
+) -> Result<Vec<f32>, ModelArtifactError> {
+    tensor.decode_f32_values().map_err(|error| {
+        invalid_cpu_lm_artifact(
+            artifacts,
+            format!("failed to decode CPU embedding LM tensor {tensor_name}: {error}"),
+        )
+    })
+}
+
+fn apply_cpu_lm_matrix_scale(
+    artifacts: &LocalModelArtifacts,
+    tensor_name: &str,
+    values: &mut [f32],
+    rows: usize,
+    columns: usize,
+    scale_shape: &[usize],
+    scale_values: &[f32],
+) -> Result<(), ModelArtifactError> {
+    match scale_shape {
+        [1] | [1, 1] => {
+            let scale = single_cpu_lm_scale(artifacts, tensor_name, scale_values)?;
+            for value in values {
+                *value *= scale;
+            }
+            Ok(())
+        }
+        [scale_rows] if *scale_rows == rows => {
+            validate_cpu_lm_row_scale_count(artifacts, tensor_name, rows, scale_values)?;
+            apply_cpu_lm_row_scales(values, columns, scale_values);
+            Ok(())
+        }
+        [scale_rows, 1] if *scale_rows == rows => {
+            validate_cpu_lm_row_scale_count(artifacts, tensor_name, rows, scale_values)?;
+            apply_cpu_lm_row_scales(values, columns, scale_values);
+            Ok(())
+        }
+        _ => Err(invalid_cpu_lm_artifact(
+            artifacts,
+            format!(
+                "CPU embedding LM tensor {tensor_name} quantization scale shape {scale_shape:?} \
+                 does not match scalar, [{rows}], or [{rows}, 1]"
+            ),
+        )),
+    }
+}
+
+fn validate_cpu_lm_row_scale_count(
+    artifacts: &LocalModelArtifacts,
+    tensor_name: &str,
+    rows: usize,
+    scale_values: &[f32],
+) -> Result<(), ModelArtifactError> {
+    if scale_values.len() != rows {
+        return Err(invalid_cpu_lm_artifact(
+            artifacts,
+            format!(
+                "CPU embedding LM tensor {tensor_name} row quantization scale has {} values but expected {rows}",
+                scale_values.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn single_cpu_lm_scale(
+    artifacts: &LocalModelArtifacts,
+    tensor_name: &str,
+    scale_values: &[f32],
+) -> Result<f32, ModelArtifactError> {
+    match scale_values {
+        [scale] => Ok(*scale),
+        _ => Err(invalid_cpu_lm_artifact(
+            artifacts,
+            format!(
+                "CPU embedding LM tensor {tensor_name} scalar quantization scale has {} values",
+                scale_values.len()
+            ),
+        )),
+    }
+}
+
+fn apply_cpu_lm_row_scales(values: &mut [f32], columns: usize, scale_values: &[f32]) {
+    for (row, scale) in values.chunks_mut(columns).zip(scale_values) {
+        for value in row {
+            *value *= *scale;
+        }
+    }
 }
 
 fn validate_cpu_lm_tensor_shape(

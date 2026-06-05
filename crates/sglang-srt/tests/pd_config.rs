@@ -336,6 +336,59 @@ fn kv_cache_model_layout_loads_repo_id_from_huggingface_cache_snapshot() {
 }
 
 #[test]
+fn pd_config_derives_glm_moe_dsa_kv_layout_from_hf_cache_repo_id() {
+    let hub_dir = temp_model_dir("pd-glm-moe-dsa-hf-cache-hub");
+    let snapshot_dir = hub_dir
+        .join("models--zai-org--GLM-5-FP8")
+        .join("snapshots")
+        .join("abc123");
+    fs::create_dir_all(&snapshot_dir).expect("snapshot dir should be created");
+    fs::create_dir_all(hub_dir.join("models--zai-org--GLM-5-FP8").join("refs"))
+        .expect("refs dir should be created");
+    fs::write(
+        hub_dir
+            .join("models--zai-org--GLM-5-FP8")
+            .join("refs")
+            .join("main"),
+        "abc123\n",
+    )
+    .expect("main ref should be written");
+    fs::write(
+        snapshot_dir.join("config.json"),
+        r#"{
+  "model_type": "glm_moe_dsa",
+  "num_hidden_layers": 78,
+  "num_attention_heads": 64,
+  "num_key_value_heads": 64,
+  "head_dim": 64
+}"#,
+    )
+    .expect("config should be written");
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "zai-org/GLM-5-FP8",
+        "--disaggregation-mode",
+        "decode",
+        "--disaggregation-transfer-backend",
+        "mooncake",
+        "--kv-cache-dtype",
+        "bfloat16",
+    ])
+    .expect("args should parse");
+
+    let config = PdConfig::from_server_args_with_hf_cache(&args, &hub_dir)
+        .expect("pd config should normalize cached GLM repo id");
+
+    assert_eq!(
+        config.kv_cache_model_layout,
+        Some(KvCacheModelLayout::multi_tensor(78, 64, 64, 2))
+    );
+
+    fs::remove_dir_all(hub_dir).expect("temp hub dir should be removed");
+}
+
+#[test]
 fn pd_config_rejects_partial_cli_kv_model_geometry() {
     let args = ServerArgs::parse_from([
         "serve",
