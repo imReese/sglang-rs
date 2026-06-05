@@ -68,6 +68,97 @@ async fn http_server_accepts_model_and_generate_requests() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_accepts_non_streaming_chat_completions_for_sgl_router() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "glm-chat-http",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let service = build_bootstrap_http_router_service(&args);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let response = post_json_with_retry(
+        addr,
+        "/v1/chat/completions",
+        r#"{"model":"glm-chat-http","messages":[{"role":"user","content":"hi"}],"max_tokens":2}"#,
+    )
+    .await;
+
+    assert_eq!(response["object"], "chat.completion");
+    assert_eq!(response["model"], "glm-chat-http");
+    assert_eq!(response["choices"][0]["index"], 0);
+    assert_eq!(response["choices"][0]["message"]["role"], "assistant");
+    assert_eq!(response["choices"][0]["message"]["content"], "  ");
+    assert_eq!(response["choices"][0]["finish_reason"], "stop");
+    assert_eq!(response["usage"]["prompt_tokens"], 2);
+    assert_eq!(response["usage"]["completion_tokens"], 2);
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_reports_plain_worker_server_info_for_sgl_router() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "glm-router-plain",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let service = build_bootstrap_http_router_service(&args);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let server_info = get_json_with_retry(addr, "/server_info").await;
+
+    assert_eq!(server_info["served_model_name"], "glm-router-plain");
+    assert_eq!(server_info["disaggregation_mode"], "null");
+    assert!(server_info.get("disaggregation_bootstrap_port").is_none());
+    assert!(server_info.get("kv_events").is_none());
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_server_rejects_disaggregated_generate_without_transfer_runtime() {
     let args = ServerArgs::parse_from([
         "serve",
@@ -100,6 +191,73 @@ async fn http_server_rejects_disaggregated_generate_without_transfer_runtime() {
 
     assert!(response.starts_with("HTTP/1.1 501"));
     assert!(response.contains("PD transfer-enabled runtime"));
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_prefill_server_reports_router_server_info_with_kv_events() {
+    let bootstrap_addr = unused_local_addr();
+    let zmq_ports = unused_contiguous_local_ports_excluding(2, &[bootstrap_addr.port()]);
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "glm-router-prefill",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--tp-size",
+        "2",
+        "--dp-size",
+        "1",
+        "--page-size",
+        "64",
+        "--disaggregation-mode",
+        "prefill",
+        "--disaggregation-transfer-backend",
+        "mooncake",
+        "--disaggregation-bootstrap-port",
+        &bootstrap_addr.port().to_string(),
+        "--disaggregation-zmq-ports",
+        &format!("{}-{}", zmq_ports[0], zmq_ports[1]),
+        "--num-reserved-decode-tokens",
+        "8",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let service = build_bootstrap_prefill_http_router_service(&args);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let server_info = get_json_with_retry(addr, "/server_info").await;
+
+    assert_eq!(server_info["served_model_name"], "glm-router-prefill");
+    assert_eq!(server_info["disaggregation_mode"], "prefill");
+    assert_eq!(
+        server_info["disaggregation_bootstrap_port"],
+        bootstrap_addr.port()
+    );
+    assert_eq!(server_info["kv_events"]["publisher"], "zmq");
+    assert_eq!(server_info["kv_events"]["endpoint_host"], "127.0.0.1");
+    assert_eq!(server_info["kv_events"]["endpoint_port_base"], zmq_ports[0]);
+    assert_eq!(server_info["kv_events"]["topic"], "");
+    assert_eq!(server_info["kv_events"]["block_size"], 64);
+    assert_eq!(server_info["kv_events"]["dp_size"], 1);
 
     shutdown_tx
         .send(())

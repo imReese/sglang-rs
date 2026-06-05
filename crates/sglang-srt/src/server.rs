@@ -11,7 +11,10 @@ use crate::deepseek_runtime::{
 };
 use crate::engine::Engine;
 use crate::grpc::{GrpcRouterService, GrpcServeError, serve_grpc_router};
-use crate::http::{HttpRouterService, HttpServeError, serve_http_router_with_shutdown};
+use crate::http::{
+    HttpKvEventsInfo, HttpRouterService, HttpServeError, HttpServerInfo,
+    serve_http_router_with_shutdown,
+};
 use crate::model_artifacts::{HfModelConfig, LocalModelArtifacts, ModelArtifactError};
 use crate::model_executor::{
     CpuEmbeddingLmModel, ForwardModel, ModelForwardError, ModelForwardOutput, ModelRunner,
@@ -330,6 +333,35 @@ pub fn prefill_mooncake_zmq_endpoints(args: &ServerArgs) -> Vec<String> {
         .collect()
 }
 
+fn http_server_info_from_args(args: &ServerArgs) -> HttpServerInfo {
+    let mut server_info = HttpServerInfo {
+        disaggregation_mode: args.disaggregation_mode.clone(),
+        disaggregation_bootstrap_port: if args.disaggregation_mode == "prefill" {
+            Some(args.disaggregation_bootstrap_port)
+        } else {
+            None
+        },
+        kv_events: None,
+    };
+
+    if let Some(ports) = args.disaggregation_zmq_ports {
+        if let (Ok(block_size), Ok(dp_size)) =
+            (u32::try_from(args.page_size), u32::try_from(args.dp_size))
+        {
+            server_info.kv_events = Some(HttpKvEventsInfo {
+                publisher: "zmq".to_string(),
+                endpoint_host: prefill_mooncake_route_rank_ip(args),
+                endpoint_port_base: ports.start,
+                topic: String::new(),
+                block_size,
+                dp_size,
+            });
+        }
+    }
+
+    server_info
+}
+
 pub fn register_prefill_mooncake_routes_from_args(
     service: &PrefillBootstrapService,
     args: &ServerArgs,
@@ -446,10 +478,10 @@ pub fn try_build_bootstrap_http_router_service(
     let engine = Engine::new(tokenizer, scheduler);
     let runtime = RouterRuntime::new(engine)
         .with_default_stop_token_ids(model_config_eos_token_ids(&args.model_path));
-    Ok(HttpRouterService::new(
-        runtime,
-        RouterGetModelInfoResponse::from_server_args(args),
-    ))
+    Ok(
+        HttpRouterService::new(runtime, RouterGetModelInfoResponse::from_server_args(args))
+            .with_server_info(http_server_info_from_args(args)),
+    )
 }
 
 pub fn build_bootstrap_prefill_http_router_service(
@@ -482,6 +514,7 @@ pub fn try_build_bootstrap_prefill_http_router_service(
         .with_default_stop_token_ids(model_config_eos_token_ids(&args.model_path));
     Ok(
         HttpRouterService::new(runtime, RouterGetModelInfoResponse::from_server_args(args))
+            .with_server_info(http_server_info_from_args(args))
             .with_disaggregated_requests(),
     )
 }
@@ -527,6 +560,7 @@ where
         .with_default_stop_token_ids(model_config_eos_token_ids(&args.model_path));
     Ok(
         HttpRouterService::new(runtime, RouterGetModelInfoResponse::from_server_args(args))
+            .with_server_info(http_server_info_from_args(args))
             .with_disaggregated_requests()
             .with_max_transfer_polls(args.disaggregation_decode_polling_interval),
     )
