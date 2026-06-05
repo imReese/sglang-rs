@@ -348,6 +348,95 @@ async fn bootstrap_grpc_router_service_generates_through_model_runner() {
 }
 
 #[tokio::test]
+async fn bootstrap_grpc_router_service_generates_from_local_safetensors_weights() {
+    let model_dir = temp_model_dir("server-weight-backed-forward");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "model_type": "sglang_embedding_lm",
+  "vocab_size": 3,
+  "hidden_size": 2
+}"#,
+    )
+    .expect("config should be written");
+    fs::write(
+        model_dir.join("tokenizer.json"),
+        word_level_tokenizer_json(),
+    )
+    .expect("tokenizer should be written");
+    write_safetensors_file(
+        &model_dir.join("model.safetensors"),
+        &[
+            ("model.embed_tokens.weight", "F32", &[3, 2], [0, 24]),
+            ("lm_head.weight", "F32", &[3, 2], [24, 48]),
+        ],
+        &[
+            0.0, 0.0, // [UNK]
+            1.0, 0.0, // hello
+            0.0, 1.0, // world
+            0.0, 0.0, // [UNK] logits
+            0.0, 0.0, // hello logits
+            2.0, 0.0, // world logits
+        ]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>(),
+    )
+    .expect("weights should be written");
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_dir.to_str().expect("temp model dir should be utf-8"),
+        "--grpc-mode",
+    ])
+    .expect("args should parse");
+    let service = build_bootstrap_grpc_router_service(&args);
+
+    let mut stream = service
+        .text_generate(Request::new(TextGenerateRequest {
+            text: "hello".to_string(),
+            sampling_params: Some(SamplingParams {
+                max_new_tokens: Some(1),
+                ..Default::default()
+            }),
+            options: Some(RequestOptions {
+                request_id: Some("bootstrap-weight-backed".to_string()),
+                stream: true,
+                data_parallel_rank: 0,
+                trace_headers: Default::default(),
+            }),
+            disaggregated_params: None,
+        }))
+        .await
+        .expect("text generate should execute")
+        .into_inner();
+
+    let response = tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
+        .await
+        .expect("one response")
+        .expect("response should be ok");
+
+    assert_eq!(response.request_id, "bootstrap-weight-backed");
+    assert_eq!(
+        response.body,
+        Some(Body::Complete(
+            sglang_srt::proto::sglang::runtime::v1::GenerateComplete {
+                output_ids: vec![2],
+                text: "world".to_string(),
+                finish_reason: "stop".to_string(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                cached_tokens: 0,
+                index: 0,
+            }
+        ))
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[tokio::test]
 async fn bootstrap_grpc_router_service_uses_config_eos_token_as_default_stop() {
     let model_dir = temp_model_dir("server-config-eos-stop");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");

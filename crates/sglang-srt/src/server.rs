@@ -8,7 +8,8 @@ use crate::engine::Engine;
 use crate::grpc::{GrpcRouterService, GrpcServeError, serve_grpc_router};
 use crate::model_artifacts::{HfModelConfig, LocalModelArtifacts, ModelArtifactError};
 use crate::model_executor::{
-    ForwardModel, ModelForwardError, ModelForwardOutput, ModelRunner, ModelWorkerBatch,
+    CpuEmbeddingLmModel, ForwardModel, ModelForwardError, ModelForwardOutput, ModelRunner,
+    ModelWorkerBatch,
 };
 use crate::router::RouterRuntime;
 use crate::scheduler::Scheduler;
@@ -19,21 +20,50 @@ use crate::transfer::{
 };
 
 #[derive(Clone, Debug, Default)]
-pub struct BootstrapForwardModel;
+pub enum BootstrapForwardModel {
+    #[default]
+    Space,
+    CpuEmbeddingLm(CpuEmbeddingLmModel),
+}
+
+impl BootstrapForwardModel {
+    fn from_server_args(args: &ServerArgs) -> Result<Self, ServerLaunchError> {
+        let model_path = Path::new(&args.model_path);
+        if model_path.is_dir() && !model_path.join("config.json").is_file() {
+            return Ok(Self::Space);
+        }
+
+        let artifacts = match LocalModelArtifacts::from_model_path(&args.model_path) {
+            Ok(artifacts) => artifacts,
+            Err(ModelArtifactError::ModelPathNotLocalDirectory { .. })
+            | Err(ModelArtifactError::NoSafetensorsWeights { .. }) => return Ok(Self::Space),
+            Err(error) => return Err(error.into()),
+        };
+
+        Ok(CpuEmbeddingLmModel::from_local_model_artifacts(&artifacts)?
+            .map(Self::CpuEmbeddingLm)
+            .unwrap_or(Self::Space))
+    }
+}
 
 impl ForwardModel for BootstrapForwardModel {
     fn forward(
         &mut self,
         batch: &ModelWorkerBatch,
     ) -> Result<ModelForwardOutput, ModelForwardError> {
-        let mut logits = Vec::with_capacity(batch.request_ids().len());
-        for _ in batch.request_ids() {
-            let mut row = vec![0.0; (b' ' as usize) + 1];
-            row[b' ' as usize] = 1.0;
-            logits.push(row);
-        }
+        match self {
+            Self::Space => {
+                let mut logits = Vec::with_capacity(batch.request_ids().len());
+                for _ in batch.request_ids() {
+                    let mut row = vec![0.0; (b' ' as usize) + 1];
+                    row[b' ' as usize] = 1.0;
+                    logits.push(row);
+                }
 
-        ModelForwardOutput::new(logits)
+                ModelForwardOutput::new(logits)
+            }
+            Self::CpuEmbeddingLm(model) => model.forward(batch),
+        }
     }
 }
 
@@ -165,8 +195,10 @@ pub fn try_build_bootstrap_grpc_router_service(
     args: &ServerArgs,
 ) -> Result<BootstrapGrpcRouterService, ServerLaunchError> {
     validate_local_model_artifacts_if_present(args)?;
-    let scheduler = Scheduler::new(ModelRunner::new(BootstrapForwardModel))
-        .with_max_running_requests(args.max_running_requests);
+    let scheduler = Scheduler::new(ModelRunner::new(BootstrapForwardModel::from_server_args(
+        args,
+    )?))
+    .with_max_running_requests(args.max_running_requests);
     let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
         &args.model_path,
         args.tokenizer_path.as_deref(),
@@ -199,7 +231,7 @@ where
 {
     validate_local_model_artifacts_if_present(args)?;
     let worker = KvTransferModelWorker::new(
-        ModelRunner::new(BootstrapForwardModel),
+        ModelRunner::new(BootstrapForwardModel::from_server_args(args)?),
         registry,
         transfer_executor,
     );

@@ -4,6 +4,7 @@ use crate::types::{DisaggregatedParams, RequestId, SamplingParams};
 use rand::RngExt as _;
 use std::fmt;
 
+use crate::model_artifacts::{LocalModelArtifacts, ModelArtifactError, SafetensorsTensorData};
 use crate::worker::{
     BatchGeneratedTokens, FallibleModelWorker, GeneratedToken, WorkerExecutionError,
 };
@@ -150,6 +151,165 @@ pub trait ForwardModel {
         &mut self,
         batch: &ModelWorkerBatch,
     ) -> Result<ModelForwardOutput, ModelForwardError>;
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CpuEmbeddingLmModel {
+    token_embeddings: Vec<f32>,
+    lm_head: Vec<f32>,
+    vocab_size: usize,
+    hidden_size: usize,
+}
+
+impl CpuEmbeddingLmModel {
+    pub fn from_local_model_artifacts(
+        artifacts: &LocalModelArtifacts,
+    ) -> Result<Option<Self>, ModelArtifactError> {
+        if artifacts.config().model_type.as_deref() != Some("sglang_embedding_lm") {
+            return Ok(None);
+        }
+
+        let vocab_size = artifacts.config().vocab_size.ok_or_else(|| {
+            invalid_cpu_lm_artifact(artifacts, "missing vocab_size for CPU embedding LM")
+        })?;
+        let hidden_size = artifacts.config().hidden_size.ok_or_else(|| {
+            invalid_cpu_lm_artifact(artifacts, "missing hidden_size for CPU embedding LM")
+        })?;
+        let token_embeddings = required_f32_matrix(
+            artifacts,
+            "model.embed_tokens.weight",
+            vocab_size,
+            hidden_size,
+        )?;
+        let lm_head = required_f32_matrix(artifacts, "lm_head.weight", vocab_size, hidden_size)?;
+
+        Ok(Some(Self {
+            token_embeddings,
+            lm_head,
+            vocab_size,
+            hidden_size,
+        }))
+    }
+
+    fn logits_for_token(&self, token_id: u32) -> Result<Vec<f32>, ModelForwardError> {
+        let token_id = usize::try_from(token_id).map_err(|_| {
+            ModelForwardError::Runtime(format!("token id {token_id} does not fit usize"))
+        })?;
+        if token_id >= self.vocab_size {
+            return Err(ModelForwardError::Runtime(format!(
+                "token id {token_id} is outside CPU embedding LM vocabulary {}",
+                self.vocab_size
+            )));
+        }
+
+        let hidden_offset = token_id * self.hidden_size;
+        let hidden = &self.token_embeddings[hidden_offset..hidden_offset + self.hidden_size];
+        let mut logits = Vec::with_capacity(self.vocab_size);
+        for output_token_id in 0..self.vocab_size {
+            let row_offset = output_token_id * self.hidden_size;
+            let row = &self.lm_head[row_offset..row_offset + self.hidden_size];
+            logits.push(dot_product(hidden, row));
+        }
+        Ok(logits)
+    }
+}
+
+impl ForwardModel for CpuEmbeddingLmModel {
+    fn forward(
+        &mut self,
+        batch: &ModelWorkerBatch,
+    ) -> Result<ModelForwardOutput, ModelForwardError> {
+        let logits = batch
+            .last_input_token_ids()
+            .into_iter()
+            .map(|token_id| self.logits_for_token(token_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        ModelForwardOutput::new(logits)
+    }
+}
+
+fn required_f32_matrix(
+    artifacts: &LocalModelArtifacts,
+    tensor_name: &str,
+    rows: usize,
+    columns: usize,
+) -> Result<Vec<f32>, ModelArtifactError> {
+    let tensor = artifacts
+        .safetensors()
+        .read_tensor(tensor_name)?
+        .ok_or_else(|| {
+            invalid_cpu_lm_artifact(
+                artifacts,
+                format!("missing CPU embedding LM tensor {tensor_name}"),
+            )
+        })?;
+
+    validate_cpu_lm_tensor_shape(artifacts, tensor_name, &tensor, rows, columns)?;
+    f32_values_from_tensor(artifacts, tensor_name, &tensor)
+}
+
+fn validate_cpu_lm_tensor_shape(
+    artifacts: &LocalModelArtifacts,
+    tensor_name: &str,
+    tensor: &SafetensorsTensorData,
+    rows: usize,
+    columns: usize,
+) -> Result<(), ModelArtifactError> {
+    if tensor.metadata.dtype != "F32" {
+        return Err(invalid_cpu_lm_artifact(
+            artifacts,
+            format!(
+                "CPU embedding LM tensor {tensor_name} has unsupported dtype {}; expected F32",
+                tensor.metadata.dtype
+            ),
+        ));
+    }
+    if tensor.metadata.shape != [rows, columns] {
+        return Err(invalid_cpu_lm_artifact(
+            artifacts,
+            format!(
+                "CPU embedding LM tensor {tensor_name} shape {:?} does not match expected [{rows}, {columns}]",
+                tensor.metadata.shape
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn f32_values_from_tensor(
+    artifacts: &LocalModelArtifacts,
+    tensor_name: &str,
+    tensor: &SafetensorsTensorData,
+) -> Result<Vec<f32>, ModelArtifactError> {
+    let mut chunks = tensor.bytes.chunks_exact(4);
+    let values = chunks
+        .by_ref()
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect::<Vec<_>>();
+    if !chunks.remainder().is_empty() {
+        return Err(invalid_cpu_lm_artifact(
+            artifacts,
+            format!("CPU embedding LM tensor {tensor_name} byte length is not divisible by 4"),
+        ));
+    }
+    Ok(values)
+}
+
+fn dot_product(left: &[f32], right: &[f32]) -> f32 {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| left * right)
+        .sum()
+}
+
+fn invalid_cpu_lm_artifact(
+    artifacts: &LocalModelArtifacts,
+    message: impl Into<String>,
+) -> ModelArtifactError {
+    ModelArtifactError::InvalidSafetensorsData {
+        path: artifacts.model_path().to_path_buf(),
+        message: message.into(),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
