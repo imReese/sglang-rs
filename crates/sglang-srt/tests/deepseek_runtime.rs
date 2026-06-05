@@ -27,6 +27,23 @@ impl ModelWorker for NoopWorker {
     }
 }
 
+#[derive(Default)]
+struct UnfinishedPrefillWorker;
+
+impl ModelWorker for UnfinishedPrefillWorker {
+    fn generate_batch(&mut self, batch: &ScheduleBatch) -> BatchGeneratedTokens {
+        BatchGeneratedTokens::from_batch(
+            batch,
+            batch
+                .requests()
+                .iter()
+                .map(|_| GeneratedToken::unfinished(vec![99]))
+                .collect(),
+        )
+        .expect("output shape should match batch")
+    }
+}
+
 #[test]
 fn deepseek_v4_runtime_builds_forward_plan_from_scheduler_batch() {
     let model_dir = temp_model_dir("deepseek-runtime-forward-plan");
@@ -118,6 +135,67 @@ fn deepseek_v4_runtime_builds_forward_plan_from_scheduler_batch() {
     assert_eq!(plan.out_cache_pages().len(), 4);
     assert_eq!(plan.data_parallel_ranks(), &[2, 0]);
     assert_eq!(plan.bootstrap_rooms(), &[Some(34), None]);
+    assert_eq!(plan.request_spans().len(), 2);
+    assert_eq!(
+        plan.request_spans()[0].request_id(),
+        &RequestId::from("pd-prefill")
+    );
+    assert_eq!(plan.request_spans()[0].token_range(), 0..2);
+    assert_eq!(
+        plan.request_spans()[0].prefix_cache_pages(),
+        &[CachePageId::from(100), CachePageId::from(101)]
+    );
+    assert_eq!(plan.request_spans()[0].out_cache_pages().len(), 2);
+    assert_eq!(plan.request_spans()[0].data_parallel_rank(), 2);
+    assert_eq!(plan.request_spans()[0].bootstrap_room(), Some(34));
+    assert_eq!(
+        plan.request_spans()[1].request_id(),
+        &RequestId::from("plain-prefill")
+    );
+    assert_eq!(plan.request_spans()[1].token_range(), 2..4);
+    assert!(plan.request_spans()[1].prefix_cache_pages().is_empty());
+    assert_eq!(plan.request_spans()[1].out_cache_pages().len(), 2);
+    assert_eq!(plan.request_spans()[1].data_parallel_rank(), 0);
+    assert_eq!(plan.request_spans()[1].bootstrap_room(), None);
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn deepseek_v4_forward_plan_handles_decode_batches_without_prefill_output_pages() {
+    let model_dir = temp_model_dir("deepseek-runtime-decode-forward-plan");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_complete_deepseek_v4_checkpoint(&model_dir);
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("artifacts should load");
+    let runtime =
+        DeepSeekV4Runtime::from_local_model_artifacts(&artifacts).expect("runtime should build");
+
+    let mut scheduler = Scheduler::new(UnfinishedPrefillWorker);
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("decode-a"),
+        vec![1, 2, 3],
+        SamplingParams::new(2),
+    ));
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should produce an unfinished request");
+
+    let batch = scheduler
+        .next_decode_batch(1)
+        .expect("decode batch should be available");
+    let worker_batch = ModelWorkerBatch::from_schedule_batch(&batch);
+    let plan = runtime.forward_plan(&worker_batch);
+
+    assert_eq!(plan.forward_mode(), ForwardMode::Decode);
+    assert_eq!(plan.request_ids(), &[RequestId::from("decode-a")]);
+    assert_eq!(plan.input_ids(), &[99]);
+    assert_eq!(plan.positions(), &[3]);
+    assert!(plan.out_cache_pages().is_empty());
+    assert_eq!(plan.request_spans().len(), 1);
+    assert_eq!(plan.request_spans()[0].token_range(), 0..1);
+    assert!(plan.request_spans()[0].out_cache_pages().is_empty());
+    assert!(plan.request_spans()[0].prefix_cache_pages().is_empty());
 
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }

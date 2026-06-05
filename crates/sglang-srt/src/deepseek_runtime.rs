@@ -1,4 +1,5 @@
 use std::fmt;
+use std::ops::Range;
 use std::path::PathBuf;
 
 use crate::cache::CachePageId;
@@ -332,10 +333,36 @@ pub struct DeepSeekV4ForwardPlan {
     out_cache_pages: Vec<CachePageId>,
     data_parallel_ranks: Vec<i32>,
     bootstrap_rooms: Vec<Option<i32>>,
+    request_spans: Vec<DeepSeekV4RequestForwardSpan>,
 }
 
 impl DeepSeekV4ForwardPlan {
     fn from_model_worker_batch(batch: &ModelWorkerBatch) -> Self {
+        let bootstrap_rooms = batch
+            .disaggregated_params()
+            .iter()
+            .map(|params| params.as_ref().map(|params| params.bootstrap_room))
+            .collect::<Vec<_>>();
+        let mut request_spans = Vec::with_capacity(batch.request_ids().len());
+        for request_index in 0..batch.request_ids().len() {
+            let token_start = batch.request_offsets()[request_index];
+            let token_count = batch.input_token_counts()[request_index];
+            let token_end = token_start + token_count;
+            let out_cache_pages = if token_end <= batch.out_cache_pages().len() {
+                batch.out_cache_pages()[token_start..token_end].to_vec()
+            } else {
+                Vec::new()
+            };
+            request_spans.push(DeepSeekV4RequestForwardSpan {
+                request_id: batch.request_ids()[request_index].clone(),
+                token_range: token_start..token_end,
+                prefix_cache_pages: batch.prefix_cache_pages()[request_index].clone(),
+                out_cache_pages,
+                data_parallel_rank: batch.data_parallel_ranks()[request_index],
+                bootstrap_room: bootstrap_rooms[request_index],
+            });
+        }
+
         Self {
             forward_mode: batch.forward_mode(),
             request_ids: batch.request_ids().to_vec(),
@@ -347,11 +374,8 @@ impl DeepSeekV4ForwardPlan {
             input_token_counts: batch.input_token_counts().to_vec(),
             out_cache_pages: batch.out_cache_pages().to_vec(),
             data_parallel_ranks: batch.data_parallel_ranks().to_vec(),
-            bootstrap_rooms: batch
-                .disaggregated_params()
-                .iter()
-                .map(|params| params.as_ref().map(|params| params.bootstrap_room))
-                .collect(),
+            bootstrap_rooms,
+            request_spans,
         }
     }
 
@@ -397,6 +421,46 @@ impl DeepSeekV4ForwardPlan {
 
     pub fn bootstrap_rooms(&self) -> &[Option<i32>] {
         &self.bootstrap_rooms
+    }
+
+    pub fn request_spans(&self) -> &[DeepSeekV4RequestForwardSpan] {
+        &self.request_spans
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeepSeekV4RequestForwardSpan {
+    request_id: RequestId,
+    token_range: Range<usize>,
+    prefix_cache_pages: Vec<CachePageId>,
+    out_cache_pages: Vec<CachePageId>,
+    data_parallel_rank: i32,
+    bootstrap_room: Option<i32>,
+}
+
+impl DeepSeekV4RequestForwardSpan {
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub fn token_range(&self) -> Range<usize> {
+        self.token_range.clone()
+    }
+
+    pub fn prefix_cache_pages(&self) -> &[CachePageId] {
+        &self.prefix_cache_pages
+    }
+
+    pub fn out_cache_pages(&self) -> &[CachePageId] {
+        &self.out_cache_pages
+    }
+
+    pub fn data_parallel_rank(&self) -> i32 {
+        self.data_parallel_rank
+    }
+
+    pub fn bootstrap_room(&self) -> Option<i32> {
+        self.bootstrap_room
     }
 }
 
