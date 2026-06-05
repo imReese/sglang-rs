@@ -9,10 +9,11 @@ use sglang_srt::transfer::{
     KvCacheTransferError, KvCacheTransferExecutor, KvCacheTransferPlan, KvCacheTransferPlanError,
     KvCacheTransferSpan, KvPoll, KvTransferModelWorker, MooncakeBatchId, MooncakeBatchReleaser,
     MooncakeError, MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeOpcode,
-    MooncakeSubmittedBatch, MooncakeTransferRequest, MooncakeTransferStatus,
-    MooncakeTransferStatusCode, MooncakeTransferStatusReader, MooncakeTransferSubmitter,
-    MooncakeTransferTarget, MooncakeTransferTargetResolver, build_mooncake_kv_transfer_requests,
-    execute_kv_cache_transfer_plan, is_decode_request_kv_ready, poll_mooncake_transfer_batches,
+    MooncakeSessionTargetResolver, MooncakeSubmittedBatch, MooncakeTransferRequest,
+    MooncakeTransferStatus, MooncakeTransferStatusCode, MooncakeTransferStatusReader,
+    MooncakeTransferSubmitter, MooncakeTransferTarget, MooncakeTransferTargetResolver,
+    build_mooncake_kv_transfer_requests, execute_kv_cache_transfer_plan,
+    is_decode_request_kv_ready, poll_mooncake_transfer_batches,
 };
 use sglang_srt::types::{DisaggregatedParams, RequestId, SamplingParams, TokenGenerateRequest};
 use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker, WorkerExecutionError};
@@ -1152,6 +1153,72 @@ fn mooncake_executor_resolves_target_per_bootstrap_room() {
 }
 
 #[test]
+fn mooncake_session_target_resolver_opens_segment_once_per_session() {
+    let mut scheduler = Scheduler::with_cache_resources(
+        FinishedWorker,
+        RadixCache::default(),
+        CachePageAllocator::new(4),
+    );
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("session-room"),
+            vec![1, 2],
+            SamplingParams::new(1),
+        )
+        .with_disaggregated_params(Some(disaggregated_params(33))),
+    );
+    let batch = scheduler
+        .next_prefill_batch(1)
+        .expect("prefill batch should be available");
+    let worker_batch = ModelWorkerBatch::from_schedule_batch(&batch);
+    let transfer_plan =
+        KvCacheTransferPlan::from_prefill_worker_batch(&worker_batch).expect("plan should build");
+    let mut registry = DecodeBootstrapRegistry::default();
+    registry
+        .register(DecodeBootstrapSession::new(
+            RequestId::from("session-room"),
+            disaggregated_params(33),
+            0,
+        ))
+        .expect("session should register");
+    let mut executor = MooncakeKvCacheTransferExecutor::with_target_resolver(
+        RecordingMooncakeSubmitter::default(),
+        MooncakeKvCacheLayout {
+            source_base_addr: 0x5000,
+            page_size_bytes: 64,
+            target_base_offset: 0,
+        },
+        MooncakeSessionTargetResolver::new(
+            RecordingSegmentOpener::new(vec![("decode-session-a".to_string(), 404)]),
+            vec![(33, "decode-session-a".to_string())],
+        ),
+    );
+
+    let first_summary =
+        execute_kv_cache_transfer_plan(&mut registry, &mut executor, &transfer_plan)
+            .expect("first transfer should open segment and submit");
+    let second_summary =
+        execute_kv_cache_transfer_plan(&mut registry, &mut executor, &transfer_plan)
+            .expect("second transfer should reuse cached target and submit");
+
+    assert_eq!(first_summary.submitted_spans(), 1);
+    assert_eq!(second_summary.submitted_spans(), 1);
+    assert_eq!(
+        executor
+            .submitter()
+            .submitted_requests
+            .iter()
+            .map(|requests| requests[0].target_id)
+            .collect::<Vec<_>>(),
+        vec![404, 404]
+    );
+    assert_eq!(
+        executor.target_resolver().opener().opened_segments(),
+        &["decode-session-a".to_string()]
+    );
+}
+
+#[test]
 fn poll_mooncake_transfer_batches_reports_pending_without_changing_status() {
     let mut registry = registry_with_session("pd-pending", 13);
     registry
@@ -1327,6 +1394,35 @@ impl MooncakeBatchReleaser for RecordingMooncakeBackend {
 
 struct RoomTargetResolver {
     targets: Vec<(i32, i32)>,
+}
+
+struct RecordingSegmentOpener {
+    targets: Vec<(String, i32)>,
+    opened_segments: Vec<String>,
+}
+
+impl RecordingSegmentOpener {
+    fn new(targets: Vec<(String, i32)>) -> Self {
+        Self {
+            targets,
+            opened_segments: Vec::new(),
+        }
+    }
+
+    fn opened_segments(&self) -> &[String] {
+        &self.opened_segments
+    }
+}
+
+impl sglang_srt::transfer::MooncakeSegmentOpener for RecordingSegmentOpener {
+    fn open_segment(&mut self, segment: &str) -> Result<i32, MooncakeError> {
+        self.opened_segments.push(segment.to_string());
+        self.targets
+            .iter()
+            .find(|(candidate, _)| candidate == segment)
+            .map(|(_, target_id)| *target_id)
+            .ok_or_else(|| MooncakeError::OpenSegmentFailed(segment.to_string()))
+    }
 }
 
 impl MooncakeTransferTargetResolver for RoomTargetResolver {

@@ -1302,6 +1302,10 @@ pub struct MooncakeTransferTarget {
     pub target_id: i32,
 }
 
+pub trait MooncakeSegmentOpener {
+    fn open_segment(&mut self, segment: &str) -> Result<i32, MooncakeError>;
+}
+
 pub trait MooncakeTransferTargetResolver {
     fn resolve_target(
         &mut self,
@@ -1326,6 +1330,69 @@ impl MooncakeTransferTargetResolver for FixedMooncakeTransferTargetResolver {
         _span: &KvCacheTransferSpan,
     ) -> Result<MooncakeTransferTarget, KvCacheTransferError> {
         Ok(self.target)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MooncakeSessionTargetResolver<O> {
+    opener: O,
+    sessions_by_room: BTreeMap<i32, String>,
+    targets_by_session: BTreeMap<String, MooncakeTransferTarget>,
+}
+
+impl<O> MooncakeSessionTargetResolver<O> {
+    pub fn new(opener: O, sessions_by_room: Vec<(i32, String)>) -> Self {
+        Self {
+            opener,
+            sessions_by_room: sessions_by_room.into_iter().collect(),
+            targets_by_session: BTreeMap::new(),
+        }
+    }
+
+    pub fn opener(&self) -> &O {
+        &self.opener
+    }
+
+    pub fn opener_mut(&mut self) -> &mut O {
+        &mut self.opener
+    }
+
+    pub fn insert_room_session(&mut self, bootstrap_room: i32, session_id: impl Into<String>) {
+        self.sessions_by_room
+            .insert(bootstrap_room, session_id.into());
+    }
+}
+
+impl<O> MooncakeTransferTargetResolver for MooncakeSessionTargetResolver<O>
+where
+    O: MooncakeSegmentOpener,
+{
+    fn resolve_target(
+        &mut self,
+        span: &KvCacheTransferSpan,
+    ) -> Result<MooncakeTransferTarget, KvCacheTransferError> {
+        let session_id = self
+            .sessions_by_room
+            .get(&span.bootstrap_room())
+            .ok_or_else(|| {
+                KvCacheTransferError::Runtime(format!(
+                    "missing Mooncake session for bootstrap room {}",
+                    span.bootstrap_room()
+                ))
+            })?
+            .clone();
+
+        if let Some(target) = self.targets_by_session.get(&session_id) {
+            return Ok(*target);
+        }
+
+        let target_id = self
+            .opener
+            .open_segment(&session_id)
+            .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
+        let target = MooncakeTransferTarget { target_id };
+        self.targets_by_session.insert(session_id, target);
+        Ok(target)
     }
 }
 
@@ -1858,6 +1925,13 @@ impl MooncakeTransferSubmitter for LinkedMooncakeTransferEngine {
         requests: &mut [MooncakeTransferRequest],
     ) -> Result<MooncakeBatchId, MooncakeError> {
         LinkedMooncakeTransferEngine::submit_transfer(self, requests)
+    }
+}
+
+#[cfg(feature = "mooncake-link")]
+impl MooncakeSegmentOpener for LinkedMooncakeTransferEngine {
+    fn open_segment(&mut self, segment: &str) -> Result<i32, MooncakeError> {
+        LinkedMooncakeTransferEngine::open_segment(self, segment)
     }
 }
 
