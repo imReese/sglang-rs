@@ -6,12 +6,13 @@ use crate::cache::{CachePageAllocator, RadixCache};
 use crate::cli::ServerArgs;
 use crate::engine::Engine;
 use crate::grpc::{GrpcRouterService, GrpcServeError, serve_grpc_router};
+use crate::http::{HttpRouterService, HttpServeError, serve_http_router};
 use crate::model_artifacts::{HfModelConfig, LocalModelArtifacts, ModelArtifactError};
 use crate::model_executor::{
     CpuEmbeddingLmModel, ForwardModel, ModelForwardError, ModelForwardOutput, ModelRunner,
     ModelWorkerBatch,
 };
-use crate::router::RouterRuntime;
+use crate::router::{RouterGetModelInfoResponse, RouterRuntime};
 use crate::scheduler::Scheduler;
 use crate::tokenizer::{RuntimeTokenizer, TokenizerError};
 use crate::transfer::{
@@ -69,6 +70,12 @@ impl ForwardModel for BootstrapForwardModel {
 
 pub type BootstrapGrpcRouterService =
     GrpcRouterService<RuntimeTokenizer, ModelRunner<BootstrapForwardModel>>;
+pub type BootstrapHttpRouterService =
+    HttpRouterService<RuntimeTokenizer, ModelRunner<BootstrapForwardModel>>;
+pub type BootstrapPrefillHttpRouterService = HttpRouterService<
+    RuntimeTokenizer,
+    KvTransferModelWorker<ModelRunner<BootstrapForwardModel>, FakeKvCacheTransferExecutor>,
+>;
 pub type BootstrapPdGrpcRouterService<E> = GrpcRouterService<
     RuntimeTokenizer,
     KvTransferModelWorker<ModelRunner<BootstrapForwardModel>, E>,
@@ -91,6 +98,7 @@ pub enum ServerLaunchError {
     ModelArtifact(ModelArtifactError),
     Tokenizer(TokenizerError),
     Grpc(GrpcServeError),
+    Http(HttpServeError),
 }
 
 impl PartialEq for ServerLaunchError {
@@ -144,6 +152,7 @@ impl fmt::Display for ServerLaunchError {
             Self::ModelArtifact(error) => write!(formatter, "model artifact error: {error}"),
             Self::Tokenizer(error) => write!(formatter, "tokenizer error: {error}"),
             Self::Grpc(error) => write!(formatter, "{error}"),
+            Self::Http(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -153,6 +162,12 @@ impl std::error::Error for ServerLaunchError {}
 impl From<GrpcServeError> for ServerLaunchError {
     fn from(value: GrpcServeError) -> Self {
         Self::Grpc(value)
+    }
+}
+
+impl From<HttpServeError> for ServerLaunchError {
+    fn from(value: HttpServeError) -> Self {
+        Self::Http(value)
     }
 }
 
@@ -187,6 +202,10 @@ pub fn grpc_listen_addr(args: &ServerArgs) -> Result<SocketAddr, ServerLaunchErr
         })
 }
 
+pub fn http_listen_addr(args: &ServerArgs) -> Result<SocketAddr, ServerLaunchError> {
+    grpc_listen_addr(args)
+}
+
 pub fn build_bootstrap_grpc_router_service(args: &ServerArgs) -> BootstrapGrpcRouterService {
     try_build_bootstrap_grpc_router_service(args).expect("bootstrap tokenizer should load")
 }
@@ -207,6 +226,65 @@ pub fn try_build_bootstrap_grpc_router_service(
     let runtime = RouterRuntime::new(engine)
         .with_default_stop_token_ids(model_config_eos_token_ids(&args.model_path));
     Ok(GrpcRouterService::with_server_args(runtime, args))
+}
+
+pub fn build_bootstrap_http_router_service(args: &ServerArgs) -> BootstrapHttpRouterService {
+    try_build_bootstrap_http_router_service(args).expect("bootstrap tokenizer should load")
+}
+
+pub fn try_build_bootstrap_http_router_service(
+    args: &ServerArgs,
+) -> Result<BootstrapHttpRouterService, ServerLaunchError> {
+    validate_local_model_artifacts_if_present(args)?;
+    let scheduler = Scheduler::new(ModelRunner::new(BootstrapForwardModel::from_server_args(
+        args,
+    )?))
+    .with_max_running_requests(args.max_running_requests);
+    let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
+        &args.model_path,
+        args.tokenizer_path.as_deref(),
+    )?;
+    let engine = Engine::new(tokenizer, scheduler);
+    let runtime = RouterRuntime::new(engine)
+        .with_default_stop_token_ids(model_config_eos_token_ids(&args.model_path));
+    Ok(HttpRouterService::new(
+        runtime,
+        RouterGetModelInfoResponse::from_server_args(args),
+    ))
+}
+
+pub fn build_bootstrap_prefill_http_router_service(
+    args: &ServerArgs,
+) -> BootstrapPrefillHttpRouterService {
+    try_build_bootstrap_prefill_http_router_service(args).expect("bootstrap tokenizer should load")
+}
+
+pub fn try_build_bootstrap_prefill_http_router_service(
+    args: &ServerArgs,
+) -> Result<BootstrapPrefillHttpRouterService, ServerLaunchError> {
+    validate_local_model_artifacts_if_present(args)?;
+    let worker = KvTransferModelWorker::new(
+        ModelRunner::new(BootstrapForwardModel::from_server_args(args)?),
+        DecodeBootstrapRegistry::default(),
+        FakeKvCacheTransferExecutor::default(),
+    );
+    let scheduler = Scheduler::with_cache_resources(
+        worker,
+        RadixCache::default(),
+        CachePageAllocator::new(args.num_reserved_decode_tokens),
+    )
+    .with_max_running_requests(args.max_running_requests);
+    let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
+        &args.model_path,
+        args.tokenizer_path.as_deref(),
+    )?;
+    let engine = Engine::new(tokenizer, scheduler);
+    let runtime = RouterRuntime::new(engine)
+        .with_default_stop_token_ids(model_config_eos_token_ids(&args.model_path));
+    Ok(HttpRouterService::new(
+        runtime,
+        RouterGetModelInfoResponse::from_server_args(args),
+    ))
 }
 
 pub fn build_bootstrap_pd_grpc_router_service<E>(
@@ -314,6 +392,28 @@ pub async fn launch_grpc_server(args: ServerArgs) -> Result<(), ServerLaunchErro
     } else {
         let service = try_build_bootstrap_grpc_router_service(&args)?;
         serve_grpc_router(addr, service, true).await?;
+    }
+    Ok(())
+}
+
+pub async fn launch_http_server(args: ServerArgs) -> Result<(), ServerLaunchError> {
+    let pd_config = PdConfig::from_server_args(&args)?;
+    let addr = http_listen_addr(&args)?;
+    match pd_config.mode {
+        DisaggregationMode::Null => {
+            let service = try_build_bootstrap_http_router_service(&args)?;
+            serve_http_router(addr, service).await?;
+        }
+        DisaggregationMode::Prefill if pd_config.transfer_backend == TransferBackend::Fake => {
+            let service = try_build_bootstrap_prefill_http_router_service(&args)?;
+            serve_http_router(addr, service).await?;
+        }
+        _ => {
+            return Err(ServerLaunchError::UnsupportedBootstrapPdRuntime {
+                mode: pd_config.mode,
+                transfer_backend: pd_config.transfer_backend,
+            });
+        }
     }
     Ok(())
 }
