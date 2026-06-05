@@ -1220,6 +1220,10 @@ pub struct MooncakeTransferRequest {
     pub length: u64,
 }
 
+// The pointer is an opaque registered device/host address passed to Mooncake; moving
+// the request between Rust threads does not grant dereference access in Rust.
+unsafe impl Send for MooncakeTransferRequest {}
+
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct MooncakeBufferEntry {

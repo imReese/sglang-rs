@@ -21,6 +21,7 @@ pub struct HttpRouterService<T, W> {
     runtime: Arc<Mutex<RouterRuntime<T, W>>>,
     model_info: RouterGetModelInfoResponse,
     allow_disaggregated_requests: bool,
+    max_transfer_polls: usize,
 }
 
 impl<T, W> Clone for HttpRouterService<T, W> {
@@ -29,6 +30,7 @@ impl<T, W> Clone for HttpRouterService<T, W> {
             runtime: Arc::clone(&self.runtime),
             model_info: self.model_info.clone(),
             allow_disaggregated_requests: self.allow_disaggregated_requests,
+            max_transfer_polls: self.max_transfer_polls,
         }
     }
 }
@@ -39,6 +41,7 @@ impl<T, W> HttpRouterService<T, W> {
             runtime: Arc::new(Mutex::new(runtime)),
             model_info,
             allow_disaggregated_requests: false,
+            max_transfer_polls: 0,
         }
     }
 
@@ -48,6 +51,11 @@ impl<T, W> HttpRouterService<T, W> {
 
     pub fn with_disaggregated_requests(mut self) -> Self {
         self.allow_disaggregated_requests = true;
+        self
+    }
+
+    pub fn with_max_transfer_polls(mut self, max_transfer_polls: usize) -> Self {
+        self.max_transfer_polls = max_transfer_polls;
         self
     }
 }
@@ -171,7 +179,11 @@ where
             .runtime
             .lock()
             .expect("HTTP router runtime lock should be held");
-        runtime.generate_text_stream(request)
+        if service.max_transfer_polls == 0 {
+            runtime.generate_text_stream(request)
+        } else {
+            runtime.generate_text_stream_with_transfer_polling(request, service.max_transfer_polls)
+        }
     };
 
     match response {

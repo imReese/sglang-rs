@@ -81,6 +81,10 @@ pub type BootstrapPrefillHttpRouterService = HttpRouterService<
     RuntimeTokenizer,
     KvTransferModelWorker<ModelRunner<BootstrapForwardModel>, FakeKvCacheTransferExecutor>,
 >;
+pub type BootstrapPdHttpRouterService<E> = HttpRouterService<
+    RuntimeTokenizer,
+    KvTransferModelWorker<ModelRunner<BootstrapForwardModel>, E>,
+>;
 pub type BootstrapPdGrpcRouterService<E> = GrpcRouterService<
     RuntimeTokenizer,
     KvTransferModelWorker<ModelRunner<BootstrapForwardModel>, E>,
@@ -415,6 +419,52 @@ pub fn try_build_bootstrap_prefill_http_router_service(
     Ok(
         HttpRouterService::new(runtime, RouterGetModelInfoResponse::from_server_args(args))
             .with_disaggregated_requests(),
+    )
+}
+
+pub fn build_bootstrap_pd_http_router_service<E>(
+    args: &ServerArgs,
+    registry: DecodeBootstrapRegistry,
+    transfer_executor: E,
+) -> BootstrapPdHttpRouterService<E>
+where
+    E: KvCacheTransferExecutor,
+{
+    try_build_bootstrap_pd_http_router_service(args, registry, transfer_executor)
+        .expect("bootstrap tokenizer should load")
+}
+
+pub fn try_build_bootstrap_pd_http_router_service<E>(
+    args: &ServerArgs,
+    registry: DecodeBootstrapRegistry,
+    transfer_executor: E,
+) -> Result<BootstrapPdHttpRouterService<E>, ServerLaunchError>
+where
+    E: KvCacheTransferExecutor,
+{
+    validate_local_model_artifacts_if_present(args)?;
+    let worker = KvTransferModelWorker::new(
+        ModelRunner::new(BootstrapForwardModel::from_server_args(args)?),
+        registry,
+        transfer_executor,
+    );
+    let scheduler = Scheduler::with_cache_resources(
+        worker,
+        RadixCache::default(),
+        CachePageAllocator::new(args.num_reserved_decode_tokens),
+    )
+    .with_max_running_requests(args.max_running_requests);
+    let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
+        &args.model_path,
+        args.tokenizer_path.as_deref(),
+    )?;
+    let engine = Engine::new(tokenizer, scheduler);
+    let runtime = RouterRuntime::new(engine)
+        .with_default_stop_token_ids(model_config_eos_token_ids(&args.model_path));
+    Ok(
+        HttpRouterService::new(runtime, RouterGetModelInfoResponse::from_server_args(args))
+            .with_disaggregated_requests()
+            .with_max_transfer_polls(args.disaggregation_decode_polling_interval),
     )
 }
 

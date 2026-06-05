@@ -7,8 +7,14 @@ use tokio::sync::oneshot;
 use sglang_srt::cli::ServerArgs;
 use sglang_srt::http::serve_http_router_with_shutdown;
 use sglang_srt::server::{
-    build_bootstrap_http_router_service, build_bootstrap_prefill_http_router_service,
-    launch_http_server_with_shutdown,
+    build_bootstrap_http_router_service, build_bootstrap_pd_http_router_service,
+    build_bootstrap_prefill_http_router_service, launch_http_server_with_shutdown,
+};
+use sglang_srt::transfer::{
+    DecodeBootstrapRegistry, MooncakeBatchId, MooncakeBatchReleaser, MooncakeError,
+    MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeTransferRequest,
+    MooncakeTransferStatus, MooncakeTransferStatusCode, MooncakeTransferStatusReader,
+    MooncakeTransferSubmitter, MooncakeTransferTarget,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -165,6 +171,69 @@ async fn http_prefill_server_accepts_disaggregated_generate_requests() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_pd_server_polls_async_transfer_before_decode() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "glm-pd-http",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--disaggregation-mode",
+        "prefill",
+        "--disaggregation-decode-polling-interval",
+        "1",
+        "--num-reserved-decode-tokens",
+        "8",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let transfer_executor = MooncakeKvCacheTransferExecutor::new(
+        RecordingMooncakeBackend::completed(),
+        MooncakeKvCacheLayout {
+            source_base_addr: 0x3000,
+            page_size_bytes: 64,
+            target_base_offset: 0,
+        },
+        MooncakeTransferTarget { target_id: 17 },
+    );
+    let service = build_bootstrap_pd_http_router_service(
+        &args,
+        DecodeBootstrapRegistry::default(),
+        transfer_executor,
+    );
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let generated = post_json_with_retry(
+        addr,
+        "/generate",
+        r#"{"request_id":"http-pd-mooncake","text":"hi","sampling_params":{"max_new_tokens":2},"bootstrap_host":"10.0.0.8","bootstrap_port":8200,"bootstrap_room":41}"#,
+    )
+    .await;
+
+    assert_eq!(generated["request_id"], "http-pd-mooncake");
+    assert_eq!(generated["usage"]["completion_tokens"], 2);
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prefill_http_launch_starts_main_and_bootstrap_listeners() {
     let http_addr = unused_local_addr();
     let bootstrap_addr = unused_local_addr();
@@ -304,6 +373,52 @@ fn unused_contiguous_local_ports(count: u16) -> Vec<u16> {
         }
     }
     panic!("contiguous local ports should be available");
+}
+
+struct RecordingMooncakeBackend {
+    status: MooncakeTransferStatusCode,
+    submitted_requests: Vec<Vec<MooncakeTransferRequest>>,
+    freed_batches: Vec<MooncakeBatchId>,
+}
+
+impl RecordingMooncakeBackend {
+    fn completed() -> Self {
+        Self {
+            status: MooncakeTransferStatusCode::Completed,
+            submitted_requests: Vec::new(),
+            freed_batches: Vec::new(),
+        }
+    }
+}
+
+impl MooncakeTransferSubmitter for RecordingMooncakeBackend {
+    fn submit_transfer(
+        &mut self,
+        requests: &mut [MooncakeTransferRequest],
+    ) -> Result<MooncakeBatchId, MooncakeError> {
+        self.submitted_requests.push(requests.to_vec());
+        Ok(500 + self.submitted_requests.len() as MooncakeBatchId - 1)
+    }
+}
+
+impl MooncakeTransferStatusReader for RecordingMooncakeBackend {
+    fn transfer_status(
+        &mut self,
+        _batch_id: MooncakeBatchId,
+        _task_id: usize,
+    ) -> Result<MooncakeTransferStatus, MooncakeError> {
+        Ok(MooncakeTransferStatus {
+            status: self.status as i32,
+            transferred_bytes: 0,
+        })
+    }
+}
+
+impl MooncakeBatchReleaser for RecordingMooncakeBackend {
+    fn free_batch(&mut self, batch_id: MooncakeBatchId) -> Result<(), MooncakeError> {
+        self.freed_batches.push(batch_id);
+        Ok(())
+    }
 }
 
 async fn get_json_with_retry(addr: SocketAddr, path: &str) -> Value {
