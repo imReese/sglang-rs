@@ -1,6 +1,6 @@
 use sglang_srt::cache::{
-    KvBlockPrefixIndex, KvCacheWorkerId, KvCacheWorkerSnapshot, compute_sglang_block_hashes,
-    sglang_sha256_digest_to_i64,
+    KvBlockPrefixIndex, KvCacheAwareSelectionConfig, KvCacheWorkerId, KvCacheWorkerSnapshot,
+    compute_sglang_block_hashes, sglang_sha256_digest_to_i64,
 };
 
 #[test]
@@ -142,6 +142,52 @@ fn kv_block_prefix_index_selects_lowest_load_worker_among_cache_matches() {
             0.5,
         )
         .expect("cache-aware selector should choose a candidate");
+
+    assert_eq!(selected, worker_b);
+}
+
+#[test]
+fn kv_block_prefix_index_skips_cache_hit_when_load_is_imbalanced() {
+    let mut index = KvBlockPrefixIndex::default();
+    let worker_a = worker("http://prefill-a:30000", 0);
+    let worker_b = worker("http://prefill-b:30000", 0);
+    let block_hashes = compute_sglang_block_hashes(&[1, 2, 3, 4], 2);
+    index.insert(&worker_b, &block_hashes);
+
+    let selected = index
+        .select_cache_aware_worker_with_config(
+            &workers_with_loads([(&worker_a, 1), (&worker_b, 11)]),
+            &block_hashes,
+            KvCacheAwareSelectionConfig {
+                cache_threshold: 0.0,
+                balance_abs_threshold: 5,
+                balance_rel_threshold: 2.0,
+            },
+        )
+        .expect("imbalanced selector should choose a candidate");
+
+    assert_eq!(selected, worker_a);
+}
+
+#[test]
+fn kv_block_prefix_index_keeps_cache_hit_below_absolute_imbalance_threshold() {
+    let mut index = KvBlockPrefixIndex::default();
+    let worker_a = worker("http://prefill-a:30000", 0);
+    let worker_b = worker("http://prefill-b:30000", 0);
+    let block_hashes = compute_sglang_block_hashes(&[1, 2, 3, 4], 2);
+    index.insert(&worker_b, &block_hashes);
+
+    let selected = index
+        .select_cache_aware_worker_with_config(
+            &workers_with_loads([(&worker_a, 1), (&worker_b, 5)]),
+            &block_hashes,
+            KvCacheAwareSelectionConfig {
+                cache_threshold: 0.0,
+                balance_abs_threshold: 5,
+                balance_rel_threshold: 2.0,
+            },
+        )
+        .expect("selector should choose a candidate");
 
     assert_eq!(selected, worker_b);
 }

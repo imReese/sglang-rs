@@ -117,6 +117,23 @@ pub struct KvCacheWorkerSnapshot {
     pub active_load: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KvCacheAwareSelectionConfig {
+    pub cache_threshold: f32,
+    pub balance_abs_threshold: usize,
+    pub balance_rel_threshold: f32,
+}
+
+impl Default for KvCacheAwareSelectionConfig {
+    fn default() -> Self {
+        Self {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KvBlockPrefixMatch {
     pub matched_blocks: usize,
@@ -171,8 +188,29 @@ impl KvBlockPrefixIndex {
         block_hashes: &[i64],
         cache_threshold: f32,
     ) -> Option<KvCacheWorkerId> {
+        self.select_cache_aware_worker_with_config(
+            candidates,
+            block_hashes,
+            KvCacheAwareSelectionConfig {
+                cache_threshold,
+                balance_abs_threshold: usize::MAX,
+                balance_rel_threshold: f32::MAX,
+            },
+        )
+    }
+
+    pub fn select_cache_aware_worker_with_config(
+        &self,
+        candidates: &[KvCacheWorkerSnapshot],
+        block_hashes: &[i64],
+        config: KvCacheAwareSelectionConfig,
+    ) -> Option<KvCacheWorkerId> {
         if candidates.is_empty() {
             return None;
+        }
+
+        if is_cache_aware_selection_imbalanced(candidates, config) {
+            return min_load_worker(candidates);
         }
 
         let matched = self.match_prefix(block_hashes);
@@ -182,7 +220,7 @@ impl KvBlockPrefixIndex {
             matched.matched_blocks as f32 / block_hashes.len() as f32
         };
 
-        if match_rate > cache_threshold && !matched.workers.is_empty() {
+        if match_rate > config.cache_threshold && !matched.workers.is_empty() {
             if let Some(worker) = candidates
                 .iter()
                 .filter(|candidate| matched.workers.contains(&candidate.id))
@@ -192,10 +230,7 @@ impl KvBlockPrefixIndex {
             }
         }
 
-        candidates
-            .iter()
-            .min_by_key(|candidate| candidate.active_load)
-            .map(|worker| worker.id.clone())
+        min_load_worker(candidates)
     }
 
     pub fn select_cache_aware_worker_for_tokens(
@@ -208,6 +243,34 @@ impl KvBlockPrefixIndex {
         let block_hashes = compute_sglang_block_hashes(input_ids, block_size);
         self.select_cache_aware_worker(candidates, &block_hashes, cache_threshold)
     }
+}
+
+fn is_cache_aware_selection_imbalanced(
+    candidates: &[KvCacheWorkerSnapshot],
+    config: KvCacheAwareSelectionConfig,
+) -> bool {
+    let Some(min_load) = candidates
+        .iter()
+        .map(|candidate| candidate.active_load)
+        .min()
+    else {
+        return false;
+    };
+    let max_load = candidates
+        .iter()
+        .map(|candidate| candidate.active_load)
+        .max()
+        .unwrap_or(0);
+    let absolute_diff = max_load.saturating_sub(min_load);
+    let relative_threshold = (min_load as f32 * config.balance_rel_threshold) as usize;
+    absolute_diff > config.balance_abs_threshold && max_load > relative_threshold
+}
+
+fn min_load_worker(candidates: &[KvCacheWorkerSnapshot]) -> Option<KvCacheWorkerId> {
+    candidates
+        .iter()
+        .min_by_key(|candidate| candidate.active_load)
+        .map(|worker| worker.id.clone())
 }
 
 fn remove_worker_from_chain(
