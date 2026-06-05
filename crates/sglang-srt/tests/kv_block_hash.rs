@@ -1,4 +1,6 @@
-use sglang_srt::cache::{compute_sglang_block_hashes, sglang_sha256_digest_to_i64};
+use sglang_srt::cache::{
+    KvBlockPrefixIndex, KvCacheWorkerId, compute_sglang_block_hashes, sglang_sha256_digest_to_i64,
+};
 
 #[test]
 fn sglang_block_hash_matches_upstream_single_block_golden() {
@@ -50,4 +52,81 @@ fn sglang_sha256_digest_to_i64_reinterprets_top_64_bits_as_signed() {
 #[should_panic(expected = "block_size must be positive")]
 fn sglang_block_hash_rejects_zero_block_size() {
     let _ = compute_sglang_block_hashes(&[1, 2, 3], 0);
+}
+
+#[test]
+fn kv_block_prefix_index_returns_workers_at_longest_matching_prefix() {
+    let mut index = KvBlockPrefixIndex::default();
+    let worker_a = worker("http://prefill-a:30000", 0);
+    let worker_b = worker("http://prefill-b:30000", 0);
+    let block_hashes = compute_sglang_block_hashes(&[1, 2, 3, 4, 5, 6], 2);
+    index.insert(&worker_a, &block_hashes[..2]);
+    index.insert(&worker_b, &block_hashes);
+
+    let full_match = index.match_prefix(&block_hashes);
+    assert_eq!(full_match.matched_blocks, 3);
+    assert_eq!(
+        full_match.workers.into_iter().collect::<Vec<_>>(),
+        vec![worker_b.clone()]
+    );
+
+    let mut partial_probe = block_hashes[..2].to_vec();
+    partial_probe.push(123456789);
+    let partial_match = index.match_prefix(&partial_probe);
+    assert_eq!(partial_match.matched_blocks, 2);
+    assert_eq!(
+        partial_match.workers.into_iter().collect::<Vec<_>>(),
+        vec![worker_a, worker_b]
+    );
+}
+
+#[test]
+fn kv_block_prefix_index_removes_worker_from_cached_prefixes() {
+    let mut index = KvBlockPrefixIndex::default();
+    let worker_a = worker("http://prefill-a:30000", 0);
+    let worker_b = worker("http://prefill-b:30000", 0);
+    let block_hashes = compute_sglang_block_hashes(&[10, 20, 30, 40, 50, 60], 2);
+    index.insert(&worker_a, &block_hashes);
+    index.insert(&worker_b, &block_hashes);
+
+    index.remove(&worker_b, &block_hashes);
+
+    let matched = index.match_prefix(&block_hashes);
+    assert_eq!(matched.matched_blocks, 3);
+    assert_eq!(
+        matched.workers.into_iter().collect::<Vec<_>>(),
+        vec![worker_a]
+    );
+}
+
+#[test]
+fn kv_block_prefix_index_clear_worker_drops_all_worker_prefixes() {
+    let mut index = KvBlockPrefixIndex::default();
+    let worker_a = worker("http://prefill-a:30000", 0);
+    let worker_b = worker("http://prefill-b:30000", 0);
+    let first_chain = compute_sglang_block_hashes(&[1, 2, 3, 4], 2);
+    let second_chain = compute_sglang_block_hashes(&[7, 8, 9, 10], 2);
+    index.insert(&worker_a, &first_chain);
+    index.insert(&worker_a, &second_chain);
+    index.insert(&worker_b, &second_chain);
+
+    index.clear_worker(&worker_a);
+
+    let first_match = index.match_prefix(&first_chain);
+    assert_eq!(first_match.matched_blocks, 0);
+    assert!(first_match.workers.is_empty());
+
+    let second_match = index.match_prefix(&second_chain);
+    assert_eq!(second_match.matched_blocks, 2);
+    assert_eq!(
+        second_match.workers.into_iter().collect::<Vec<_>>(),
+        vec![worker_b]
+    );
+}
+
+fn worker(endpoint: &str, dp_rank: u32) -> KvCacheWorkerId {
+    KvCacheWorkerId {
+        endpoint: endpoint.to_string(),
+        dp_rank,
+    }
 }

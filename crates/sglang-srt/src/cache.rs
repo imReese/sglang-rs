@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
 
 use sha2::{Digest, Sha256};
@@ -103,6 +103,95 @@ fn sglang_hash_block(parent_digest: Option<&[u8; 32]>, input_ids: &[u32]) -> [u8
         hasher.update(input_id.to_le_bytes());
     }
     hasher.finalize().into()
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct KvCacheWorkerId {
+    pub endpoint: String,
+    pub dp_rank: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KvBlockPrefixMatch {
+    pub matched_blocks: usize,
+    pub workers: BTreeSet<KvCacheWorkerId>,
+}
+
+#[derive(Default)]
+pub struct KvBlockPrefixIndex {
+    root: KvBlockPrefixNode,
+}
+
+impl KvBlockPrefixIndex {
+    pub fn insert(&mut self, worker: &KvCacheWorkerId, block_hashes: &[i64]) {
+        let mut node = &mut self.root;
+        for block_hash in block_hashes {
+            node = node.children.entry(*block_hash).or_default();
+            node.workers.insert(worker.clone());
+        }
+    }
+
+    pub fn remove(&mut self, worker: &KvCacheWorkerId, block_hashes: &[i64]) {
+        remove_worker_from_chain(&mut self.root, worker, block_hashes);
+    }
+
+    pub fn clear_worker(&mut self, worker: &KvCacheWorkerId) {
+        clear_worker_from_block_node(&mut self.root, worker);
+    }
+
+    pub fn match_prefix(&self, block_hashes: &[i64]) -> KvBlockPrefixMatch {
+        let mut node = &self.root;
+        let mut matched_blocks = 0;
+        let mut workers = BTreeSet::new();
+
+        for block_hash in block_hashes {
+            let Some(child) = node.children.get(block_hash) else {
+                break;
+            };
+            matched_blocks += 1;
+            workers = child.workers.clone();
+            node = child;
+        }
+
+        KvBlockPrefixMatch {
+            matched_blocks,
+            workers,
+        }
+    }
+}
+
+fn remove_worker_from_chain(
+    node: &mut KvBlockPrefixNode,
+    worker: &KvCacheWorkerId,
+    block_hashes: &[i64],
+) -> bool {
+    let Some((block_hash, remaining_hashes)) = block_hashes.split_first() else {
+        return node.workers.is_empty() && node.children.is_empty();
+    };
+
+    if let Some(child) = node.children.get_mut(block_hash) {
+        child.workers.remove(worker);
+        if remove_worker_from_chain(child, worker, remaining_hashes) {
+            node.children.remove(block_hash);
+        }
+    }
+
+    node.workers.is_empty() && node.children.is_empty()
+}
+
+fn clear_worker_from_block_node(node: &mut KvBlockPrefixNode, worker: &KvCacheWorkerId) -> bool {
+    node.workers.remove(worker);
+    node.children.retain(|_, child| {
+        clear_worker_from_block_node(child, worker);
+        !(child.workers.is_empty() && child.children.is_empty())
+    });
+    node.workers.is_empty() && node.children.is_empty()
+}
+
+#[derive(Default)]
+struct KvBlockPrefixNode {
+    workers: BTreeSet<KvCacheWorkerId>,
+    children: HashMap<i64, KvBlockPrefixNode>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
