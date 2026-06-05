@@ -6,7 +6,7 @@ use crate::cache::{CachePageAllocator, RadixCache};
 use crate::cli::ServerArgs;
 use crate::engine::Engine;
 use crate::grpc::{GrpcRouterService, GrpcServeError, serve_grpc_router};
-use crate::model_artifacts::{LocalModelArtifacts, ModelArtifactError};
+use crate::model_artifacts::{HfModelConfig, LocalModelArtifacts, ModelArtifactError};
 use crate::model_executor::{
     ForwardModel, ModelForwardError, ModelForwardOutput, ModelRunner, ModelWorkerBatch,
 };
@@ -172,7 +172,8 @@ pub fn try_build_bootstrap_grpc_router_service(
         args.tokenizer_path.as_deref(),
     )?;
     let engine = Engine::new(tokenizer, scheduler);
-    let runtime = RouterRuntime::new(engine);
+    let runtime = RouterRuntime::new(engine)
+        .with_default_stop_token_ids(model_config_eos_token_ids(&args.model_path));
     Ok(GrpcRouterService::with_server_args(runtime, args))
 }
 
@@ -213,9 +214,16 @@ where
         args.tokenizer_path.as_deref(),
     )?;
     let engine = Engine::new(tokenizer, scheduler);
-    let runtime = RouterRuntime::new(engine);
+    let runtime = RouterRuntime::new(engine)
+        .with_default_stop_token_ids(model_config_eos_token_ids(&args.model_path));
     Ok(GrpcRouterService::with_server_args(runtime, args)
         .with_max_transfer_polls(args.disaggregation_decode_polling_interval))
+}
+
+fn model_config_eos_token_ids(model_path: &str) -> Vec<u32> {
+    HfModelConfig::from_model_path(model_path)
+        .map(|config| config.eos_token_ids)
+        .unwrap_or_default()
 }
 
 fn validate_local_model_artifacts_if_present(args: &ServerArgs) -> Result<(), ServerLaunchError> {

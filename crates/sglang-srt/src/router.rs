@@ -377,6 +377,10 @@ fn usize_to_i32(value: usize) -> Option<i32> {
     i32::try_from(value).ok()
 }
 
+fn u32_to_i32(value: u32) -> Option<i32> {
+    i32::try_from(value).ok()
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RouterGenerateResponse {
     pub request_id: String,
@@ -572,6 +576,11 @@ impl RouterGetModelInfoResponse {
         if let Some(model_type) = config.model_type {
             self.model_type = model_type;
         }
+        self.eos_token_ids = config
+            .eos_token_ids
+            .into_iter()
+            .filter_map(u32_to_i32)
+            .collect();
         if let Some(vocab_size) = config.vocab_size.and_then(usize_to_i32) {
             self.vocab_size = vocab_size;
         }
@@ -603,6 +612,7 @@ impl RouterGetModelInfoResponse {
 pub struct RouterRuntime<T, W> {
     engine: Engine<T, W>,
     validation_config: RouterValidationConfig,
+    default_stop_token_ids: Vec<u32>,
     generation_paused: bool,
 }
 
@@ -618,8 +628,16 @@ impl<T, W> RouterRuntime<T, W> {
         Self {
             engine,
             validation_config,
+            default_stop_token_ids: Vec::new(),
             generation_paused: false,
         }
+    }
+
+    pub fn with_default_stop_token_ids(mut self, default_stop_token_ids: Vec<u32>) -> Self {
+        self.default_stop_token_ids = default_stop_token_ids;
+        self.default_stop_token_ids.sort_unstable();
+        self.default_stop_token_ids.dedup();
+        self
     }
 
     pub fn engine(&self) -> &Engine<T, W> {
@@ -682,6 +700,19 @@ impl<T, W> RouterRuntime<T, W> {
 
         Ok(())
     }
+
+    fn apply_default_stop_token_ids(
+        &self,
+        mut request: TokenGenerateRequest,
+    ) -> TokenGenerateRequest {
+        request
+            .sampling
+            .stop_token_ids
+            .extend_from_slice(&self.default_stop_token_ids);
+        request.sampling.stop_token_ids.sort_unstable();
+        request.sampling.stop_token_ids.dedup();
+        request
+    }
 }
 
 impl<T, W> RouterRuntime<T, W>
@@ -729,7 +760,9 @@ where
         let validated_request = request.try_into_validated_token_request(self.validation_config)?;
         self.ensure_generation_ready()?;
         let prompt_tokens = validated_request.prompt_tokens as i32;
-        let output = self.engine.generate_tokens(validated_request.request)?;
+        let output = self
+            .engine
+            .generate_tokens(self.apply_default_stop_token_ids(validated_request.request))?;
 
         Ok(RouterGenerateResponse::from_token_generate_output(
             output,
@@ -747,7 +780,7 @@ where
         let stream = validated_request.stream;
         let outputs = self
             .engine
-            .generate_token_stream(validated_request.request)?;
+            .generate_token_stream(self.apply_default_stop_token_ids(validated_request.request))?;
         let mut output_ids = Vec::new();
         let mut responses = Vec::with_capacity(outputs.len());
 
@@ -872,7 +905,7 @@ where
         let prompt_tokens = validated_request.prompt_tokens as i32;
         let stream = validated_request.stream;
         let outputs = self.engine.generate_token_stream_with_transfer_polling(
-            validated_request.request,
+            self.apply_default_stop_token_ids(validated_request.request),
             max_transfer_polls,
         )?;
         let mut output_ids = Vec::new();

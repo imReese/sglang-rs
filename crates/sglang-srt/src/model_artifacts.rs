@@ -756,6 +756,7 @@ impl Eq for HfConfigFloat {}
 pub struct HfModelConfig {
     pub model_type: Option<String>,
     pub architectures: Vec<String>,
+    pub eos_token_ids: Vec<u32>,
     pub vocab_size: Option<usize>,
     pub max_position_embeddings: Option<usize>,
     pub num_hidden_layers: Option<usize>,
@@ -792,6 +793,7 @@ impl HfModelConfig {
         Ok(Self {
             model_type: read_string_field(&value, "model_type"),
             architectures: read_string_array_field(&value, "architectures"),
+            eos_token_ids: read_u32_or_array_field(&value, "eos_token_id", &config_path)?,
             vocab_size: read_usize_field(&value, "vocab_size", &config_path)?,
             max_position_embeddings: read_usize_field(
                 &value,
@@ -1891,6 +1893,46 @@ fn read_usize_field(
             path: config_path.to_path_buf(),
             message: format!("field {field} does not fit in usize"),
         })
+}
+
+fn read_u32_or_array_field(
+    value: &serde_json::Value,
+    field: &'static str,
+    config_path: &Path,
+) -> Result<Vec<u32>, ModelArtifactError> {
+    let Some(raw) = value.get(field) else {
+        return Ok(Vec::new());
+    };
+    if raw.is_null() {
+        return Ok(Vec::new());
+    }
+    if let Some(values) = raw.as_array() {
+        return values
+            .iter()
+            .map(|value| read_u32_value(value, field, config_path))
+            .collect();
+    }
+
+    Ok(vec![read_u32_value(raw, field, config_path)?])
+}
+
+fn read_u32_value(
+    value: &serde_json::Value,
+    field: &'static str,
+    config_path: &Path,
+) -> Result<u32, ModelArtifactError> {
+    let Some(value) = value.as_u64() else {
+        return Err(ModelArtifactError::InvalidModelConfig {
+            path: config_path.to_path_buf(),
+            message: format!(
+                "field {field} must be an unsigned integer or array of unsigned integers"
+            ),
+        });
+    };
+    u32::try_from(value).map_err(|_| ModelArtifactError::InvalidModelConfig {
+        path: config_path.to_path_buf(),
+        message: format!("field {field} does not fit in u32"),
+    })
 }
 
 fn read_f64_field(

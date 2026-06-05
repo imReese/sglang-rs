@@ -52,6 +52,7 @@ fn local_model_artifacts_loads_deepseek_v4_config_and_indexed_safetensors() {
     );
     assert_eq!(artifacts.config().vocab_size, Some(129_280));
     assert_eq!(artifacts.config().max_position_embeddings, Some(163_840));
+    assert_eq!(artifacts.config().eos_token_ids, vec![32, 100_001]);
     assert_eq!(artifacts.config().num_hidden_layers, Some(43));
     assert_eq!(artifacts.config().hidden_size, Some(7168));
     assert_eq!(artifacts.config().intermediate_size, Some(18_432));
@@ -2373,6 +2374,7 @@ fn deepseek_v4_config_json() -> &'static str {
     r#"{
   "model_type": "deepseek_v4",
   "architectures": ["DeepSeekV4ForCausalLM"],
+  "eos_token_id": [32, 100001],
   "vocab_size": 129280,
   "max_position_embeddings": 163840,
   "num_hidden_layers": 43,
