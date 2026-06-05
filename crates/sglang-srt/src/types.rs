@@ -48,12 +48,13 @@ impl Default for SamplingParams {
 }
 
 pub const FAKE_BOOTSTRAP_HOST: &str = "2.2.2.2";
+pub type BootstrapRoom = u64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DisaggregatedParams {
     pub bootstrap_host: String,
     pub bootstrap_port: u16,
-    pub bootstrap_room: i32,
+    pub bootstrap_room: BootstrapRoom,
 }
 
 #[derive(Clone, Debug, PartialEq)]

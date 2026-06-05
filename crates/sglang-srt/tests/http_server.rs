@@ -18,6 +18,7 @@ use sglang_srt::transfer::{
     MooncakeTransferStatus, MooncakeTransferStatusCode, MooncakeTransferStatusReader,
     MooncakeTransferSubmitter, MooncakeTransferTarget,
 };
+use sglang_srt::types::BootstrapRoom;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_server_accepts_model_and_generate_requests() {
@@ -465,7 +466,11 @@ fn kv_args_frame(session_id: &str, dst_kv_ptrs: &[u64], dst_kv_item_len: usize) 
     ]
 }
 
-fn transfer_metadata_frame(room: i32, session_id: &str, dst_kv_indices: &[i32]) -> Vec<Vec<u8>> {
+fn transfer_metadata_frame(
+    room: BootstrapRoom,
+    session_id: &str,
+    dst_kv_indices: &[i32],
+) -> Vec<Vec<u8>> {
     vec![
         room.to_string().into_bytes(),
         b"10.0.0.9".to_vec(),

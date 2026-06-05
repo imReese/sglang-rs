@@ -161,6 +161,39 @@ fn router_generate_request_preserves_disaggregated_params_for_pd() {
 }
 
 #[test]
+fn router_generate_request_accepts_sgl_router_63_bit_bootstrap_room() {
+    let bootstrap_room = i64::MAX as u64;
+    let request = RouterGenerateRequest {
+        request_id: "router-pd-wide-room".to_string(),
+        tokenized: Some(RouterTokenizedInput {
+            original_text: String::new(),
+            input_ids: vec![101, 202],
+        }),
+        sampling_params: None,
+        disaggregated_params: Some(RouterDisaggregatedParams {
+            bootstrap_host: "10.0.0.7".to_string(),
+            bootstrap_port: 8998,
+            bootstrap_room,
+        }),
+        stream: true,
+        data_parallel_rank: 0,
+        trace_headers: Default::default(),
+    };
+
+    let token_request = request
+        .try_into_token_generate_request()
+        .expect("63-bit sgl-router bootstrap_room should map");
+
+    assert_eq!(
+        token_request
+            .disaggregated_params
+            .expect("disaggregated params")
+            .bootstrap_room,
+        bootstrap_room
+    );
+}
+
+#[test]
 fn router_sampling_params_default_to_sglang_max_new_tokens() {
     let request = RouterGenerateRequest {
         request_id: "default-sampling".to_string(),

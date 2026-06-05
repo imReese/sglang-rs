@@ -15,6 +15,7 @@ use crate::router::{
     RouterRuntime, RouterSamplingParams, RouterTextGenerateRequest,
 };
 use crate::tokenizer::Tokenizer;
+use crate::types::BootstrapRoom;
 use crate::worker::WorkerExecutor;
 
 pub struct HttpRouterService<T, W> {
@@ -269,7 +270,7 @@ fn json_to_disaggregated_params(
         return Ok(Some(RouterDisaggregatedParams {
             bootstrap_host: required_string(payload, "bootstrap_host")?.to_string(),
             bootstrap_port: required_u16(payload, "bootstrap_port")?,
-            bootstrap_room: required_i32(payload, "bootstrap_room")?,
+            bootstrap_room: required_bootstrap_room(payload, "bootstrap_room")?,
         }));
     }
 
@@ -283,7 +284,7 @@ fn json_to_disaggregated_params(
     Ok(Some(RouterDisaggregatedParams {
         bootstrap_host: required_string(value, "bootstrap_host")?.to_string(),
         bootstrap_port: required_u16(value, "bootstrap_port")?,
-        bootstrap_room: required_i32(value, "bootstrap_room")?,
+        bootstrap_room: required_bootstrap_room(value, "bootstrap_room")?,
     }))
 }
 
@@ -316,12 +317,16 @@ fn required_string<'a>(value: &'a Value, field: &'static str) -> Result<&'a str,
         .ok_or_else(|| format!("{field} must be a string"))
 }
 
-fn required_i32(value: &Value, field: &'static str) -> Result<i32, String> {
+fn required_bootstrap_room(value: &Value, field: &'static str) -> Result<BootstrapRoom, String> {
     let raw = value
         .get(field)
-        .and_then(Value::as_i64)
-        .ok_or_else(|| format!("{field} must be an integer"))?;
-    i32::try_from(raw).map_err(|_| format!("{field} is too large for i32"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("{field} must be an unsigned integer"))?;
+    if raw > i64::MAX as u64 {
+        return Err(format!("{field} must fit in signed 63-bit range"));
+    }
+
+    Ok(raw)
 }
 
 fn required_u16(value: &Value, field: &'static str) -> Result<u16, String> {

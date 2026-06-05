@@ -12,6 +12,7 @@ use sglang_srt::pd_bootstrap::{
     serve_mooncake_bootstrap_zmq_with_shutdown, serve_prefill_bootstrap_with_shutdown,
 };
 use sglang_srt::transfer::{KvPoll, MooncakeRemoteKvLayout};
+use sglang_srt::types::BootstrapRoom;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prefill_bootstrap_route_registers_topology_and_rank_endpoint() {
@@ -575,7 +576,7 @@ async fn watch_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
     }
 }
 
-fn transfer_frame(room: i32, session_id: &str) -> Vec<Vec<u8>> {
+fn transfer_frame(room: BootstrapRoom, session_id: &str) -> Vec<Vec<u8>> {
     vec![
         room.to_string().into_bytes(),
         b"10.0.0.12".to_vec(),

@@ -1,7 +1,7 @@
 use sglang_srt::transfer::{
     DecodeBootstrapRegistry, DecodeBootstrapRegistryError, DecodeBootstrapSession, KvPoll,
 };
-use sglang_srt::types::{DisaggregatedParams, RequestId};
+use sglang_srt::types::{BootstrapRoom, DisaggregatedParams, RequestId};
 
 #[test]
 fn decode_bootstrap_registry_tracks_session_dp_rank_and_status_by_room() {
@@ -76,7 +76,7 @@ fn decode_bootstrap_registry_reports_missing_room_on_status_update() {
     );
 }
 
-fn session(request_id: &str, bootstrap_room: i32) -> DecodeBootstrapSession {
+fn session(request_id: &str, bootstrap_room: BootstrapRoom) -> DecodeBootstrapSession {
     DecodeBootstrapSession::new(
         RequestId::from(request_id),
         DisaggregatedParams {

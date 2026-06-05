@@ -9,7 +9,8 @@ use crate::model_artifacts::{HfModelConfig, LocalModelArtifacts, RoutedExpertChe
 use crate::scheduler::SchedulerError;
 use crate::tokenizer::{Tokenizer, TokenizerError};
 use crate::types::{
-    DisaggregatedParams, RequestId, SamplingParams, TokenGenerateOutput, TokenGenerateRequest,
+    BootstrapRoom, DisaggregatedParams, RequestId, SamplingParams, TokenGenerateOutput,
+    TokenGenerateRequest,
 };
 use crate::worker::WorkerExecutor;
 
@@ -101,7 +102,7 @@ pub struct RouterTokenizedInput {
 pub struct RouterDisaggregatedParams {
     pub bootstrap_host: String,
     pub bootstrap_port: u16,
-    pub bootstrap_room: i32,
+    pub bootstrap_room: BootstrapRoom,
 }
 
 impl From<RouterDisaggregatedParams> for DisaggregatedParams {

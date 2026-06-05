@@ -12,7 +12,7 @@ use crate::model_artifacts::{
 use crate::model_executor::ModelWorkerBatch;
 use crate::scheduler::ForwardMode;
 use crate::transfer::{KvCacheModelLayout, PdConfigError};
-use crate::types::RequestId;
+use crate::types::{BootstrapRoom, RequestId};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeepSeekV4Runtime {
@@ -332,7 +332,7 @@ pub struct DeepSeekV4ForwardPlan {
     input_token_counts: Vec<usize>,
     out_cache_pages: Vec<CachePageId>,
     data_parallel_ranks: Vec<i32>,
-    bootstrap_rooms: Vec<Option<i32>>,
+    bootstrap_rooms: Vec<Option<BootstrapRoom>>,
     request_spans: Vec<DeepSeekV4RequestForwardSpan>,
 }
 
@@ -419,7 +419,7 @@ impl DeepSeekV4ForwardPlan {
         &self.data_parallel_ranks
     }
 
-    pub fn bootstrap_rooms(&self) -> &[Option<i32>] {
+    pub fn bootstrap_rooms(&self) -> &[Option<BootstrapRoom>] {
         &self.bootstrap_rooms
     }
 
@@ -435,7 +435,7 @@ pub struct DeepSeekV4RequestForwardSpan {
     prefix_cache_pages: Vec<CachePageId>,
     out_cache_pages: Vec<CachePageId>,
     data_parallel_rank: i32,
-    bootstrap_room: Option<i32>,
+    bootstrap_room: Option<BootstrapRoom>,
 }
 
 impl DeepSeekV4RequestForwardSpan {
@@ -459,7 +459,7 @@ impl DeepSeekV4RequestForwardSpan {
         self.data_parallel_rank
     }
 
-    pub fn bootstrap_room(&self) -> Option<i32> {
+    pub fn bootstrap_room(&self) -> Option<BootstrapRoom> {
         self.bootstrap_room
     }
 }

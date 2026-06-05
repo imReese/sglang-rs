@@ -11,9 +11,10 @@ use sglang_srt::grpc::{
 use sglang_srt::proto::sglang::runtime::v1::generate_response::Body;
 use sglang_srt::proto::sglang::runtime::v1::sglang_service_server::SglangService;
 use sglang_srt::proto::sglang::runtime::v1::{
-    AbortRequest, ContinueGenerationRequest, DetokenizeRequest, FlushCacheRequest, GenerateRequest,
-    GetLoadRequest, GetModelInfoRequest, GetServerInfoRequest, ListModelsRequest,
-    PauseGenerationRequest, RequestOptions, SamplingParams, TextGenerateRequest, TokenizeRequest,
+    AbortRequest, ContinueGenerationRequest, DetokenizeRequest, DisaggregatedParams,
+    FlushCacheRequest, GenerateRequest, GetLoadRequest, GetModelInfoRequest, GetServerInfoRequest,
+    ListModelsRequest, PauseGenerationRequest, RequestOptions, SamplingParams, TextGenerateRequest,
+    TokenizeRequest,
 };
 use sglang_srt::router::{RouterProtocolError, RouterRuntime};
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
@@ -25,7 +26,7 @@ use sglang_srt::transfer::{
     MooncakeTransferStatusReader, MooncakeTransferSubmitter, MooncakeTransferTarget,
 };
 use sglang_srt::types::{
-    DisaggregatedParams as RuntimeDisaggregatedParams, RequestId,
+    BootstrapRoom, DisaggregatedParams as RuntimeDisaggregatedParams, RequestId,
     SamplingParams as RuntimeSamplingParams,
 };
 use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
@@ -65,7 +66,11 @@ fn generated_proto_generate_request_round_trips_with_prost() {
             data_parallel_rank: 0,
             trace_headers: [("traceparent".to_string(), "00-abc".to_string())].into(),
         }),
-        disaggregated_params: None,
+        disaggregated_params: Some(DisaggregatedParams {
+            bootstrap_host: "10.0.0.7".to_string(),
+            bootstrap_port: 8998,
+            bootstrap_room: i64::MAX as u64,
+        }),
     };
 
     let mut bytes = Vec::new();
@@ -88,6 +93,13 @@ fn generated_proto_generate_request_round_trips_with_prost() {
             .trace_headers
             .get("traceparent"),
         Some(&"00-abc".to_string())
+    );
+    assert_eq!(
+        decoded
+            .disaggregated_params
+            .expect("disaggregated params")
+            .bootstrap_room,
+        i64::MAX as u64
     );
 }
 
@@ -916,7 +928,10 @@ impl MooncakeBatchReleaser for RecordingMooncakeBackend {
     }
 }
 
-fn grpc_registry_with_session(request_id: &str, bootstrap_room: i32) -> DecodeBootstrapRegistry {
+fn grpc_registry_with_session(
+    request_id: &str,
+    bootstrap_room: BootstrapRoom,
+) -> DecodeBootstrapRegistry {
     let mut registry = DecodeBootstrapRegistry::default();
     registry
         .register(DecodeBootstrapSession::new(

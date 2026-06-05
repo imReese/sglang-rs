@@ -21,6 +21,7 @@ use crate::transfer::{
     MooncakeTransferPollSummary, MooncakeTransferStatusReader, MooncakeTransferSubmitter,
     MooncakeTransferTargetResolver,
 };
+use crate::types::BootstrapRoom;
 
 #[derive(Clone, Debug, Default)]
 pub struct PrefillBootstrapService {
@@ -119,9 +120,9 @@ pub struct PrefillBootstrapState {
     registered_count: usize,
     prefill_port_table:
         BTreeMap<usize, BTreeMap<usize, BTreeMap<usize, BTreeMap<usize, PrefillRankInfo>>>>,
-    room_to_dp_rank: BTreeMap<i32, RegisteredDpRank>,
+    room_to_dp_rank: BTreeMap<BootstrapRoom, RegisteredDpRank>,
     decode_kv_args_table: BTreeMap<String, MooncakeKvArgsRegisterInfo>,
-    transfer_rooms: BTreeMap<i32, MooncakeTransferRoom>,
+    transfer_rooms: BTreeMap<BootstrapRoom, MooncakeTransferRoom>,
 }
 
 impl PrefillBootstrapState {
@@ -170,17 +171,17 @@ impl PrefillBootstrapState {
         self.decode_kv_args_table.get(session_id)
     }
 
-    pub fn transfer_room(&self, room: i32) -> Option<&MooncakeTransferRoom> {
+    pub fn transfer_room(&self, room: BootstrapRoom) -> Option<&MooncakeTransferRoom> {
         self.transfer_rooms.get(&room)
     }
 
-    pub fn transfer_status(&self, room: i32) -> Option<KvPoll> {
+    pub fn transfer_status(&self, room: BootstrapRoom) -> Option<KvPoll> {
         self.transfer_rooms.get(&room).map(|room| room.status)
     }
 
     pub fn remote_kv_layouts_for_room(
         &self,
-        room: i32,
+        room: BootstrapRoom,
     ) -> Result<Vec<(String, MooncakeRemoteKvLayout)>, MooncakeRemoteKvLayoutError> {
         let room_state = self
             .transfer_rooms
@@ -304,7 +305,7 @@ impl PrefillBootstrapState {
             .cloned()
     }
 
-    fn register_dp_rank(&mut self, bootstrap_room: i32, dp_rank: i32) {
+    fn register_dp_rank(&mut self, bootstrap_room: BootstrapRoom, dp_rank: i32) {
         self.room_to_dp_rank.insert(
             bootstrap_room,
             RegisteredDpRank {
@@ -376,7 +377,7 @@ impl MooncakeKvArgsRegisterInfo {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MooncakeTransferInfo {
-    pub room: i32,
+    pub room: BootstrapRoom,
     pub endpoint: String,
     pub dst_port: u16,
     pub mooncake_session_id: String,
@@ -404,7 +405,7 @@ impl MooncakeTransferInfo {
         };
 
         Ok(Self {
-            room: parse_i32(frame, 0, "room")?,
+            room: parse_bootstrap_room(frame, 0, "room")?,
             endpoint: ascii_field(frame, 1, "endpoint")?.to_string(),
             dst_port: parse_u16(frame, 2, "dst_port")?,
             mooncake_session_id: ascii_field(frame, 3, "mooncake_session_id")?.to_string(),
@@ -428,9 +429,9 @@ pub struct MooncakeTransferRoom {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MooncakeRemoteKvLayoutError {
-    MissingTransferRoom(i32),
+    MissingTransferRoom(BootstrapRoom),
     MissingKvArgsRegistration {
-        room: i32,
+        room: BootstrapRoom,
         mooncake_session_id: String,
     },
 }
@@ -490,13 +491,13 @@ struct RouteQuery {
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 struct RegisterDpRankRequest {
-    bootstrap_room: i32,
+    bootstrap_room: BootstrapRoom,
     dp_rank: i32,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 struct QueryDpRanksRequest {
-    bootstrap_rooms: Vec<i32>,
+    bootstrap_rooms: Vec<BootstrapRoom>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -632,7 +633,7 @@ impl MooncakeDecodeKvArgsRegistration {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MooncakeDecodeTransferMetadata {
-    pub room: i32,
+    pub room: BootstrapRoom,
     pub endpoint: String,
     pub dst_port: u16,
     pub mooncake_session_id: String,
@@ -1200,6 +1201,29 @@ fn parse_i32(
             field: name,
             value: value.to_string(),
         })
+}
+
+fn parse_bootstrap_room(
+    frame: &[Vec<u8>],
+    index: usize,
+    name: &'static str,
+) -> Result<BootstrapRoom, MooncakeBootstrapFrameError> {
+    let value = ascii_field(frame, index, name)?;
+    let room =
+        value
+            .parse::<BootstrapRoom>()
+            .map_err(|_| MooncakeBootstrapFrameError::IntegerField {
+                field: name,
+                value: value.to_string(),
+            })?;
+    if room > i64::MAX as u64 {
+        return Err(MooncakeBootstrapFrameError::IntegerField {
+            field: name,
+            value: value.to_string(),
+        });
+    }
+
+    Ok(room)
 }
 
 fn parse_u16(

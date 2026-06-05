@@ -17,7 +17,9 @@ use sglang_srt::transfer::{
     build_mooncake_remote_kv_transfer_requests, execute_kv_cache_transfer_plan,
     is_decode_request_kv_ready, poll_mooncake_transfer_batches,
 };
-use sglang_srt::types::{DisaggregatedParams, RequestId, SamplingParams, TokenGenerateRequest};
+use sglang_srt::types::{
+    BootstrapRoom, DisaggregatedParams, RequestId, SamplingParams, TokenGenerateRequest,
+};
 use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker, WorkerExecutionError};
 
 #[derive(Default)]
@@ -1459,8 +1461,8 @@ fn poll_mooncake_transfer_batches_marks_failed_status_and_returns_error() {
 
 #[derive(Default)]
 struct RecordingTransferExecutor {
-    seen_rooms: Vec<i32>,
-    fail_room: Option<i32>,
+    seen_rooms: Vec<BootstrapRoom>,
+    fail_room: Option<BootstrapRoom>,
 }
 
 impl KvCacheTransferExecutor for RecordingTransferExecutor {
@@ -1583,7 +1585,7 @@ impl MooncakeBatchReleaser for RecordingMooncakeBackend {
 }
 
 struct RoomTargetResolver {
-    targets: Vec<(i32, i32)>,
+    targets: Vec<(BootstrapRoom, i32)>,
 }
 
 struct SessionTargetResolver {
@@ -1708,7 +1710,7 @@ fn transfer_plan_for_request(
     request_id: &str,
     input_ids: &[u32],
     cached_prefix_len: Option<usize>,
-    bootstrap_room: i32,
+    bootstrap_room: BootstrapRoom,
 ) -> KvCacheTransferPlan {
     let mut prefix_cache = RadixCache::default();
     if let Some(cached_prefix_len) = cached_prefix_len {
@@ -1743,7 +1745,10 @@ fn transfer_plan_for_request(
         .expect("transfer plan should build")
 }
 
-fn registry_with_session(request_id: &str, bootstrap_room: i32) -> DecodeBootstrapRegistry {
+fn registry_with_session(
+    request_id: &str,
+    bootstrap_room: BootstrapRoom,
+) -> DecodeBootstrapRegistry {
     let mut registry = DecodeBootstrapRegistry::default();
     registry
         .register(DecodeBootstrapSession::new(
@@ -1770,7 +1775,11 @@ fn kv_args_frame(session_id: &str, dst_kv_ptrs: &[u64], dst_kv_item_len: usize) 
     ]
 }
 
-fn transfer_metadata_frame(room: i32, session_id: &str, dst_kv_indices: &[i32]) -> Vec<Vec<u8>> {
+fn transfer_metadata_frame(
+    room: BootstrapRoom,
+    session_id: &str,
+    dst_kv_indices: &[i32],
+) -> Vec<Vec<u8>> {
     vec![
         room.to_string().into_bytes(),
         b"10.0.0.9".to_vec(),
@@ -1808,7 +1817,7 @@ fn pack_list_of_buffers(buffers: &[Vec<u8>]) -> Vec<u8> {
     packed
 }
 
-fn disaggregated_params(bootstrap_room: i32) -> DisaggregatedParams {
+fn disaggregated_params(bootstrap_room: BootstrapRoom) -> DisaggregatedParams {
     DisaggregatedParams {
         bootstrap_host: "10.0.0.7".to_string(),
         bootstrap_port: 8998,

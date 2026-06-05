@@ -11,7 +11,7 @@ use crate::cli::{ServerArgs, ZmqPortRange};
 use crate::model_artifacts::{HfModelConfig, resolve_model_path};
 use crate::model_executor::ModelWorkerBatch;
 use crate::scheduler::{ForwardMode, ScheduleBatch, ScheduledRequest};
-use crate::types::{DisaggregatedParams, RequestId};
+use crate::types::{BootstrapRoom, DisaggregatedParams, RequestId};
 use crate::worker::{
     BatchGeneratedTokens, DecodeRequestState, FallibleModelWorker, WorkerExecutionError,
 };
@@ -723,8 +723,8 @@ impl DecodeBootstrapSession {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DecodeBootstrapRegistryError {
-    DuplicateBootstrapRoom(i32),
-    MissingBootstrapRoom(i32),
+    DuplicateBootstrapRoom(BootstrapRoom),
+    MissingBootstrapRoom(BootstrapRoom),
 }
 
 impl fmt::Display for DecodeBootstrapRegistryError {
@@ -744,7 +744,7 @@ impl std::error::Error for DecodeBootstrapRegistryError {}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DecodeBootstrapRegistry {
-    sessions_by_room: BTreeMap<i32, DecodeBootstrapSession>,
+    sessions_by_room: BTreeMap<BootstrapRoom, DecodeBootstrapSession>,
 }
 
 impl DecodeBootstrapRegistry {
@@ -761,18 +761,18 @@ impl DecodeBootstrapRegistry {
         Ok(())
     }
 
-    pub fn get(&self, bootstrap_room: i32) -> Option<&DecodeBootstrapSession> {
+    pub fn get(&self, bootstrap_room: BootstrapRoom) -> Option<&DecodeBootstrapSession> {
         self.sessions_by_room.get(&bootstrap_room)
     }
 
-    pub fn query_data_parallel_rank(&self, bootstrap_room: i32) -> Option<i32> {
+    pub fn query_data_parallel_rank(&self, bootstrap_room: BootstrapRoom) -> Option<i32> {
         self.get(bootstrap_room)
             .map(DecodeBootstrapSession::data_parallel_rank)
     }
 
     pub fn update_status(
         &mut self,
-        bootstrap_room: i32,
+        bootstrap_room: BootstrapRoom,
         status: KvPoll,
     ) -> Result<(), DecodeBootstrapRegistryError> {
         let session = self.sessions_by_room.get_mut(&bootstrap_room).ok_or(
@@ -782,7 +782,7 @@ impl DecodeBootstrapRegistry {
         Ok(())
     }
 
-    pub fn remove(&mut self, bootstrap_room: i32) -> Option<DecodeBootstrapSession> {
+    pub fn remove(&mut self, bootstrap_room: BootstrapRoom) -> Option<DecodeBootstrapSession> {
         self.sessions_by_room.remove(&bootstrap_room)
     }
 
@@ -818,7 +818,7 @@ impl KvCacheTransferSpan {
         self.data_parallel_rank
     }
 
-    pub fn bootstrap_room(&self) -> i32 {
+    pub fn bootstrap_room(&self) -> BootstrapRoom {
         self.disaggregated_params.bootstrap_room
     }
 
@@ -983,11 +983,11 @@ pub trait KvCacheTransferExecutor {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FakeKvCacheTransferExecutor {
-    transferred_rooms: Vec<i32>,
+    transferred_rooms: Vec<BootstrapRoom>,
 }
 
 impl FakeKvCacheTransferExecutor {
-    pub fn transferred_rooms(&self) -> &[i32] {
+    pub fn transferred_rooms(&self) -> &[BootstrapRoom] {
         &self.transferred_rooms
     }
 }
@@ -1405,12 +1405,12 @@ impl MooncakeTransferTargetResolver for FixedMooncakeTransferTargetResolver {
 #[derive(Clone, Debug)]
 pub struct MooncakeSessionTargetResolver<O> {
     opener: O,
-    sessions_by_room: BTreeMap<i32, String>,
+    sessions_by_room: BTreeMap<BootstrapRoom, String>,
     targets_by_session: BTreeMap<String, MooncakeTransferTarget>,
 }
 
 impl<O> MooncakeSessionTargetResolver<O> {
-    pub fn new(opener: O, sessions_by_room: Vec<(i32, String)>) -> Self {
+    pub fn new(opener: O, sessions_by_room: Vec<(BootstrapRoom, String)>) -> Self {
         Self {
             opener,
             sessions_by_room: sessions_by_room.into_iter().collect(),
@@ -1426,7 +1426,11 @@ impl<O> MooncakeSessionTargetResolver<O> {
         &mut self.opener
     }
 
-    pub fn insert_room_session(&mut self, bootstrap_room: i32, session_id: impl Into<String>) {
+    pub fn insert_room_session(
+        &mut self,
+        bootstrap_room: BootstrapRoom,
+        session_id: impl Into<String>,
+    ) {
         self.sessions_by_room
             .insert(bootstrap_room, session_id.into());
     }
@@ -1717,13 +1721,17 @@ pub trait MooncakeBatchReleaser {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MooncakeSubmittedBatch {
-    bootstrap_room: i32,
+    bootstrap_room: BootstrapRoom,
     batch_id: MooncakeBatchId,
     task_count: usize,
 }
 
 impl MooncakeSubmittedBatch {
-    pub fn new(bootstrap_room: i32, batch_id: MooncakeBatchId, task_count: usize) -> Self {
+    pub fn new(
+        bootstrap_room: BootstrapRoom,
+        batch_id: MooncakeBatchId,
+        task_count: usize,
+    ) -> Self {
         Self {
             bootstrap_room,
             batch_id,
@@ -1731,7 +1739,7 @@ impl MooncakeSubmittedBatch {
         }
     }
 
-    pub fn bootstrap_room(&self) -> i32 {
+    pub fn bootstrap_room(&self) -> BootstrapRoom {
         self.bootstrap_room
     }
 
@@ -1858,7 +1866,7 @@ pub struct MooncakeKvCacheTransferExecutor<S, R = FixedMooncakeTransferTargetRes
     submitter: S,
     layout: MooncakeKvCacheLayout,
     target_resolver: R,
-    remote_kv_layouts_by_room: BTreeMap<i32, BTreeMap<String, MooncakeRemoteKvLayout>>,
+    remote_kv_layouts_by_room: BTreeMap<BootstrapRoom, BTreeMap<String, MooncakeRemoteKvLayout>>,
     submitted_batches: Vec<MooncakeBatchId>,
     submitted_transfers: Vec<MooncakeSubmittedBatch>,
 }
@@ -1880,7 +1888,7 @@ impl<S> MooncakeKvCacheTransferExecutor<S> {
         submitter: S,
         layout: MooncakeKvCacheLayout,
         target: MooncakeTransferTarget,
-        remote_kv_layouts: Vec<(i32, MooncakeRemoteKvLayout)>,
+        remote_kv_layouts: Vec<(BootstrapRoom, MooncakeRemoteKvLayout)>,
     ) -> Self {
         Self::with_target_resolver_and_remote_kv_layouts(
             submitter,
@@ -1911,7 +1919,7 @@ impl<S, R> MooncakeKvCacheTransferExecutor<S, R> {
         submitter: S,
         layout: MooncakeKvCacheLayout,
         target_resolver: R,
-        remote_kv_layouts: Vec<(i32, MooncakeRemoteKvLayout)>,
+        remote_kv_layouts: Vec<(BootstrapRoom, MooncakeRemoteKvLayout)>,
     ) -> Self {
         let mut remote_kv_layouts_by_room = BTreeMap::new();
         for (room, layout) in remote_kv_layouts {
@@ -1935,7 +1943,7 @@ impl<S, R> MooncakeKvCacheTransferExecutor<S, R> {
         submitter: S,
         layout: MooncakeKvCacheLayout,
         target_resolver: R,
-        remote_kv_layouts: Vec<(i32, String, MooncakeRemoteKvLayout)>,
+        remote_kv_layouts: Vec<(BootstrapRoom, String, MooncakeRemoteKvLayout)>,
     ) -> Self {
         let mut remote_kv_layouts_by_room = BTreeMap::new();
         for (room, session_id, layout) in remote_kv_layouts {
@@ -1979,17 +1987,23 @@ impl<S, R> MooncakeKvCacheTransferExecutor<S, R> {
         &self.submitted_transfers
     }
 
-    pub fn remote_kv_layouts(&self) -> &BTreeMap<i32, BTreeMap<String, MooncakeRemoteKvLayout>> {
+    pub fn remote_kv_layouts(
+        &self,
+    ) -> &BTreeMap<BootstrapRoom, BTreeMap<String, MooncakeRemoteKvLayout>> {
         &self.remote_kv_layouts_by_room
     }
 
-    pub fn insert_remote_kv_layout(&mut self, bootstrap_room: i32, layout: MooncakeRemoteKvLayout) {
+    pub fn insert_remote_kv_layout(
+        &mut self,
+        bootstrap_room: BootstrapRoom,
+        layout: MooncakeRemoteKvLayout,
+    ) {
         self.insert_remote_kv_session_layout(bootstrap_room, String::new(), layout);
     }
 
     pub fn insert_remote_kv_session_layout(
         &mut self,
-        bootstrap_room: i32,
+        bootstrap_room: BootstrapRoom,
         session_id: impl Into<String>,
         layout: MooncakeRemoteKvLayout,
     ) {

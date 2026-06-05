@@ -51,7 +51,7 @@ message SamplingParams {
 message DisaggregatedParams {
   string bootstrap_host = 1;
   uint32 bootstrap_port = 2;
-  int32 bootstrap_room = 3;
+  uint64 bootstrap_room = 3;
 }
 
 message RequestOptions {
