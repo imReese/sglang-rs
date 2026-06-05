@@ -183,6 +183,46 @@ fn kv_block_prefix_index_selects_lowest_load_worker_below_match_threshold() {
     assert_eq!(selected, worker_b);
 }
 
+#[test]
+fn kv_block_prefix_index_selects_cache_aware_worker_from_token_ids() {
+    let mut index = KvBlockPrefixIndex::default();
+    let worker_a = worker("http://prefill-a:30000", 0);
+    let worker_b = worker("http://prefill-b:30000", 0);
+    let worker_c = worker("http://prefill-c:30000", 0);
+    let input_ids = [11, 22, 33, 44, 55, 66];
+    let block_hashes = compute_sglang_block_hashes(&input_ids, 2);
+    index.insert(&worker_b, &block_hashes);
+
+    let selected = index
+        .select_cache_aware_worker_for_tokens(
+            &workers_with_loads([(&worker_a, 0), (&worker_b, 9), (&worker_c, 2)]),
+            &input_ids,
+            2,
+            0.5,
+        )
+        .expect("token-id selector should choose a candidate");
+
+    assert_eq!(selected, worker_b);
+}
+
+#[test]
+fn kv_block_prefix_index_token_selector_falls_back_for_empty_tokens() {
+    let index = KvBlockPrefixIndex::default();
+    let worker_a = worker("http://prefill-a:30000", 0);
+    let worker_b = worker("http://prefill-b:30000", 0);
+
+    let selected = index
+        .select_cache_aware_worker_for_tokens(
+            &workers_with_loads([(&worker_a, 5), (&worker_b, 1)]),
+            &[],
+            2,
+            0.5,
+        )
+        .expect("empty request selector should fall back to load");
+
+    assert_eq!(selected, worker_b);
+}
+
 fn worker(endpoint: &str, dp_rank: u32) -> KvCacheWorkerId {
     KvCacheWorkerId {
         endpoint: endpoint.to_string(),

@@ -197,6 +197,17 @@ impl KvBlockPrefixIndex {
             .min_by_key(|candidate| candidate.active_load)
             .map(|worker| worker.id.clone())
     }
+
+    pub fn select_cache_aware_worker_for_tokens(
+        &self,
+        candidates: &[KvCacheWorkerSnapshot],
+        input_ids: &[u32],
+        block_size: usize,
+        cache_threshold: f32,
+    ) -> Option<KvCacheWorkerId> {
+        let block_hashes = compute_sglang_block_hashes(input_ids, block_size);
+        self.select_cache_aware_worker(candidates, &block_hashes, cache_threshold)
+    }
 }
 
 fn remove_worker_from_chain(
