@@ -14,15 +14,18 @@ use crate::model_executor::{
     ModelWorkerBatch,
 };
 use crate::pd_bootstrap::{
-    PrefillBootstrapServeError, PrefillBootstrapService, PrefillRouteRegistration,
-    serve_mooncake_bootstrap_zmq_endpoints_with_shutdown, serve_prefill_bootstrap_with_shutdown,
+    MooncakeBootstrapKvCacheTransferExecutor, PrefillBootstrapServeError, PrefillBootstrapService,
+    PrefillRouteRegistration, serve_mooncake_bootstrap_zmq_endpoints_with_shutdown,
+    serve_prefill_bootstrap_with_shutdown,
 };
 use crate::router::{RouterGetModelInfoResponse, RouterRuntime};
 use crate::scheduler::Scheduler;
 use crate::tokenizer::{RuntimeTokenizer, TokenizerError};
 use crate::transfer::{
     DecodeBootstrapRegistry, DisaggregationMode, FakeKvCacheTransferExecutor,
-    KvCacheTransferExecutor, KvTransferModelWorker, PdConfig, PdConfigError, TransferBackend,
+    KvCacheTransferExecutor, KvTransferModelWorker, MooncakeBatchReleaser,
+    MooncakeKvCacheTransferExecutor, MooncakeTransferStatusReader, MooncakeTransferSubmitter,
+    MooncakeTransferTargetResolver, PdConfig, PdConfigError, TransferBackend,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -465,6 +468,46 @@ where
         HttpRouterService::new(runtime, RouterGetModelInfoResponse::from_server_args(args))
             .with_disaggregated_requests()
             .with_max_transfer_polls(args.disaggregation_decode_polling_interval),
+    )
+}
+
+pub fn build_bootstrap_mooncake_prefill_http_router_service<S, R>(
+    args: &ServerArgs,
+    bootstrap_service: PrefillBootstrapService,
+    transfer_executor: MooncakeKvCacheTransferExecutor<S, R>,
+) -> BootstrapPdHttpRouterService<
+    MooncakeBootstrapKvCacheTransferExecutor<MooncakeKvCacheTransferExecutor<S, R>>,
+>
+where
+    S: MooncakeTransferSubmitter + MooncakeTransferStatusReader + MooncakeBatchReleaser,
+    R: MooncakeTransferTargetResolver,
+{
+    try_build_bootstrap_mooncake_prefill_http_router_service(
+        args,
+        bootstrap_service,
+        transfer_executor,
+    )
+    .expect("bootstrap tokenizer should load")
+}
+
+pub fn try_build_bootstrap_mooncake_prefill_http_router_service<S, R>(
+    args: &ServerArgs,
+    bootstrap_service: PrefillBootstrapService,
+    transfer_executor: MooncakeKvCacheTransferExecutor<S, R>,
+) -> Result<
+    BootstrapPdHttpRouterService<
+        MooncakeBootstrapKvCacheTransferExecutor<MooncakeKvCacheTransferExecutor<S, R>>,
+    >,
+    ServerLaunchError,
+>
+where
+    S: MooncakeTransferSubmitter + MooncakeTransferStatusReader + MooncakeBatchReleaser,
+    R: MooncakeTransferTargetResolver,
+{
+    try_build_bootstrap_pd_http_router_service(
+        args,
+        DecodeBootstrapRegistry::default(),
+        MooncakeBootstrapKvCacheTransferExecutor::new(bootstrap_service, transfer_executor),
     )
 }
 

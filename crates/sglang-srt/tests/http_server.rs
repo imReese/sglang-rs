@@ -6,9 +6,11 @@ use tokio::sync::oneshot;
 
 use sglang_srt::cli::ServerArgs;
 use sglang_srt::http::serve_http_router_with_shutdown;
+use sglang_srt::pd_bootstrap::PrefillBootstrapService;
 use sglang_srt::server::{
-    build_bootstrap_http_router_service, build_bootstrap_pd_http_router_service,
-    build_bootstrap_prefill_http_router_service, launch_http_server_with_shutdown,
+    build_bootstrap_http_router_service, build_bootstrap_mooncake_prefill_http_router_service,
+    build_bootstrap_pd_http_router_service, build_bootstrap_prefill_http_router_service,
+    launch_http_server_with_shutdown,
 };
 use sglang_srt::transfer::{
     DecodeBootstrapRegistry, MooncakeBatchId, MooncakeBatchReleaser, MooncakeError,
@@ -234,6 +236,103 @@ async fn http_pd_server_polls_async_transfer_before_decode() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mooncake_prefill_http_uses_bootstrap_kv_layout_for_transfer() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "glm-mooncake-prefill-http",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--disaggregation-mode",
+        "prefill",
+        "--disaggregation-transfer-backend",
+        "mooncake",
+        "--disaggregation-decode-polling-interval",
+        "1",
+        "--num-reserved-decode-tokens",
+        "8",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let bootstrap_service = PrefillBootstrapService::default();
+    {
+        let mut state = bootstrap_service
+            .state()
+            .lock()
+            .expect("bootstrap state lock should be held");
+        state
+            .ingest_mooncake_bootstrap_frame(&kv_args_frame("session-a", &[0x9000], 128))
+            .expect("KVArgs frame should parse");
+        state
+            .ingest_mooncake_bootstrap_frame(&transfer_metadata_frame(34, "session-a", &[4, 5]))
+            .expect("transfer metadata frame should parse");
+    }
+    let transfer_executor = MooncakeKvCacheTransferExecutor::new(
+        RecordingMooncakeBackend::completed(),
+        MooncakeKvCacheLayout {
+            source_base_addr: 0x2000,
+            page_size_bytes: 128,
+            target_base_offset: 0xdead_0000,
+        },
+        MooncakeTransferTarget { target_id: 7 },
+    );
+    let service = build_bootstrap_mooncake_prefill_http_router_service(
+        &args,
+        bootstrap_service,
+        transfer_executor,
+    );
+    let inspected_service = service.clone();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let generated = post_json_with_retry(
+        addr,
+        "/generate",
+        r#"{"request_id":"http-pd-mooncake-prefill","text":"hi","sampling_params":{"max_new_tokens":2},"bootstrap_host":"10.0.0.8","bootstrap_port":8200,"bootstrap_room":34}"#,
+    )
+    .await;
+
+    assert_eq!(generated["request_id"], "http-pd-mooncake-prefill");
+    assert_eq!(generated["usage"]["completion_tokens"], 2);
+
+    let runtime = inspected_service
+        .runtime()
+        .lock()
+        .expect("runtime lock should be held");
+    let worker = runtime.engine().scheduler().worker();
+    let submitted_requests = &worker
+        .transfer_executor()
+        .inner()
+        .submitter()
+        .submitted_requests;
+    assert_eq!(submitted_requests.len(), 1);
+    assert_eq!(submitted_requests[0].len(), 2);
+    assert_eq!(submitted_requests[0][0].target_id, 7);
+    assert_eq!(submitted_requests[0][0].target_offset, 0x9000 + 4 * 128);
+    assert_eq!(submitted_requests[0][1].target_id, 7);
+    assert_eq!(submitted_requests[0][1].target_offset, 0x9000 + 5 * 128);
+
+    drop(runtime);
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prefill_http_launch_starts_main_and_bootstrap_listeners() {
     let http_addr = unused_local_addr();
     let bootstrap_addr = unused_local_addr();
@@ -349,6 +448,59 @@ async fn prefill_http_launch_registers_mooncake_zmq_routes() {
         .await
         .expect("server task should join")
         .expect("servers should stop cleanly");
+}
+
+fn kv_args_frame(session_id: &str, dst_kv_ptrs: &[u64], dst_kv_item_len: usize) -> Vec<Vec<u8>> {
+    vec![
+        b"None".to_vec(),
+        b"10.0.0.9".to_vec(),
+        b"41001".to_vec(),
+        session_id.as_bytes().to_vec(),
+        pack_u64s(dst_kv_ptrs),
+        pack_u64s(&[]),
+        pack_list_of_buffers(&[]),
+        b"1".to_vec(),
+        b"8".to_vec(),
+        dst_kv_item_len.to_string().into_bytes(),
+    ]
+}
+
+fn transfer_metadata_frame(room: i32, session_id: &str, dst_kv_indices: &[i32]) -> Vec<Vec<u8>> {
+    vec![
+        room.to_string().into_bytes(),
+        b"10.0.0.9".to_vec(),
+        b"41001".to_vec(),
+        session_id.as_bytes().to_vec(),
+        pack_i32s(dst_kv_indices),
+        b"11".to_vec(),
+        pack_list_of_buffers(&[]),
+        b"1".to_vec(),
+        b"64".to_vec(),
+    ]
+}
+
+fn pack_u64s(values: &[u64]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+fn pack_i32s(values: &[i32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+fn pack_list_of_buffers(buffers: &[Vec<u8>]) -> Vec<u8> {
+    let mut packed = Vec::new();
+    packed.extend_from_slice(&(buffers.len() as u64).to_le_bytes());
+    for buffer in buffers {
+        packed.extend_from_slice(&(buffer.len() as u64).to_le_bytes());
+        packed.extend_from_slice(buffer);
+    }
+    packed
 }
 
 fn unused_local_addr() -> SocketAddr {
