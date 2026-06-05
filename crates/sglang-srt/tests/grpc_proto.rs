@@ -13,8 +13,8 @@ use sglang_srt::proto::sglang::runtime::v1::sglang_service_server::SglangService
 use sglang_srt::proto::sglang::runtime::v1::{
     AbortRequest, ContinueGenerationRequest, DetokenizeRequest, DisaggregatedParams,
     FlushCacheRequest, GenerateRequest, GetLoadRequest, GetModelInfoRequest, GetServerInfoRequest,
-    ListModelsRequest, PauseGenerationRequest, RequestOptions, SamplingParams, TextGenerateRequest,
-    TokenizeRequest,
+    ListModelsRequest, OpenAiJsonRequest, PauseGenerationRequest, RequestOptions, SamplingParams,
+    TextGenerateRequest, TokenizeRequest,
 };
 use sglang_srt::router::{RouterProtocolError, RouterRuntime};
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
@@ -291,6 +291,50 @@ async fn grpc_generate_non_stream_returns_only_complete_response() {
         ))
     );
     assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn grpc_chat_complete_returns_openai_chat_json() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "tiny",
+        "--grpc-mode",
+    ])
+    .expect("args should parse");
+    let runtime = RouterRuntime::new(Engine::new(
+        ByteTokenizer,
+        Scheduler::new(GrpcTwoStepWorker),
+    ));
+    let service = GrpcRouterService::with_server_args(runtime, &args);
+    let payload = serde_json::json!({
+        "model": "tiny",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 2,
+    });
+
+    let mut stream = service
+        .chat_complete(Request::new(OpenAiJsonRequest {
+            json: serde_json::to_vec(&payload).expect("payload should serialize"),
+            options: None,
+        }))
+        .await
+        .expect("chat complete should execute")
+        .into_inner();
+    let response = stream
+        .next()
+        .await
+        .expect("chat complete response")
+        .expect("chat complete response ok");
+    assert!(stream.next().await.is_none());
+
+    let body: serde_json::Value =
+        serde_json::from_slice(&response.json).expect("response should be JSON");
+    assert_eq!(body["object"], "chat.completion");
+    assert_eq!(body["model"], "tiny");
+    assert_eq!(body["choices"][0]["message"]["role"], "assistant");
 }
 
 #[tokio::test]

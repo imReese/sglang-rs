@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use serde_json::{Value, json};
 use tonic::{Code, Request, Response, Status};
 
 use crate::cli::ServerArgs;
@@ -210,6 +211,48 @@ fn router_runtime_error_to_status(error: RouterRuntimeError) -> Status {
         RouterRuntimeError::Protocol(error) => router_protocol_error_to_status(error),
         RouterRuntimeError::Runtime(error) => Status::internal(error.to_string()),
     }
+}
+
+fn openai_chat_response_from_router_responses(
+    mut responses: Vec<RouterGenerateResponse>,
+    model: &str,
+) -> Result<OpenAiJsonResponse, Status> {
+    let Some(response) = responses.pop() else {
+        return Err(Status::internal("generation produced no response"));
+    };
+
+    let json = match response.body {
+        RouterGenerateResponseBody::Complete(complete) => json!({
+            "id": format!("chatcmpl-{}", response.request_id),
+            "object": "chat.completion",
+            "model": model,
+            "choices": [{
+                "index": complete.index,
+                "message": {
+                    "role": "assistant",
+                    "content": complete.text,
+                },
+                "finish_reason": complete.finish_reason,
+            }],
+            "usage": {
+                "prompt_tokens": complete.prompt_tokens,
+                "completion_tokens": complete.completion_tokens,
+                "cached_tokens": complete.cached_tokens,
+            }
+        }),
+        RouterGenerateResponseBody::Chunk(_) => {
+            return Err(Status::internal(
+                "non-stream gRPC chat completion returned a stream chunk",
+            ));
+        }
+        RouterGenerateResponseBody::Error(error) => {
+            return Err(Status::internal(error.message));
+        }
+    };
+
+    let json = serde_json::to_vec(&json)
+        .map_err(|e| Status::internal(format!("serialize OpenAI chat JSON: {e}")))?;
+    Ok(OpenAiJsonResponse { json })
 }
 
 fn unimplemented_rpc(name: &'static str) -> Status {
@@ -452,9 +495,28 @@ where
 
     async fn chat_complete(
         &self,
-        _request: Request<OpenAiJsonRequest>,
+        request: Request<OpenAiJsonRequest>,
     ) -> Result<Response<Self::ChatCompleteStream>, Status> {
-        Err(unimplemented_rpc("ChatComplete"))
+        let payload: Value = serde_json::from_slice(&request.into_inner().json)
+            .map_err(|e| Status::invalid_argument(format!("invalid OpenAI JSON payload: {e}")))?;
+        let model = self.model_info()?.served_model_name;
+        let request = crate::http::http_chat_payload_to_router_request(payload, &model)
+            .map_err(Status::invalid_argument)?;
+        if request.stream {
+            return Err(unimplemented_rpc("ChatComplete streaming"));
+        }
+
+        let responses = self
+            .runtime
+            .lock()
+            .map_err(|_| Status::internal("router runtime mutex poisoned"))?
+            .generate_text_stream_with_transfer_polling(request, self.max_transfer_polls)
+            .map_err(router_runtime_error_to_status)?;
+
+        let response = openai_chat_response_from_router_responses(responses, &model)?;
+        Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
+            [Ok(response)],
+        ))))
     }
 
     async fn complete(

@@ -13,8 +13,11 @@ use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
 use reqwest::{Client, Url};
+use sglang_srt::proto::sglang::runtime::v1::sglang_service_client::SglangServiceClient;
+use sglang_srt::proto::sglang::runtime::v1::OpenAiJsonRequest;
 use std::sync::Arc;
 use std::time::Duration;
+use tonic::Request as GrpcRequest;
 
 /// Parse a worker URL emitted by discovery.  On failure, trip the worker's
 /// circuit breaker so the malformed worker drops out of subsequent
@@ -28,6 +31,24 @@ fn parse_worker_url(worker_url: &str, breaker: &CircuitBreaker) -> Result<Url, A
             source: anyhow::Error::new(e).context("parse worker URL"),
         }
     })
+}
+
+fn is_grpc_worker_url(worker_url: &str) -> bool {
+    worker_url.starts_with("grpc://") || worker_url.starts_with("grpcs://")
+}
+
+fn grpc_endpoint_from_worker_url(worker_url: &Url) -> Option<String> {
+    match worker_url.scheme() {
+        "grpc" => Some(format!(
+            "http://{}",
+            worker_url.as_str().trim_start_matches("grpc://")
+        )),
+        "grpcs" => Some(format!(
+            "https://{}",
+            worker_url.as_str().trim_start_matches("grpcs://")
+        )),
+        _ => None,
+    }
 }
 
 #[derive(Debug)]
@@ -101,6 +122,11 @@ impl Proxy {
                 worker: worker_url.to_string(),
             });
         }
+        if is_grpc_worker_url(worker_url) {
+            return self
+                .forward_grpc_json_to(worker_url, breaker, path, body)
+                .await;
+        }
         let worker_url = parse_worker_url(worker_url, breaker)?;
         let url = worker_url.join(path).map_err(|e| {
             ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
@@ -145,6 +171,79 @@ impl Proxy {
         }
         let mut out = Response::new(Body::from(bytes));
         *out.status_mut() = status;
+        out.headers_mut().insert(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("application/json"),
+        );
+        Ok(out)
+    }
+
+    async fn forward_grpc_json_to(
+        &self,
+        worker_url: &str,
+        breaker: &CircuitBreaker,
+        path: &str,
+        body: Bytes,
+    ) -> Result<Response<Body>, ApiError> {
+        if path != "/v1/chat/completions" {
+            breaker.record_failure();
+            return Err(ApiError::WorkerMisconfigured {
+                worker: worker_url.to_string(),
+                source: anyhow::anyhow!("gRPC worker transport does not support path {path}"),
+            });
+        }
+
+        let parsed = parse_worker_url(worker_url, breaker)?;
+        let endpoint = grpc_endpoint_from_worker_url(&parsed).ok_or_else(|| {
+            breaker.record_failure();
+            ApiError::WorkerMisconfigured {
+                worker: worker_url.to_string(),
+                source: anyhow::anyhow!("unsupported gRPC worker URL scheme {}", parsed.scheme()),
+            }
+        })?;
+
+        let fut = async {
+            let channel = tonic::transport::Endpoint::from_shared(endpoint.clone())
+                .map_err(|e| anyhow::anyhow!("invalid gRPC endpoint {endpoint}: {e}"))?
+                .connect_timeout(self.request_timeout)
+                .timeout(self.request_timeout)
+                .connect()
+                .await
+                .map_err(|e| anyhow::anyhow!("connect gRPC worker {endpoint}: {e}"))?;
+            let mut client = SglangServiceClient::new(channel);
+            let mut stream = client
+                .chat_complete(GrpcRequest::new(OpenAiJsonRequest {
+                    json: body.to_vec(),
+                    options: None,
+                }))
+                .await
+                .map_err(|e| anyhow::anyhow!("gRPC ChatComplete failed: {e}"))?
+                .into_inner();
+            let first = stream
+                .message()
+                .await
+                .map_err(|e| anyhow::anyhow!("read gRPC ChatComplete response: {e}"))?
+                .ok_or_else(|| anyhow::anyhow!("gRPC ChatComplete returned no response"))?;
+            Ok::<_, anyhow::Error>(first.json)
+        };
+
+        let json = match tokio::time::timeout(self.request_timeout, fut).await {
+            Ok(Ok(json)) => json,
+            Ok(Err(source)) => {
+                breaker.record_failure();
+                return Err(ApiError::UpstreamUnreachable {
+                    worker: parsed,
+                    source,
+                });
+            }
+            Err(_) => {
+                breaker.record_failure();
+                return Err(ApiError::UpstreamTimeout { worker: parsed });
+            }
+        };
+
+        breaker.record_success();
+        let mut out = Response::new(Body::from(json));
         out.headers_mut().insert(
             HeaderName::from_static("content-type"),
             HeaderValue::from_static("application/json"),

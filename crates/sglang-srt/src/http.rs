@@ -426,7 +426,7 @@ fn http_generate_payload_to_router_request(
     })
 }
 
-fn http_chat_payload_to_router_request(
+pub(crate) fn http_chat_payload_to_router_request(
     payload: Value,
     served_model_name: &str,
 ) -> Result<RouterTextGenerateRequest, String> {
