@@ -2,7 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use sglang_srt::cache::{CachePageAllocator, CachePageId, RadixCache};
-use sglang_srt::deepseek_runtime::{DeepSeekV4FeedForwardTensorDescriptors, DeepSeekV4Runtime};
+use sglang_srt::deepseek_runtime::{
+    DeepSeekV4FeedForwardTensorDescriptors, DeepSeekV4Runtime, DeepSeekV4TensorPlacementKind,
+};
 use sglang_srt::model_artifacts::LocalModelArtifacts;
 use sglang_srt::model_executor::ModelWorkerBatch;
 use sglang_srt::scheduler::{ForwardMode, ScheduleBatch, ScheduledRequest, Scheduler};
@@ -196,6 +198,75 @@ fn deepseek_v4_forward_plan_handles_decode_batches_without_prefill_output_pages(
     assert_eq!(plan.request_spans()[0].token_range(), 0..1);
     assert!(plan.request_spans()[0].out_cache_pages().is_empty());
     assert!(plan.request_spans()[0].prefix_cache_pages().is_empty());
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn deepseek_v4_runtime_builds_tensor_parallel_placement_plan() {
+    let model_dir = temp_model_dir("deepseek-runtime-tp-placement");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_complete_deepseek_v4_checkpoint(&model_dir);
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("artifacts should load");
+    let runtime =
+        DeepSeekV4Runtime::from_local_model_artifacts(&artifacts).expect("runtime should build");
+
+    let plan = runtime.tensor_parallel_placement_plan(8);
+
+    assert_eq!(plan.tensor_parallel_size(), 8);
+    assert_eq!(
+        plan.kind_for("model.embed_tokens.weight"),
+        Some(DeepSeekV4TensorPlacementKind::VocabParallel { axis: 0 })
+    );
+    assert_eq!(
+        plan.kind_for("lm_head.weight"),
+        Some(DeepSeekV4TensorPlacementKind::VocabParallel { axis: 0 })
+    );
+    assert_eq!(
+        plan.kind_for("model.norm.weight"),
+        Some(DeepSeekV4TensorPlacementKind::Replicated)
+    );
+    assert_eq!(
+        plan.kind_for("model.hc_head_fn"),
+        Some(DeepSeekV4TensorPlacementKind::Replicated)
+    );
+    assert_eq!(
+        plan.kind_for("model.layers.0.self_attn.wq_a.weight"),
+        Some(DeepSeekV4TensorPlacementKind::Replicated)
+    );
+    assert_eq!(
+        plan.kind_for("model.layers.0.self_attn.wkv.weight"),
+        Some(DeepSeekV4TensorPlacementKind::Replicated)
+    );
+    assert_eq!(
+        plan.kind_for("model.layers.0.self_attn.wq_b.weight"),
+        Some(DeepSeekV4TensorPlacementKind::ColumnParallel { axis: 0 })
+    );
+    assert_eq!(
+        plan.kind_for("model.layers.0.self_attn.wo_a.weight"),
+        Some(DeepSeekV4TensorPlacementKind::ColumnParallel { axis: 0 })
+    );
+    assert_eq!(
+        plan.kind_for("model.layers.0.self_attn.wo_b.weight"),
+        Some(DeepSeekV4TensorPlacementKind::RowParallel { axis: 1 })
+    );
+    assert_eq!(
+        plan.kind_for("model.layers.0.mlp.gate.weight"),
+        Some(DeepSeekV4TensorPlacementKind::Replicated)
+    );
+    assert_eq!(
+        plan.kind_for("model.layers.0.ffn.experts.0.w1.weight"),
+        Some(DeepSeekV4TensorPlacementKind::ColumnParallel { axis: 0 })
+    );
+    assert_eq!(
+        plan.kind_for("model.layers.0.ffn.experts.0.w3.weight"),
+        Some(DeepSeekV4TensorPlacementKind::ColumnParallel { axis: 0 })
+    );
+    assert_eq!(
+        plan.kind_for("model.layers.0.ffn.experts.0.w2.weight"),
+        Some(DeepSeekV4TensorPlacementKind::RowParallel { axis: 1 })
+    );
 
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }

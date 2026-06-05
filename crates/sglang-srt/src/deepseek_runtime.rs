@@ -72,6 +72,13 @@ impl DeepSeekV4Runtime {
     pub fn forward_plan(&self, batch: &ModelWorkerBatch) -> DeepSeekV4ForwardPlan {
         DeepSeekV4ForwardPlan::from_model_worker_batch(batch)
     }
+
+    pub fn tensor_parallel_placement_plan(
+        &self,
+        tensor_parallel_size: usize,
+    ) -> DeepSeekV4TensorPlacementPlan {
+        DeepSeekV4TensorPlacementPlan::from_runtime(self, tensor_parallel_size)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -178,6 +185,85 @@ impl DeepSeekV4LayerTensorDescriptors {
     pub fn feed_forward(&self) -> &DeepSeekV4FeedForwardTensorDescriptors {
         &self.feed_forward
     }
+
+    fn push_tensor_placements(&self, entries: &mut Vec<DeepSeekV4TensorPlacement>) {
+        push_placement(
+            entries,
+            &self.wq_a,
+            DeepSeekV4TensorPlacementKind::Replicated,
+        );
+        push_placement(
+            entries,
+            &self.wq_b,
+            DeepSeekV4TensorPlacementKind::ColumnParallel { axis: 0 },
+        );
+        push_placement(
+            entries,
+            &self.wkv,
+            DeepSeekV4TensorPlacementKind::Replicated,
+        );
+        push_placement(
+            entries,
+            &self.q_norm,
+            DeepSeekV4TensorPlacementKind::Replicated,
+        );
+        push_placement(
+            entries,
+            &self.kv_norm,
+            DeepSeekV4TensorPlacementKind::Replicated,
+        );
+        push_placement(
+            entries,
+            &self.wo_a,
+            DeepSeekV4TensorPlacementKind::ColumnParallel { axis: 0 },
+        );
+        push_placement(
+            entries,
+            &self.wo_b,
+            DeepSeekV4TensorPlacementKind::RowParallel { axis: 1 },
+        );
+        push_placement(
+            entries,
+            &self.input_layernorm,
+            DeepSeekV4TensorPlacementKind::Replicated,
+        );
+        push_placement(
+            entries,
+            &self.post_attention_layernorm,
+            DeepSeekV4TensorPlacementKind::Replicated,
+        );
+        push_placement(
+            entries,
+            &self.hc_attn_fn,
+            DeepSeekV4TensorPlacementKind::Replicated,
+        );
+        push_placement(
+            entries,
+            &self.hc_attn_base,
+            DeepSeekV4TensorPlacementKind::Replicated,
+        );
+        push_placement(
+            entries,
+            &self.hc_attn_scale,
+            DeepSeekV4TensorPlacementKind::Replicated,
+        );
+        push_placement(
+            entries,
+            &self.hc_ffn_fn,
+            DeepSeekV4TensorPlacementKind::Replicated,
+        );
+        push_placement(
+            entries,
+            &self.hc_ffn_base,
+            DeepSeekV4TensorPlacementKind::Replicated,
+        );
+        push_placement(
+            entries,
+            &self.hc_ffn_scale,
+            DeepSeekV4TensorPlacementKind::Replicated,
+        );
+        self.feed_forward.push_tensor_placements(entries);
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -237,6 +323,35 @@ impl DeepSeekV4FeedForwardTensorDescriptors {
             },
         }
     }
+
+    fn push_tensor_placements(&self, entries: &mut Vec<DeepSeekV4TensorPlacement>) {
+        match self {
+            Self::Dense {
+                gate_up_proj,
+                down_proj,
+            } => {
+                push_placement(
+                    entries,
+                    gate_up_proj,
+                    DeepSeekV4TensorPlacementKind::ColumnParallel { axis: 0 },
+                );
+                push_placement(
+                    entries,
+                    down_proj,
+                    DeepSeekV4TensorPlacementKind::RowParallel { axis: 1 },
+                );
+            }
+            Self::Moe {
+                gate,
+                routed_experts,
+            } => {
+                push_placement(entries, gate, DeepSeekV4TensorPlacementKind::Replicated);
+                for expert in routed_experts {
+                    expert.push_tensor_placements(entries);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -262,6 +377,24 @@ impl DeepSeekV4RoutedExpertTensorDescriptors {
 
     pub fn down(&self) -> &DeepSeekTensorDescriptor {
         &self.down
+    }
+
+    fn push_tensor_placements(&self, entries: &mut Vec<DeepSeekV4TensorPlacement>) {
+        push_placement(
+            entries,
+            &self.gate,
+            DeepSeekV4TensorPlacementKind::ColumnParallel { axis: 0 },
+        );
+        push_placement(
+            entries,
+            &self.up,
+            DeepSeekV4TensorPlacementKind::ColumnParallel { axis: 0 },
+        );
+        push_placement(
+            entries,
+            &self.down,
+            DeepSeekV4TensorPlacementKind::RowParallel { axis: 1 },
+        );
     }
 }
 
@@ -318,6 +451,107 @@ impl DeepSeekTensorDescriptor {
     pub fn byte_len(&self) -> usize {
         self.byte_len
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeepSeekV4TensorPlacementKind {
+    Replicated,
+    VocabParallel { axis: usize },
+    ColumnParallel { axis: usize },
+    RowParallel { axis: usize },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeepSeekV4TensorPlacementPlan {
+    tensor_parallel_size: usize,
+    entries: Vec<DeepSeekV4TensorPlacement>,
+}
+
+impl DeepSeekV4TensorPlacementPlan {
+    fn from_runtime(runtime: &DeepSeekV4Runtime, tensor_parallel_size: usize) -> Self {
+        let mut entries = Vec::new();
+        push_placement(
+            &mut entries,
+            runtime.root_tensors().token_embeddings(),
+            DeepSeekV4TensorPlacementKind::VocabParallel { axis: 0 },
+        );
+        push_placement(
+            &mut entries,
+            runtime.root_tensors().final_norm(),
+            DeepSeekV4TensorPlacementKind::Replicated,
+        );
+        push_placement(
+            &mut entries,
+            runtime.root_tensors().hc_head_fn(),
+            DeepSeekV4TensorPlacementKind::Replicated,
+        );
+        push_placement(
+            &mut entries,
+            runtime.root_tensors().hc_head_base(),
+            DeepSeekV4TensorPlacementKind::Replicated,
+        );
+        push_placement(
+            &mut entries,
+            runtime.root_tensors().hc_head_scale(),
+            DeepSeekV4TensorPlacementKind::Replicated,
+        );
+        push_placement(
+            &mut entries,
+            runtime.root_tensors().lm_head(),
+            DeepSeekV4TensorPlacementKind::VocabParallel { axis: 0 },
+        );
+
+        for layer in runtime.layers() {
+            layer.push_tensor_placements(&mut entries);
+        }
+
+        Self {
+            tensor_parallel_size,
+            entries,
+        }
+    }
+
+    pub fn tensor_parallel_size(&self) -> usize {
+        self.tensor_parallel_size
+    }
+
+    pub fn entries(&self) -> &[DeepSeekV4TensorPlacement] {
+        &self.entries
+    }
+
+    pub fn kind_for(&self, tensor_name: &str) -> Option<DeepSeekV4TensorPlacementKind> {
+        self.entries
+            .iter()
+            .find(|entry| entry.tensor().tensor_name() == tensor_name)
+            .map(DeepSeekV4TensorPlacement::kind)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeepSeekV4TensorPlacement {
+    tensor: DeepSeekTensorDescriptor,
+    kind: DeepSeekV4TensorPlacementKind,
+}
+
+impl DeepSeekV4TensorPlacement {
+    pub fn tensor(&self) -> &DeepSeekTensorDescriptor {
+        &self.tensor
+    }
+
+    pub fn kind(&self) -> DeepSeekV4TensorPlacementKind {
+        self.kind
+    }
+}
+
+fn push_placement(
+    entries: &mut Vec<DeepSeekV4TensorPlacement>,
+    tensor: &DeepSeekTensorDescriptor,
+    kind: DeepSeekV4TensorPlacementKind,
+) {
+    entries.push(DeepSeekV4TensorPlacement {
+        tensor: tensor.clone(),
+        kind,
+    });
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
