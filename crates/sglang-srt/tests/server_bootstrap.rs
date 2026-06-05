@@ -417,6 +417,93 @@ async fn bootstrap_grpc_router_service_uses_config_eos_token_as_default_stop() {
 }
 
 #[tokio::test]
+async fn bootstrap_grpc_router_service_ignores_config_eos_when_requested() {
+    let model_dir = temp_model_dir("server-ignore-config-eos");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "model_type": "llama",
+  "eos_token_id": 32
+}"#,
+    )
+    .expect("config should be written");
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_dir.to_str().expect("temp model dir should be utf-8"),
+        "--grpc-mode",
+    ])
+    .expect("args should parse");
+    let service = build_bootstrap_grpc_router_service(&args);
+
+    let mut stream = service
+        .text_generate(Request::new(TextGenerateRequest {
+            text: "hello".to_string(),
+            sampling_params: Some(SamplingParams {
+                max_new_tokens: Some(2),
+                ignore_eos: Some(true),
+                ..Default::default()
+            }),
+            options: Some(RequestOptions {
+                request_id: Some("bootstrap-ignore-config-eos".to_string()),
+                stream: true,
+                data_parallel_rank: 0,
+                trace_headers: Default::default(),
+            }),
+            disaggregated_params: None,
+        }))
+        .await
+        .expect("text generate should execute")
+        .into_inner();
+
+    let first = tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
+        .await
+        .expect("first response")
+        .expect("response should be ok");
+    let second = tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
+        .await
+        .expect("second response")
+        .expect("response should be ok");
+
+    assert_eq!(first.request_id, "bootstrap-ignore-config-eos");
+    assert_eq!(
+        first.body,
+        Some(Body::Chunk(
+            sglang_srt::proto::sglang::runtime::v1::GenerateStreamChunk {
+                token_ids: vec![b' ' as u32],
+                text: " ".to_string(),
+                prompt_tokens: 5,
+                completion_tokens: 1,
+                cached_tokens: 0,
+                index: 0,
+            }
+        ))
+    );
+    assert_eq!(
+        second.body,
+        Some(Body::Complete(
+            sglang_srt::proto::sglang::runtime::v1::GenerateComplete {
+                output_ids: vec![b' ' as u32, b' ' as u32],
+                text: "  ".to_string(),
+                finish_reason: "stop".to_string(),
+                prompt_tokens: 5,
+                completion_tokens: 2,
+                cached_tokens: 0,
+                index: 0,
+            }
+        ))
+    );
+    assert!(
+        tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
+            .await
+            .is_none()
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[tokio::test]
 async fn bootstrap_grpc_router_service_uses_local_hf_tokenizer_when_available() {
     let model_dir = temp_model_dir("server-hf-tokenizer");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");

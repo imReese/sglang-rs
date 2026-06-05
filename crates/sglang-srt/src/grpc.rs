@@ -568,6 +568,7 @@ fn proto_sampling_params_to_router(params: ProtoSamplingParams) -> RouterSamplin
             .into_iter()
             .map(|stop_token_id| stop_token_id as i32)
             .collect(),
+        ignore_eos: params.ignore_eos,
         n: params.n,
         best_of: params.best_of,
     }

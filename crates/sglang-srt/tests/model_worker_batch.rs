@@ -368,6 +368,27 @@ fn model_runner_finishes_request_when_sampled_token_matches_stop_token() {
     assert_eq!(scheduler.decode_queue_depth(), 0);
 }
 
+#[test]
+fn model_runner_ignores_stop_tokens_when_ignore_eos_is_enabled() {
+    let mut scheduler = Scheduler::new(ModelRunner::new(TwoStepForwardModel::default()));
+    let mut sampling = SamplingParams::new(2);
+    sampling.stop_token_ids = vec![1];
+    sampling.ignore_eos = true;
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("runner-ignore-eos"),
+        vec![10, 11],
+        sampling,
+    ));
+
+    let outputs = scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should dispatch through model runner");
+
+    assert_eq!(outputs[0].token_ids, vec![1]);
+    assert!(!outputs[0].finished);
+    assert_eq!(scheduler.decode_queue_depth(), 1);
+}
+
 #[derive(Default)]
 struct FlattenedPrefillLogitsModel;
 

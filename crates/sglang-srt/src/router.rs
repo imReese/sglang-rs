@@ -34,6 +34,7 @@ pub struct RouterSamplingParams {
     pub repetition_penalty: Option<f32>,
     pub stop_token_id: Option<i32>,
     pub stop_token_ids: Vec<i32>,
+    pub ignore_eos: Option<bool>,
     pub n: Option<i32>,
     pub best_of: Option<i32>,
 }
@@ -71,6 +72,7 @@ impl RouterSamplingParams {
             top_k: self.top_k,
             min_p: self.min_p,
             stop_token_ids: merged_stop_token_ids(self.stop_token_id, self.stop_token_ids),
+            ignore_eos: self.ignore_eos.unwrap_or(false),
         })
     }
 }
@@ -705,6 +707,9 @@ impl<T, W> RouterRuntime<T, W> {
         &self,
         mut request: TokenGenerateRequest,
     ) -> TokenGenerateRequest {
+        if request.sampling.ignore_eos {
+            return request;
+        }
         request
             .sampling
             .stop_token_ids

@@ -497,7 +497,9 @@ where
                 .into_iter()
                 .zip(batch.requests())
                 .map(|(token_id, request)| {
-                    if request.sampling().stop_token_ids.contains(&token_id) {
+                    if !request.sampling().ignore_eos
+                        && request.sampling().stop_token_ids.contains(&token_id)
+                    {
                         GeneratedToken::finished(vec![token_id])
                     } else {
                         GeneratedToken::unfinished(vec![token_id])

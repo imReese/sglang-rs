@@ -279,6 +279,7 @@ fn router_generate_request_accepts_valid_extended_sampling_params() {
             repetition_penalty: Some(1.0),
             stop_token_id: None,
             stop_token_ids: Vec::new(),
+            ignore_eos: None,
             n: Some(1),
             best_of: Some(1),
         }),

@@ -56,6 +56,7 @@ fn generated_proto_generate_request_round_trips_with_prost() {
             top_p: Some(0.95),
             stop_token_id: Some(2),
             stop_token_ids: vec![3, 4],
+            ignore_eos: Some(true),
             ..Default::default()
         }),
         options: Some(RequestOptions {
@@ -79,6 +80,7 @@ fn generated_proto_generate_request_round_trips_with_prost() {
     assert_eq!(sampling_params.max_new_tokens, Some(16));
     assert_eq!(sampling_params.stop_token_id, Some(2));
     assert_eq!(sampling_params.stop_token_ids, vec![3, 4]);
+    assert_eq!(sampling_params.ignore_eos, Some(true));
     assert_eq!(
         decoded
             .options
