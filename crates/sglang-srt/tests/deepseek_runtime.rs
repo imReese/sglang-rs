@@ -6,7 +6,7 @@ use sglang_srt::deepseek_runtime::{
     DeepSeekV4FeedForwardTensorDescriptors, DeepSeekV4Runtime, DeepSeekV4TensorPlacementKind,
     DeepSeekV4TensorShardLoadError, DeepSeekV4TensorShardPlanError, DeepSeekV4TensorShardSelection,
 };
-use sglang_srt::model_artifacts::LocalModelArtifacts;
+use sglang_srt::model_artifacts::{LocalModelArtifacts, SafetensorsTensorDecodeError};
 use sglang_srt::model_executor::ModelWorkerBatch;
 use sglang_srt::scheduler::{ForwardMode, ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::transfer::KvCacheDtype;
@@ -386,6 +386,59 @@ fn deepseek_v4_tensor_parallel_rank_plan_loads_sharded_tensor_bytes() {
         .expect("row-parallel tensor should be planned");
     assert_eq!(row_parallel.shape(), &[2, 2]);
     assert_eq!(row_parallel.bytes(), &[42, 43, 46, 47]);
+    assert_eq!(
+        embeddings
+            .decode_f32_values()
+            .expect_err("U8 shard should not decode as f32"),
+        SafetensorsTensorDecodeError::UnsupportedDtype {
+            dtype: "U8".to_string()
+        }
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn deepseek_v4_loaded_tensor_shards_decode_f32_values_after_slicing() {
+    let model_dir = temp_model_dir("deepseek-runtime-tp-rank-decode-f32");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    let shape_overrides: &[(&str, &[usize])] = &[
+        ("model.embed_tokens.weight", &[4, 2]),
+        ("lm_head.weight", &[4, 2]),
+        ("model.layers.0.self_attn.wq_b.weight", &[4, 2]),
+        ("model.layers.0.self_attn.wo_a.weight", &[4, 2]),
+        ("model.layers.0.self_attn.wo_b.weight", &[2, 4]),
+        ("model.layers.0.ffn.experts.0.w1.weight", &[4, 2]),
+        ("model.layers.0.ffn.experts.0.w2.weight", &[2, 4]),
+        ("model.layers.0.ffn.experts.0.w3.weight", &[4, 2]),
+    ];
+    write_complete_deepseek_v4_checkpoint_with_shapes(&model_dir, shape_overrides);
+    write_deepseek_v4_safetensors_with_shapes_and_dtype(&model_dir, shape_overrides, "F32");
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("artifacts should load");
+    let runtime =
+        DeepSeekV4Runtime::from_local_model_artifacts(&artifacts).expect("runtime should build");
+    let loaded = runtime
+        .load_tensor_parallel_shards(2)
+        .expect("all TP rank shards should load");
+
+    let rank1 = loaded.rank(1).expect("rank 1 should load");
+    assert_eq!(
+        rank1
+            .tensor_shard("model.embed_tokens.weight")
+            .expect("rank 1 embedding shard should exist")
+            .decode_f32_values()
+            .expect("F32 embedding shard should decode"),
+        vec![4.0, 5.0, 6.0, 7.0]
+    );
+    assert_eq!(
+        rank1
+            .tensor_shard("model.layers.0.self_attn.wo_b.weight")
+            .expect("rank 1 row-parallel shard should exist")
+            .decode_f32_values()
+            .expect("F32 row-parallel shard should decode"),
+        vec![42.0, 43.0, 46.0, 47.0]
+    );
 
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
@@ -620,20 +673,39 @@ fn write_complete_deepseek_v4_checkpoint_with_shapes(
 }
 
 fn write_deepseek_v4_safetensors_with_shapes(model_dir: &Path, overrides: &[(&str, &[usize])]) {
+    write_deepseek_v4_safetensors_with_shapes_and_dtype(model_dir, overrides, "U8");
+}
+
+fn write_deepseek_v4_safetensors_with_shapes_and_dtype(
+    model_dir: &Path,
+    overrides: &[(&str, &[usize])],
+    dtype: &str,
+) {
     let tensor_shapes = complete_deepseek_v4_tensor_shapes(overrides);
     let mut offset = 0;
     let tensors = tensor_shapes
         .iter()
         .map(|(name, shape)| {
-            let len = shape.iter().product::<usize>();
-            let tensor = (*name, "U8", shape.as_slice(), [offset, offset + len]);
-            offset += len;
+            let element_count = shape.iter().product::<usize>();
+            let byte_len = match dtype {
+                "F32" => element_count * 4,
+                "U8" => element_count,
+                _ => panic!("test fixture dtype {dtype} is not supported"),
+            };
+            let tensor = (*name, dtype, shape.as_slice(), [offset, offset + byte_len]);
+            offset += byte_len;
             tensor
         })
         .collect::<Vec<_>>();
-    let payload = (0..offset)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
+    let payload = match dtype {
+        "F32" => (0..offset / 4)
+            .flat_map(|index| (index as f32).to_le_bytes())
+            .collect::<Vec<_>>(),
+        "U8" => (0..offset)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>(),
+        _ => panic!("test fixture dtype {dtype} is not supported"),
+    };
     write_safetensors_file(&model_dir.join("model.safetensors"), &tensors, &payload)
         .expect("shardable safetensors should be written");
 }

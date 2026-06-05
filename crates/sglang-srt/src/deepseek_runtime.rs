@@ -9,7 +9,8 @@ use crate::model_artifacts::{
     DeepSeekLayerCheckpointWeights, DeepSeekLayerFeedForwardCheckpointWeights,
     DeepSeekModelCheckpointWeights, DeepSeekModelTensorSpan, LocalModelArtifacts,
     LocalModelCheckpointCatalog, ModelArtifactError, SafetensorsLayerTensorSpan,
-    SafetensorsTensorData, SafetensorsTensorMetadata, SafetensorsTensorSpan,
+    SafetensorsTensorData, SafetensorsTensorDecodeError, SafetensorsTensorMetadata,
+    SafetensorsTensorSpan,
 };
 use crate::model_executor::ModelWorkerBatch;
 use crate::scheduler::ForwardMode;
@@ -740,6 +741,18 @@ impl DeepSeekV4LoadedTensorShard {
 
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    pub fn decode_f32_values(&self) -> Result<Vec<f32>, SafetensorsTensorDecodeError> {
+        SafetensorsTensorData {
+            metadata: SafetensorsTensorMetadata {
+                dtype: self.dtype.clone(),
+                shape: self.shape.clone(),
+                data_offsets: [0, self.bytes.len()],
+            },
+            bytes: self.bytes.clone(),
+        }
+        .decode_f32_values()
     }
 }
 

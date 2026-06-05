@@ -388,8 +388,9 @@ async fn prefill_http_launch_starts_main_and_bootstrap_listeners() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prefill_http_launch_registers_mooncake_zmq_routes() {
     let http_addr = unused_local_addr();
-    let bootstrap_addr = unused_local_addr();
-    let zmq_ports = unused_contiguous_local_ports(2);
+    let bootstrap_addr = unused_local_addr_excluding(&[http_addr.port()]);
+    let zmq_ports =
+        unused_contiguous_local_ports_excluding(2, &[http_addr.port(), bootstrap_addr.port()]);
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
@@ -515,12 +516,25 @@ fn unused_local_addr() -> SocketAddr {
         .expect("ephemeral listener should have local addr")
 }
 
-fn unused_contiguous_local_ports(count: u16) -> Vec<u16> {
+fn unused_local_addr_excluding(excluded_ports: &[u16]) -> SocketAddr {
+    for _ in 0..100 {
+        let addr = unused_local_addr();
+        if !excluded_ports.contains(&addr.port()) {
+            return addr;
+        }
+    }
+    panic!("distinct ephemeral port should be available");
+}
+
+fn unused_contiguous_local_ports_excluding(count: u16, excluded_ports: &[u16]) -> Vec<u16> {
     for _ in 0..100 {
         let first = unused_local_addr().port();
         let Some(last) = first.checked_add(count - 1) else {
             continue;
         };
+        if (first..=last).any(|port| excluded_ports.contains(&port)) {
+            continue;
+        }
         let listeners = (first..=last)
             .map(|port| TcpListener::bind(("127.0.0.1", port)))
             .collect::<Result<Vec<_>, _>>();
@@ -594,7 +608,7 @@ async fn request_json_with_retry(
 ) -> Value {
     let mut last_error = None;
 
-    for _ in 0..20 {
+    for _ in 0..100 {
         match request_json(addr, method, path, body).await {
             Ok(value) => return value,
             Err(error) => {
@@ -618,7 +632,7 @@ async fn request_raw_with_retry(
 ) -> String {
     let mut last_error = None;
 
-    for _ in 0..20 {
+    for _ in 0..100 {
         match request_raw(addr, method, path, body).await {
             Ok(value) => return value,
             Err(error) => {
