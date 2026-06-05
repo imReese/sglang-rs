@@ -691,6 +691,83 @@ async fn grpc_get_server_info_reports_rust_runtime() {
 }
 
 #[tokio::test]
+async fn grpc_get_server_info_reports_pd_prefill_attributes() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "grpc-prefill-info",
+        "--grpc-mode",
+        "--host",
+        "0.0.0.0",
+        "--dist-init-addr",
+        "10.95.250.21:6676",
+        "--disaggregation-mode",
+        "prefill",
+        "--disaggregation-transfer-backend",
+        "mooncake",
+        "--disaggregation-bootstrap-port",
+        "8200",
+        "--disaggregation-zmq-ports",
+        "7000-7001",
+        "--tp-size",
+        "2",
+        "--dp-size",
+        "1",
+        "--page-size",
+        "64",
+    ])
+    .expect("args should parse");
+    let service = GrpcRouterService::with_server_args(
+        RouterRuntime::new(Engine::new(
+            ByteTokenizer,
+            Scheduler::new(GrpcTwoStepWorker),
+        )),
+        &args,
+    );
+
+    let response = service
+        .get_server_info(Request::new(GetServerInfoRequest {}))
+        .await
+        .expect("server info should execute")
+        .into_inner();
+
+    assert_eq!(
+        response.attributes.get("served_model_name"),
+        Some(&"grpc-prefill-info".to_string())
+    );
+    assert_eq!(
+        response.attributes.get("disaggregation_mode"),
+        Some(&"prefill".to_string())
+    );
+    assert_eq!(
+        response.attributes.get("disaggregation_bootstrap_port"),
+        Some(&"8200".to_string())
+    );
+    assert_eq!(
+        response.attributes.get("kv_events.publisher"),
+        Some(&"zmq".to_string())
+    );
+    assert_eq!(
+        response.attributes.get("kv_events.endpoint_host"),
+        Some(&"10.95.250.21".to_string())
+    );
+    assert_eq!(
+        response.attributes.get("kv_events.endpoint_port_base"),
+        Some(&"7000".to_string())
+    );
+    assert_eq!(
+        response.attributes.get("kv_events.block_size"),
+        Some(&"64".to_string())
+    );
+    assert_eq!(
+        response.attributes.get("kv_events.dp_size"),
+        Some(&"1".to_string())
+    );
+}
+
+#[tokio::test]
 async fn grpc_get_load_reports_scheduler_metrics() {
     let mut scheduler = Scheduler::with_cache_resources(
         GrpcTwoStepWorker,

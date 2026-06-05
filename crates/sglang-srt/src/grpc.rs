@@ -52,6 +52,7 @@ pub struct GrpcRouterService<T, W> {
     runtime: Arc<Mutex<RouterRuntime<T, W>>>,
     model_info: Option<RouterGetModelInfoResponse>,
     max_transfer_polls: usize,
+    server_info_attributes: HashMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -89,6 +90,7 @@ impl<T, W> GrpcRouterService<T, W> {
             runtime: Arc::new(Mutex::new(runtime)),
             model_info: None,
             max_transfer_polls: 0,
+            server_info_attributes: default_server_info_attributes(),
         }
     }
 
@@ -100,6 +102,7 @@ impl<T, W> GrpcRouterService<T, W> {
             runtime: Arc::new(Mutex::new(runtime)),
             model_info: Some(model_info),
             max_transfer_polls: 0,
+            server_info_attributes: default_server_info_attributes(),
         }
     }
 
@@ -110,6 +113,12 @@ impl<T, W> GrpcRouterService<T, W> {
 
     pub fn with_server_args(runtime: RouterRuntime<T, W>, args: &ServerArgs) -> Self {
         Self::with_model_info(runtime, RouterGetModelInfoResponse::from_server_args(args))
+            .with_server_info_attributes(server_info_attributes_from_args(args))
+    }
+
+    pub fn with_server_info_attributes(mut self, attributes: HashMap<String, String>) -> Self {
+        self.server_info_attributes = attributes;
+        self
     }
 
     pub fn from_engine(engine: Engine<T, W>) -> Self {
@@ -343,7 +352,7 @@ where
         Ok(Response::new(ServerInfoResponse {
             version: env!("CARGO_PKG_VERSION").to_string(),
             runtime: "sglang-rs".to_string(),
-            attributes: HashMap::from([("transport".to_string(), "tonic-grpc".to_string())]),
+            attributes: self.server_info_attributes.clone(),
         }))
     }
 
@@ -503,6 +512,70 @@ where
     ) -> Result<Response<ControlResponse>, Status> {
         Err(unimplemented_rpc("UpdateWeightsFromDisk"))
     }
+}
+
+fn default_server_info_attributes() -> HashMap<String, String> {
+    HashMap::from([("transport".to_string(), "tonic-grpc".to_string())])
+}
+
+fn server_info_attributes_from_args(args: &ServerArgs) -> HashMap<String, String> {
+    let mut attributes = default_server_info_attributes();
+    attributes.insert(
+        "served_model_name".to_string(),
+        args.served_model_name
+            .clone()
+            .unwrap_or_else(|| args.model_path.clone()),
+    );
+    attributes.insert(
+        "disaggregation_mode".to_string(),
+        args.disaggregation_mode.clone(),
+    );
+
+    if args.disaggregation_mode == "prefill" {
+        attributes.insert(
+            "disaggregation_bootstrap_port".to_string(),
+            args.disaggregation_bootstrap_port.to_string(),
+        );
+    }
+
+    if let Some(ports) = args.disaggregation_zmq_ports {
+        attributes.insert("kv_events.publisher".to_string(), "zmq".to_string());
+        attributes.insert(
+            "kv_events.endpoint_host".to_string(),
+            grpc_kv_events_endpoint_host(args).to_string(),
+        );
+        attributes.insert(
+            "kv_events.endpoint_port_base".to_string(),
+            ports.start.to_string(),
+        );
+        attributes.insert("kv_events.topic".to_string(), String::new());
+        attributes.insert(
+            "kv_events.block_size".to_string(),
+            args.page_size.to_string(),
+        );
+        attributes.insert("kv_events.dp_size".to_string(), args.dp_size.to_string());
+    }
+
+    attributes
+}
+
+fn grpc_kv_events_endpoint_host(args: &ServerArgs) -> &str {
+    if matches!(args.host.as_str(), "0.0.0.0" | "::" | "[::]") {
+        if let Some(host) = args.dist_init_addr.as_deref().and_then(host_from_addr) {
+            return host;
+        }
+    }
+    &args.host
+}
+
+fn host_from_addr(addr: &str) -> Option<&str> {
+    if let Some(rest) = addr.strip_prefix('[') {
+        let (host, _) = rest.split_once(']')?;
+        return Some(host);
+    }
+    addr.rsplit_once(':')
+        .map(|(host, _)| host)
+        .filter(|host| !host.is_empty())
 }
 
 fn proto_generate_request_to_router_request(
