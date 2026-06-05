@@ -1,5 +1,8 @@
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use tonic::Request;
 
@@ -14,8 +17,8 @@ use sglang_srt::proto::sglang::runtime::v1::{
 use sglang_srt::server::{
     ServerLaunchError, build_bootstrap_fake_pd_grpc_router_service,
     build_bootstrap_grpc_router_service, build_bootstrap_pd_grpc_router_service, grpc_listen_addr,
-    launch_grpc_server, prefill_mooncake_zmq_endpoints, register_prefill_mooncake_routes_from_args,
-    try_build_bootstrap_grpc_router_service,
+    launch_grpc_server, launch_grpc_server_with_shutdown, prefill_mooncake_zmq_endpoints,
+    register_prefill_mooncake_routes_from_args, try_build_bootstrap_grpc_router_service,
 };
 use sglang_srt::tokenizer::TokenizerError;
 use sglang_srt::transfer::{
@@ -999,11 +1002,43 @@ async fn bootstrap_pd_grpc_router_service_applies_max_running_requests() {
 }
 
 #[tokio::test]
-async fn launch_grpc_server_rejects_unsupported_bootstrap_pd_backend() {
+async fn launch_grpc_server_rejects_unsupported_nixl_pd_backend() {
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
         "dummy",
+        "--grpc-mode",
+        "--disaggregation-mode",
+        "decode",
+        "--disaggregation-transfer-backend",
+        "nixl",
+    ])
+    .expect("args should parse");
+
+    let error = launch_grpc_server(args)
+        .await
+        .expect_err("unsupported PD backend should fail before serving");
+
+    assert_eq!(
+        error,
+        ServerLaunchError::UnsupportedBootstrapPdRuntime {
+            mode: DisaggregationMode::Decode,
+            transfer_backend: TransferBackend::Nixl,
+        }
+    );
+}
+
+#[tokio::test]
+async fn launch_grpc_server_serves_mooncake_decode_pd_runtime() {
+    let addr = unused_local_addr();
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--host",
+        &addr.ip().to_string(),
+        "--port",
+        &addr.port().to_string(),
         "--grpc-mode",
         "--disaggregation-mode",
         "decode",
@@ -1020,17 +1055,72 @@ async fn launch_grpc_server_rejects_unsupported_bootstrap_pd_backend() {
     ])
     .expect("args should parse");
 
-    let error = launch_grpc_server(args)
-        .await
-        .expect_err("unsupported PD backend should fail before serving");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let mut server = tokio::spawn(launch_grpc_server_with_shutdown(args, async move {
+        let _ = shutdown_rx.await;
+    }));
 
-    assert_eq!(
-        error,
-        ServerLaunchError::UnsupportedBootstrapPdRuntime {
-            mode: DisaggregationMode::Decode,
-            transfer_backend: TransferBackend::Mooncake,
-        }
+    tokio::time::timeout(Duration::from_millis(100), &mut server)
+        .await
+        .expect_err("Mooncake decode gRPC launch should keep serving until shutdown");
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    let result = server.await.expect("server task should join");
+
+    result.expect("Mooncake decode gRPC launch should stop cleanly after shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn launch_grpc_server_serves_mooncake_prefill_pd_runtime_with_bootstrap() {
+    let addrs = unused_distinct_local_addrs(3);
+    let grpc_addr = addrs[0];
+    let bootstrap_addr = addrs[1];
+    let zmq_addr = addrs[2];
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--host",
+        &grpc_addr.ip().to_string(),
+        "--port",
+        &grpc_addr.port().to_string(),
+        "--grpc-mode",
+        "--disaggregation-mode",
+        "prefill",
+        "--disaggregation-transfer-backend",
+        "mooncake",
+        "--disaggregation-bootstrap-port",
+        &bootstrap_addr.port().to_string(),
+        "--disaggregation-zmq-ports",
+        &format!("{}-{}", zmq_addr.port(), zmq_addr.port()),
+        "--kv-cache-dtype",
+        "bfloat16",
+        "--page-size",
+        "64",
+    ])
+    .expect("args should parse");
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let mut server = tokio::spawn(launch_grpc_server_with_shutdown(args, async move {
+        let _ = shutdown_rx.await;
+    }));
+
+    let health = get_raw_with_retry(bootstrap_addr, "/health").await;
+    assert!(
+        health.starts_with("HTTP/1.1 200"),
+        "bootstrap health response should be HTTP 200, got {health:?}"
     );
+
+    tokio::time::timeout(Duration::from_millis(100), &mut server)
+        .await
+        .expect_err("Mooncake prefill gRPC launch should keep serving until shutdown");
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    let result = server.await.expect("server task should join");
+
+    result.expect("Mooncake prefill gRPC launch should stop cleanly after shutdown");
 }
 
 #[tokio::test]
@@ -1445,4 +1535,61 @@ fn write_safetensors_file(
 
 fn temp_model_dir(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("sglang-rs-{name}-{}", std::process::id()))
+}
+
+fn unused_local_addr() -> SocketAddr {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("local port should bind")
+        .local_addr()
+        .expect("local port should have address")
+}
+
+fn unused_distinct_local_addrs(count: usize) -> Vec<SocketAddr> {
+    let listeners = (0..count)
+        .map(|_| TcpListener::bind("127.0.0.1:0").expect("local port should bind"))
+        .collect::<Vec<_>>();
+    listeners
+        .iter()
+        .map(|listener| {
+            listener
+                .local_addr()
+                .expect("local port should have address")
+        })
+        .collect()
+}
+
+async fn get_raw_with_retry(addr: SocketAddr, path: &'static str) -> String {
+    for _ in 0..50 {
+        match raw_http_request(addr, "GET", path, None).await {
+            Ok(response) => return response,
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+
+    raw_http_request(addr, "GET", path, None)
+        .await
+        .expect("HTTP bootstrap endpoint should respond")
+}
+
+async fn raw_http_request(
+    addr: SocketAddr,
+    method: &'static str,
+    path: &'static str,
+    body: Option<&'static str>,
+) -> std::io::Result<String> {
+    tokio::task::spawn_blocking(move || {
+        let mut stream = TcpStream::connect(addr)?;
+        let body = body.unwrap_or_default();
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes())?;
+
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        Ok(response)
+    })
+    .await
+    .expect("blocking HTTP request should join")
 }
