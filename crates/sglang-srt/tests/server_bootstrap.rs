@@ -116,7 +116,11 @@ async fn bootstrap_grpc_router_service_reports_local_moe_checkpoint_coverage() {
   "hc_mult": 1,
   "n_routed_experts": 1,
   "first_k_dense_replace": 0,
-  "moe_layer_freq": 1
+  "moe_layer_freq": 1,
+  "num_key_value_heads": 1,
+  "qk_nope_head_dim": 64,
+  "qk_rope_head_dim": 32,
+  "v_head_dim": 64
 }"#,
     )
     .expect("config should be written");
@@ -283,9 +287,9 @@ async fn bootstrap_grpc_router_service_rejects_generation_for_unsupported_local_
 
     assert_eq!(error.code(), tonic::Code::Internal);
     assert!(
-        error.message().contains(
-            "local model type deepseek_v4 has checkpoint metadata but no Rust forward runtime"
-        ),
+        error
+            .message()
+            .contains("DeepSeek V4 Rust forward kernels are not implemented"),
         "unexpected error: {error:?}"
     );
 
@@ -1297,7 +1301,11 @@ fn write_complete_deepseek_v4_checkpoint(model_dir: &std::path::Path) {
   "hc_mult": 1,
   "n_routed_experts": 1,
   "first_k_dense_replace": 0,
-  "moe_layer_freq": 1
+  "moe_layer_freq": 1,
+  "num_key_value_heads": 1,
+  "qk_nope_head_dim": 64,
+  "qk_rope_head_dim": 32,
+  "v_head_dim": 64
 }"#,
     )
     .expect("config should be written");

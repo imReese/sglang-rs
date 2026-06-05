@@ -861,6 +861,12 @@ pub struct HfModelConfig {
     pub rms_norm_eps: Option<HfConfigFloat>,
     pub hc_eps: Option<HfConfigFloat>,
     pub tie_word_embeddings: Option<bool>,
+    pub num_attention_heads: Option<usize>,
+    pub num_key_value_heads: Option<usize>,
+    pub head_dim: Option<usize>,
+    pub qk_nope_head_dim: Option<usize>,
+    pub qk_rope_head_dim: Option<usize>,
+    pub v_head_dim: Option<usize>,
 }
 
 impl HfModelConfig {
@@ -916,6 +922,12 @@ impl HfModelConfig {
             rms_norm_eps: read_f64_field(&value, "rms_norm_eps", &config_path)?,
             hc_eps: read_f64_field(&value, "hc_eps", &config_path)?,
             tie_word_embeddings: read_bool_field(&value, "tie_word_embeddings", &config_path)?,
+            num_attention_heads: read_usize_field(&value, "num_attention_heads", &config_path)?,
+            num_key_value_heads: read_usize_field(&value, "num_key_value_heads", &config_path)?,
+            head_dim: read_usize_field(&value, "head_dim", &config_path)?,
+            qk_nope_head_dim: read_usize_field(&value, "qk_nope_head_dim", &config_path)?,
+            qk_rope_head_dim: read_usize_field(&value, "qk_rope_head_dim", &config_path)?,
+            v_head_dim: read_usize_field(&value, "v_head_dim", &config_path)?,
         })
     }
 

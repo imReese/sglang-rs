@@ -8,7 +8,7 @@ use std::path::Path;
 
 use crate::cache::CachePageId;
 use crate::cli::{ServerArgs, ZmqPortRange};
-use crate::model_artifacts::resolve_model_path;
+use crate::model_artifacts::{HfModelConfig, resolve_model_path};
 use crate::model_executor::ModelWorkerBatch;
 use crate::scheduler::{ForwardMode, ScheduleBatch, ScheduledRequest};
 use crate::types::{DisaggregatedParams, RequestId};
@@ -197,6 +197,39 @@ impl KvCacheModelLayout {
         Self::from_resolved_model_path(&model_path)
     }
 
+    pub fn from_hf_config(config: &HfModelConfig) -> Result<Option<Self>, PdConfigError> {
+        let Some(num_layers) = config.num_hidden_layers else {
+            return Ok(None);
+        };
+
+        if config.model_type.as_deref() == Some("deepseek_v4") {
+            let qk_nope_head_dim =
+                required_hf_config_usize(config.qk_nope_head_dim, "qk_nope_head_dim")?;
+            let qk_rope_head_dim =
+                required_hf_config_usize(config.qk_rope_head_dim, "qk_rope_head_dim")?;
+            return Self::deepseek_v4_packed_layout(num_layers, qk_nope_head_dim, qk_rope_head_dim)
+                .map(Some);
+        }
+
+        let num_attention_heads =
+            required_hf_config_usize(config.num_attention_heads, "num_attention_heads")?;
+        let kv_heads = config.num_key_value_heads.unwrap_or(num_attention_heads);
+        let head_dim = match config.head_dim {
+            Some(head_dim) => head_dim,
+            None => {
+                let hidden_size = required_hf_config_usize(config.hidden_size, "hidden_size")?;
+                if num_attention_heads == 0 || hidden_size % num_attention_heads != 0 {
+                    return Err(PdConfigError::InvalidModelConfig(format!(
+                        "hidden_size ({hidden_size}) must be divisible by num_attention_heads ({num_attention_heads})"
+                    )));
+                }
+                hidden_size / num_attention_heads
+            }
+        };
+
+        Ok(Some(Self::multi_tensor(num_layers, kv_heads, head_dim, 2)))
+    }
+
     fn from_resolved_model_path(model_path: &Path) -> Result<Option<Self>, PdConfigError> {
         if !model_path.is_dir() {
             return Ok(None);
@@ -231,26 +264,8 @@ impl KvCacheModelLayout {
         if config.get("model_type").and_then(serde_json::Value::as_str) == Some("deepseek_v4") {
             let qk_nope_head_dim = required_usize_field(config, "qk_nope_head_dim")?;
             let qk_rope_head_dim = required_usize_field(config, "qk_rope_head_dim")?;
-            if qk_nope_head_dim % 64 != 0 {
-                return Err(PdConfigError::InvalidModelConfig(format!(
-                    "qk_nope_head_dim must be divisible by 64 for DeepSeek V4 packed KV layout: {qk_nope_head_dim}"
-                )));
-            }
-
-            let rope_bytes = qk_rope_head_dim
-                .checked_mul(2)
-                .ok_or(PdConfigError::KvCacheLayoutOverflow)?;
-            let scale_bytes = qk_nope_head_dim / 64;
-            let bytes_per_token_per_layer = qk_nope_head_dim
-                .checked_add(rope_bytes)
-                .and_then(|value| value.checked_add(scale_bytes))
-                .and_then(|value| value.checked_add(1))
-                .ok_or(PdConfigError::KvCacheLayoutOverflow)?;
-
-            return Ok(Some(Self::packed_bytes_per_layer(
-                num_layers,
-                bytes_per_token_per_layer,
-            )));
+            return Self::deepseek_v4_packed_layout(num_layers, qk_nope_head_dim, qk_rope_head_dim)
+                .map(Some);
         }
 
         let num_attention_heads = required_usize_field(config, "num_attention_heads")?;
@@ -271,6 +286,41 @@ impl KvCacheModelLayout {
 
         Ok(Some(Self::multi_tensor(num_layers, kv_heads, head_dim, 2)))
     }
+
+    fn deepseek_v4_packed_layout(
+        num_layers: usize,
+        qk_nope_head_dim: usize,
+        qk_rope_head_dim: usize,
+    ) -> Result<Self, PdConfigError> {
+        if qk_nope_head_dim % 64 != 0 {
+            return Err(PdConfigError::InvalidModelConfig(format!(
+                "qk_nope_head_dim must be divisible by 64 for DeepSeek V4 packed KV layout: {qk_nope_head_dim}"
+            )));
+        }
+
+        let rope_bytes = qk_rope_head_dim
+            .checked_mul(2)
+            .ok_or(PdConfigError::KvCacheLayoutOverflow)?;
+        let scale_bytes = qk_nope_head_dim / 64;
+        let bytes_per_token_per_layer = qk_nope_head_dim
+            .checked_add(rope_bytes)
+            .and_then(|value| value.checked_add(scale_bytes))
+            .and_then(|value| value.checked_add(1))
+            .ok_or(PdConfigError::KvCacheLayoutOverflow)?;
+
+        Ok(Self::packed_bytes_per_layer(
+            num_layers,
+            bytes_per_token_per_layer,
+        ))
+    }
+}
+
+fn required_hf_config_usize(
+    value: Option<usize>,
+    field: &'static str,
+) -> Result<usize, PdConfigError> {
+    value
+        .ok_or_else(|| PdConfigError::InvalidModelConfig(format!("missing required field {field}")))
 }
 
 fn read_usize_field(

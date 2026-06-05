@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cache::{CachePageAllocator, RadixCache};
 use crate::cli::ServerArgs;
+use crate::deepseek_runtime::{DeepSeekRuntimeError, DeepSeekV4Runtime};
 use crate::engine::Engine;
 use crate::grpc::{GrpcRouterService, GrpcServeError, serve_grpc_router};
 use crate::http::{HttpRouterService, HttpServeError, serve_http_router_with_shutdown};
@@ -33,6 +34,7 @@ pub enum BootstrapForwardModel {
     #[default]
     Space,
     CpuEmbeddingLm(CpuEmbeddingLmModel),
+    DeepSeekV4(DeepSeekV4Runtime),
     UnsupportedLocalModelRuntime {
         model_path: PathBuf,
         model_type: Option<String>,
@@ -56,6 +58,9 @@ impl BootstrapForwardModel {
         Ok(
             match CpuEmbeddingLmModel::from_local_model_artifacts(&artifacts)? {
                 Some(model) => Self::CpuEmbeddingLm(model),
+                None if artifacts.config().model_type.as_deref() == Some("deepseek_v4") => {
+                    Self::DeepSeekV4(DeepSeekV4Runtime::from_local_model_artifacts(&artifacts)?)
+                }
                 None => Self::UnsupportedLocalModelRuntime {
                     model_path: artifacts.model_path().to_path_buf(),
                     model_type: artifacts.config().model_type.clone(),
@@ -82,6 +87,15 @@ impl ForwardModel for BootstrapForwardModel {
                 ModelForwardOutput::new(logits)
             }
             Self::CpuEmbeddingLm(model) => model.forward(batch),
+            Self::DeepSeekV4(runtime) => {
+                let plan = runtime.forward_plan(batch);
+                Err(ModelForwardError::Runtime(format!(
+                    "DeepSeek V4 Rust forward kernels are not implemented; runtime descriptor loaded {} layer(s), planning {} request(s) and {} token(s)",
+                    runtime.layer_count(),
+                    plan.request_ids().len(),
+                    plan.input_ids().len()
+                )))
+            }
             Self::UnsupportedLocalModelRuntime {
                 model_path,
                 model_type,
@@ -130,6 +144,7 @@ pub enum ServerLaunchError {
     Grpc(GrpcServeError),
     Http(HttpServeError),
     PrefillBootstrap(PrefillBootstrapServeError),
+    DeepSeekRuntime(DeepSeekRuntimeError),
     ServerTaskJoin(String),
     ZmqRoutePortCountMismatch {
         expected: usize,
@@ -163,6 +178,7 @@ impl PartialEq for ServerLaunchError {
             ) => left_mode == right_mode && left_backend == right_backend,
             (Self::Tokenizer(left), Self::Tokenizer(right)) => left == right,
             (Self::ModelArtifact(left), Self::ModelArtifact(right)) => left == right,
+            (Self::DeepSeekRuntime(left), Self::DeepSeekRuntime(right)) => left == right,
             (
                 Self::ZmqRoutePortCountMismatch {
                     expected: left_expected,
@@ -200,6 +216,7 @@ impl fmt::Display for ServerLaunchError {
             Self::Grpc(error) => write!(formatter, "{error}"),
             Self::Http(error) => write!(formatter, "{error}"),
             Self::PrefillBootstrap(error) => write!(formatter, "{error}"),
+            Self::DeepSeekRuntime(error) => write!(formatter, "DeepSeek runtime error: {error}"),
             Self::ServerTaskJoin(error) => write!(formatter, "server task failed to join: {error}"),
             Self::ZmqRoutePortCountMismatch { expected, actual } => write!(
                 formatter,
@@ -244,6 +261,12 @@ impl From<ModelArtifactError> for ServerLaunchError {
 impl From<TokenizerError> for ServerLaunchError {
     fn from(value: TokenizerError) -> Self {
         Self::Tokenizer(value)
+    }
+}
+
+impl From<DeepSeekRuntimeError> for ServerLaunchError {
+    fn from(value: DeepSeekRuntimeError) -> Self {
+        Self::DeepSeekRuntime(value)
     }
 }
 
