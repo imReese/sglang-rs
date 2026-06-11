@@ -7,7 +7,9 @@ use crate::policies::SelectionContext;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{RequestOutcome, StaleRequestOutcome, WorkerModeLabel};
-use crate::server::routes::pd::{PdDispatchPlan, RouteDispatchPlan, RouteWorkerSelection};
+use crate::server::routes::pd::{
+    PdDispatchPlan, RouteDispatchPlan, RouteSelectionError, RouteWorkerSelection,
+};
 use crate::tokenizer::adapter;
 use crate::workers::LoadGuard;
 use axum::body::{to_bytes, Body};
@@ -315,37 +317,11 @@ async fn routed_generation(
     let model_str = select_model(&ctx, probe.model, model_selection)?;
     let model_id = ModelId(model_str.clone());
 
-    // PD pool isolation: for PD-mode deployments, prefill traffic
-    // selects from the prefill pool only. Plain-mode deployments fall
-    // through to the full candidate set. Partial-failure errors
-    // (`no_prefill_workers_available`) are surfaced as 503 with a
-    // distinct error code so operators can alert independently.
     let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry));
-    let workers = resolver
-        .prefill_candidates(&model_id)
-        .map_err(|e| match e {
-            PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers {
-                model: model_str.clone(),
-            },
-            PdResolveError::NoPrefillWorkersAvailable => ApiError::NoPrefillWorkersAvailable {
-                model: model_str.clone(),
-            },
-            PdResolveError::NoDecodeWorkersAvailable => ApiError::NoDecodeWorkersAvailable {
-                model: model_str.clone(),
-            },
-        })?;
-
     let policy = ctx
         .policies
         .get(&model_id)
         .ok_or_else(|| ApiError::ModelNotFound(model_str.clone()))?;
-    let selection_ctx = SelectionContext::new(&model_id, Some(&body));
-    let worker =
-        policy
-            .select(&workers, &selection_ctx)
-            .ok_or_else(|| ApiError::PolicySelectionFailed {
-                model: model_str.clone(),
-            })?;
 
     // Route-local worker selection. This mirrors sgl-model-gateway's
     // `WorkerSelection::{Single, Dual}` boundary: the policy picks a
@@ -356,18 +332,32 @@ async fn routed_generation(
     // to find). PD-mode requests that fail to resolve a
     // decode peer (`NoDecodeWorkersAvailable`) bubble up as 503 so
     // operators can alert on prefill-vs-decode pool imbalance.
-    let selection = RouteWorkerSelection::from_selected_worker(&resolver, &model_id, worker)
-        .map_err(|e| match e {
-            PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers {
+    let selection = RouteWorkerSelection::select_with_policy(
+        &resolver,
+        policy.as_ref(),
+        &model_id,
+        Some(&body),
+    )
+    .map_err(|e| match e {
+        RouteSelectionError::Resolve(PdResolveError::NoHealthyWorkers) => {
+            ApiError::NoHealthyWorkers {
                 model: model_str.clone(),
-            },
-            PdResolveError::NoDecodeWorkersAvailable => ApiError::NoDecodeWorkersAvailable {
+            }
+        }
+        RouteSelectionError::Resolve(PdResolveError::NoDecodeWorkersAvailable) => {
+            ApiError::NoDecodeWorkersAvailable {
                 model: model_str.clone(),
-            },
-            PdResolveError::NoPrefillWorkersAvailable => ApiError::NoPrefillWorkersAvailable {
+            }
+        }
+        RouteSelectionError::Resolve(PdResolveError::NoPrefillWorkersAvailable) => {
+            ApiError::NoPrefillWorkersAvailable {
                 model: model_str.clone(),
-            },
-        })?;
+            }
+        }
+        RouteSelectionError::PolicySelectionFailed => ApiError::PolicySelectionFailed {
+            model: model_str.clone(),
+        },
+    })?;
     let worker = Arc::clone(selection.primary_worker());
     let mut pd_dispatch_plan: Option<PdDispatchPlan> = None;
 

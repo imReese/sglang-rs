@@ -3,6 +3,7 @@
 
 use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
+use crate::policies::{Policy, SelectionContext};
 use crate::server::error::ApiError;
 use crate::workers::Worker;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
@@ -78,6 +79,22 @@ pub(crate) enum RouteWorkerSelection {
 }
 
 impl RouteWorkerSelection {
+    pub(crate) fn select_with_policy(
+        resolver: &PdPoolResolver,
+        policy: &dyn Policy,
+        model: &ModelId,
+        request_body: Option<&Bytes>,
+    ) -> Result<Self, RouteSelectionError> {
+        let workers = resolver
+            .prefill_candidates(model)
+            .map_err(RouteSelectionError::Resolve)?;
+        let selection_ctx = SelectionContext::new(model, request_body.map(Bytes::as_ref));
+        let worker = policy
+            .select(&workers, &selection_ctx)
+            .ok_or(RouteSelectionError::PolicySelectionFailed)?;
+        Self::from_selected_worker(resolver, model, worker).map_err(RouteSelectionError::Resolve)
+    }
+
     pub(crate) fn from_selected_worker(
         resolver: &PdPoolResolver,
         model: &ModelId,
@@ -98,6 +115,12 @@ impl RouteWorkerSelection {
             Self::Dual { pair } => pair.prefill(),
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RouteSelectionError {
+    Resolve(PdResolveError),
+    PolicySelectionFailed,
 }
 
 /// Prepared HTTP PD execution request. This is the small request
@@ -784,6 +807,71 @@ mod tests {
         assert_eq!(selection.primary_worker().id, WorkerId("prefill".into()));
         match selection {
             RouteWorkerSelection::Dual { pair } => {
+                assert_eq!(pair.decode().id, WorkerId("decode".into()));
+            }
+            RouteWorkerSelection::Single { .. } => panic!("expected PD worker pair"),
+        }
+    }
+
+    #[test]
+    fn route_worker_selection_stage_selects_plain_worker_with_policy() {
+        let model = ModelId("tiny".into());
+        let registry = Arc::new(WorkerRegistry::default());
+        registry
+            .add(worker_spec(
+                "plain",
+                "grpc://plain.local:30000",
+                WorkerMode::Plain,
+                None,
+            ))
+            .unwrap();
+        let resolver = PdPoolResolver::new(Arc::clone(&registry));
+        let policy = crate::policies::round_robin::RoundRobinPolicy::new();
+        let body = Bytes::from_static(br#"{"model":"tiny","messages":[]}"#);
+
+        let selection =
+            RouteWorkerSelection::select_with_policy(&resolver, &policy, &model, Some(&body))
+                .unwrap();
+
+        match selection {
+            RouteWorkerSelection::Single { worker } => {
+                assert_eq!(worker.id, WorkerId("plain".into()));
+            }
+            RouteWorkerSelection::Dual { .. } => panic!("expected single worker selection"),
+        }
+    }
+
+    #[test]
+    fn route_worker_selection_stage_selects_pd_pair_with_policy() {
+        let model = ModelId("tiny".into());
+        let registry = Arc::new(WorkerRegistry::default());
+        registry
+            .add(worker_spec(
+                "prefill",
+                "grpc://host-a.local:30000",
+                WorkerMode::Prefill,
+                Some(8200),
+            ))
+            .unwrap();
+        registry
+            .add(worker_spec(
+                "decode",
+                "grpc://host-a.local:30001",
+                WorkerMode::Decode,
+                None,
+            ))
+            .unwrap();
+        let resolver = PdPoolResolver::new(Arc::clone(&registry));
+        let policy = crate::policies::round_robin::RoundRobinPolicy::new();
+        let body = Bytes::from_static(br#"{"model":"tiny","messages":[]}"#);
+
+        let selection =
+            RouteWorkerSelection::select_with_policy(&resolver, &policy, &model, Some(&body))
+                .unwrap();
+
+        match selection {
+            RouteWorkerSelection::Dual { pair } => {
+                assert_eq!(pair.prefill().id, WorkerId("prefill".into()));
                 assert_eq!(pair.decode().id, WorkerId("decode".into()));
             }
             RouteWorkerSelection::Single { .. } => panic!("expected PD worker pair"),
