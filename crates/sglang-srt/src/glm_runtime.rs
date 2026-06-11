@@ -11,6 +11,7 @@ use crate::model_artifacts::{
     SafetensorsTensorData, SafetensorsTensorDecodeError, SafetensorsTensorMetadata,
     SafetensorsTensorSpan,
 };
+use crate::model_executor::ModelWorkerBatch;
 use crate::transfer::{KvCacheModelLayout, PdConfigError};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -19,6 +20,7 @@ pub struct GlmMoeDsaRuntime {
     root_tensors: GlmMoeDsaRootTensorDescriptors,
     layers: Vec<GlmMoeDsaLayerTensorDescriptors>,
     kv_cache_layout: KvCacheModelLayout,
+    rms_norm_eps_bits: u32,
 }
 
 impl GlmMoeDsaRuntime {
@@ -45,6 +47,12 @@ impl GlmMoeDsaRuntime {
                 .map(GlmMoeDsaLayerTensorDescriptors::from_checkpoint)
                 .collect(),
             kv_cache_layout,
+            rms_norm_eps_bits: artifacts
+                .config()
+                .rms_norm_eps
+                .map(|value| value.get() as f32)
+                .unwrap_or(1e-6)
+                .to_bits(),
         })
     }
 
@@ -66,6 +74,10 @@ impl GlmMoeDsaRuntime {
 
     pub fn kv_cache_layout(&self) -> KvCacheModelLayout {
         self.kv_cache_layout
+    }
+
+    pub fn rms_norm_eps(&self) -> f32 {
+        f32::from_bits(self.rms_norm_eps_bits)
     }
 
     pub fn tensor_parallel_placement_plan(
@@ -811,6 +823,7 @@ impl GlmMoeDsaLoadedTensorRank {
 pub struct GlmMoeDsaF32TensorParallelRuntime {
     tensor_parallel_size: usize,
     layer_count: usize,
+    rms_norm_eps: f32,
     ranks: Vec<GlmMoeDsaF32TensorRank>,
 }
 
@@ -827,6 +840,7 @@ impl GlmMoeDsaF32TensorParallelRuntime {
         Ok(Self {
             tensor_parallel_size: runtime.tensor_parallel_size(),
             layer_count: runtime.layer_count(),
+            rms_norm_eps: runtime.runtime.rms_norm_eps(),
             ranks,
         })
     }
@@ -843,6 +857,10 @@ impl GlmMoeDsaF32TensorParallelRuntime {
         self.layer_count
     }
 
+    pub fn rms_norm_eps(&self) -> f32 {
+        self.rms_norm_eps
+    }
+
     pub fn ranks(&self) -> &[GlmMoeDsaF32TensorRank] {
         &self.ranks
     }
@@ -851,6 +869,86 @@ impl GlmMoeDsaF32TensorParallelRuntime {
         self.ranks
             .iter()
             .find(|rank| rank.tensor_parallel_rank() == tensor_parallel_rank)
+    }
+
+    pub fn embedding_lm_head_logits(
+        &self,
+        batch: &ModelWorkerBatch,
+    ) -> Result<Vec<Vec<f32>>, GlmMoeDsaF32KernelError> {
+        batch
+            .last_input_token_ids()
+            .into_iter()
+            .map(|token_id| self.embedding_lm_head_logits_for_token(token_id))
+            .collect()
+    }
+
+    fn embedding_lm_head_logits_for_token(
+        &self,
+        token_id: u32,
+    ) -> Result<Vec<f32>, GlmMoeDsaF32KernelError> {
+        let mut hidden = self.token_embedding(token_id)?;
+        let norm_weight = self.final_norm_weight()?;
+        apply_rms_norm(
+            "model.norm.weight",
+            &mut hidden,
+            norm_weight,
+            self.rms_norm_eps,
+        )?;
+
+        let mut logits = Vec::<Option<f32>>::new();
+        for rank in &self.ranks {
+            for (token_id, logit) in rank.lm_head_partial_logits(&hidden)? {
+                if logits.len() <= token_id {
+                    logits.resize(token_id + 1, None);
+                }
+                logits[token_id] = Some(logit);
+            }
+        }
+
+        logits
+            .into_iter()
+            .enumerate()
+            .map(|(token_id, logit)| {
+                logit.ok_or(GlmMoeDsaF32KernelError::MissingVocabularyLogit { token_id })
+            })
+            .collect()
+    }
+
+    fn token_embedding(&self, token_id: u32) -> Result<Vec<f32>, GlmMoeDsaF32KernelError> {
+        let token_id =
+            usize::try_from(token_id).map_err(|_| GlmMoeDsaF32KernelError::TokenIdOutOfRange {
+                token_id: token_id.to_string(),
+            })?;
+        let mut saw_embedding = false;
+        for rank in &self.ranks {
+            let Some(embedding) = rank.tensor_shard("model.embed_tokens.weight") else {
+                continue;
+            };
+            saw_embedding = true;
+            if let Some(values) = embedding.vocab_parallel_row(token_id)? {
+                return Ok(values.to_vec());
+            }
+        }
+
+        if saw_embedding {
+            Err(GlmMoeDsaF32KernelError::TokenOutOfVocabulary { token_id })
+        } else {
+            Err(GlmMoeDsaF32KernelError::MissingTensor {
+                tensor_name: "model.embed_tokens.weight".to_string(),
+            })
+        }
+    }
+
+    fn final_norm_weight(&self) -> Result<&[f32], GlmMoeDsaF32KernelError> {
+        for rank in &self.ranks {
+            if let Some(norm) = rank.tensor_shard("model.norm.weight") {
+                return norm.vector_values();
+            }
+        }
+
+        Err(GlmMoeDsaF32KernelError::MissingTensor {
+            tensor_name: "model.norm.weight".to_string(),
+        })
     }
 }
 
@@ -970,6 +1068,59 @@ impl GlmMoeDsaF32TensorShard {
             })
             .collect())
     }
+
+    fn vocab_parallel_row(
+        &self,
+        global_row: usize,
+    ) -> Result<Option<&[f32]>, GlmMoeDsaF32KernelError> {
+        let [rows, columns] = self.shape.as_slice() else {
+            return Err(GlmMoeDsaF32KernelError::TensorRankMismatch {
+                tensor_name: self.tensor_name.clone(),
+                expected_rank: 2,
+                shape: self.shape.clone(),
+            });
+        };
+
+        let global_row_start = match &self.selection {
+            GlmMoeDsaTensorShardSelection::Full => 0,
+            GlmMoeDsaTensorShardSelection::Slice { axis: 0, range } => range.start,
+            GlmMoeDsaTensorShardSelection::Slice { axis, .. } => {
+                return Err(GlmMoeDsaF32KernelError::TensorSelectionMismatch {
+                    tensor_name: self.tensor_name.clone(),
+                    expected_axis: 0,
+                    actual_axis: *axis,
+                });
+            }
+        };
+        let Some(local_row) = global_row.checked_sub(global_row_start) else {
+            return Ok(None);
+        };
+        if local_row >= *rows {
+            return Ok(None);
+        }
+
+        let start = local_row * columns;
+        let end = start + columns;
+        Ok(Some(&self.values[start..end]))
+    }
+
+    fn vector_values(&self) -> Result<&[f32], GlmMoeDsaF32KernelError> {
+        let [length] = self.shape.as_slice() else {
+            return Err(GlmMoeDsaF32KernelError::TensorRankMismatch {
+                tensor_name: self.tensor_name.clone(),
+                expected_rank: 1,
+                shape: self.shape.clone(),
+            });
+        };
+        if self.values.len() != *length {
+            return Err(GlmMoeDsaF32KernelError::TensorDataLengthMismatch {
+                tensor_name: self.tensor_name.clone(),
+                expected: *length,
+                actual: self.values.len(),
+            });
+        }
+        Ok(&self.values)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1002,10 +1153,24 @@ pub enum GlmMoeDsaF32KernelError {
     MissingTensor {
         tensor_name: String,
     },
+    TokenIdOutOfRange {
+        token_id: String,
+    },
+    TokenOutOfVocabulary {
+        token_id: usize,
+    },
+    MissingVocabularyLogit {
+        token_id: usize,
+    },
     TensorRankMismatch {
         tensor_name: String,
         expected_rank: usize,
         shape: Vec<usize>,
+    },
+    TensorDataLengthMismatch {
+        tensor_name: String,
+        expected: usize,
+        actual: usize,
     },
     HiddenSizeMismatch {
         tensor_name: String,
@@ -1025,6 +1190,18 @@ impl fmt::Display for GlmMoeDsaF32KernelError {
             Self::MissingTensor { tensor_name } => {
                 write!(formatter, "missing f32 tensor {tensor_name}")
             }
+            Self::TokenIdOutOfRange { token_id } => {
+                write!(formatter, "token id {token_id} does not fit usize")
+            }
+            Self::TokenOutOfVocabulary { token_id } => {
+                write!(formatter, "token id {token_id} is outside GLM vocabulary")
+            }
+            Self::MissingVocabularyLogit { token_id } => {
+                write!(
+                    formatter,
+                    "missing GLM vocab-parallel logit for token {token_id}"
+                )
+            }
             Self::TensorRankMismatch {
                 tensor_name,
                 expected_rank,
@@ -1032,6 +1209,14 @@ impl fmt::Display for GlmMoeDsaF32KernelError {
             } => write!(
                 formatter,
                 "f32 tensor {tensor_name} expected rank {expected_rank} but shape is {shape:?}"
+            ),
+            Self::TensorDataLengthMismatch {
+                tensor_name,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "f32 tensor {tensor_name} expected {expected} value(s) but decoded {actual}"
             ),
             Self::HiddenSizeMismatch {
                 tensor_name,
@@ -1054,6 +1239,28 @@ impl fmt::Display for GlmMoeDsaF32KernelError {
 }
 
 impl std::error::Error for GlmMoeDsaF32KernelError {}
+
+fn apply_rms_norm(
+    tensor_name: &str,
+    hidden: &mut [f32],
+    weight: &[f32],
+    eps: f32,
+) -> Result<(), GlmMoeDsaF32KernelError> {
+    if hidden.len() != weight.len() {
+        return Err(GlmMoeDsaF32KernelError::HiddenSizeMismatch {
+            tensor_name: tensor_name.to_string(),
+            expected: weight.len(),
+            actual: hidden.len(),
+        });
+    }
+
+    let mean_square = hidden.iter().map(|value| value * value).sum::<f32>() / hidden.len() as f32;
+    let inv_rms = (mean_square + eps).sqrt().recip();
+    for (value, weight) in hidden.iter_mut().zip(weight) {
+        *value *= inv_rms * weight;
+    }
+    Ok(())
+}
 
 impl From<ModelArtifactError> for GlmMoeDsaRuntimeError {
     fn from(error: ModelArtifactError) -> Self {

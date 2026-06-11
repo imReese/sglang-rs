@@ -7,7 +7,31 @@ use sglang_srt::glm_runtime::{
 };
 use sglang_srt::model_artifacts::LocalModelArtifacts;
 use sglang_srt::model_artifacts::SafetensorsTensorDecodeError;
+use sglang_srt::model_executor::ModelWorkerBatch;
+use sglang_srt::scheduler::{ScheduledRequest, Scheduler};
 use sglang_srt::transfer::KvCacheDtype;
+use sglang_srt::types::{RequestId, SamplingParams};
+use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
+
+#[derive(Default)]
+struct NoopWorker;
+
+impl ModelWorker for NoopWorker {
+    fn generate_batch(
+        &mut self,
+        batch: &sglang_srt::scheduler::ScheduleBatch,
+    ) -> BatchGeneratedTokens {
+        BatchGeneratedTokens::from_batch(
+            batch,
+            batch
+                .requests()
+                .iter()
+                .map(|_| GeneratedToken::finished(vec![0]))
+                .collect(),
+        )
+        .expect("generated tokens should match batch")
+    }
+}
 
 #[test]
 fn glm_moe_dsa_runtime_builds_tensor_parallel_placement_plan() {
@@ -133,6 +157,48 @@ fn glm_moe_dsa_f32_rank_computes_vocab_parallel_lm_head_partial_logits() {
 }
 
 #[test]
+fn glm_moe_dsa_f32_runtime_computes_embedding_norm_lm_head_logits_for_batch() {
+    let model_dir = temp_model_dir("glm-runtime-f32-forward-logits");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_glm_moe_dsa_forward_fixture(&model_dir);
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("GLM artifacts should load");
+    let runtime =
+        GlmMoeDsaRuntime::from_local_model_artifacts(&artifacts).expect("runtime should build");
+    let f32_runtime = runtime
+        .load_tensor_parallel_shards(2)
+        .expect("all TP rank shards should load")
+        .decode_f32_tensor_parallel_shards()
+        .expect("F32 cache should decode");
+    let mut scheduler = Scheduler::new(NoopWorker);
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("glm-forward-a"),
+        vec![0, 1],
+        SamplingParams::new(1),
+    ));
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("glm-forward-b"),
+        vec![0, 3],
+        SamplingParams::new(1),
+    ));
+    let batch = scheduler
+        .next_prefill_batch(8)
+        .expect("prefill batch should be available");
+    let worker_batch = ModelWorkerBatch::from_schedule_batch(&batch);
+
+    let logits = f32_runtime
+        .embedding_lm_head_logits(&worker_batch)
+        .expect("embedding/norm/lm_head logits should compute");
+
+    assert_eq!(
+        logits,
+        vec![vec![2.0, 4.0, 6.0, 8.0], vec![8.0, 16.0, 24.0, 32.0]]
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
 fn glm_moe_dsa_f32_rank_rejects_lm_head_hidden_size_mismatch() {
     let model_dir = temp_model_dir("glm-runtime-tp-lm-head-hidden-mismatch");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");
@@ -240,6 +306,78 @@ fn write_complete_glm_moe_dsa_checkpoint_with_dtype(model_dir: &Path, dtype: &st
             .collect::<Vec<_>>(),
         _ => panic!("test fixture dtype {dtype} is not supported"),
     };
+
+    write_safetensors_file(&model_dir.join("model.safetensors"), &tensors, &payload)
+        .expect("safetensors shard should be written");
+}
+
+fn write_glm_moe_dsa_forward_fixture(model_dir: &Path) {
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "model_type": "glm_moe_dsa",
+  "vocab_size": 4,
+  "num_hidden_layers": 1,
+  "hidden_size": 4,
+  "num_attention_heads": 2,
+  "num_key_value_heads": 2,
+  "head_dim": 2,
+  "rms_norm_eps": 0.0,
+  "n_routed_experts": 1,
+  "first_k_dense_replace": 0,
+  "moe_layer_freq": 1
+}"#,
+    )
+    .expect("config should be written");
+
+    let mut cursor = 0_usize;
+    let mut tensors = Vec::new();
+    let mut payload = Vec::new();
+    for (name, values, shape) in [
+        (
+            "model.embed_tokens.weight",
+            vec![
+                0.0, 0.0, 0.0, 0.0, // token 0
+                1.0, 0.0, 0.0, 0.0, // token 1
+                0.0, 1.0, 0.0, 0.0, // token 2
+                0.0, 0.0, 0.0, 2.0, // token 3
+            ],
+            vec![4, 4],
+        ),
+        ("model.norm.weight", vec![1.0, 1.0, 1.0, 1.0], vec![4]),
+        (
+            "lm_head.weight",
+            vec![
+                1.0, 0.0, 0.0, 4.0, // token 0 logit
+                2.0, 0.0, 0.0, 8.0, // token 1 logit
+                3.0, 0.0, 0.0, 12.0, // token 2 logit
+                4.0, 0.0, 0.0, 16.0, // token 3 logit
+            ],
+            vec![4, 4],
+        ),
+    ] {
+        let start = cursor;
+        for value in values.into_iter().map(|value| value as f32) {
+            payload.extend_from_slice(&value.to_le_bytes());
+            cursor += 4;
+        }
+        tensors.push((name, "F32", shape, [start, cursor]));
+    }
+    for (name, shape) in complete_glm_moe_dsa_tensor_shapes()
+        .into_iter()
+        .filter(|(name, _)| {
+            !matches!(
+                *name,
+                "model.embed_tokens.weight" | "model.norm.weight" | "lm_head.weight"
+            )
+        })
+    {
+        let element_count = shape.iter().product::<usize>();
+        let start = cursor;
+        payload.resize(payload.len() + element_count * 4, 0);
+        cursor += element_count * 4;
+        tensors.push((name, "F32", shape, [start, cursor]));
+    }
 
     write_safetensors_file(&model_dir.join("model.safetensors"), &tensors, &payload)
         .expect("safetensors shard should be written");

@@ -311,7 +311,12 @@ async fn bootstrap_grpc_router_service_rejects_generation_for_unsupported_local_
 async fn bootstrap_grpc_router_service_routes_glm_moe_dsa_through_runtime_loader() {
     let model_dir = temp_model_dir("server-glm-runtime-forward");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");
-    write_complete_glm_moe_dsa_checkpoint(&model_dir);
+    write_complete_glm_moe_dsa_forward_checkpoint(&model_dir);
+    fs::write(
+        model_dir.join("tokenizer.json"),
+        word_level_tokenizer_json(),
+    )
+    .expect("tokenizer should be written");
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
@@ -321,7 +326,7 @@ async fn bootstrap_grpc_router_service_routes_glm_moe_dsa_through_runtime_loader
     .expect("args should parse");
     let service = build_bootstrap_grpc_router_service(&args);
 
-    let error = match service
+    let mut stream = service
         .text_generate(Request::new(TextGenerateRequest {
             text: "hello".to_string(),
             sampling_params: Some(SamplingParams {
@@ -337,21 +342,28 @@ async fn bootstrap_grpc_router_service_routes_glm_moe_dsa_through_runtime_loader
             disaggregated_params: None,
         }))
         .await
-    {
-        Ok(_) => panic!("GLM runtime should not generate fake output before kernels exist"),
-        Err(error) => error,
-    };
+        .expect("GLM f32 runtime should execute")
+        .into_inner();
 
-    assert_eq!(error.code(), tonic::Code::Internal);
-    assert!(
-        error
-            .message()
-            .contains("GLM MoE DSA Rust forward kernels are not implemented"),
-        "unexpected error: {error:?}"
-    );
-    assert!(
-        error.message().contains("loaded 1 tensor-parallel rank(s)"),
-        "unexpected error: {error:?}"
+    let response = tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
+        .await
+        .expect("one response")
+        .expect("response should be ok");
+
+    assert_eq!(response.request_id, "glm-runtime-forward");
+    assert_eq!(
+        response.body,
+        Some(Body::Complete(
+            sglang_srt::proto::sglang::runtime::v1::GenerateComplete {
+                output_ids: vec![2],
+                text: "world".to_string(),
+                finish_reason: "stop".to_string(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                cached_tokens: 0,
+                index: 0,
+            }
+        ))
     );
 
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
@@ -1597,103 +1609,120 @@ fn write_complete_deepseek_v4_checkpoint(model_dir: &std::path::Path) {
     .expect("shard should be written");
 }
 
-fn write_complete_glm_moe_dsa_checkpoint(model_dir: &std::path::Path) {
+fn write_complete_glm_moe_dsa_forward_checkpoint(model_dir: &std::path::Path) {
     fs::write(
         model_dir.join("config.json"),
         r#"{
   "model_type": "glm_moe_dsa",
+  "vocab_size": 3,
   "num_hidden_layers": 1,
-  "hidden_size": 1,
-  "num_attention_heads": 1,
-  "num_key_value_heads": 1,
-  "head_dim": 1,
+  "hidden_size": 4,
+  "num_attention_heads": 2,
+  "num_key_value_heads": 2,
+  "head_dim": 2,
+  "rms_norm_eps": 0.0,
   "n_routed_experts": 1,
   "first_k_dense_replace": 0,
   "moe_layer_freq": 1
 }"#,
     )
     .expect("config should be written");
+
+    let root_values: [f32; 28] = [
+        0.0, 0.0, 0.0, 0.0, // [UNK] embedding
+        1.0, 0.0, 0.0, 0.0, // hello embedding
+        0.0, 0.0, 1.0, 0.0, // world embedding
+        1.0, 1.0, 1.0, 1.0, // final norm
+        1.0, 0.0, 0.0, 0.0, // [UNK] lm_head
+        2.0, 0.0, 0.0, 0.0, // hello lm_head
+        3.0, 0.0, 0.0, 0.0, // world lm_head
+    ];
+    let mut payload = root_values
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    payload.resize(164, 0);
     write_safetensors_file(
         &model_dir.join("model.safetensors"),
         &[
-            ("model.embed_tokens.weight", "U8", &[1], [0, 1]),
-            ("model.norm.weight", "U8", &[1], [1, 2]),
-            ("lm_head.weight", "U8", &[1], [2, 3]),
+            ("model.embed_tokens.weight", "F32", &[3, 4], [0, 48]),
+            ("model.norm.weight", "F32", &[4], [48, 64]),
+            ("lm_head.weight", "F32", &[3, 4], [64, 112]),
             (
                 "model.layers.0.self_attn.q_a_proj.weight",
-                "U8",
+                "F32",
                 &[1],
-                [3, 4],
+                [112, 116],
             ),
             (
                 "model.layers.0.self_attn.q_a_layernorm.weight",
-                "U8",
+                "F32",
                 &[1],
-                [4, 5],
+                [116, 120],
             ),
             (
                 "model.layers.0.self_attn.q_b_proj.weight",
-                "U8",
+                "F32",
                 &[1],
-                [5, 6],
+                [120, 124],
             ),
             (
                 "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
-                "U8",
+                "F32",
                 &[1],
-                [6, 7],
+                [124, 128],
             ),
             (
                 "model.layers.0.self_attn.kv_a_layernorm.weight",
-                "U8",
+                "F32",
                 &[1],
-                [7, 8],
+                [128, 132],
             ),
             (
                 "model.layers.0.self_attn.kv_b_proj.weight",
-                "U8",
+                "F32",
                 &[1],
-                [8, 9],
+                [132, 136],
             ),
             (
                 "model.layers.0.self_attn.o_proj.weight",
-                "U8",
+                "F32",
                 &[1],
-                [9, 10],
+                [136, 140],
             ),
             (
                 "model.layers.0.input_layernorm.weight",
-                "U8",
+                "F32",
                 &[1],
-                [10, 11],
+                [140, 144],
             ),
             (
                 "model.layers.0.post_attention_layernorm.weight",
-                "U8",
+                "F32",
                 &[1],
-                [11, 12],
+                [144, 148],
             ),
-            ("model.layers.0.mlp.gate.weight", "U8", &[1], [12, 13]),
+            ("model.layers.0.mlp.gate.weight", "F32", &[1], [148, 152]),
             (
                 "model.layers.0.mlp.experts.0.gate_proj.weight",
-                "U8",
+                "F32",
                 &[1],
-                [13, 14],
+                [152, 156],
             ),
             (
                 "model.layers.0.mlp.experts.0.down_proj.weight",
-                "U8",
+                "F32",
                 &[1],
-                [14, 15],
+                [156, 160],
             ),
             (
                 "model.layers.0.mlp.experts.0.up_proj.weight",
-                "U8",
+                "F32",
                 &[1],
-                [15, 16],
+                [160, 164],
             ),
         ],
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        &payload,
     )
     .expect("shard should be written");
 }
