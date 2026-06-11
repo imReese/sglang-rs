@@ -55,6 +55,18 @@ impl Drop for LoadGuard {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvCacheLayoutInfo {
+    pub dtype: String,
+    pub page_size: u64,
+    pub num_layers: u64,
+    pub kv_heads: u64,
+    pub head_dim: u64,
+    pub kv_tensors_per_token: u64,
+    pub bytes_per_token: u64,
+    pub page_size_bytes: u64,
+}
+
 impl WorkerMode {
     fn as_u8(self) -> u8 {
         match self {
@@ -99,6 +111,11 @@ pub struct Worker {
     /// decode and plain). Set via `--disaggregation-bootstrap-port` at
     /// worker startup; carried from `WorkerSpec`.
     bootstrap_port: Option<u16>,
+    /// Runtime KV-cache layout reported by the worker's `/server_info`
+    /// or gRPC `GetServerInfo`. This is not a discovery-backend field:
+    /// it depends on the loaded model/config and is used by router-side
+    /// PD checks and future heterogeneous-pool routing decisions.
+    kv_cache_layout: Option<KvCacheLayoutInfo>,
 }
 
 impl Worker {
@@ -111,6 +128,14 @@ impl Worker {
     pub fn with_cb_config(
         spec: crate::discovery::WorkerSpec,
         cb: Option<CircuitBreakerConfig>,
+    ) -> Self {
+        Self::with_cb_config_and_kv_cache_layout(spec, cb, None)
+    }
+
+    pub fn with_cb_config_and_kv_cache_layout(
+        spec: crate::discovery::WorkerSpec,
+        cb: Option<CircuitBreakerConfig>,
+        kv_cache_layout: Option<KvCacheLayoutInfo>,
     ) -> Self {
         let breaker = match cb {
             Some(cfg) => Arc::new(CircuitBreaker::with_config(cfg)),
@@ -126,6 +151,7 @@ impl Worker {
             active_requests: Arc::new(AtomicUsize::new(0)),
             bootstrap_host,
             bootstrap_port: spec.bootstrap_port,
+            kv_cache_layout,
         }
     }
 
@@ -137,6 +163,10 @@ impl Worker {
     /// SGLang bootstrap server port. `None` for decode / plain workers.
     pub fn bootstrap_port(&self) -> Option<u16> {
         self.bootstrap_port
+    }
+
+    pub fn kv_cache_layout(&self) -> Option<&KvCacheLayoutInfo> {
+        self.kv_cache_layout.as_ref()
     }
 
     /// Returns the current [`WorkerMode`] of this worker.
@@ -242,6 +272,33 @@ mod tests {
             bootstrap_port: Some(8997),
         });
         assert_eq!(w.bootstrap_port(), Some(8997));
+    }
+
+    #[test]
+    fn worker_keeps_runtime_kv_cache_layout_metadata() {
+        let layout = KvCacheLayoutInfo {
+            dtype: "bfloat16".to_string(),
+            page_size: 64,
+            num_layers: 78,
+            kv_heads: 64,
+            head_dim: 64,
+            kv_tensors_per_token: 2,
+            bytes_per_token: 1_277_952,
+            page_size_bytes: 81_788_928,
+        };
+        let w = Worker::with_cb_config_and_kv_cache_layout(
+            WorkerSpec {
+                id: WorkerId("p1".into()),
+                url: "http://10.0.0.1:30000".into(),
+                mode: WorkerMode::Prefill,
+                model_ids: vec![ModelId("glm".into())],
+                bootstrap_port: Some(8997),
+            },
+            None,
+            Some(layout.clone()),
+        );
+
+        assert_eq!(w.kv_cache_layout(), Some(&layout));
     }
 
     #[test]

@@ -169,6 +169,14 @@ async fn manager_resolves_pd_role_from_real_srt_grpc_server_info() {
         &bootstrap_addr.port().to_string(),
         "--disaggregation-zmq-ports",
         &format!("{}-{}", zmq_addr.port(), zmq_addr.port()),
+        "--kv-cache-dtype",
+        "bfloat16",
+        "--kv-cache-num-layers",
+        "78",
+        "--kv-cache-kv-heads",
+        "64",
+        "--kv-cache-head-dim",
+        "64",
         "--page-size",
         "64",
     ])
@@ -201,6 +209,17 @@ async fn manager_resolves_pd_role_from_real_srt_grpc_server_info() {
         "manager should classify real Rust SRT gRPC prefill worker from GetServerInfo"
     );
     assert_eq!(workers[0].bootstrap_port(), Some(bootstrap_addr.port()));
+    let kv_cache = workers[0]
+        .kv_cache_layout()
+        .expect("manager should carry SRT GetServerInfo kv_cache layout onto the worker");
+    assert_eq!(kv_cache.dtype, "bfloat16");
+    assert_eq!(kv_cache.page_size, 64);
+    assert_eq!(kv_cache.num_layers, 78);
+    assert_eq!(kv_cache.kv_heads, 64);
+    assert_eq!(kv_cache.head_dim, 64);
+    assert_eq!(kv_cache.kv_tensors_per_token, 2);
+    assert_eq!(kv_cache.bytes_per_token, 78 * 2 * 64 * 64 * 2);
+    assert_eq!(kv_cache.page_size_bytes, 64 * 78 * 2 * 64 * 64 * 2);
 
     shutdown_tx
         .send(())

@@ -8,5 +8,6 @@ pub mod worker;
 
 pub use introspect::{ServerInfo, WorkerIntrospector};
 pub use registry::WorkerRegistry;
+pub use worker::KvCacheLayoutInfo;
 pub use worker::LoadGuard;
 pub use worker::Worker;

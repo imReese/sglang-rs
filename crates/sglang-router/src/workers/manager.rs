@@ -254,7 +254,7 @@ async fn register_one(
         }
     }
     let cb = cfg.as_ref().and_then(|c| cb_config_for_spec(&spec, c));
-    if let Err(e) = registry.add_with_cb(spec, cb) {
+    if let Err(e) = registry.add_with_cb_and_kv_cache_layout(spec, cb, info.kv_cache_layout) {
         // Mixed PD + plain on the same model is rejected at registration
         // time. Log loudly so the operator notices the conflicting
         // worker — the alternative (silently dropping into either pool)

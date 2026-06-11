@@ -3,7 +3,7 @@
 
 use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use crate::health::circuit_breaker::CircuitBreakerConfig;
-use crate::workers::worker::Worker;
+use crate::workers::worker::{KvCacheLayoutInfo, Worker};
 use dashmap::DashMap;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -84,6 +84,15 @@ impl WorkerRegistry {
         spec: WorkerSpec,
         cb: Option<CircuitBreakerConfig>,
     ) -> Result<(), AddWorkerError> {
+        self.add_with_cb_and_kv_cache_layout(spec, cb, None)
+    }
+
+    pub fn add_with_cb_and_kv_cache_layout(
+        &self,
+        spec: WorkerSpec,
+        cb: Option<CircuitBreakerConfig>,
+        kv_cache_layout: Option<KvCacheLayoutInfo>,
+    ) -> Result<(), AddWorkerError> {
         let incoming_mode = spec.mode;
         // Hold the write lock for the entire validate→insert sequence.
         // Without it, two concurrent callers for conflicting modes on
@@ -121,7 +130,11 @@ impl WorkerRegistry {
                 }
             }
         }
-        let w = Arc::new(Worker::with_cb_config(spec, cb));
+        let w = Arc::new(Worker::with_cb_config_and_kv_cache_layout(
+            spec,
+            cb,
+            kv_cache_layout,
+        ));
         let id = w.id.clone();
         self.remove_locked(&id);
         for m in &w.model_ids {

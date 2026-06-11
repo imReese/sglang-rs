@@ -32,6 +32,7 @@ use tracing::warn;
 use url::Url;
 
 use crate::policies::kv_events::EventConfig;
+use crate::workers::KvCacheLayoutInfo;
 
 /// Default timeout for `/server_info`. Conservative for a small JSON
 /// payload served by SGLang's HTTP server.
@@ -57,6 +58,7 @@ pub struct ServerInfo {
     pub served_model_name: Option<String>,
     pub event_config: Option<EventConfig>,
     pub disaggregation_role: Option<DisaggregationRole>,
+    pub kv_cache_layout: Option<KvCacheLayoutInfo>,
 }
 
 /// PD classification derived from a worker's `/server_info` response.
@@ -288,11 +290,15 @@ fn server_info_from_body(parsed: ServerInfoBody, worker_url: &str) -> ServerInfo
         parsed.disaggregation_bootstrap_port,
         worker_url,
     );
+    let kv_cache_layout = parsed
+        .kv_cache
+        .and_then(|block| resolve_kv_cache_layout(block, worker_url));
 
     ServerInfo {
         served_model_name,
         event_config,
         disaggregation_role,
+        kv_cache_layout,
     }
 }
 
@@ -407,6 +413,8 @@ struct ServerInfoBody {
     /// bootstrap server binds to exactly this port (no internal offset).
     #[serde(default)]
     disaggregation_bootstrap_port: Option<u16>,
+    #[serde(default)]
+    kv_cache: Option<KvCacheBlock>,
 }
 
 impl ServerInfoBody {
@@ -416,12 +424,14 @@ impl ServerInfoBody {
         let disaggregation_bootstrap_port =
             parse_u16_attribute(&attributes, "disaggregation_bootstrap_port");
         let kv_events = kv_events_block_from_attributes(&attributes);
+        let kv_cache = kv_cache_block_from_attributes(&attributes);
 
         Self {
             served_model_name,
             kv_events,
             disaggregation_mode,
             disaggregation_bootstrap_port,
+            kv_cache,
         }
     }
 }
@@ -446,6 +456,12 @@ fn parse_u32_attribute(attributes: &HashMap<String, String>, key: &str) -> Optio
         .and_then(|value| value.parse::<u32>().ok())
 }
 
+fn parse_u64_attribute(attributes: &HashMap<String, String>, key: &str) -> Option<u64> {
+    attributes
+        .get(key)
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
 fn kv_events_block_from_attributes(attributes: &HashMap<String, String>) -> Option<KvEventsBlock> {
     let endpoint_host = non_empty_attribute(attributes, "kv_events.endpoint_host")?;
     let endpoint_port_base = parse_u16_attribute(attributes, "kv_events.endpoint_port_base")?;
@@ -465,6 +481,70 @@ fn kv_events_block_from_attributes(attributes: &HashMap<String, String>) -> Opti
     })
 }
 
+fn kv_cache_block_from_attributes(attributes: &HashMap<String, String>) -> Option<KvCacheBlock> {
+    let dtype = non_empty_attribute(attributes, "kv_cache.dtype")?;
+    Some(KvCacheBlock {
+        dtype: Some(dtype),
+        page_size: parse_u64_attribute(attributes, "kv_cache.page_size"),
+        num_layers: parse_u64_attribute(attributes, "kv_cache.num_layers"),
+        kv_heads: parse_u64_attribute(attributes, "kv_cache.kv_heads"),
+        head_dim: parse_u64_attribute(attributes, "kv_cache.head_dim"),
+        kv_tensors_per_token: parse_u64_attribute(attributes, "kv_cache.kv_tensors_per_token"),
+        bytes_per_token: parse_u64_attribute(attributes, "kv_cache.bytes_per_token"),
+        page_size_bytes: parse_u64_attribute(attributes, "kv_cache.page_size_bytes"),
+    })
+}
+
+fn resolve_kv_cache_layout(block: KvCacheBlock, worker_url: &str) -> Option<KvCacheLayoutInfo> {
+    let Some(dtype) = block
+        .dtype
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        warn!(
+            worker_url = %worker_url,
+            "introspect: /server_info kv_cache block is missing dtype; ignoring kv_cache metadata"
+        );
+        return None;
+    };
+
+    let (
+        Some(page_size),
+        Some(num_layers),
+        Some(kv_heads),
+        Some(head_dim),
+        Some(kv_tensors_per_token),
+        Some(bytes_per_token),
+        Some(page_size_bytes),
+    ) = (
+        block.page_size,
+        block.num_layers,
+        block.kv_heads,
+        block.head_dim,
+        block.kv_tensors_per_token,
+        block.bytes_per_token,
+        block.page_size_bytes,
+    )
+    else {
+        warn!(
+            worker_url = %worker_url,
+            "introspect: /server_info kv_cache block is incomplete; ignoring kv_cache metadata"
+        );
+        return None;
+    };
+
+    Some(KvCacheLayoutInfo {
+        dtype,
+        page_size,
+        num_layers,
+        kv_heads,
+        head_dim,
+        kv_tensors_per_token,
+        bytes_per_token,
+        page_size_bytes,
+    })
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct KvEventsBlock {
     // Forward-compatibility: the only publisher implementation
@@ -481,6 +561,26 @@ pub(crate) struct KvEventsBlock {
     pub topic: String,
     pub block_size: u32,
     pub dp_size: u32,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct KvCacheBlock {
+    #[serde(default)]
+    dtype: Option<String>,
+    #[serde(default)]
+    page_size: Option<u64>,
+    #[serde(default)]
+    num_layers: Option<u64>,
+    #[serde(default)]
+    kv_heads: Option<u64>,
+    #[serde(default)]
+    head_dim: Option<u64>,
+    #[serde(default)]
+    kv_tensors_per_token: Option<u64>,
+    #[serde(default)]
+    bytes_per_token: Option<u64>,
+    #[serde(default)]
+    page_size_bytes: Option<u64>,
 }
 
 #[cfg(test)]
@@ -540,6 +640,38 @@ mod tests {
         assert_eq!(cfg.topic, "kv");
         assert_eq!(cfg.block_size, 64);
         assert_eq!(cfg.dp_size, 2);
+    }
+
+    #[tokio::test]
+    async fn fetch_returns_kv_cache_layout_metadata() {
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "GLM-5-FP8",
+            "kv_cache": {
+                "dtype": "bfloat16",
+                "page_size": 64,
+                "num_layers": 78,
+                "kv_heads": 64,
+                "head_dim": 64,
+                "kv_tensors_per_token": 2,
+                "bytes_per_token": 1_277_952,
+                "page_size_bytes": 81_788_928,
+            }
+        }))
+        .await;
+
+        let got = fast_introspector().fetch(&url).await;
+        let layout = got
+            .kv_cache_layout
+            .expect("kv_cache metadata should be parsed");
+
+        assert_eq!(layout.dtype, "bfloat16");
+        assert_eq!(layout.page_size, 64);
+        assert_eq!(layout.num_layers, 78);
+        assert_eq!(layout.kv_heads, 64);
+        assert_eq!(layout.head_dim, 64);
+        assert_eq!(layout.kv_tensors_per_token, 2);
+        assert_eq!(layout.bytes_per_token, 1_277_952);
+        assert_eq!(layout.page_size_bytes, 81_788_928);
     }
 
     #[tokio::test]
