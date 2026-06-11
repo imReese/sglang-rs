@@ -19,9 +19,10 @@ use serde_json::Value;
 use sglang_srt::proto::sglang::runtime::v1::generate_response::Body as ProtoGenerateResponseBody;
 use sglang_srt::proto::sglang::runtime::v1::sglang_service_client::SglangServiceClient;
 use sglang_srt::proto::sglang::runtime::v1::{
-    DisaggregatedParams as ProtoDisaggregatedParams, GenerateResponse as ProtoGenerateResponse,
-    OpenAiJsonRequest, OpenAiJsonResponse, RequestOptions as ProtoRequestOptions,
-    SamplingParams as ProtoSamplingParams, TextGenerateRequest as ProtoTextGenerateRequest,
+    DisaggregatedParams as ProtoDisaggregatedParams, GenerateRequest as ProtoGenerateRequest,
+    GenerateResponse as ProtoGenerateResponse, OpenAiJsonRequest, OpenAiJsonResponse,
+    RequestOptions as ProtoRequestOptions, SamplingParams as ProtoSamplingParams,
+    TextGenerateRequest as ProtoTextGenerateRequest,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -179,6 +180,17 @@ fn optional_string_field(
         .transpose()
 }
 
+fn request_options_from_json(
+    object: &serde_json::Map<String, Value>,
+) -> Result<ProtoRequestOptions, tonic::Status> {
+    Ok(ProtoRequestOptions {
+        request_id: optional_string_field(object, "request_id")?,
+        stream: optional_bool_field(object, "stream")?.unwrap_or(false),
+        data_parallel_rank: optional_i32_field(object, "data_parallel_rank")?.unwrap_or_default(),
+        trace_headers: Default::default(),
+    })
+}
+
 fn proto_sampling_params_from_json(
     payload: &serde_json::Map<String, Value>,
 ) -> Result<Option<ProtoSamplingParams>, tonic::Status> {
@@ -280,14 +292,37 @@ fn proto_disaggregated_params_from_json(
     }))
 }
 
-fn proto_text_generate_request_from_json(
-    body: &[u8],
-) -> Result<ProtoTextGenerateRequest, tonic::Status> {
+fn generate_json_object(body: &[u8]) -> Result<serde_json::Map<String, Value>, tonic::Status> {
     let value: Value = serde_json::from_slice(body)
         .map_err(|e| grpc_generate_status(format!("invalid /generate JSON: {e}")))?;
-    let object = value
+    value
         .as_object()
-        .ok_or_else(|| grpc_generate_status("/generate body must be a JSON object"))?;
+        .cloned()
+        .ok_or_else(|| grpc_generate_status("/generate body must be a JSON object"))
+}
+
+enum NativeGenerateRequest {
+    Text(ProtoTextGenerateRequest),
+    Tokenized(ProtoGenerateRequest),
+}
+
+fn proto_native_generate_request_from_json(
+    body: &[u8],
+) -> Result<NativeGenerateRequest, tonic::Status> {
+    let object = generate_json_object(body)?;
+    if object.contains_key("input_ids") {
+        return Ok(NativeGenerateRequest::Tokenized(
+            proto_generate_request_from_json_object(&object)?,
+        ));
+    }
+    Ok(NativeGenerateRequest::Text(
+        proto_text_generate_request_from_json_object(&object)?,
+    ))
+}
+
+fn proto_text_generate_request_from_json_object(
+    object: &serde_json::Map<String, Value>,
+) -> Result<ProtoTextGenerateRequest, tonic::Status> {
     let text = object
         .get("text")
         .and_then(Value::as_str)
@@ -297,13 +332,33 @@ fn proto_text_generate_request_from_json(
     Ok(ProtoTextGenerateRequest {
         text,
         sampling_params: proto_sampling_params_from_json(object)?,
-        options: Some(ProtoRequestOptions {
-            request_id: optional_string_field(object, "request_id")?,
-            stream: optional_bool_field(object, "stream")?.unwrap_or(false),
-            data_parallel_rank: optional_i32_field(object, "data_parallel_rank")?
-                .unwrap_or_default(),
-            trace_headers: Default::default(),
-        }),
+        options: Some(request_options_from_json(object)?),
+        disaggregated_params: proto_disaggregated_params_from_json(object)?,
+    })
+}
+
+fn proto_generate_request_from_json_object(
+    object: &serde_json::Map<String, Value>,
+) -> Result<ProtoGenerateRequest, tonic::Status> {
+    let input_ids = object
+        .get("input_ids")
+        .ok_or_else(|| grpc_generate_status("missing input_ids"))?
+        .as_array()
+        .ok_or_else(|| grpc_generate_status("input_ids must be an array"))?
+        .iter()
+        .map(|value| value_as_u32(value, "input_ids"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let original_text = object
+        .get("original_text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    Ok(ProtoGenerateRequest {
+        input_ids,
+        original_text,
+        sampling_params: proto_sampling_params_from_json(object)?,
+        options: Some(request_options_from_json(object)?),
         disaggregated_params: proto_disaggregated_params_from_json(object)?,
     })
 }
@@ -601,7 +656,7 @@ impl Proxy {
 
         let fut = async {
             let request =
-                proto_text_generate_request_from_json(&body).map_err(GrpcForwardError::Status)?;
+                proto_native_generate_request_from_json(&body).map_err(GrpcForwardError::Status)?;
             let channel = tonic::transport::Endpoint::from_shared(endpoint.clone())
                 .map_err(|e| {
                     GrpcForwardError::Transport(anyhow::anyhow!(
@@ -618,18 +673,25 @@ impl Proxy {
                     ))
                 })?;
             let mut client = SglangServiceClient::new(channel);
-            let mut stream = client
-                .text_generate(GrpcRequest::new(request))
-                .await
-                .map_err(GrpcForwardError::Status)?
-                .into_inner();
+            let mut stream = match request {
+                NativeGenerateRequest::Text(request) => client
+                    .text_generate(GrpcRequest::new(request))
+                    .await
+                    .map_err(GrpcForwardError::Status)?
+                    .into_inner(),
+                NativeGenerateRequest::Tokenized(request) => client
+                    .generate(GrpcRequest::new(request))
+                    .await
+                    .map_err(GrpcForwardError::Status)?
+                    .into_inner(),
+            };
             let first = stream
                 .message()
                 .await
                 .map_err(GrpcForwardError::Status)?
                 .ok_or_else(|| {
                     GrpcForwardError::Status(tonic::Status::internal(
-                        "gRPC TextGenerate returned no response",
+                        "gRPC native Generate returned no response",
                     ))
                 })?;
             proto_generate_response_to_json(first).map_err(GrpcForwardError::Transport)
@@ -888,7 +950,7 @@ impl Proxy {
 
         let fut = async {
             let request =
-                proto_text_generate_request_from_json(&body).map_err(GrpcForwardError::Status)?;
+                proto_native_generate_request_from_json(&body).map_err(GrpcForwardError::Status)?;
             let channel = tonic::transport::Endpoint::from_shared(endpoint.clone())
                 .map_err(|e| {
                     GrpcForwardError::Transport(anyhow::anyhow!(
@@ -904,11 +966,18 @@ impl Proxy {
                     ))
                 })?;
             let mut client = SglangServiceClient::new(channel);
-            client
-                .text_generate(GrpcRequest::new(request))
-                .await
-                .map_err(GrpcForwardError::Status)
-                .map(|response| response.into_inner())
+            match request {
+                NativeGenerateRequest::Text(request) => client
+                    .text_generate(GrpcRequest::new(request))
+                    .await
+                    .map_err(GrpcForwardError::Status)
+                    .map(|response| response.into_inner()),
+                NativeGenerateRequest::Tokenized(request) => client
+                    .generate(GrpcRequest::new(request))
+                    .await
+                    .map_err(GrpcForwardError::Status)
+                    .map(|response| response.into_inner()),
+            }
         };
 
         let stream = match tokio::time::timeout(self.request_timeout, fut).await {
