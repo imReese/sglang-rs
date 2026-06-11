@@ -1,18 +1,226 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::{Context, Result};
-use clap::Parser;
-use sgl_router::config::LogFormat;
+use anyhow::{anyhow, bail, Context, Result};
+use clap::{ArgAction, Parser, Subcommand};
+use sgl_router::config::{
+    ActiveLoadConfig, Config, DiscoveryBackend, DiscoveryConfig, LogFormat, ModelConfig,
+    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::signal::unix::{signal, Signal, SignalKind};
 
 #[derive(Parser, Debug)]
-#[command(name = "sgl-router", version)]
+#[command(
+    name = "sgl-router",
+    alias = "sglang-router",
+    alias = "smg",
+    version,
+    args_conflicts_with_subcommands = true
+)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    #[command(flatten)]
+    router_args: RouterArgs,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Launch the router, matching sgl-model-gateway's primary command shape.
+    #[command(visible_alias = "start")]
+    Launch {
+        #[command(flatten)]
+        args: RouterArgs,
+    },
+}
+
+#[derive(Parser, Debug, Clone)]
+struct RouterArgs {
     #[arg(long, env = "SGL_ROUTER_CONFIG")]
-    config: PathBuf,
+    config: Option<PathBuf>,
+
+    #[arg(long, default_value = "0.0.0.0")]
+    host: String,
+
+    #[arg(long, default_value_t = 30000)]
+    port: u16,
+
+    /// Regular-mode worker URLs, matching sgl-model-gateway's `--worker-urls`.
+    #[arg(long, num_args = 0..)]
+    worker_urls: Vec<String>,
+
+    /// Load-balancing policy name accepted by sgl-model-gateway.
+    #[arg(
+        long,
+        default_value = "round_robin",
+        value_parser = ["random", "round_robin", "cache_aware", "cache_aware_zmq", "power_of_two"]
+    )]
+    policy: String,
+
+    /// Enable PD (prefill/decode) routing mode.
+    #[arg(long, default_value_t = false)]
+    pd_disaggregation: bool,
+
+    /// Prefill worker URL, optionally followed by a bootstrap port.
+    #[arg(long, num_args = 1..=2, action = ArgAction::Append)]
+    prefill: Vec<String>,
+
+    /// Decode worker URL. Can be specified multiple times.
+    #[arg(long, action = ArgAction::Append)]
+    decode: Vec<String>,
+
+    /// Optional static model id for config-file parity.
+    #[arg(long)]
+    model_id: Option<String>,
+
+    /// sgl-model-gateway-compatible alias for `--model-id`.
+    #[arg(long)]
+    served_model_name: Option<String>,
+
+    /// Optional tokenizer path for a statically configured model.
+    #[arg(long)]
+    tokenizer_path: Option<String>,
+
+    #[arg(long, default_value = "info")]
+    log_level: String,
+}
+
+impl Cli {
+    fn into_config(self) -> Result<Config> {
+        match self.command {
+            Some(Commands::Launch { args }) => args.into_config(),
+            None => self.router_args.into_config(),
+        }
+    }
+}
+
+impl RouterArgs {
+    fn into_config(self) -> Result<Config> {
+        if let Some(config_path) = self.config {
+            return Config::from_path(&config_path)
+                .with_context(|| format!("load config from {}", config_path.display()));
+        }
+
+        let urls = if self.pd_disaggregation {
+            let prefill_urls = extract_url_values(&self.prefill);
+            let decode_urls = extract_url_values(&self.decode);
+            if prefill_urls.is_empty() || decode_urls.is_empty() {
+                bail!(
+                    "direct PD launch requires at least one --prefill URL and at least one --decode URL"
+                );
+            }
+            let mut urls = prefill_urls;
+            urls.extend(decode_urls);
+            urls
+        } else {
+            extract_url_values(&self.worker_urls)
+        };
+        let urls = validate_and_normalize_urls(urls)?;
+        if urls.is_empty() {
+            bail!(
+                "direct launch requires --worker-urls, or --pd-disaggregation with --prefill and --decode"
+            );
+        }
+
+        let models = self.static_models()?;
+        Ok(Config {
+            server: ServerConfig {
+                host: self.host,
+                port: self.port,
+            },
+            observability: ObservabilityConfig {
+                log_level: self.log_level,
+                log_format: LogFormat::Text,
+            },
+            models,
+            discovery: DiscoveryConfig {
+                backend: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig { urls }),
+            },
+            proxy: ProxyConfig::default(),
+            active_load: ActiveLoadConfig::default(),
+        })
+    }
+
+    fn static_models(&self) -> Result<Vec<ModelConfig>> {
+        let model_id = self
+            .served_model_name
+            .as_ref()
+            .or(self.model_id.as_ref())
+            .map(|id| id.trim())
+            .filter(|id| !id.is_empty());
+        let tokenizer_path = self
+            .tokenizer_path
+            .as_ref()
+            .map(|path| path.trim())
+            .filter(|path| !path.is_empty());
+        match (model_id, tokenizer_path) {
+            (None, None) => Ok(Vec::new()),
+            (Some(_), None) => bail!(
+                "direct launch with --model-id/--served-model-name also requires --tokenizer-path"
+            ),
+            (None, Some(_)) => bail!(
+                "direct launch with --tokenizer-path also requires --model-id or --served-model-name"
+            ),
+            (Some(id), Some(path)) => Ok(vec![ModelConfig {
+                id: id.to_string(),
+                tokenizer_path: path.to_string(),
+                policy: policy_kind_from_smg_name(&self.policy)?,
+                circuit_breaker: None,
+                cache_aware: None,
+            }]),
+        }
+    }
+}
+
+fn extract_url_values(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .filter(|value| {
+            let trimmed = value.trim();
+            trimmed.starts_with("http://")
+                || trimmed.starts_with("https://")
+                || trimmed.starts_with("grpc://")
+                || trimmed.starts_with("grpcs://")
+        })
+        .cloned()
+        .collect()
+}
+
+fn validate_and_normalize_urls(values: Vec<String>) -> Result<Vec<String>> {
+    let mut urls = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for raw in values {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parsed = url::Url::parse(trimmed)
+            .map_err(|e| anyhow!("worker URL {raw:?} is not a valid URL: {e}"))?;
+        match parsed.scheme() {
+            "http" | "https" | "grpc" | "grpcs" => {}
+            other => bail!(
+                "worker URL {raw:?} has unsupported scheme {other:?}; only http, https, grpc, and grpcs are supported"
+            ),
+        }
+        let normalized = parsed.as_str().trim_end_matches('/').to_string();
+        if seen.insert(normalized.clone()) {
+            urls.push(normalized);
+        }
+    }
+    Ok(urls)
+}
+
+fn policy_kind_from_smg_name(name: &str) -> Result<PolicyKind> {
+    match name {
+        "round_robin" => Ok(PolicyKind::RoundRobin),
+        "random" => Ok(PolicyKind::Random),
+        "power_of_two" => Ok(PolicyKind::PowerOfTwo),
+        "cache_aware" | "cache_aware_zmq" => Ok(PolicyKind::CacheAwareZmq),
+        other => bail!("unsupported router policy {other:?}"),
+    }
 }
 
 /// Install the global tracing subscriber.
@@ -87,8 +295,7 @@ async fn main() -> Result<()> {
     // output. The configured-format subscriber installs after this and
     // becomes a no-op via try_init's idempotency.
     install_bootstrap_subscriber();
-    let cfg = sgl_router::config::Config::from_path(&cli.config)
-        .with_context(|| format!("load config from {}", cli.config.display()))?;
+    let cfg = cli.into_config()?;
 
     init_tracing(&cfg.observability.log_level, cfg.observability.log_format)?;
 
@@ -235,5 +442,66 @@ mod tests {
         // Doesn't matter whether we win or lose the race against another
         // subscriber install — the function must return Ok either way.
         assert!(init_tracing("info", LogFormat::Json).is_ok());
+    }
+
+    #[test]
+    fn launch_cli_accepts_sgl_model_gateway_pd_args() {
+        let cli = Cli::try_parse_from([
+            "sgl-router",
+            "launch",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "30000",
+            "--pd-disaggregation",
+            "--prefill",
+            "http://127.0.0.1:30001",
+            "8200",
+            "--decode",
+            "http://127.0.0.1:30002",
+            "--policy",
+            "cache_aware",
+        ])
+        .expect("SMG-compatible PD launch args should parse");
+
+        let cfg = cli
+            .into_config()
+            .expect("SMG-compatible PD launch args should build router config");
+
+        assert_eq!(cfg.server.host, "0.0.0.0");
+        assert_eq!(cfg.server.port, 30000);
+        match cfg.discovery.backend {
+            DiscoveryBackend::StaticUrls(static_urls) => {
+                assert_eq!(
+                    static_urls.urls,
+                    vec![
+                        "http://127.0.0.1:30001".to_string(),
+                        "http://127.0.0.1:30002".to_string(),
+                    ]
+                );
+            }
+            other => panic!("expected static_urls discovery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn launch_cli_rejects_partial_pd_pools() {
+        let cli = Cli::try_parse_from([
+            "sgl-router",
+            "launch",
+            "--pd-disaggregation",
+            "--prefill",
+            "http://127.0.0.1:30001",
+            "8200",
+        ])
+        .expect("CLI syntax is valid; semantic validation belongs to into_config");
+
+        let err = cli
+            .into_config()
+            .expect_err("PD direct launch must require both prefill and decode pools");
+        assert!(
+            err.to_string().contains("--prefill") && err.to_string().contains("--decode"),
+            "unexpected error: {err}"
+        );
     }
 }
