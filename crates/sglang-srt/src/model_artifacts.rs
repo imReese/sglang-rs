@@ -1091,8 +1091,16 @@ pub struct HfModelConfig {
 
 impl HfModelConfig {
     pub fn from_model_path(path: impl AsRef<Path>) -> Result<Self, ModelArtifactError> {
-        let model_path = resolve_model_path(path.as_ref());
-        Self::from_resolved_model_path(&model_path)
+        let path = path.as_ref();
+        let model_path = resolve_model_path(path);
+        match Self::from_resolved_model_path(&model_path) {
+            Ok(config) => Ok(config),
+            Err(_) if looks_like_hf_model_id(path) => {
+                let config_path = download_hf_model_config(path)?;
+                Self::from_resolved_config_path(&config_path)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn from_model_path_with_hf_cache(
@@ -1105,16 +1113,19 @@ impl HfModelConfig {
     }
 
     fn from_resolved_model_path(path: &Path) -> Result<Self, ModelArtifactError> {
-        let config_path = path.join("config.json");
+        Self::from_resolved_config_path(&path.join("config.json"))
+    }
+
+    fn from_resolved_config_path(config_path: &Path) -> Result<Self, ModelArtifactError> {
         let raw = fs::read_to_string(&config_path).map_err(|error| {
             ModelArtifactError::ReadModelConfig {
-                path: config_path.clone(),
+                path: config_path.to_path_buf(),
                 message: error.to_string(),
             }
         })?;
         let value: serde_json::Value =
             serde_json::from_str(&raw).map_err(|error| ModelArtifactError::InvalidModelConfig {
-                path: config_path.clone(),
+                path: config_path.to_path_buf(),
                 message: error.to_string(),
             })?;
 
@@ -2387,6 +2398,39 @@ fn read_string_array_field(value: &serde_json::Value, field: &str) -> Vec<String
         .filter_map(serde_json::Value::as_str)
         .map(ToString::to_string)
         .collect()
+}
+
+fn looks_like_hf_model_id(path: &Path) -> bool {
+    path.to_str().is_some_and(|model_id| {
+        model_id.contains('/')
+            && !model_id.starts_with('/')
+            && !model_id.starts_with('-')
+            && !model_id.contains('\\')
+    })
+}
+
+fn download_hf_model_config(model_id: &Path) -> Result<PathBuf, ModelArtifactError> {
+    let model_id = model_id
+        .to_str()
+        .expect("looks_like_hf_model_id should only accept UTF-8 repo ids");
+    let mut builder = if let Some(cache) = std::env::var_os("HUGGINGFACE_HUB_CACHE") {
+        hf_hub::api::sync::ApiBuilder::from_cache(hf_hub::Cache::new(PathBuf::from(cache)))
+    } else {
+        hf_hub::api::sync::ApiBuilder::from_env()
+    };
+    builder = builder.with_progress(false);
+    let api = builder
+        .build()
+        .map_err(|error| ModelArtifactError::ReadModelConfig {
+            path: PathBuf::from(model_id).join("config.json"),
+            message: format!("failed to initialize Hugging Face Hub client: {error}"),
+        })?;
+    api.model(model_id.to_string())
+        .get("config.json")
+        .map_err(|error| ModelArtifactError::ReadModelConfig {
+            path: PathBuf::from(model_id).join("config.json"),
+            message: format!("failed to fetch Hugging Face config.json: {error}"),
+        })
 }
 
 fn read_usize_field(

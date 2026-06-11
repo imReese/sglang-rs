@@ -4,7 +4,7 @@ use std::ffi::CString;
 use std::ffi::{NulError, c_char, c_int, c_void};
 use std::fmt;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 #[cfg(feature = "mooncake-link")]
 use std::sync::{Arc, Mutex};
 
@@ -216,14 +216,12 @@ impl KvCacheModelLayout {
             return Ok(None);
         }
 
-        let config_path = download_hf_model_config(model_path)?;
-        let Some(snapshot_dir) = config_path.parent() else {
-            return Err(PdConfigError::InvalidModelConfig(format!(
-                "downloaded Hugging Face config path has no parent: {}",
-                config_path.display()
-            )));
-        };
-        Self::from_resolved_model_path(snapshot_dir)
+        let config = HfModelConfig::from_model_path(model_path).map_err(|error| {
+            PdConfigError::InvalidModelConfig(format!(
+                "failed to load Hugging Face config for {model_path}: {error}"
+            ))
+        })?;
+        Self::from_hf_config(&config)
     }
 
     pub fn from_model_path_with_hf_cache(
@@ -388,27 +386,6 @@ fn looks_like_hf_model_id(model_path: &str) -> bool {
         && !model_path.starts_with('/')
         && !model_path.starts_with('-')
         && !model_path.contains('\\')
-}
-
-fn download_hf_model_config(model_id: &str) -> Result<PathBuf, PdConfigError> {
-    let mut builder = if let Some(cache) = std::env::var_os("HUGGINGFACE_HUB_CACHE") {
-        hf_hub::api::sync::ApiBuilder::from_cache(hf_hub::Cache::new(PathBuf::from(cache)))
-    } else {
-        hf_hub::api::sync::ApiBuilder::from_env()
-    };
-    builder = builder.with_progress(false);
-    let api = builder.build().map_err(|error| {
-        PdConfigError::InvalidModelConfig(format!(
-            "failed to initialize Hugging Face Hub client for {model_id}: {error}"
-        ))
-    })?;
-    api.model(model_id.to_string())
-        .get("config.json")
-        .map_err(|error| {
-            PdConfigError::InvalidModelConfig(format!(
-                "failed to fetch Hugging Face config.json for {model_id}: {error}"
-            ))
-        })
 }
 
 fn required_usize_field(
