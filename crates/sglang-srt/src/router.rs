@@ -545,6 +545,7 @@ pub struct RouterGetModelInfoResponse {
     pub vocab_size: i32,
     pub supports_vision: bool,
     pub model_type: String,
+    pub architectures: Vec<String>,
     pub eos_token_ids: Vec<i32>,
     pub pad_token_id: i32,
     pub bos_token_id: i32,
@@ -577,6 +578,7 @@ impl RouterGetModelInfoResponse {
             vocab_size: 0,
             supports_vision: false,
             model_type: String::new(),
+            architectures: Vec::new(),
             eos_token_ids: Vec::new(),
             pad_token_id: 0,
             bos_token_id: 0,
@@ -603,6 +605,7 @@ impl RouterGetModelInfoResponse {
         if let Some(model_type) = config.model_type {
             self.model_type = model_type;
         }
+        self.architectures = config.architectures;
         self.eos_token_ids = config
             .eos_token_ids
             .into_iter()

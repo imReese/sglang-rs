@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::{fs, path::PathBuf};
 
 use serde_json::Value;
 use tokio::sync::oneshot;
@@ -483,6 +484,113 @@ async fn http_server_reports_plain_worker_server_info_for_sgl_router() {
         .await
         .expect("server task should join")
         .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_reports_model_info_and_legacy_aliases_for_sgl_gateway_discovery() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy-model",
+        "--tokenizer-path",
+        "dummy-tokenizer",
+        "--served-model-name",
+        "glm-router-discovery",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let service = build_bootstrap_http_router_service(&args);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let model_info = get_json_with_retry(addr, "/model_info").await;
+    let legacy_model_info = get_json_with_retry(addr, "/get_model_info").await;
+    let legacy_server_info = get_json_with_retry(addr, "/get_server_info").await;
+
+    assert_eq!(model_info["model_path"], "dummy-model");
+    assert_eq!(model_info["tokenizer_path"], "dummy-tokenizer");
+    assert_eq!(model_info["is_generation"], true);
+    assert_eq!(model_info["model_type"], "");
+    assert_eq!(
+        model_info["architectures"].as_array().unwrap().len(),
+        0,
+        "gateway discovery should be able to deserialize architectures as an array"
+    );
+    assert_eq!(legacy_model_info, model_info);
+    assert_eq!(
+        legacy_server_info["served_model_name"],
+        "glm-router-discovery"
+    );
+    assert_eq!(legacy_server_info["disaggregation_mode"], "null");
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_model_info_reports_local_model_architectures_for_gateway_discovery() {
+    let model_dir = temp_model_dir("http-model-info-architectures");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "model_type": "glm_moe_dsa",
+  "architectures": ["GlmMoEDSAModel"]
+}"#,
+    )
+    .expect("config should be written");
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_dir.to_str().expect("temp model dir should be utf-8"),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let service = build_bootstrap_http_router_service(&args);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let model_info = get_json_with_retry(addr, "/model_info").await;
+
+    assert_eq!(model_info["model_type"], "glm_moe_dsa");
+    assert_eq!(
+        model_info["architectures"],
+        serde_json::json!(["GlmMoEDSAModel"])
+    );
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1234,6 +1342,10 @@ fn unused_local_addr() -> SocketAddr {
     listener
         .local_addr()
         .expect("ephemeral listener should have local addr")
+}
+
+fn temp_model_dir(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("sglang-rs-{name}-{}", std::process::id()))
 }
 
 fn unused_contiguous_local_ports_excluding(count: u16, excluded_ports: &[u16]) -> Vec<u16> {

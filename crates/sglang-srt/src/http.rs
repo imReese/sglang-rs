@@ -107,7 +107,10 @@ where
         Router::new()
             .route("/health", get(health))
             .route("/v1/models", get(list_models::<T, W>))
+            .route("/model_info", get(model_info::<T, W>))
+            .route("/get_model_info", get(model_info::<T, W>))
             .route("/server_info", get(server_info::<T, W>))
+            .route("/get_server_info", get(server_info::<T, W>))
             .route("/v1/chat/completions", post(chat_completions::<T, W>))
             .route("/v1/completions", post(completions::<T, W>))
             .route("/generate", post(generate::<T, W>))
@@ -212,6 +215,31 @@ where
     }
 
     Json(body)
+}
+
+async fn model_info<T, W>(State(service): State<HttpRouterService<T, W>>) -> Json<Value>
+where
+    T: Send + 'static,
+    W: Send + 'static,
+{
+    let info = service.model_info;
+    Json(json!({
+        "model_path": info.model_path,
+        "tokenizer_path": info.tokenizer_path,
+        "is_generation": info.is_generation,
+        "preferred_sampling_params": info.preferred_sampling_params,
+        "weight_version": info.weight_version,
+        "has_image_understanding": info.supports_vision,
+        "has_audio_understanding": false,
+        "model_type": info.model_type,
+        "architectures": info.architectures,
+        "max_context_length": info.max_context_length,
+        "vocab_size": info.vocab_size,
+        "eos_token_ids": info.eos_token_ids,
+        "pad_token_id": info.pad_token_id,
+        "bos_token_id": info.bos_token_id,
+        "max_req_input_len": info.max_req_input_len,
+    }))
 }
 
 async fn generate<T, W>(
