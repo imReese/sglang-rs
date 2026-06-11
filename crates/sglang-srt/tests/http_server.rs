@@ -139,6 +139,109 @@ async fn http_server_accepts_tokenized_generate_requests() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_accepts_tokenize_and_detokenize_requests_for_sglang_clients() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "glm-http-tokenize",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let service = build_bootstrap_http_router_service(&args);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let tokenized = post_json_with_retry(
+        addr,
+        "/v1/tokenize",
+        r#"{"model":"glm-http-tokenize","prompt":"Hello","add_special_tokens":true}"#,
+    )
+    .await;
+    assert_eq!(
+        tokenized["tokens"],
+        serde_json::json!([72, 101, 108, 108, 111])
+    );
+    assert_eq!(tokenized["count"], 5);
+    assert_eq!(tokenized["max_model_len"], -1);
+
+    let detokenized = post_json_with_retry(
+        addr,
+        "/detokenize",
+        r#"{"model":"glm-http-tokenize","tokens":[72,101,108,108,111],"skip_special_tokens":true}"#,
+    )
+    .await;
+    assert_eq!(detokenized["text"], "Hello");
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_rejects_invalid_detokenize_tokens() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "glm-http-detokenize-errors",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let service = build_bootstrap_http_router_service(&args);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let response = request_raw_with_retry(
+        addr,
+        "POST",
+        "/v1/detokenize",
+        Some(r#"{"model":"glm-http-detokenize-errors","tokens":[256]}"#),
+    )
+    .await;
+
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    assert!(
+        response.contains("Error decoding tokens"),
+        "invalid tokens should return an SGLang-style decode error: {response}"
+    );
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_server_accepts_streaming_generate_requests() {
     let args = ServerArgs::parse_from([
         "serve",

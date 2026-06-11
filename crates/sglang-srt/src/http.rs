@@ -119,6 +119,10 @@ where
                 "/flush_cache",
                 get(flush_cache::<T, W>).post(flush_cache::<T, W>),
             )
+            .route("/v1/tokenize", post(tokenize::<T, W>))
+            .route("/tokenize", post(tokenize::<T, W>))
+            .route("/v1/detokenize", post(detokenize::<T, W>))
+            .route("/detokenize", post(detokenize::<T, W>))
             .route("/v1/chat/completions", post(chat_completions::<T, W>))
             .route("/v1/completions", post(completions::<T, W>))
             .route("/generate", post(generate::<T, W>))
@@ -346,6 +350,201 @@ where
         };
         (StatusCode::BAD_REQUEST, message).into_response()
     }
+}
+
+enum TokenizePrompt {
+    Single(String),
+    Batch(Vec<String>),
+}
+
+enum DetokenizeTokens {
+    Single(Vec<u32>),
+    Batch(Vec<Vec<u32>>),
+}
+
+async fn tokenize<T, W>(
+    State(service): State<HttpRouterService<T, W>>,
+    Json(payload): Json<Value>,
+) -> Response
+where
+    T: Tokenizer + Send + 'static,
+    W: WorkerExecutor + Send + 'static,
+{
+    let prompt = match parse_tokenize_prompt(&payload) {
+        Ok(prompt) => prompt,
+        Err(message) => return bad_request_json(message),
+    };
+
+    let max_model_len = if service.model_info.max_context_length > 0 {
+        service.model_info.max_context_length
+    } else {
+        -1
+    };
+    let runtime = match service.runtime.lock() {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": {"message": "router runtime mutex poisoned"}
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    match prompt {
+        TokenizePrompt::Single(prompt) => {
+            let response = runtime.tokenize(&prompt);
+            Json(json!({
+                "tokens": response.token_ids,
+                "count": response.token_ids.len(),
+                "max_model_len": max_model_len,
+            }))
+            .into_response()
+        }
+        TokenizePrompt::Batch(prompts) => {
+            let mut token_batches = Vec::with_capacity(prompts.len());
+            let mut counts = Vec::with_capacity(prompts.len());
+            for prompt in prompts {
+                let token_ids = runtime.tokenize(&prompt).token_ids;
+                counts.push(token_ids.len());
+                token_batches.push(token_ids);
+            }
+            Json(json!({
+                "tokens": token_batches,
+                "count": counts,
+                "max_model_len": max_model_len,
+            }))
+            .into_response()
+        }
+    }
+}
+
+async fn detokenize<T, W>(
+    State(service): State<HttpRouterService<T, W>>,
+    Json(payload): Json<Value>,
+) -> Response
+where
+    T: Tokenizer + Send + 'static,
+    W: WorkerExecutor + Send + 'static,
+{
+    let tokens = match parse_detokenize_tokens(&payload) {
+        Ok(tokens) => tokens,
+        Err(message) => return bad_request_json(message),
+    };
+
+    let runtime = match service.runtime.lock() {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": {"message": "router runtime mutex poisoned"}
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    match tokens {
+        DetokenizeTokens::Single(token_ids) => match runtime.detokenize(&token_ids) {
+            Ok(response) => Json(json!({ "text": response.text })).into_response(),
+            Err(error) => bad_request_json(format!(
+                "Error decoding tokens: {error}. Input tokens might be invalid for the model."
+            )),
+        },
+        DetokenizeTokens::Batch(token_batches) => {
+            let mut texts = Vec::with_capacity(token_batches.len());
+            for token_ids in token_batches {
+                match runtime.detokenize(&token_ids) {
+                    Ok(response) => texts.push(response.text),
+                    Err(error) => {
+                        return bad_request_json(format!(
+                            "Error decoding tokens: {error}. Input tokens might be invalid for the model."
+                        ));
+                    }
+                }
+            }
+            Json(json!({ "text": texts })).into_response()
+        }
+    }
+}
+
+fn parse_tokenize_prompt(payload: &Value) -> Result<TokenizePrompt, String> {
+    let has_prompt = payload.get("prompt").is_some();
+    let has_messages = payload.get("messages").is_some();
+    if has_prompt == has_messages {
+        return Err("Exactly one of 'prompt' or 'messages' must be provided.".to_string());
+    }
+    if has_messages {
+        return Err("messages tokenization requires chat template support".to_string());
+    }
+
+    match payload.get("prompt") {
+        Some(Value::String(prompt)) => Ok(TokenizePrompt::Single(prompt.clone())),
+        Some(Value::Array(prompts)) => {
+            let mut out = Vec::with_capacity(prompts.len());
+            for prompt in prompts {
+                let Some(prompt) = prompt.as_str() else {
+                    return Err(
+                        "Invalid prompt type: expected string or list of strings.".to_string()
+                    );
+                };
+                out.push(prompt.to_string());
+            }
+            Ok(TokenizePrompt::Batch(out))
+        }
+        _ => Err("Invalid prompt type: expected string or list of strings.".to_string()),
+    }
+}
+
+fn parse_detokenize_tokens(payload: &Value) -> Result<DetokenizeTokens, String> {
+    let tokens = payload
+        .get("tokens")
+        .ok_or_else(|| "missing `tokens` field".to_string())?;
+    let Value::Array(items) = tokens else {
+        return Err("Invalid tokens type: expected list of integers or list of lists.".to_string());
+    };
+
+    if items.is_empty() {
+        return Ok(DetokenizeTokens::Single(Vec::new()));
+    }
+    if items[0].is_array() {
+        let mut batches = Vec::with_capacity(items.len());
+        for item in items {
+            let Value::Array(token_list) = item else {
+                return Err(
+                    "Invalid tokens type: expected list of integers or list of lists.".to_string(),
+                );
+            };
+            batches.push(parse_token_id_list(token_list)?);
+        }
+        return Ok(DetokenizeTokens::Batch(batches));
+    }
+
+    Ok(DetokenizeTokens::Single(parse_token_id_list(items)?))
+}
+
+fn parse_token_id_list(items: &[Value]) -> Result<Vec<u32>, String> {
+    let mut token_ids = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(token_id) = item.as_u64() else {
+            return Err("Invalid input: 'tokens' must be a list of integers.".to_string());
+        };
+        let token_id = u32::try_from(token_id)
+            .map_err(|_| "Invalid input: token id exceeds u32 range.".to_string())?;
+        token_ids.push(token_id);
+    }
+    Ok(token_ids)
+}
+
+fn bad_request_json(message: impl Into<String>) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": { "message": message.into() } })),
+    )
+        .into_response()
 }
 
 async fn generate<T, W>(
