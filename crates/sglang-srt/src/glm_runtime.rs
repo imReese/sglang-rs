@@ -1102,6 +1102,42 @@ impl GlmMoeDsaF32TensorParallelRuntime {
             .collect()
     }
 
+    pub fn transformer_layer_output(
+        &self,
+        layer_id: usize,
+        hidden_states: &[Vec<f32>],
+        residuals: Option<&[Vec<f32>]>,
+    ) -> Result<Vec<GlmMoeDsaF32LayerOutput>, GlmMoeDsaF32KernelError> {
+        if let Some(residuals) = residuals {
+            if residuals.len() != hidden_states.len() {
+                return Err(GlmMoeDsaF32KernelError::TokenCountMismatch {
+                    tensor_name: format!("model.layers.{layer_id}.input_layernorm.weight"),
+                    expected: hidden_states.len(),
+                    actual: residuals.len(),
+                });
+            }
+        }
+
+        let mut attention_input = Vec::with_capacity(hidden_states.len());
+        let mut attention_residual = Vec::with_capacity(hidden_states.len());
+        for (token_index, hidden) in hidden_states.iter().enumerate() {
+            let residual = residuals.and_then(|residuals| residuals.get(token_index));
+            let (normalized, residual) =
+                self.prepare_attention_input(layer_id, hidden, residual.map(Vec::as_slice))?;
+            attention_input.push(normalized);
+            attention_residual.push(residual);
+        }
+
+        let attention_output = self.attention_output(layer_id, &attention_input)?;
+        attention_output
+            .iter()
+            .zip(&attention_residual)
+            .map(|(attention_output, residual)| {
+                self.feed_forward_layer_output(layer_id, attention_output, Some(residual))
+            })
+            .collect()
+    }
+
     pub fn dense_mlp_output(
         &self,
         layer_id: usize,
@@ -1318,6 +1354,33 @@ impl GlmMoeDsaF32TensorParallelRuntime {
 
     fn final_norm_weight(&self) -> Result<&[f32], GlmMoeDsaF32KernelError> {
         self.layer_norm_weight("model.norm.weight")
+    }
+
+    fn prepare_attention_input(
+        &self,
+        layer_id: usize,
+        hidden: &[f32],
+        residual: Option<&[f32]>,
+    ) -> Result<(Vec<f32>, Vec<f32>), GlmMoeDsaF32KernelError> {
+        let norm_name = format!("model.layers.{layer_id}.input_layernorm.weight");
+        let mut residual_out = hidden.to_vec();
+        if let Some(residual) = residual {
+            if residual.len() != hidden.len() {
+                return Err(GlmMoeDsaF32KernelError::HiddenSizeMismatch {
+                    tensor_name: norm_name,
+                    expected: hidden.len(),
+                    actual: residual.len(),
+                });
+            }
+            for (output, residual) in residual_out.iter_mut().zip(residual) {
+                *output += residual;
+            }
+        }
+
+        let mut normalized = residual_out.clone();
+        let norm_weight = self.layer_norm_weight(&norm_name)?;
+        apply_rms_norm(&norm_name, &mut normalized, norm_weight, self.rms_norm_eps)?;
+        Ok((normalized, residual_out))
     }
 
     fn replicated_projection_with_norm(
@@ -1992,6 +2055,11 @@ pub enum GlmMoeDsaF32KernelError {
         expected: usize,
         actual: usize,
     },
+    TokenCountMismatch {
+        tensor_name: String,
+        expected: usize,
+        actual: usize,
+    },
     TensorSelectionMismatch {
         tensor_name: String,
         expected_axis: usize,
@@ -2056,6 +2124,14 @@ impl fmt::Display for GlmMoeDsaF32KernelError {
             } => write!(
                 formatter,
                 "f32 tensor {tensor_name} expected hidden size {expected} but got {actual}"
+            ),
+            Self::TokenCountMismatch {
+                tensor_name,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "f32 tensor {tensor_name} expected {expected} token(s) but got {actual}"
             ),
             Self::TensorSelectionMismatch {
                 tensor_name,

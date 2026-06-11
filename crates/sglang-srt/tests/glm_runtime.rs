@@ -268,6 +268,58 @@ fn glm_moe_dsa_f32_runtime_computes_tensor_parallel_causal_attention_output() {
 }
 
 #[test]
+fn glm_moe_dsa_f32_runtime_computes_dense_transformer_layer_output() {
+    let model_dir = temp_model_dir("glm-runtime-f32-dense-transformer-layer");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_glm_moe_dsa_attention_output_fixture(&model_dir);
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("GLM artifacts should load");
+    let runtime =
+        GlmMoeDsaRuntime::from_local_model_artifacts(&artifacts).expect("runtime should build");
+    let f32_runtime = runtime
+        .load_tensor_parallel_shards(2)
+        .expect("all TP rank shards should load")
+        .decode_f32_tensor_parallel_shards()
+        .expect("F32 cache should decode");
+
+    let output = f32_runtime
+        .transformer_layer_output(0, &[vec![1.0, 1.0], vec![1.0, -1.0]], None)
+        .expect("dense transformer layer should compute");
+
+    assert_eq!(output.len(), 2);
+
+    let residual0 = [6.0_f32, 13.0_f32];
+    let residual0_rms = ((residual0[0] * residual0[0] + residual0[1] * residual0[1]) / 2.0).sqrt();
+    let normalized0 = [residual0[0] / residual0_rms, residual0[1] / residual0_rms];
+    let activation00 = silu(normalized0[0]) * (2.0 * normalized0[0]);
+    let activation01 = silu(normalized0[1]) * (3.0 * normalized0[1]);
+    assert_close(
+        output[0].hidden_states(),
+        &[
+            5.0 * activation00 + 7.0 * activation01,
+            11.0 * activation00 + 13.0 * activation01,
+        ],
+    );
+    assert_close(output[0].residual(), &residual0);
+
+    let residual1 = [4.0_f32, 6.0_f32];
+    let residual1_rms = ((residual1[0] * residual1[0] + residual1[1] * residual1[1]) / 2.0).sqrt();
+    let normalized1 = [residual1[0] / residual1_rms, residual1[1] / residual1_rms];
+    let activation10 = silu(normalized1[0]) * (2.0 * normalized1[0]);
+    let activation11 = silu(normalized1[1]) * (3.0 * normalized1[1]);
+    assert_close(
+        output[1].hidden_states(),
+        &[
+            5.0 * activation10 + 7.0 * activation11,
+            11.0 * activation10 + 13.0 * activation11,
+        ],
+    );
+    assert_close(output[1].residual(), &residual1);
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
 fn glm_moe_dsa_f32_runtime_computes_tensor_parallel_dense_mlp_output() {
     let model_dir = temp_model_dir("glm-runtime-f32-dense-mlp");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");
@@ -740,17 +792,17 @@ fn write_glm_moe_dsa_attention_output_fixture(model_dir: &Path) {
         (
             "model.layers.0.mlp.gate_proj.weight",
             vec![2, 2],
-            vec![0.0; 4],
+            vec![1.0, 0.0, 0.0, 1.0],
         ),
         (
             "model.layers.0.mlp.up_proj.weight",
             vec![2, 2],
-            vec![0.0; 4],
+            vec![2.0, 0.0, 0.0, 3.0],
         ),
         (
             "model.layers.0.mlp.down_proj.weight",
             vec![2, 2],
-            vec![0.0; 4],
+            vec![5.0, 7.0, 11.0, 13.0],
         ),
     ];
     let mut cursor = 0_usize;
