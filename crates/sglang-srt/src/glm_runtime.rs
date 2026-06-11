@@ -892,6 +892,41 @@ impl GlmMoeDsaF32LayerOutput {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlmMoeDsaF32AttentionProjectionOutput {
+    q_lora: Vec<f32>,
+    q: Vec<f32>,
+    kv_lora: Vec<f32>,
+    kv: Vec<f32>,
+}
+
+impl GlmMoeDsaF32AttentionProjectionOutput {
+    fn new(q_lora: Vec<f32>, q: Vec<f32>, kv_lora: Vec<f32>, kv: Vec<f32>) -> Self {
+        Self {
+            q_lora,
+            q,
+            kv_lora,
+            kv,
+        }
+    }
+
+    pub fn q_lora(&self) -> &[f32] {
+        &self.q_lora
+    }
+
+    pub fn q(&self) -> &[f32] {
+        &self.q
+    }
+
+    pub fn kv_lora(&self) -> &[f32] {
+        &self.kv_lora
+    }
+
+    pub fn kv(&self) -> &[f32] {
+        &self.kv
+    }
+}
+
 impl GlmMoeDsaF32TensorParallelRuntime {
     fn from_loaded_runtime(
         runtime: &GlmMoeDsaLoadedTensorParallelRuntime,
@@ -966,6 +1001,36 @@ impl GlmMoeDsaF32TensorParallelRuntime {
             .into_iter()
             .map(|token_id| self.embedding_lm_head_logits_for_token(token_id))
             .collect()
+    }
+
+    pub fn attention_projection_output(
+        &self,
+        layer_id: usize,
+        hidden: &[f32],
+    ) -> Result<GlmMoeDsaF32AttentionProjectionOutput, GlmMoeDsaF32KernelError> {
+        let q_lora = self.replicated_projection_with_norm(
+            &format!("model.layers.{layer_id}.self_attn.q_a_proj.weight"),
+            &format!("model.layers.{layer_id}.self_attn.q_a_layernorm.weight"),
+            hidden,
+        )?;
+        let q = self.column_parallel_projection(
+            &format!("model.layers.{layer_id}.self_attn.q_b_proj.weight"),
+            &q_lora,
+        )?;
+
+        let kv_lora = self.replicated_projection_with_norm(
+            &format!("model.layers.{layer_id}.self_attn.kv_a_proj_with_mqa.weight"),
+            &format!("model.layers.{layer_id}.self_attn.kv_a_layernorm.weight"),
+            hidden,
+        )?;
+        let kv = self.column_parallel_projection(
+            &format!("model.layers.{layer_id}.self_attn.kv_b_proj.weight"),
+            &kv_lora,
+        )?;
+
+        Ok(GlmMoeDsaF32AttentionProjectionOutput::new(
+            q_lora, q, kv_lora, kv,
+        ))
     }
 
     pub fn dense_mlp_output(
@@ -1184,6 +1249,64 @@ impl GlmMoeDsaF32TensorParallelRuntime {
 
     fn final_norm_weight(&self) -> Result<&[f32], GlmMoeDsaF32KernelError> {
         self.layer_norm_weight("model.norm.weight")
+    }
+
+    fn replicated_projection_with_norm(
+        &self,
+        projection_name: &str,
+        norm_name: &str,
+        hidden: &[f32],
+    ) -> Result<Vec<f32>, GlmMoeDsaF32KernelError> {
+        for rank in &self.ranks {
+            if let Some(projection) = rank.tensor_shard(projection_name) {
+                let mut output = projection.output_parallel_matvec(hidden)?;
+                let norm_weight = self.layer_norm_weight(norm_name)?;
+                apply_rms_norm(norm_name, &mut output, norm_weight, self.rms_norm_eps)?;
+                return Ok(output);
+            }
+        }
+
+        Err(GlmMoeDsaF32KernelError::MissingTensor {
+            tensor_name: projection_name.to_string(),
+        })
+    }
+
+    fn column_parallel_projection(
+        &self,
+        tensor_name: &str,
+        hidden: &[f32],
+    ) -> Result<Vec<f32>, GlmMoeDsaF32KernelError> {
+        let mut output = Vec::<Option<f32>>::new();
+        let mut saw_tensor = false;
+        for rank in &self.ranks {
+            let Some(projection) = rank.tensor_shard(tensor_name) else {
+                continue;
+            };
+            saw_tensor = true;
+            for (output_index, value) in projection.output_parallel_indexed_matvec(hidden)? {
+                if output.len() <= output_index {
+                    output.resize(output_index + 1, None);
+                }
+                output[output_index] = Some(value);
+            }
+        }
+
+        if !saw_tensor {
+            return Err(GlmMoeDsaF32KernelError::MissingTensor {
+                tensor_name: tensor_name.to_string(),
+            });
+        }
+
+        output
+            .into_iter()
+            .enumerate()
+            .map(|(output_index, value)| {
+                value.ok_or_else(|| GlmMoeDsaF32KernelError::MissingTensorShardOutput {
+                    tensor_name: tensor_name.to_string(),
+                    output_index,
+                })
+            })
+            .collect()
     }
 
     fn layer_norm_weight(&self, tensor_name: &str) -> Result<&[f32], GlmMoeDsaF32KernelError> {
@@ -1464,6 +1587,53 @@ impl GlmMoeDsaF32TensorShard {
             .collect())
     }
 
+    fn output_parallel_indexed_matvec(
+        &self,
+        hidden: &[f32],
+    ) -> Result<Vec<(usize, f32)>, GlmMoeDsaF32KernelError> {
+        let [rows, columns] = self.shape.as_slice() else {
+            return Err(GlmMoeDsaF32KernelError::TensorRankMismatch {
+                tensor_name: self.tensor_name.clone(),
+                expected_rank: 2,
+                shape: self.shape.clone(),
+            });
+        };
+        if *columns != hidden.len() {
+            return Err(GlmMoeDsaF32KernelError::HiddenSizeMismatch {
+                tensor_name: self.tensor_name.clone(),
+                expected: *columns,
+                actual: hidden.len(),
+            });
+        }
+
+        let global_row_start = match &self.selection {
+            GlmMoeDsaTensorShardSelection::Full => 0,
+            GlmMoeDsaTensorShardSelection::Slice { axis: 0, range } => range.start,
+            GlmMoeDsaTensorShardSelection::Slice { axis, .. } => {
+                return Err(GlmMoeDsaF32KernelError::TensorSelectionMismatch {
+                    tensor_name: self.tensor_name.clone(),
+                    expected_axis: 0,
+                    actual_axis: *axis,
+                });
+            }
+        };
+
+        Ok(self
+            .values
+            .chunks_exact(*columns)
+            .take(*rows)
+            .enumerate()
+            .map(|(row_index, row)| {
+                let value = row
+                    .iter()
+                    .zip(hidden)
+                    .map(|(weight, value)| weight * value)
+                    .sum();
+                (global_row_start + row_index, value)
+            })
+            .collect())
+    }
+
     fn row_parallel_matvec_contribution(
         &self,
         hidden: &[f32],
@@ -1600,6 +1770,10 @@ pub enum GlmMoeDsaF32KernelError {
     MissingVocabularyLogit {
         token_id: usize,
     },
+    MissingTensorShardOutput {
+        tensor_name: String,
+        output_index: usize,
+    },
     TensorRankMismatch {
         tensor_name: String,
         expected_rank: usize,
@@ -1649,6 +1823,13 @@ impl fmt::Display for GlmMoeDsaF32KernelError {
                     "missing GLM vocab-parallel logit for token {token_id}"
                 )
             }
+            Self::MissingTensorShardOutput {
+                tensor_name,
+                output_index,
+            } => write!(
+                formatter,
+                "missing GLM tensor-parallel output index {output_index} for tensor {tensor_name}"
+            ),
             Self::TensorRankMismatch {
                 tensor_name,
                 expected_rank,
