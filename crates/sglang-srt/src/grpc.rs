@@ -297,6 +297,90 @@ fn openai_chat_stream_response_from_router_response(
     Ok(OpenAiJsonResponse { json })
 }
 
+fn openai_completion_response_from_router_responses(
+    mut responses: Vec<RouterGenerateResponse>,
+    model: &str,
+) -> Result<OpenAiJsonResponse, Status> {
+    let Some(response) = responses.pop() else {
+        return Err(Status::internal("generation produced no response"));
+    };
+
+    let json = match response.body {
+        RouterGenerateResponseBody::Complete(complete) => json!({
+            "id": format!("cmpl-{}", response.request_id),
+            "object": "text_completion",
+            "model": model,
+            "choices": [{
+                "index": complete.index,
+                "text": complete.text,
+                "logprobs": Value::Null,
+                "finish_reason": complete.finish_reason,
+            }],
+            "usage": {
+                "prompt_tokens": complete.prompt_tokens,
+                "completion_tokens": complete.completion_tokens,
+                "total_tokens": complete.prompt_tokens + complete.completion_tokens,
+                "cached_tokens": complete.cached_tokens,
+            }
+        }),
+        RouterGenerateResponseBody::Chunk(_) => {
+            return Err(Status::internal(
+                "non-stream gRPC completion returned a stream chunk",
+            ));
+        }
+        RouterGenerateResponseBody::Error(error) => {
+            return Err(Status::internal(error.message));
+        }
+    };
+
+    let json = serde_json::to_vec(&json)
+        .map_err(|e| Status::internal(format!("serialize OpenAI completion JSON: {e}")))?;
+    Ok(OpenAiJsonResponse { json })
+}
+
+fn openai_completion_stream_response_from_router_response(
+    response: RouterGenerateResponse,
+    model: &str,
+) -> Result<OpenAiJsonResponse, Status> {
+    let json = match response.body {
+        RouterGenerateResponseBody::Chunk(chunk) => json!({
+            "id": format!("cmpl-{}", response.request_id),
+            "object": "text_completion",
+            "model": model,
+            "choices": [{
+                "index": chunk.index,
+                "text": chunk.text,
+                "logprobs": Value::Null,
+                "finish_reason": Value::Null,
+            }],
+        }),
+        RouterGenerateResponseBody::Complete(complete) => json!({
+            "id": format!("cmpl-{}", response.request_id),
+            "object": "text_completion",
+            "model": model,
+            "choices": [{
+                "index": complete.index,
+                "text": "",
+                "logprobs": Value::Null,
+                "finish_reason": complete.finish_reason,
+            }],
+            "usage": {
+                "prompt_tokens": complete.prompt_tokens,
+                "completion_tokens": complete.completion_tokens,
+                "total_tokens": complete.prompt_tokens + complete.completion_tokens,
+                "cached_tokens": complete.cached_tokens,
+            }
+        }),
+        RouterGenerateResponseBody::Error(error) => {
+            return Err(Status::internal(error.message));
+        }
+    };
+
+    let json = serde_json::to_vec(&json)
+        .map_err(|e| Status::internal(format!("serialize OpenAI completion stream JSON: {e}")))?;
+    Ok(OpenAiJsonResponse { json })
+}
+
 fn unimplemented_rpc(name: &'static str) -> Status {
     Status::unimplemented(format!(
         "{name} is not implemented in the Rust gRPC runtime yet"
@@ -571,9 +655,38 @@ where
 
     async fn complete(
         &self,
-        _request: Request<OpenAiJsonRequest>,
+        request: Request<OpenAiJsonRequest>,
     ) -> Result<Response<Self::CompleteStream>, Status> {
-        Err(unimplemented_rpc("Complete"))
+        let payload: Value = serde_json::from_slice(&request.into_inner().json)
+            .map_err(|e| Status::invalid_argument(format!("invalid OpenAI JSON payload: {e}")))?;
+        let model = self.model_info()?.served_model_name;
+        let request = crate::http::http_completion_payload_to_router_request(payload, &model)
+            .map_err(Status::invalid_argument)?;
+        let stream = request.stream;
+
+        let responses = self
+            .runtime
+            .lock()
+            .map_err(|_| Status::internal("router runtime mutex poisoned"))?
+            .generate_text_stream_with_transfer_polling(request, self.max_transfer_polls)
+            .map_err(router_runtime_error_to_status)?;
+
+        if stream {
+            let stream = responses
+                .into_iter()
+                .map(|response| {
+                    openai_completion_stream_response_from_router_response(response, &model)
+                })
+                .collect::<Vec<_>>();
+            return Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
+                stream,
+            ))));
+        }
+
+        let response = openai_completion_response_from_router_responses(responses, &model)?;
+        Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
+            [Ok(response)],
+        ))))
     }
 
     async fn open_ai_embed(

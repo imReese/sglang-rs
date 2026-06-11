@@ -267,6 +267,138 @@ async fn http_server_accepts_streaming_chat_completions_for_openai_clients() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_accepts_openai_completions() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "glm-completions-http",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let service = build_bootstrap_http_router_service(&args);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let response = request_raw_with_retry(
+        addr,
+        "POST",
+        "/v1/completions",
+        Some(r#"{"model":"glm-completions-http","prompt":"hi","max_tokens":2}"#),
+    )
+    .await;
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "OpenAI completions should succeed, got response: {response}"
+    );
+    let (_, body) = response
+        .split_once("\r\n\r\n")
+        .expect("HTTP response should include headers");
+    let response: Value = serde_json::from_str(body).expect("response should be JSON");
+    assert_eq!(response["object"], "text_completion");
+    assert_eq!(response["model"], "glm-completions-http");
+    assert_eq!(response["choices"][0]["index"], 0);
+    assert_eq!(response["choices"][0]["text"], "  ");
+    assert_eq!(response["choices"][0]["finish_reason"], "stop");
+    assert_eq!(response["usage"]["prompt_tokens"], 2);
+    assert_eq!(response["usage"]["completion_tokens"], 2);
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_accepts_streaming_openai_completions() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "glm-completions-http-stream",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let service = build_bootstrap_http_router_service(&args);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let response = request_raw_with_retry(
+        addr,
+        "POST",
+        "/v1/completions",
+        Some(
+            r#"{"model":"glm-completions-http-stream","prompt":"hi","max_tokens":2,"stream":true}"#,
+        ),
+    )
+    .await;
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "streaming completions should succeed, got response: {response}"
+    );
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("content-type: text/event-stream"),
+        "streaming completions must return SSE content-type, got response: {response}"
+    );
+    let events = parse_sse_data(&response);
+    assert_eq!(events.last().map(String::as_str), Some("[DONE]"));
+    let chunks = events
+        .iter()
+        .filter(|event| event.as_str() != "[DONE]")
+        .map(|event| serde_json::from_str::<Value>(event))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("SSE data chunks should be JSON");
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| chunk["object"] == "text_completion"),
+        "expected OpenAI completion chunks, got {chunks:?}"
+    );
+    assert!(
+        chunks.iter().any(|chunk| chunk["finish_reason"] == "stop"
+            || chunk["choices"][0]["finish_reason"] == "stop"),
+        "expected final stop chunk, got {chunks:?}"
+    );
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_server_reports_plain_worker_server_info_for_sgl_router() {
     let args = ServerArgs::parse_from([
         "serve",

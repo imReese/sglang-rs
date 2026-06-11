@@ -395,6 +395,106 @@ async fn grpc_chat_complete_streams_openai_chat_chunks() {
 }
 
 #[tokio::test]
+async fn grpc_complete_returns_openai_completion_json() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "tiny",
+        "--grpc-mode",
+    ])
+    .expect("args should parse");
+    let runtime = RouterRuntime::new(Engine::new(
+        ByteTokenizer,
+        Scheduler::new(GrpcTwoStepWorker),
+    ));
+    let service = GrpcRouterService::with_server_args(runtime, &args);
+    let payload = serde_json::json!({
+        "model": "tiny",
+        "prompt": "hi",
+        "max_tokens": 2,
+    });
+
+    let mut stream = service
+        .complete(Request::new(OpenAiJsonRequest {
+            json: serde_json::to_vec(&payload).expect("payload should serialize"),
+            options: None,
+        }))
+        .await
+        .expect("complete should execute")
+        .into_inner();
+    let response = stream
+        .next()
+        .await
+        .expect("completion response")
+        .expect("completion response ok");
+    assert!(stream.next().await.is_none());
+
+    let body: serde_json::Value =
+        serde_json::from_slice(&response.json).expect("response should be JSON");
+    assert_eq!(body["object"], "text_completion");
+    assert_eq!(body["model"], "tiny");
+    assert_eq!(body["choices"][0]["text"], "*+");
+    assert_eq!(body["choices"][0]["finish_reason"], "stop");
+}
+
+#[tokio::test]
+async fn grpc_complete_streams_openai_completion_chunks() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "tiny",
+        "--grpc-mode",
+    ])
+    .expect("args should parse");
+    let runtime = RouterRuntime::new(Engine::new(
+        ByteTokenizer,
+        Scheduler::new(GrpcTwoStepWorker),
+    ));
+    let service = GrpcRouterService::with_server_args(runtime, &args);
+    let payload = serde_json::json!({
+        "model": "tiny",
+        "prompt": "hi",
+        "max_tokens": 2,
+        "stream": true,
+    });
+
+    let mut stream = service
+        .complete(Request::new(OpenAiJsonRequest {
+            json: serde_json::to_vec(&payload).expect("payload should serialize"),
+            options: None,
+        }))
+        .await
+        .expect("streaming complete should execute")
+        .into_inner();
+    let first = stream
+        .next()
+        .await
+        .expect("first completion chunk")
+        .expect("first completion chunk ok");
+    let second = stream
+        .next()
+        .await
+        .expect("final completion chunk")
+        .expect("final completion chunk ok");
+    assert!(stream.next().await.is_none());
+
+    let first: serde_json::Value =
+        serde_json::from_slice(&first.json).expect("first chunk should be JSON");
+    assert_eq!(first["object"], "text_completion");
+    assert_eq!(first["choices"][0]["text"], "*");
+    assert!(first["choices"][0]["finish_reason"].is_null());
+
+    let second: serde_json::Value =
+        serde_json::from_slice(&second.json).expect("final chunk should be JSON");
+    assert_eq!(second["object"], "text_completion");
+    assert_eq!(second["choices"][0]["finish_reason"], "stop");
+}
+
+#[tokio::test]
 async fn grpc_generate_can_poll_pd_transfer_before_decode() {
     let worker = KvTransferModelWorker::new(
         GrpcTwoStepWorker,
