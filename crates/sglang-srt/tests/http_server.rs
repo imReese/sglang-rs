@@ -5,24 +5,45 @@ use std::{fs, path::PathBuf};
 use serde_json::Value;
 use tokio::sync::oneshot;
 
+use sglang_srt::cache::{CachePageAllocator, RadixCache};
 use sglang_srt::cli::ServerArgs;
-use sglang_srt::http::serve_http_router_with_shutdown;
+use sglang_srt::engine::Engine;
+use sglang_srt::http::{HttpRouterService, serve_http_router_with_shutdown};
 use sglang_srt::pd_bootstrap::{
     PrefillBootstrapService, serve_mooncake_bootstrap_zmq_with_shutdown,
     serve_prefill_bootstrap_with_shutdown,
 };
+use sglang_srt::router::{RouterGetModelInfoResponse, RouterRuntime};
+use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::server::{
     build_bootstrap_http_router_service, build_bootstrap_mooncake_prefill_http_router_service,
     build_bootstrap_pd_http_router_service, build_bootstrap_prefill_http_router_service,
     launch_http_server_with_shutdown, register_prefill_mooncake_routes_from_args,
 };
+use sglang_srt::tokenizer::ByteTokenizer;
 use sglang_srt::transfer::{
     DecodeBootstrapRegistry, MooncakeBatchId, MooncakeBatchReleaser, MooncakeError,
     MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeTransferRequest,
     MooncakeTransferStatus, MooncakeTransferStatusCode, MooncakeTransferStatusReader,
     MooncakeTransferSubmitter, MooncakeTransferTarget,
 };
-use sglang_srt::types::BootstrapRoom;
+use sglang_srt::types::{BootstrapRoom, RequestId, SamplingParams as RuntimeSamplingParams};
+use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
+
+#[derive(Default)]
+struct HttpTwoStepWorker;
+
+impl ModelWorker for HttpTwoStepWorker {
+    fn generate_batch(&mut self, batch: &ScheduleBatch) -> BatchGeneratedTokens {
+        let token = match batch.forward_mode() {
+            sglang_srt::scheduler::ForwardMode::Prefill => GeneratedToken::unfinished(vec![42]),
+            sglang_srt::scheduler::ForwardMode::Decode => GeneratedToken::finished(vec![43]),
+        };
+
+        BatchGeneratedTokens::from_batch(batch, vec![token])
+            .expect("output shape should match batch")
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_server_accepts_model_and_generate_requests() {
@@ -591,6 +612,138 @@ async fn http_server_model_info_reports_local_model_architectures_for_gateway_di
         .expect("server task should join")
         .expect("server should stop cleanly");
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_reports_runtime_loads_for_sglang_control_plane() {
+    let mut scheduler = Scheduler::with_cache_resources(
+        HttpTwoStepWorker,
+        RadixCache::default(),
+        CachePageAllocator::new(4),
+    );
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("http-load-waiting"),
+        vec![1, 2, 3],
+        RuntimeSamplingParams::new(1),
+    ));
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "glm-loads",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let runtime = RouterRuntime::new(Engine::new(ByteTokenizer, scheduler));
+    let service =
+        HttpRouterService::new(runtime, RouterGetModelInfoResponse::from_server_args(&args));
+    let addr = unused_local_addr();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let loads = get_json_with_retry(addr, "/v1/loads").await;
+    let legacy_load = get_json_with_retry(addr, "/get_load").await;
+
+    assert_eq!(loads["version"], env!("CARGO_PKG_VERSION"));
+    assert!(loads["timestamp"].as_u64().is_some());
+    assert_eq!(loads["loads"][0]["dp_rank"], 0);
+    assert_eq!(loads["loads"][0]["num_waiting_reqs"], 1);
+    assert_eq!(loads["loads"][0]["num_running_reqs"], 0);
+    assert_eq!(loads["loads"][0]["waiting_queue_depth"], 1);
+    assert_eq!(loads["loads"][0]["decode_queue_depth"], 0);
+    assert_eq!(loads["loads"][0]["available_cache_pages"], 4);
+    assert_eq!(legacy_load[0]["num_reqs"], 1);
+    assert_eq!(legacy_load[0]["num_waiting_reqs"], 1);
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_flush_cache_uses_router_runtime_state() {
+    let mut busy_scheduler = Scheduler::new(HttpTwoStepWorker);
+    busy_scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("http-flush-waiting"),
+        vec![1, 2, 3],
+        RuntimeSamplingParams::new(1),
+    ));
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let busy_runtime = RouterRuntime::new(Engine::new(ByteTokenizer, busy_scheduler));
+    let busy_service = HttpRouterService::new(
+        busy_runtime,
+        RouterGetModelInfoResponse::from_server_args(&args),
+    );
+    let busy_addr = unused_local_addr();
+    let (busy_shutdown_tx, busy_shutdown_rx) = oneshot::channel();
+    let busy_server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(busy_addr, busy_service, async move {
+            let _ = busy_shutdown_rx.await;
+        })
+        .await
+    });
+
+    let busy_response = request_raw_with_retry(busy_addr, "POST", "/flush_cache", None).await;
+    assert!(
+        busy_response.starts_with("HTTP/1.1 400"),
+        "flush_cache must reject when requests are queued, got {busy_response}"
+    );
+
+    busy_shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    busy_server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+
+    let idle_service = build_bootstrap_http_router_service(&args);
+    let idle_addr = unused_local_addr();
+    let (idle_shutdown_tx, idle_shutdown_rx) = oneshot::channel();
+    let idle_server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(idle_addr, idle_service, async move {
+            let _ = idle_shutdown_rx.await;
+        })
+        .await
+    });
+
+    let idle_response = request_raw_with_retry(idle_addr, "POST", "/flush_cache", None).await;
+    assert!(
+        idle_response.starts_with("HTTP/1.1 200"),
+        "flush_cache should succeed when runtime is idle, got {idle_response}"
+    );
+    assert!(idle_response.contains("Cache flushed."));
+
+    idle_shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    idle_server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

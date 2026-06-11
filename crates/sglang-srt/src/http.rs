@@ -2,6 +2,7 @@ use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::State;
@@ -111,6 +112,13 @@ where
             .route("/get_model_info", get(model_info::<T, W>))
             .route("/server_info", get(server_info::<T, W>))
             .route("/get_server_info", get(server_info::<T, W>))
+            .route("/v1/loads", get(loads::<T, W>))
+            .route("/get_loads", get(loads::<T, W>))
+            .route("/get_load", get(legacy_load::<T, W>))
+            .route(
+                "/flush_cache",
+                get(flush_cache::<T, W>).post(flush_cache::<T, W>),
+            )
             .route("/v1/chat/completions", post(chat_completions::<T, W>))
             .route("/v1/completions", post(completions::<T, W>))
             .route("/generate", post(generate::<T, W>))
@@ -240,6 +248,104 @@ where
         "bos_token_id": info.bos_token_id,
         "max_req_input_len": info.max_req_input_len,
     }))
+}
+
+async fn loads<T, W>(State(service): State<HttpRouterService<T, W>>) -> Response
+where
+    T: Send + 'static,
+    W: Send + 'static,
+{
+    let load = match service.runtime.lock() {
+        Ok(runtime) => runtime.load(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": {"message": "router runtime mutex poisoned"}
+                })),
+            )
+                .into_response();
+        }
+    };
+    let num_running_reqs = load.decode_queue_depth;
+    let num_waiting_reqs = load.waiting_queue_depth;
+
+    Json(json!({
+        "timestamp": unix_timestamp_secs(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "loads": [{
+            "dp_rank": 0,
+            "num_running_reqs": num_running_reqs,
+            "num_waiting_reqs": num_waiting_reqs,
+            "num_reqs": num_running_reqs + num_waiting_reqs,
+            "waiting_queue_depth": load.waiting_queue_depth,
+            "decode_queue_depth": load.decode_queue_depth,
+            "available_cache_pages": load.available_cache_pages,
+        }]
+    }))
+    .into_response()
+}
+
+async fn legacy_load<T, W>(State(service): State<HttpRouterService<T, W>>) -> Response
+where
+    T: Send + 'static,
+    W: Send + 'static,
+{
+    let load = match service.runtime.lock() {
+        Ok(runtime) => runtime.load(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": {"message": "router runtime mutex poisoned"}
+                })),
+            )
+                .into_response();
+        }
+    };
+    let num_running_reqs = load.decode_queue_depth;
+    let num_waiting_reqs = load.waiting_queue_depth;
+
+    Json(json!([{
+        "dp_rank": 0,
+        "num_reqs": num_running_reqs + num_waiting_reqs,
+        "num_waiting_reqs": num_waiting_reqs,
+        "num_tokens": 0,
+        "num_pending_tokens": 0,
+    }]))
+    .into_response()
+}
+
+async fn flush_cache<T, W>(State(service): State<HttpRouterService<T, W>>) -> Response
+where
+    T: Tokenizer + Send + 'static,
+    W: WorkerExecutor + Send + 'static,
+{
+    let response = match service.runtime.lock() {
+        Ok(mut runtime) => runtime.flush_cache(),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "router runtime mutex poisoned",
+            )
+                .into_response();
+        }
+    };
+
+    if response.success {
+        (
+            StatusCode::OK,
+            "Cache flushed.\nPlease check backend logs for more details. (When there are running or waiting requests, the operation will not be performed.)\n",
+        )
+            .into_response()
+    } else {
+        let message = if response.message.is_empty() {
+            "Flush cache failed.\n".to_string()
+        } else {
+            response.message
+        };
+        (StatusCode::BAD_REQUEST, message).into_response()
+    }
 }
 
 async fn generate<T, W>(
@@ -1108,4 +1214,11 @@ fn optional_i32_array(value: &Value, field: &'static str) -> Result<Option<Vec<i
         })
         .collect::<Result<Vec<_>, _>>()
         .map(Some)
+}
+
+fn unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
