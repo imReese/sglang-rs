@@ -8,7 +8,8 @@ use crate::model_artifacts::{
     GlmMoeDsaLayerCheckpointWeights, GlmMoeDsaLayerFeedForwardCheckpointWeights,
     GlmMoeDsaModelCheckpointWeights, GlmMoeDsaModelTensorSpan, LocalModelArtifacts,
     LocalModelCheckpointCatalog, ModelArtifactError, SafetensorsLayerTensorSpan,
-    SafetensorsTensorData, SafetensorsTensorMetadata, SafetensorsTensorSpan,
+    SafetensorsTensorData, SafetensorsTensorDecodeError, SafetensorsTensorMetadata,
+    SafetensorsTensorSpan,
 };
 use crate::transfer::{KvCacheModelLayout, PdConfigError};
 
@@ -651,6 +652,18 @@ impl GlmMoeDsaLoadedTensorShard {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+
+    pub fn decode_f32_values(&self) -> Result<Vec<f32>, SafetensorsTensorDecodeError> {
+        SafetensorsTensorData {
+            metadata: SafetensorsTensorMetadata {
+                dtype: self.dtype.clone(),
+                shape: self.shape.clone(),
+                data_offsets: [0, self.bytes.len()],
+            },
+            bytes: self.bytes.clone(),
+        }
+        .decode_f32_values()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -728,6 +741,12 @@ impl GlmMoeDsaLoadedTensorParallelRuntime {
             .map(GlmMoeDsaLoadedTensorRank::loaded_byte_len)
             .sum()
     }
+
+    pub fn decode_f32_tensor_parallel_shards(
+        &self,
+    ) -> Result<GlmMoeDsaF32TensorParallelRuntime, SafetensorsTensorDecodeError> {
+        GlmMoeDsaF32TensorParallelRuntime::from_loaded_runtime(self)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -773,6 +792,184 @@ impl GlmMoeDsaLoadedTensorRank {
             .iter()
             .find(|shard| shard.tensor_name() == tensor_name)
     }
+
+    fn decode_f32_shards(&self) -> Result<GlmMoeDsaF32TensorRank, SafetensorsTensorDecodeError> {
+        let shards = self
+            .shards
+            .iter()
+            .map(GlmMoeDsaF32TensorShard::from_loaded_shard)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(GlmMoeDsaF32TensorRank {
+            tensor_parallel_rank: self.tensor_parallel_rank,
+            shards,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlmMoeDsaF32TensorParallelRuntime {
+    tensor_parallel_size: usize,
+    layer_count: usize,
+    ranks: Vec<GlmMoeDsaF32TensorRank>,
+}
+
+impl GlmMoeDsaF32TensorParallelRuntime {
+    fn from_loaded_runtime(
+        runtime: &GlmMoeDsaLoadedTensorParallelRuntime,
+    ) -> Result<Self, SafetensorsTensorDecodeError> {
+        let ranks = runtime
+            .ranks()
+            .iter()
+            .map(GlmMoeDsaLoadedTensorRank::decode_f32_shards)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            tensor_parallel_size: runtime.tensor_parallel_size(),
+            layer_count: runtime.layer_count(),
+            ranks,
+        })
+    }
+
+    pub fn tensor_parallel_size(&self) -> usize {
+        self.tensor_parallel_size
+    }
+
+    pub fn rank_count(&self) -> usize {
+        self.ranks.len()
+    }
+
+    pub fn layer_count(&self) -> usize {
+        self.layer_count
+    }
+
+    pub fn ranks(&self) -> &[GlmMoeDsaF32TensorRank] {
+        &self.ranks
+    }
+
+    pub fn rank(&self, tensor_parallel_rank: usize) -> Option<&GlmMoeDsaF32TensorRank> {
+        self.ranks
+            .iter()
+            .find(|rank| rank.tensor_parallel_rank() == tensor_parallel_rank)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlmMoeDsaF32TensorRank {
+    tensor_parallel_rank: usize,
+    shards: Vec<GlmMoeDsaF32TensorShard>,
+}
+
+impl GlmMoeDsaF32TensorRank {
+    pub fn tensor_parallel_rank(&self) -> usize {
+        self.tensor_parallel_rank
+    }
+
+    pub fn shards(&self) -> &[GlmMoeDsaF32TensorShard] {
+        &self.shards
+    }
+
+    pub fn tensor_shard(&self, tensor_name: &str) -> Option<&GlmMoeDsaF32TensorShard> {
+        self.shards
+            .iter()
+            .find(|shard| shard.tensor_name() == tensor_name)
+    }
+
+    pub fn lm_head_partial_logits(
+        &self,
+        hidden: &[f32],
+    ) -> Result<Vec<(usize, f32)>, GlmMoeDsaF32KernelError> {
+        let lm_head = self.tensor_shard("lm_head.weight").ok_or_else(|| {
+            GlmMoeDsaF32KernelError::MissingTensor {
+                tensor_name: "lm_head.weight".to_string(),
+            }
+        })?;
+        lm_head.vocab_parallel_matvec(hidden)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlmMoeDsaF32TensorShard {
+    tensor_name: String,
+    shape: Vec<usize>,
+    selection: GlmMoeDsaTensorShardSelection,
+    values: Vec<f32>,
+}
+
+impl GlmMoeDsaF32TensorShard {
+    fn from_loaded_shard(
+        shard: &GlmMoeDsaLoadedTensorShard,
+    ) -> Result<Self, SafetensorsTensorDecodeError> {
+        Ok(Self {
+            tensor_name: shard.tensor_name().to_string(),
+            shape: shard.shape().to_vec(),
+            selection: shard.selection().clone(),
+            values: shard.decode_f32_values()?,
+        })
+    }
+
+    pub fn tensor_name(&self) -> &str {
+        &self.tensor_name
+    }
+
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    pub fn selection(&self) -> &GlmMoeDsaTensorShardSelection {
+        &self.selection
+    }
+
+    pub fn values(&self) -> &[f32] {
+        &self.values
+    }
+
+    fn vocab_parallel_matvec(
+        &self,
+        hidden: &[f32],
+    ) -> Result<Vec<(usize, f32)>, GlmMoeDsaF32KernelError> {
+        let [rows, columns] = self.shape.as_slice() else {
+            return Err(GlmMoeDsaF32KernelError::TensorRankMismatch {
+                tensor_name: self.tensor_name.clone(),
+                expected_rank: 2,
+                shape: self.shape.clone(),
+            });
+        };
+        if *columns != hidden.len() {
+            return Err(GlmMoeDsaF32KernelError::HiddenSizeMismatch {
+                tensor_name: self.tensor_name.clone(),
+                expected: *columns,
+                actual: hidden.len(),
+            });
+        }
+
+        let global_row_start = match &self.selection {
+            GlmMoeDsaTensorShardSelection::Full => 0,
+            GlmMoeDsaTensorShardSelection::Slice { axis: 0, range } => range.start,
+            GlmMoeDsaTensorShardSelection::Slice { axis, .. } => {
+                return Err(GlmMoeDsaF32KernelError::TensorSelectionMismatch {
+                    tensor_name: self.tensor_name.clone(),
+                    expected_axis: 0,
+                    actual_axis: *axis,
+                });
+            }
+        };
+
+        Ok(self
+            .values
+            .chunks_exact(*columns)
+            .take(*rows)
+            .enumerate()
+            .map(|(row_index, row)| {
+                let logit = row
+                    .iter()
+                    .zip(hidden)
+                    .map(|(weight, value)| weight * value)
+                    .sum();
+                (global_row_start + row_index, logit)
+            })
+            .collect())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -799,6 +996,64 @@ impl fmt::Display for GlmMoeDsaRuntimeError {
 }
 
 impl std::error::Error for GlmMoeDsaRuntimeError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GlmMoeDsaF32KernelError {
+    MissingTensor {
+        tensor_name: String,
+    },
+    TensorRankMismatch {
+        tensor_name: String,
+        expected_rank: usize,
+        shape: Vec<usize>,
+    },
+    HiddenSizeMismatch {
+        tensor_name: String,
+        expected: usize,
+        actual: usize,
+    },
+    TensorSelectionMismatch {
+        tensor_name: String,
+        expected_axis: usize,
+        actual_axis: usize,
+    },
+}
+
+impl fmt::Display for GlmMoeDsaF32KernelError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingTensor { tensor_name } => {
+                write!(formatter, "missing f32 tensor {tensor_name}")
+            }
+            Self::TensorRankMismatch {
+                tensor_name,
+                expected_rank,
+                shape,
+            } => write!(
+                formatter,
+                "f32 tensor {tensor_name} expected rank {expected_rank} but shape is {shape:?}"
+            ),
+            Self::HiddenSizeMismatch {
+                tensor_name,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "f32 tensor {tensor_name} expected hidden size {expected} but got {actual}"
+            ),
+            Self::TensorSelectionMismatch {
+                tensor_name,
+                expected_axis,
+                actual_axis,
+            } => write!(
+                formatter,
+                "f32 tensor {tensor_name} expected selection axis {expected_axis} but got {actual_axis}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GlmMoeDsaF32KernelError {}
 
 impl From<ModelArtifactError> for GlmMoeDsaRuntimeError {
     fn from(error: ModelArtifactError) -> Self {
