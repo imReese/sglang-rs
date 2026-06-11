@@ -121,6 +121,25 @@ pub async fn generate(
     .await
 }
 
+/// POST /v1/rerank — route reranker requests through the same worker
+/// selection and PD dual-dispatch path as sgl-model-gateway's HTTP
+/// PDRouter. Rerank requests are non-streaming and carry `model` in the
+/// request body.
+pub async fn rerank(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    routed_generation(
+        ctx,
+        headers,
+        body,
+        "/v1/rerank",
+        ModelSelection::RequireBodyModel,
+    )
+    .await
+}
+
 #[derive(Clone, Copy)]
 enum ModelSelection {
     RequireBodyModel,

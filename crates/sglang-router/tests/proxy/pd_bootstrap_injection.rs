@@ -6,7 +6,7 @@
 //!
 //! Asserts the router-side contract for SGLang disagg-prefill HTTP mode:
 //!
-//! * Every PD-mode `/v1/chat/completions` request fans out to BOTH a
+//! * Every supported PD-mode generation/rerank request fans out to BOTH a
 //!   prefill and a decode worker (the prefill is `tokio::spawn`'d in
 //!   the background; the decode is awaited for the client response).
 //! * Both bodies carry the SAME flat top-level fields:
@@ -98,6 +98,22 @@ fn generate_batch_request() -> Request<Body> {
                     "max_new_tokens": 2,
                 },
                 "stream": true,
+            }))
+            .unwrap(),
+        ))
+        .unwrap()
+}
+
+fn rerank_request() -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/rerank")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "query": "rust router",
+                "documents": ["prefill", "decode"],
             }))
             .unwrap(),
         ))
@@ -259,6 +275,54 @@ async fn pd_mode_generate_batch_injects_per_item_bootstrap_fields() {
             .all(|room| room.as_u64().is_some_and(|room| room <= i64::MAX as u64)));
     }
     assert_eq!(bootstrap_room_array(&pj), bootstrap_room_array(&dj));
+}
+
+#[tokio::test]
+async fn pd_mode_rerank_injects_scalar_bootstrap_fields_into_both_bodies() {
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx(vec![
+        WorkerSpec {
+            id: WorkerId("p1".into()),
+            url: prefill.url.clone(),
+            mode: WorkerMode::Prefill,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: Some(8997),
+        },
+        WorkerSpec {
+            id: WorkerId("d1".into()),
+            url: decode.url.clone(),
+            mode: WorkerMode::Decode,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+        },
+    ]);
+    let app = build_router(ctx);
+
+    let res = app.oneshot(rerank_request()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "decode side should 200");
+
+    let prefill_body = await_captured_body(&prefill, Duration::from_secs(2), "prefill").await;
+    let decode_body = await_captured_body(&decode, Duration::from_secs(2), "decode").await;
+    let pj = parse_body(&prefill_body);
+    let dj = parse_body(&decode_body);
+
+    let p_room = bootstrap_room(&pj).expect("prefill body missing bootstrap_room");
+    let d_room = bootstrap_room(&dj).expect("decode body missing bootstrap_room");
+    assert_eq!(p_room, d_room);
+    assert!(p_room <= i64::MAX as u64);
+    assert_eq!(bootstrap_host(&pj), Some("127.0.0.1"));
+    assert_eq!(bootstrap_host(&dj), Some("127.0.0.1"));
+    assert_eq!(bootstrap_port(&pj), Some(8997));
+    assert_eq!(bootstrap_port(&dj), Some(8997));
+    assert!(
+        pj.get("bootstrap_room").is_some_and(Value::is_number),
+        "rerank is not a batch-generation request; bootstrap_room should be scalar"
+    );
+    assert!(
+        dj.get("bootstrap_room").is_some_and(Value::is_number),
+        "rerank is not a batch-generation request; bootstrap_room should be scalar"
+    );
 }
 
 /// Plain-mode (non-PD) requests do NOT carry any `bootstrap_*` field.
