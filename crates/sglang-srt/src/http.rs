@@ -3,16 +3,17 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+use axum::body::Body;
 use axum::extract::State;
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::http::{HeaderName, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
 
 use crate::router::{
-    RouterDisaggregatedParams, RouterGenerateResponseBody, RouterGetModelInfoResponse,
-    RouterRuntime, RouterSamplingParams, RouterTextGenerateRequest,
+    RouterDisaggregatedParams, RouterGenerateResponse, RouterGenerateResponseBody,
+    RouterGetModelInfoResponse, RouterRuntime, RouterSamplingParams, RouterTextGenerateRequest,
 };
 use crate::tokenizer::Tokenizer;
 use crate::types::BootstrapRoom;
@@ -296,7 +297,7 @@ where
 async fn chat_completions<T, W>(
     State(service): State<HttpRouterService<T, W>>,
     Json(payload): Json<Value>,
-) -> impl IntoResponse
+) -> Response
 where
     T: Tokenizer + Send + 'static,
     W: WorkerExecutor + Send + 'static,
@@ -308,19 +309,11 @@ where
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "error": { "message": error } })),
-            );
+            )
+                .into_response();
         }
     };
-    if request.stream {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(json!({
-                "error": {
-                    "message": "streaming chat completions are not implemented by the Rust worker HTTP endpoint"
-                }
-            })),
-        );
-    }
+    let stream = request.stream;
     if request.disaggregated_params.is_some() && !service.allow_disaggregated_requests {
         return (
             StatusCode::NOT_IMPLEMENTED,
@@ -329,7 +322,8 @@ where
                     "message": "disaggregated HTTP chat completions require a PD transfer-enabled runtime"
                 }
             })),
-        );
+        )
+            .into_response();
     }
 
     let response = {
@@ -346,11 +340,15 @@ where
 
     match response {
         Ok(mut responses) => {
+            if stream {
+                return http_chat_stream_response_from_router_responses(responses, &model);
+            }
             let Some(response) = responses.pop() else {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({ "error": { "message": "generation produced no response" } })),
-                );
+                )
+                    .into_response();
             };
             match response.body {
                 RouterGenerateResponseBody::Complete(complete) => (
@@ -373,7 +371,8 @@ where
                             "cached_tokens": complete.cached_tokens,
                         }
                     })),
-                ),
+                )
+                    .into_response(),
                 RouterGenerateResponseBody::Chunk(_) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({
@@ -381,18 +380,84 @@ where
                             "message": "non-stream HTTP chat completion returned a stream chunk"
                         }
                     })),
-                ),
+                )
+                    .into_response(),
                 RouterGenerateResponseBody::Error(error) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({ "error": { "message": error.message } })),
-                ),
+                )
+                    .into_response(),
             }
         }
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": { "message": error.to_string() } })),
-        ),
+        )
+            .into_response(),
     }
+}
+
+fn http_chat_stream_response_from_router_responses(
+    responses: Vec<RouterGenerateResponse>,
+    model: &str,
+) -> Response {
+    let mut body = String::new();
+    for response in responses {
+        let json = match response.body {
+            RouterGenerateResponseBody::Chunk(chunk) => json!({
+                "id": format!("chatcmpl-{}", response.request_id),
+                "object": "chat.completion.chunk",
+                "model": model,
+                "choices": [{
+                    "index": chunk.index,
+                    "delta": {
+                        "content": chunk.text,
+                    },
+                    "finish_reason": Value::Null,
+                }],
+            }),
+            RouterGenerateResponseBody::Complete(complete) => json!({
+                "id": format!("chatcmpl-{}", response.request_id),
+                "object": "chat.completion.chunk",
+                "model": model,
+                "choices": [{
+                    "index": complete.index,
+                    "delta": {},
+                    "finish_reason": complete.finish_reason,
+                }],
+                "usage": {
+                    "prompt_tokens": complete.prompt_tokens,
+                    "completion_tokens": complete.completion_tokens,
+                    "cached_tokens": complete.cached_tokens,
+                }
+            }),
+            RouterGenerateResponseBody::Error(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": { "message": error.message } })),
+                )
+                    .into_response();
+            }
+        };
+        let Ok(json) = serde_json::to_string(&json) else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": { "message": "serialize OpenAI chat stream JSON" } })),
+            )
+                .into_response();
+        };
+        body.push_str("data: ");
+        body.push_str(&json);
+        body.push_str("\n\n");
+    }
+    body.push_str("data: [DONE]\n\n");
+
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        HeaderName::from_static("content-type"),
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response
 }
 
 fn http_generate_payload_to_router_request(
