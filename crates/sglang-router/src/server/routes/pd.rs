@@ -13,6 +13,67 @@ pub(crate) const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-d
 /// prefill and decode side of a PD-disaggregated request.
 pub(crate) const X_SGL_BOOTSTRAP_ROOM: HeaderName = HeaderName::from_static("x-sgl-bootstrap-room");
 
+/// Request-scoped PD dispatch metadata. This mirrors the role of
+/// sgl-model-gateway's dispatch metadata stage for the current HTTP
+/// router path: one object owns the decode affinity hint and the
+/// bootstrap metadata that must be observable on the response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PdDispatchMetadata {
+    decode_url: String,
+    bootstrap: Option<BootstrapMetadata>,
+}
+
+impl PdDispatchMetadata {
+    pub(crate) fn new(decode_url: impl Into<String>) -> Self {
+        Self {
+            decode_url: decode_url.into(),
+            bootstrap: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_bootstrap(
+        decode_url: impl Into<String>,
+        bootstrap: BootstrapMetadata,
+    ) -> Self {
+        Self {
+            decode_url: decode_url.into(),
+            bootstrap: Some(bootstrap),
+        }
+    }
+
+    pub(crate) fn set_bootstrap(&mut self, bootstrap: BootstrapMetadata) {
+        self.bootstrap = Some(bootstrap);
+    }
+
+    pub(crate) fn insert_request_headers(&self, headers: &mut HeaderMap) {
+        self.insert_decode_header(headers, "request");
+    }
+
+    pub(crate) fn insert_response_headers(&self, headers: &mut HeaderMap) {
+        self.insert_decode_header(headers, "response");
+        if let Some(bootstrap) = &self.bootstrap {
+            bootstrap.insert_response_header(headers);
+        }
+    }
+
+    fn insert_decode_header(&self, headers: &mut HeaderMap, direction: &'static str) {
+        match HeaderValue::from_str(&self.decode_url) {
+            Ok(value) => {
+                headers.insert(X_SGL_DECODE_URL, value);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    decode_url = %self.decode_url,
+                    %direction,
+                    %error,
+                    "decode worker URL rejected by header parser; omitting decode hint",
+                );
+            }
+        }
+    }
+}
+
 /// Per-request metadata injected into both sides of an SGLang
 /// disaggregated prefill/decode dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +213,37 @@ mod tests {
         metadata.insert_response_header(&mut headers);
         assert_eq!(
             headers
+                .get(X_SGL_BOOTSTRAP_ROOM)
+                .and_then(|v| v.to_str().ok()),
+            Some("42")
+        );
+    }
+
+    #[test]
+    fn dispatch_metadata_inserts_request_and_response_observability_headers() {
+        let bootstrap = BootstrapMetadata::with_room("prefill.local", 8200, 42);
+        let dispatch = PdDispatchMetadata::with_bootstrap("grpc://decode.local:30000", bootstrap);
+
+        let mut request_headers = HeaderMap::new();
+        dispatch.insert_request_headers(&mut request_headers);
+        assert_eq!(
+            request_headers
+                .get(X_SGL_DECODE_URL)
+                .and_then(|v| v.to_str().ok()),
+            Some("grpc://decode.local:30000")
+        );
+        assert!(request_headers.get(X_SGL_BOOTSTRAP_ROOM).is_none());
+
+        let mut response_headers = HeaderMap::new();
+        dispatch.insert_response_headers(&mut response_headers);
+        assert_eq!(
+            response_headers
+                .get(X_SGL_DECODE_URL)
+                .and_then(|v| v.to_str().ok()),
+            Some("grpc://decode.local:30000")
+        );
+        assert_eq!(
+            response_headers
                 .get(X_SGL_BOOTSTRAP_ROOM)
                 .and_then(|v| v.to_str().ok()),
             Some("42")

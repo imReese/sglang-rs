@@ -7,12 +7,12 @@ use crate::policies::SelectionContext;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{RequestOutcome, StaleRequestOutcome, WorkerModeLabel};
-use crate::server::routes::pd::{reject_batched_request, BootstrapMetadata, X_SGL_DECODE_URL};
+use crate::server::routes::pd::{reject_batched_request, BootstrapMetadata, PdDispatchMetadata};
 use crate::tokenizer::adapter;
 use crate::workers::{LoadGuard, Worker};
 use axum::body::{to_bytes, Body};
 use axum::extract::State;
-use axum::http::{HeaderMap, HeaderValue, Response};
+use axum::http::{HeaderMap, Response};
 use axum::response::IntoResponse;
 use axum::Json;
 use bytes::Bytes;
@@ -382,28 +382,12 @@ async fn routed_generation(
     } else {
         None
     };
-    let decode_hint_url: Option<String> = decode_peer.as_ref().map(|d| d.url.clone());
-    let mut bootstrap_metadata_hint: Option<BootstrapMetadata> = None;
+    let mut pd_dispatch_metadata: Option<PdDispatchMetadata> = decode_peer
+        .as_ref()
+        .map(|d| PdDispatchMetadata::new(d.url.clone()));
     let mut request_headers = headers;
-    if let Some(url) = &decode_hint_url {
-        match HeaderValue::from_str(url) {
-            Ok(v) => {
-                request_headers.insert(X_SGL_DECODE_URL, v);
-            }
-            Err(e) => {
-                // Discovery emits URLs the proxy has already used; a
-                // header-value parse failure here means the URL
-                // contains a control character (e.g. CR / LF) — drop
-                // the header but keep the request: bootstrap injection
-                // below carries the host/port the engine actually
-                // needs; the header is purely observability.
-                tracing::warn!(
-                    decode_url = %url,
-                    error = %e,
-                    "decode worker URL rejected by header parser; sending request without decode hint",
-                );
-            }
-        }
+    if let Some(metadata) = &pd_dispatch_metadata {
+        metadata.insert_request_headers(&mut request_headers);
     }
     let headers = request_headers;
 
@@ -492,7 +476,9 @@ async fn routed_generation(
         let bootstrap_metadata = BootstrapMetadata::new(worker.bootstrap_host(), bootstrap_port);
         let bootstrap_room = bootstrap_metadata.room();
         let injected_body = bootstrap_metadata.inject_into_body(&body)?;
-        bootstrap_metadata_hint = Some(bootstrap_metadata);
+        if let Some(metadata) = &mut pd_dispatch_metadata {
+            metadata.set_bootstrap(bootstrap_metadata);
+        }
 
         let prefill_url = worker.url.clone();
         let prefill_breaker = Arc::clone(&worker.breaker);
@@ -644,23 +630,8 @@ async fn routed_generation(
     match result {
         Ok(response) => {
             let mut response = postprocess_response(response, postprocess).await?;
-            if let Some(url) = decode_hint_url {
-                match HeaderValue::from_str(&url) {
-                    Ok(v) => {
-                        response.headers_mut().insert(X_SGL_DECODE_URL, v);
-                    }
-                    Err(e) => {
-                        // Already-validated upstream; defensive log only.
-                        tracing::warn!(
-                            decode_url = %url,
-                            error = %e,
-                            "decode worker URL rejected by header parser on response; omitting response-side hint",
-                        );
-                    }
-                }
-            }
-            if let Some(metadata) = bootstrap_metadata_hint {
-                metadata.insert_response_header(response.headers_mut());
+            if let Some(metadata) = pd_dispatch_metadata {
+                metadata.insert_response_headers(response.headers_mut());
             }
             Ok(response)
         }
