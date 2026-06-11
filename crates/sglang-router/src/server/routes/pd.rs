@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::server::error::ApiError;
+use crate::workers::Worker;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use bytes::Bytes;
+use std::sync::Arc;
 
 /// Observability header carrying the decode-pool URL selected via host
 /// affinity for a PD-disaggregated request.
@@ -12,6 +14,43 @@ pub(crate) const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-d
 /// Observability header carrying the bootstrap room shared by the
 /// prefill and decode side of a PD-disaggregated request.
 pub(crate) const X_SGL_BOOTSTRAP_ROOM: HeaderName = HeaderName::from_static("x-sgl-bootstrap-room");
+
+/// Selected PD worker pair, matching sgl-model-gateway's
+/// `WorkerSelection::Dual { prefill, decode }` shape for the current
+/// HTTP route path.
+#[derive(Debug, Clone)]
+pub(crate) struct PdWorkerPair {
+    prefill: Arc<Worker>,
+    decode: Arc<Worker>,
+}
+
+impl PdWorkerPair {
+    pub(crate) fn new(prefill: Arc<Worker>, decode: Arc<Worker>) -> Self {
+        Self { prefill, decode }
+    }
+
+    pub(crate) fn decode(&self) -> &Arc<Worker> {
+        &self.decode
+    }
+
+    pub(crate) fn prepare_plan(&self, body: &Bytes) -> Result<PdDispatchPlan, ApiError> {
+        let bootstrap_port =
+            self.prefill
+                .bootstrap_port()
+                .ok_or_else(|| ApiError::WorkerMisconfigured {
+                    worker: self.prefill.url.clone(),
+                    source: anyhow::anyhow!(
+                        "PD prefill worker is missing disaggregation bootstrap_port"
+                    ),
+                })?;
+        PdDispatchPlan::new(
+            self.decode.url.clone(),
+            self.prefill.bootstrap_host(),
+            bootstrap_port,
+            body,
+        )
+    }
+}
 
 /// Request-scoped PD dispatch metadata. This mirrors the role of
 /// sgl-model-gateway's dispatch metadata stage for the current HTTP
@@ -262,8 +301,21 @@ fn request_batch_size(obj: &serde_json::Map<String, serde_json::Value>) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+    use crate::workers::Worker;
     use axum::http::HeaderMap;
     use bytes::Bytes;
+    use std::sync::Arc;
+
+    fn worker(id: &str, url: &str, mode: WorkerMode, bootstrap_port: Option<u16>) -> Worker {
+        Worker::new(WorkerSpec {
+            id: WorkerId(id.into()),
+            url: url.into(),
+            mode,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port,
+        })
+    }
 
     #[test]
     fn bootstrap_metadata_injects_body_and_response_header_from_one_room() {
@@ -346,6 +398,38 @@ mod tests {
                 .get(X_SGL_BOOTSTRAP_ROOM)
                 .and_then(|v| v.to_str().ok()),
             Some("42")
+        );
+    }
+
+    #[test]
+    fn worker_pair_prepares_plan_from_prefill_bootstrap_and_decode_url() {
+        let prefill = Arc::new(worker(
+            "prefill",
+            "http://prefill.local:30000",
+            WorkerMode::Prefill,
+            Some(8200),
+        ));
+        let decode = Arc::new(worker(
+            "decode",
+            "grpc://decode.local:30000",
+            WorkerMode::Decode,
+            None,
+        ));
+        let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
+
+        let plan = PdWorkerPair::new(prefill, decode)
+            .prepare_plan(&body)
+            .unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_slice(plan.body()).unwrap();
+        assert_eq!(parsed["bootstrap_host"], "prefill.local");
+        assert_eq!(parsed["bootstrap_port"], 8200);
+
+        let mut headers = HeaderMap::new();
+        plan.insert_request_headers(&mut headers);
+        assert_eq!(
+            headers.get(X_SGL_DECODE_URL).and_then(|v| v.to_str().ok()),
+            Some("grpc://decode.local:30000")
         );
     }
 

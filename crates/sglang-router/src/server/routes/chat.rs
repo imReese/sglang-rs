@@ -7,7 +7,7 @@ use crate::policies::SelectionContext;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{RequestOutcome, StaleRequestOutcome, WorkerModeLabel};
-use crate::server::routes::pd::{reject_batched_request, PdDispatchPlan};
+use crate::server::routes::pd::{reject_batched_request, PdDispatchPlan, PdWorkerPair};
 use crate::tokenizer::adapter;
 use crate::workers::{LoadGuard, Worker};
 use axum::body::{to_bytes, Body};
@@ -421,6 +421,7 @@ async fn routed_generation(
     let metrics_model = model_str.clone();
 
     let result = if let Some(decode_worker) = decode_peer {
+        let worker_pair = PdWorkerPair::new(Arc::clone(&worker), decode_worker);
         // PD-disagg dispatch (Pattern B — spawn prefill, await decode).
         //
         // SGLang's HTTP-mode disagg-prefill requires three flat
@@ -458,21 +459,7 @@ async fn routed_generation(
         // the current implementation ships without one (matching SMG's
         // shutdown behaviour).
         reject_batched_request(upstream_path, &body)?;
-        let bootstrap_port =
-            worker
-                .bootstrap_port()
-                .ok_or_else(|| ApiError::WorkerMisconfigured {
-                    worker: worker.url.clone(),
-                    source: anyhow::anyhow!(
-                        "PD prefill worker is missing disaggregation bootstrap_port"
-                    ),
-                })?;
-        let plan = PdDispatchPlan::new(
-            decode_worker.url.clone(),
-            worker.bootstrap_host(),
-            bootstrap_port,
-            &body,
-        )?;
+        let plan = worker_pair.prepare_plan(&body)?;
         let bootstrap_room = plan.bootstrap_room();
         plan.insert_request_headers(&mut request_headers);
         let headers = request_headers;
@@ -521,6 +508,7 @@ async fn routed_generation(
         // the client sees. The decode side gets its own LoadGuard so
         // per-worker `active_requests` reflects decode-pool load for
         // cache-aware-zmq decisions on the decode side.
+        let decode_worker = worker_pair.decode();
         let decode_guard = decode_worker.load_guard();
         if streaming {
             let stream_guards: Box<dyn Send + 'static> = Box::new(decode_guard);
