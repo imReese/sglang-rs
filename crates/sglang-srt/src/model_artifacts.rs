@@ -321,12 +321,73 @@ impl LocalModelCheckpointCatalog {
 
     pub fn glm_moe_dsa_model_weights(
         &self,
-    ) -> Result<GlmMoeDsaModelCheckpointWeights, ModelArtifactError> {
+    ) -> Result<GlmMoeDsaModelCheckpointWeights<'_>, ModelArtifactError> {
+        let num_hidden_layers = self.config.num_hidden_layers.ok_or_else(|| {
+            invalid_safetensors_data(
+                &self.model_path,
+                "missing GLM-DSA model num_hidden_layers config",
+            )
+        })?;
+        let layers = (0..num_hidden_layers)
+            .map(|layer_id| self.glm_moe_dsa_layer_weights(layer_id))
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(GlmMoeDsaModelCheckpointWeights {
             token_embeddings: self
                 .required_glm_moe_dsa_model_tensor("model.embed_tokens.weight")?,
             final_norm: self.required_glm_moe_dsa_model_tensor("model.norm.weight")?,
             lm_head: self.required_glm_moe_dsa_model_tensor("lm_head.weight")?,
+            layers,
+        })
+    }
+
+    pub fn glm_moe_dsa_layer_weights(
+        &self,
+        layer_id: usize,
+    ) -> Result<GlmMoeDsaLayerCheckpointWeights<'_>, ModelArtifactError> {
+        let feed_forward = if self.config.is_moe_layer(layer_id) {
+            let routed_experts = self.routed_experts.layer(layer_id).ok_or_else(|| {
+                invalid_safetensors_data(
+                    &self.model_path,
+                    format!("missing GLM-DSA layer {layer_id} routed expert weights"),
+                )
+            })?;
+            GlmMoeDsaLayerFeedForwardCheckpointWeights::Moe {
+                gate: self.required_glm_moe_dsa_layer_tensor(layer_id, "mlp.gate.weight")?,
+                routed_experts,
+            }
+        } else {
+            GlmMoeDsaLayerFeedForwardCheckpointWeights::Dense {
+                gate_proj: self
+                    .required_glm_moe_dsa_layer_tensor(layer_id, "mlp.gate_proj.weight")?,
+                up_proj: self.required_glm_moe_dsa_layer_tensor(layer_id, "mlp.up_proj.weight")?,
+                down_proj: self
+                    .required_glm_moe_dsa_layer_tensor(layer_id, "mlp.down_proj.weight")?,
+            }
+        };
+
+        Ok(GlmMoeDsaLayerCheckpointWeights {
+            layer_id,
+            q_a_proj: self
+                .required_glm_moe_dsa_layer_tensor(layer_id, "self_attn.q_a_proj.weight")?,
+            q_a_layernorm: self
+                .required_glm_moe_dsa_layer_tensor(layer_id, "self_attn.q_a_layernorm.weight")?,
+            q_b_proj: self
+                .required_glm_moe_dsa_layer_tensor(layer_id, "self_attn.q_b_proj.weight")?,
+            kv_a_proj_with_mqa: self.required_glm_moe_dsa_layer_tensor(
+                layer_id,
+                "self_attn.kv_a_proj_with_mqa.weight",
+            )?,
+            kv_a_layernorm: self
+                .required_glm_moe_dsa_layer_tensor(layer_id, "self_attn.kv_a_layernorm.weight")?,
+            kv_b_proj: self
+                .required_glm_moe_dsa_layer_tensor(layer_id, "self_attn.kv_b_proj.weight")?,
+            o_proj: self.required_glm_moe_dsa_layer_tensor(layer_id, "self_attn.o_proj.weight")?,
+            input_layernorm: self
+                .required_glm_moe_dsa_layer_tensor(layer_id, "input_layernorm.weight")?,
+            post_attention_layernorm: self
+                .required_glm_moe_dsa_layer_tensor(layer_id, "post_attention_layernorm.weight")?,
+            feed_forward,
         })
     }
 
@@ -425,6 +486,19 @@ impl LocalModelCheckpointCatalog {
             })
     }
 
+    fn required_glm_moe_dsa_layer_tensor(
+        &self,
+        layer_id: usize,
+        suffix: &str,
+    ) -> Result<&SafetensorsLayerTensorSpan, ModelArtifactError> {
+        self.layer_tensors.span(layer_id, suffix).ok_or_else(|| {
+            invalid_safetensors_data(
+                &self.model_path,
+                format!("missing GLM-DSA layer {layer_id} tensor {suffix}"),
+            )
+        })
+    }
+
     fn validate_deepseek_hc_head_shapes(
         &self,
         weights: &DeepSeekModelCheckpointWeights<'_>,
@@ -483,13 +557,14 @@ pub struct GlmMoeDsaModelTensorSpan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GlmMoeDsaModelCheckpointWeights {
+pub struct GlmMoeDsaModelCheckpointWeights<'a> {
     token_embeddings: GlmMoeDsaModelTensorSpan,
     final_norm: GlmMoeDsaModelTensorSpan,
     lm_head: GlmMoeDsaModelTensorSpan,
+    layers: Vec<GlmMoeDsaLayerCheckpointWeights<'a>>,
 }
 
-impl GlmMoeDsaModelCheckpointWeights {
+impl<'a> GlmMoeDsaModelCheckpointWeights<'a> {
     pub fn token_embeddings(&self) -> &GlmMoeDsaModelTensorSpan {
         &self.token_embeddings
     }
@@ -501,6 +576,92 @@ impl GlmMoeDsaModelCheckpointWeights {
     pub fn lm_head(&self) -> &GlmMoeDsaModelTensorSpan {
         &self.lm_head
     }
+
+    pub fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
+    pub fn layers(&self) -> &[GlmMoeDsaLayerCheckpointWeights<'a>] {
+        &self.layers
+    }
+
+    pub fn layer(&self, layer_id: usize) -> Option<&GlmMoeDsaLayerCheckpointWeights<'a>> {
+        self.layers.get(layer_id)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GlmMoeDsaLayerCheckpointWeights<'a> {
+    layer_id: usize,
+    q_a_proj: &'a SafetensorsLayerTensorSpan,
+    q_a_layernorm: &'a SafetensorsLayerTensorSpan,
+    q_b_proj: &'a SafetensorsLayerTensorSpan,
+    kv_a_proj_with_mqa: &'a SafetensorsLayerTensorSpan,
+    kv_a_layernorm: &'a SafetensorsLayerTensorSpan,
+    kv_b_proj: &'a SafetensorsLayerTensorSpan,
+    o_proj: &'a SafetensorsLayerTensorSpan,
+    input_layernorm: &'a SafetensorsLayerTensorSpan,
+    post_attention_layernorm: &'a SafetensorsLayerTensorSpan,
+    feed_forward: GlmMoeDsaLayerFeedForwardCheckpointWeights<'a>,
+}
+
+impl<'a> GlmMoeDsaLayerCheckpointWeights<'a> {
+    pub fn layer_id(&self) -> usize {
+        self.layer_id
+    }
+
+    pub fn q_a_proj(&self) -> &SafetensorsLayerTensorSpan {
+        self.q_a_proj
+    }
+
+    pub fn q_a_layernorm(&self) -> &SafetensorsLayerTensorSpan {
+        self.q_a_layernorm
+    }
+
+    pub fn q_b_proj(&self) -> &SafetensorsLayerTensorSpan {
+        self.q_b_proj
+    }
+
+    pub fn kv_a_proj_with_mqa(&self) -> &SafetensorsLayerTensorSpan {
+        self.kv_a_proj_with_mqa
+    }
+
+    pub fn kv_a_layernorm(&self) -> &SafetensorsLayerTensorSpan {
+        self.kv_a_layernorm
+    }
+
+    pub fn kv_b_proj(&self) -> &SafetensorsLayerTensorSpan {
+        self.kv_b_proj
+    }
+
+    pub fn o_proj(&self) -> &SafetensorsLayerTensorSpan {
+        self.o_proj
+    }
+
+    pub fn input_layernorm(&self) -> &SafetensorsLayerTensorSpan {
+        self.input_layernorm
+    }
+
+    pub fn post_attention_layernorm(&self) -> &SafetensorsLayerTensorSpan {
+        self.post_attention_layernorm
+    }
+
+    pub fn feed_forward(&self) -> &GlmMoeDsaLayerFeedForwardCheckpointWeights<'a> {
+        &self.feed_forward
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GlmMoeDsaLayerFeedForwardCheckpointWeights<'a> {
+    Dense {
+        gate_proj: &'a SafetensorsLayerTensorSpan,
+        up_proj: &'a SafetensorsLayerTensorSpan,
+        down_proj: &'a SafetensorsLayerTensorSpan,
+    },
+    Moe {
+        gate: &'a SafetensorsLayerTensorSpan,
+        routed_experts: SafetensorsRoutedExpertLayerWeights<'a>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

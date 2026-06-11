@@ -2,9 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use sglang_srt::model_artifacts::{
-    DeepSeekLayerFeedForwardCheckpointWeights, HfModelConfig, LocalModelArtifacts,
-    ModelArtifactError, SafetensorsCheckpointFingerprintEntry, SafetensorsLayerTensorCatalog,
-    SafetensorsLayerTensorSpan, SafetensorsQuantizedLinearScaleKind,
+    DeepSeekLayerFeedForwardCheckpointWeights, GlmMoeDsaLayerFeedForwardCheckpointWeights,
+    HfModelConfig, LocalModelArtifacts, ModelArtifactError, SafetensorsCheckpointFingerprintEntry,
+    SafetensorsLayerTensorCatalog, SafetensorsLayerTensorSpan, SafetensorsQuantizedLinearScaleKind,
     SafetensorsQuantizedLinearWeightSpan, SafetensorsRoutedExpertProjection,
     SafetensorsRoutedExpertWeightCatalog, SafetensorsRoutedExpertWeightGroup,
     SafetensorsRoutedExpertWeightSpan, SafetensorsTensorData, SafetensorsTensorMetadata,
@@ -497,6 +497,296 @@ fn local_model_artifacts_dispatches_checkpoint_validation_by_model_type() {
     fs::remove_dir_all(deepseek_dir).expect("temp model dir should be removed");
     fs::remove_dir_all(generic_dir).expect("temp model dir should be removed");
     fs::remove_dir_all(glm_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn local_model_checkpoint_catalog_exposes_glm_moe_dsa_dense_layer_weights() {
+    let model_dir = temp_model_dir("glm-moe-dsa-dense-layer-weights");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "model_type": "glm_moe_dsa",
+  "num_hidden_layers": 1,
+  "hidden_size": 1
+}"#,
+    )
+    .expect("config should be written");
+    write_safetensors_file(
+        &model_dir.join("model.safetensors"),
+        &[
+            ("model.embed_tokens.weight", "U8", &[1], [0, 1]),
+            ("model.norm.weight", "U8", &[1], [1, 2]),
+            ("lm_head.weight", "U8", &[1], [2, 3]),
+            (
+                "model.layers.0.self_attn.q_a_proj.weight",
+                "U8",
+                &[1],
+                [3, 4],
+            ),
+            (
+                "model.layers.0.self_attn.q_a_layernorm.weight",
+                "U8",
+                &[1],
+                [4, 5],
+            ),
+            (
+                "model.layers.0.self_attn.q_b_proj.weight",
+                "U8",
+                &[1],
+                [5, 6],
+            ),
+            (
+                "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
+                "U8",
+                &[1],
+                [6, 7],
+            ),
+            (
+                "model.layers.0.self_attn.kv_a_layernorm.weight",
+                "U8",
+                &[1],
+                [7, 8],
+            ),
+            (
+                "model.layers.0.self_attn.kv_b_proj.weight",
+                "U8",
+                &[1],
+                [8, 9],
+            ),
+            (
+                "model.layers.0.self_attn.o_proj.weight",
+                "U8",
+                &[1],
+                [9, 10],
+            ),
+            (
+                "model.layers.0.input_layernorm.weight",
+                "U8",
+                &[1],
+                [10, 11],
+            ),
+            (
+                "model.layers.0.post_attention_layernorm.weight",
+                "U8",
+                &[1],
+                [11, 12],
+            ),
+            ("model.layers.0.mlp.gate_proj.weight", "U8", &[1], [12, 13]),
+            ("model.layers.0.mlp.up_proj.weight", "U8", &[1], [13, 14]),
+            ("model.layers.0.mlp.down_proj.weight", "U8", &[1], [14, 15]),
+        ],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    )
+    .expect("shard should be written");
+
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("GLM artifacts should load");
+    let checkpoint_catalog = artifacts
+        .checkpoint_catalog()
+        .expect("checkpoint catalog should build");
+    let weights = checkpoint_catalog
+        .glm_moe_dsa_model_weights()
+        .expect("GLM-DSA checkpoint catalog should expose layer weights");
+
+    assert_eq!(
+        weights.token_embeddings().tensor_name,
+        "model.embed_tokens.weight"
+    );
+    assert_eq!(weights.final_norm().tensor_name, "model.norm.weight");
+    assert_eq!(weights.lm_head().tensor_name, "lm_head.weight");
+    assert_eq!(weights.layer_count(), 1);
+
+    let layer = weights.layer(0).expect("layer 0 should be present");
+    assert_eq!(
+        layer.q_a_proj().tensor_name,
+        "model.layers.0.self_attn.q_a_proj.weight"
+    );
+    assert_eq!(
+        layer.kv_b_proj().tensor_name,
+        "model.layers.0.self_attn.kv_b_proj.weight"
+    );
+    assert_eq!(
+        layer.o_proj().tensor_name,
+        "model.layers.0.self_attn.o_proj.weight"
+    );
+    match layer.feed_forward() {
+        GlmMoeDsaLayerFeedForwardCheckpointWeights::Dense {
+            gate_proj,
+            up_proj,
+            down_proj,
+        } => {
+            assert_eq!(gate_proj.tensor_name, "model.layers.0.mlp.gate_proj.weight");
+            assert_eq!(up_proj.tensor_name, "model.layers.0.mlp.up_proj.weight");
+            assert_eq!(down_proj.tensor_name, "model.layers.0.mlp.down_proj.weight");
+        }
+        GlmMoeDsaLayerFeedForwardCheckpointWeights::Moe { .. } => {
+            panic!("dense GLM-DSA layer should not expose MoE weights")
+        }
+    }
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn local_model_checkpoint_catalog_exposes_glm_moe_dsa_moe_layer_weights() {
+    let model_dir = temp_model_dir("glm-moe-dsa-moe-layer-weights");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "model_type": "glm_moe_dsa",
+  "num_hidden_layers": 1,
+  "n_routed_experts": 2,
+  "first_k_dense_replace": 0,
+  "moe_layer_freq": 1
+}"#,
+    )
+    .expect("config should be written");
+    let header_len = write_safetensors_file(
+        &model_dir.join("model.safetensors"),
+        &[
+            ("model.embed_tokens.weight", "U8", &[1], [0, 1]),
+            ("model.norm.weight", "U8", &[1], [1, 2]),
+            ("lm_head.weight", "U8", &[1], [2, 3]),
+            (
+                "model.layers.0.self_attn.q_a_proj.weight",
+                "U8",
+                &[1],
+                [3, 4],
+            ),
+            (
+                "model.layers.0.self_attn.q_a_layernorm.weight",
+                "U8",
+                &[1],
+                [4, 5],
+            ),
+            (
+                "model.layers.0.self_attn.q_b_proj.weight",
+                "U8",
+                &[1],
+                [5, 6],
+            ),
+            (
+                "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
+                "U8",
+                &[1],
+                [6, 7],
+            ),
+            (
+                "model.layers.0.self_attn.kv_a_layernorm.weight",
+                "U8",
+                &[1],
+                [7, 8],
+            ),
+            (
+                "model.layers.0.self_attn.kv_b_proj.weight",
+                "U8",
+                &[1],
+                [8, 9],
+            ),
+            (
+                "model.layers.0.self_attn.o_proj.weight",
+                "U8",
+                &[1],
+                [9, 10],
+            ),
+            (
+                "model.layers.0.input_layernorm.weight",
+                "U8",
+                &[1],
+                [10, 11],
+            ),
+            (
+                "model.layers.0.post_attention_layernorm.weight",
+                "U8",
+                &[1],
+                [11, 12],
+            ),
+            ("model.layers.0.mlp.gate.weight", "U8", &[1], [12, 13]),
+            (
+                "model.layers.0.mlp.experts.0.gate_proj.weight",
+                "U8",
+                &[1],
+                [13, 14],
+            ),
+            (
+                "model.layers.0.mlp.experts.0.down_proj.weight",
+                "U8",
+                &[1],
+                [14, 15],
+            ),
+            (
+                "model.layers.0.mlp.experts.0.up_proj.weight",
+                "U8",
+                &[1],
+                [15, 16],
+            ),
+            (
+                "model.layers.0.mlp.experts.1.gate_proj.weight",
+                "U8",
+                &[1],
+                [16, 17],
+            ),
+            (
+                "model.layers.0.mlp.experts.1.down_proj.weight",
+                "U8",
+                &[1],
+                [17, 18],
+            ),
+            (
+                "model.layers.0.mlp.experts.1.up_proj.weight",
+                "U8",
+                &[1],
+                [18, 19],
+            ),
+        ],
+        &[
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+        ],
+    )
+    .expect("shard should be written");
+
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("GLM artifacts should load");
+    let checkpoint_catalog = artifacts
+        .checkpoint_catalog()
+        .expect("checkpoint catalog should build");
+    let weights = checkpoint_catalog
+        .glm_moe_dsa_model_weights()
+        .expect("GLM-DSA checkpoint catalog should expose MoE layer weights");
+
+    let layer = weights.layer(0).expect("layer 0 should be present");
+    match layer.feed_forward() {
+        GlmMoeDsaLayerFeedForwardCheckpointWeights::Moe {
+            gate,
+            routed_experts,
+        } => {
+            assert_eq!(gate.tensor_name, "model.layers.0.mlp.gate.weight");
+            assert_eq!(routed_experts.layer_id(), 0);
+            assert_eq!(routed_experts.expert_count(), 2);
+            assert_eq!(routed_experts.expert_ids().collect::<Vec<_>>(), vec![0, 1]);
+            let expert_1 = routed_experts
+                .group(1)
+                .expect("expert 1 weights should be present");
+            assert_eq!(expert_1.layer_id, 0);
+            assert_eq!(expert_1.expert_id, 1);
+            assert_eq!(
+                expert_1.gate.absolute_byte_offset,
+                8 + header_len as u64 + 16
+            );
+            assert_eq!(
+                expert_1.down.absolute_byte_offset,
+                8 + header_len as u64 + 17
+            );
+            assert_eq!(expert_1.up.absolute_byte_offset, 8 + header_len as u64 + 18);
+        }
+        GlmMoeDsaLayerFeedForwardCheckpointWeights::Dense { .. } => {
+            panic!("MoE GLM-DSA layer should expose routed expert weights")
+        }
+    }
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
 
 #[test]
