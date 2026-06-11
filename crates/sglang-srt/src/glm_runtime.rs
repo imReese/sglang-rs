@@ -24,6 +24,7 @@ pub struct GlmMoeDsaRuntime {
     num_experts_per_tok: usize,
     norm_topk_prob: bool,
     routed_scaling_factor_bits: u32,
+    attention_shape: GlmMoeDsaAttentionShape,
 }
 
 impl GlmMoeDsaRuntime {
@@ -64,6 +65,7 @@ impl GlmMoeDsaRuntime {
                 .map(|value| value.get() as f32)
                 .unwrap_or(1.0)
                 .to_bits(),
+            attention_shape: GlmMoeDsaAttentionShape::from_config(artifacts.config()),
         })
     }
 
@@ -103,6 +105,10 @@ impl GlmMoeDsaRuntime {
         f32::from_bits(self.routed_scaling_factor_bits)
     }
 
+    pub fn attention_shape(&self) -> GlmMoeDsaAttentionShape {
+        self.attention_shape
+    }
+
     pub fn tensor_parallel_placement_plan(
         &self,
         tensor_parallel_size: usize,
@@ -115,6 +121,42 @@ impl GlmMoeDsaRuntime {
         tensor_parallel_size: usize,
     ) -> Result<GlmMoeDsaLoadedTensorParallelRuntime, GlmMoeDsaTensorShardLoadError> {
         GlmMoeDsaLoadedTensorParallelRuntime::from_runtime(self, tensor_parallel_size)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GlmMoeDsaAttentionShape {
+    num_attention_heads: usize,
+    qk_nope_head_dim: usize,
+    qk_rope_head_dim: usize,
+    v_head_dim: usize,
+}
+
+impl GlmMoeDsaAttentionShape {
+    fn from_config(config: &crate::model_artifacts::HfModelConfig) -> Self {
+        let head_dim = config.head_dim.unwrap_or(1);
+        Self {
+            num_attention_heads: config.num_attention_heads.unwrap_or(1),
+            qk_nope_head_dim: config.qk_nope_head_dim.unwrap_or(head_dim),
+            qk_rope_head_dim: config.qk_rope_head_dim.unwrap_or(0),
+            v_head_dim: config.v_head_dim.unwrap_or(head_dim),
+        }
+    }
+
+    fn qk_head_dim(self) -> usize {
+        self.qk_nope_head_dim + self.qk_rope_head_dim
+    }
+
+    fn query_width(self) -> usize {
+        self.num_attention_heads * self.qk_head_dim()
+    }
+
+    fn kv_width(self) -> usize {
+        self.num_attention_heads * (self.qk_nope_head_dim + self.v_head_dim)
+    }
+
+    fn value_width(self) -> usize {
+        self.num_attention_heads * self.v_head_dim
     }
 }
 
@@ -850,6 +892,7 @@ pub struct GlmMoeDsaF32TensorParallelRuntime {
     num_experts_per_tok: usize,
     norm_topk_prob: bool,
     routed_scaling_factor: f32,
+    attention_shape: GlmMoeDsaAttentionShape,
     feed_forward_kinds: Vec<GlmMoeDsaF32FeedForwardKind>,
     ranks: Vec<GlmMoeDsaF32TensorRank>,
 }
@@ -944,6 +987,7 @@ impl GlmMoeDsaF32TensorParallelRuntime {
             num_experts_per_tok: runtime.runtime.num_experts_per_tok(),
             norm_topk_prob: runtime.runtime.norm_topk_prob(),
             routed_scaling_factor: runtime.runtime.routed_scaling_factor(),
+            attention_shape: runtime.runtime.attention_shape(),
             feed_forward_kinds: runtime
                 .runtime
                 .layers()
@@ -980,6 +1024,10 @@ impl GlmMoeDsaF32TensorParallelRuntime {
 
     pub fn routed_scaling_factor(&self) -> f32 {
         self.routed_scaling_factor
+    }
+
+    pub fn attention_shape(&self) -> GlmMoeDsaAttentionShape {
+        self.attention_shape
     }
 
     pub fn ranks(&self) -> &[GlmMoeDsaF32TensorRank] {
@@ -1031,6 +1079,27 @@ impl GlmMoeDsaF32TensorParallelRuntime {
         Ok(GlmMoeDsaF32AttentionProjectionOutput::new(
             q_lora, q, kv_lora, kv,
         ))
+    }
+
+    pub fn attention_output(
+        &self,
+        layer_id: usize,
+        hidden_states: &[Vec<f32>],
+    ) -> Result<Vec<Vec<f32>>, GlmMoeDsaF32KernelError> {
+        let projections = hidden_states
+            .iter()
+            .map(|hidden| self.attention_projection_output(layer_id, hidden))
+            .collect::<Result<Vec<_>, _>>()?;
+        let attention_values = self.causal_attention_values(layer_id, &projections)?;
+        attention_values
+            .iter()
+            .map(|values| {
+                self.row_parallel_projection(
+                    &format!("model.layers.{layer_id}.self_attn.o_proj.weight"),
+                    values,
+                )
+            })
+            .collect()
     }
 
     pub fn dense_mlp_output(
@@ -1307,6 +1376,140 @@ impl GlmMoeDsaF32TensorParallelRuntime {
                 })
             })
             .collect()
+    }
+
+    fn row_parallel_projection(
+        &self,
+        tensor_name: &str,
+        hidden: &[f32],
+    ) -> Result<Vec<f32>, GlmMoeDsaF32KernelError> {
+        let mut output = Vec::<f32>::new();
+        let mut saw_tensor = false;
+        for rank in &self.ranks {
+            let Some(projection) = rank.tensor_shard(tensor_name) else {
+                continue;
+            };
+            saw_tensor = true;
+            let hidden_slice = match projection.selection() {
+                GlmMoeDsaTensorShardSelection::Full => hidden,
+                GlmMoeDsaTensorShardSelection::Slice { axis: 1, range } => {
+                    if range.end > hidden.len() {
+                        return Err(GlmMoeDsaF32KernelError::HiddenSizeMismatch {
+                            tensor_name: tensor_name.to_string(),
+                            expected: range.end,
+                            actual: hidden.len(),
+                        });
+                    }
+                    &hidden[range.clone()]
+                }
+                GlmMoeDsaTensorShardSelection::Slice { axis, .. } => {
+                    return Err(GlmMoeDsaF32KernelError::TensorSelectionMismatch {
+                        tensor_name: tensor_name.to_string(),
+                        expected_axis: 1,
+                        actual_axis: *axis,
+                    });
+                }
+            };
+            let contribution = projection.row_parallel_matvec_contribution(hidden_slice)?;
+            if output.is_empty() {
+                output.resize(contribution.len(), 0.0);
+            } else if output.len() != contribution.len() {
+                return Err(GlmMoeDsaF32KernelError::HiddenSizeMismatch {
+                    tensor_name: tensor_name.to_string(),
+                    expected: output.len(),
+                    actual: contribution.len(),
+                });
+            }
+            for (output, contribution) in output.iter_mut().zip(contribution) {
+                *output += contribution;
+            }
+        }
+
+        if saw_tensor {
+            Ok(output)
+        } else {
+            Err(GlmMoeDsaF32KernelError::MissingTensor {
+                tensor_name: tensor_name.to_string(),
+            })
+        }
+    }
+
+    fn causal_attention_values(
+        &self,
+        layer_id: usize,
+        projections: &[GlmMoeDsaF32AttentionProjectionOutput],
+    ) -> Result<Vec<Vec<f32>>, GlmMoeDsaF32KernelError> {
+        let shape = self.attention_shape;
+        let query_width = shape.query_width();
+        let kv_width = shape.kv_width();
+        let value_width = shape.value_width();
+
+        for projection in projections {
+            if projection.q().len() != query_width {
+                return Err(GlmMoeDsaF32KernelError::HiddenSizeMismatch {
+                    tensor_name: format!("model.layers.{layer_id}.self_attn.q_b_proj.weight"),
+                    expected: query_width,
+                    actual: projection.q().len(),
+                });
+            }
+            if projection.kv().len() != kv_width {
+                return Err(GlmMoeDsaF32KernelError::HiddenSizeMismatch {
+                    tensor_name: format!("model.layers.{layer_id}.self_attn.kv_b_proj.weight"),
+                    expected: kv_width,
+                    actual: projection.kv().len(),
+                });
+            }
+        }
+
+        let scale = (shape.qk_head_dim() as f32).sqrt().recip();
+        let mut outputs = Vec::with_capacity(projections.len());
+        for token_index in 0..projections.len() {
+            let mut token_output = vec![0.0; value_width];
+            for head_index in 0..shape.num_attention_heads {
+                let scores = (0..=token_index)
+                    .map(|key_index| {
+                        self.attention_score_for_head(
+                            &projections[token_index],
+                            &projections[key_index],
+                            head_index,
+                        ) * scale
+                    })
+                    .collect::<Vec<_>>();
+                let weights = softmax(&scores);
+
+                for (key_index, weight) in (0..=token_index).zip(weights) {
+                    let value = value_for_head(&projections[key_index], shape, head_index);
+                    let output_start = head_index * shape.v_head_dim;
+                    for (output, value) in token_output
+                        [output_start..output_start + shape.v_head_dim]
+                        .iter_mut()
+                        .zip(value)
+                    {
+                        *output += weight * value;
+                    }
+                }
+            }
+            outputs.push(token_output);
+        }
+
+        Ok(outputs)
+    }
+
+    fn attention_score_for_head(
+        &self,
+        query_projection: &GlmMoeDsaF32AttentionProjectionOutput,
+        key_projection: &GlmMoeDsaF32AttentionProjectionOutput,
+        head_index: usize,
+    ) -> f32 {
+        let shape = self.attention_shape;
+        let query_start = head_index * shape.qk_head_dim();
+        let query_nope = &query_projection.q()[query_start..query_start + shape.qk_nope_head_dim];
+        let key = key_for_head(key_projection, shape, head_index);
+        query_nope
+            .iter()
+            .zip(key)
+            .map(|(query, key)| query * key)
+            .sum()
     }
 
     fn layer_norm_weight(&self, tensor_name: &str) -> Result<&[f32], GlmMoeDsaF32KernelError> {
@@ -1907,6 +2110,43 @@ fn apply_rms_norm(
 
 fn silu(value: f32) -> f32 {
     value / (1.0 + (-value).exp())
+}
+
+fn key_for_head(
+    projection: &GlmMoeDsaF32AttentionProjectionOutput,
+    shape: GlmMoeDsaAttentionShape,
+    head_index: usize,
+) -> &[f32] {
+    let head_width = shape.qk_nope_head_dim + shape.v_head_dim;
+    let head_start = head_index * head_width;
+    &projection.kv()[head_start..head_start + shape.qk_nope_head_dim]
+}
+
+fn value_for_head(
+    projection: &GlmMoeDsaF32AttentionProjectionOutput,
+    shape: GlmMoeDsaAttentionShape,
+    head_index: usize,
+) -> &[f32] {
+    let head_width = shape.qk_nope_head_dim + shape.v_head_dim;
+    let head_start = head_index * head_width;
+    let value_start = head_start + shape.qk_nope_head_dim;
+    &projection.kv()[value_start..value_start + shape.v_head_dim]
+}
+
+fn softmax(logits: &[f32]) -> Vec<f32> {
+    let max_logit = logits
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, |max, value| max.max(value));
+    let exp_values = logits
+        .iter()
+        .map(|logit| (*logit - max_logit).exp())
+        .collect::<Vec<_>>();
+    let exp_sum = exp_values.iter().sum::<f32>();
+    exp_values
+        .into_iter()
+        .map(|exp_value| exp_value / exp_sum)
+        .collect()
 }
 
 fn topk_softmax_weights(
