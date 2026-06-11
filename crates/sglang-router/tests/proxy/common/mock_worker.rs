@@ -5,7 +5,7 @@
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
@@ -399,7 +399,12 @@ async fn serve_tiny_server_info() -> Json<Value> {
 }
 
 #[allow(dead_code)] // Used by `MockWorker::start`, only some test files need it.
-async fn chat(State(s): State<MockWorkerState>, headers: HeaderMap, body: Bytes) -> Response<Body> {
+async fn chat(
+    State(s): State<MockWorkerState>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
     {
         let mut g = s.captured.lock().unwrap();
         g.last_body = Some(body.clone());
@@ -411,6 +416,26 @@ async fn chat(State(s): State<MockWorkerState>, headers: HeaderMap, body: Bytes)
         }
     }
     let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    if uri.path() == "/v1/rerank" {
+        let docs = v
+            .get("documents")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let results: Vec<Value> = docs
+            .iter()
+            .enumerate()
+            .map(|(index, doc)| {
+                serde_json::json!({
+                    "score": 1.0 - (index as f64 * 0.1),
+                    "document": doc.as_str().unwrap_or_default(),
+                    "index": index,
+                })
+            })
+            .collect();
+        return Json(results).into_response();
+    }
+
     let streaming = v.get("stream").and_then(|x| x.as_bool()).unwrap_or(false);
     if streaming {
         let chunks: Vec<_> = s

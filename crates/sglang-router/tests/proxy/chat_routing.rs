@@ -127,6 +127,44 @@ async fn rerank_plain_mode_proxies_without_bootstrap_fields() {
 }
 
 #[tokio::test]
+async fn rerank_plain_mode_wraps_worker_results_like_gateway() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/rerank")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "query": "rust router",
+                "documents": ["prefill", "decode"],
+                "top_k": 1,
+                "return_documents": false,
+                "rid": "req-123",
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(v["id"], "req-123");
+    assert_eq!(v["object"], "rerank");
+    assert_eq!(v["model"], "tiny");
+    assert!(v["created"].as_u64().is_some_and(|created| created > 0));
+    assert_eq!(v["results"].as_array().unwrap().len(), 1);
+    assert_eq!(v["results"][0]["index"], 0);
+    assert_eq!(v["results"][0]["score"], 1.0);
+    assert!(v["results"][0].get("document").is_none());
+}
+
+#[tokio::test]
 async fn embeddings_plain_mode_proxies_without_bootstrap_fields() {
     let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx_with_worker(&worker.url);

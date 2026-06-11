@@ -8,14 +8,17 @@ use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{RequestOutcome, StaleRequestOutcome, WorkerModeLabel};
 use crate::workers::{LoadGuard, Worker};
-use axum::body::Body;
+use axum::body::{to_bytes, Body};
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
+use axum::response::IntoResponse;
+use axum::Json;
 use bytes::Bytes;
 use serde::de::IgnoredAny;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Observability header carrying the decode-pool URL selected via host
 /// affinity for a PD-disaggregated request. The router fans the
@@ -81,6 +84,7 @@ pub async fn chat_completions(
         body,
         "/v1/chat/completions",
         ModelSelection::RequireBodyModel,
+        ResponsePostprocess::None,
     )
     .await
 }
@@ -98,6 +102,7 @@ pub async fn completions(
         body,
         "/v1/completions",
         ModelSelection::RequireBodyModel,
+        ResponsePostprocess::None,
     )
     .await
 }
@@ -117,6 +122,7 @@ pub async fn generate(
         body,
         "/generate",
         ModelSelection::BodyModelOrSingleConfigured,
+        ResponsePostprocess::None,
     )
     .await
 }
@@ -130,12 +136,14 @@ pub async fn rerank(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
+    let rerank_options = parse_rerank_response_options(&body)?;
     routed_generation(
         ctx,
         headers,
         body,
         "/v1/rerank",
         ModelSelection::RequireBodyModel,
+        ResponsePostprocess::Rerank(rerank_options),
     )
     .await
 }
@@ -180,6 +188,46 @@ pub async fn classify(
 enum ModelSelection {
     RequireBodyModel,
     BodyModelOrSingleConfigured,
+}
+
+#[derive(Clone, Debug)]
+enum ResponsePostprocess {
+    None,
+    Rerank(RerankResponseOptions),
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RerankResponseOptions {
+    #[serde(default = "unknown_model")]
+    model: String,
+    #[serde(default)]
+    top_k: Option<usize>,
+    #[serde(default = "default_true")]
+    return_documents: bool,
+    #[serde(default)]
+    rid: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RerankResult {
+    score: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    document: Option<String>,
+    index: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    meta_info: Option<HashMap<String, serde_json::Value>>,
+}
+
+#[derive(Debug, Serialize)]
+struct RerankResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<serde_json::Value>,
+    object: &'static str,
+    created: u64,
+    model: String,
+    results: Vec<RerankResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<serde_json::Value>,
 }
 
 async fn routed_plain_json(
@@ -268,6 +316,7 @@ async fn routed_generation(
     body: Bytes,
     upstream_path: &'static str,
     model_selection: ModelSelection,
+    postprocess: ResponsePostprocess,
 ) -> Result<Response<Body>, ApiError> {
     let probe = parse_probe(&body)?;
     let streaming = probe.stream.unwrap_or(false);
@@ -594,6 +643,7 @@ async fn routed_generation(
     // request-side parse — we only reach this branch when the URL was
     // header-valid, so the second parse is safe.
     match (result, decode_hint_url) {
+        (Ok(response), None) => postprocess_response(response, postprocess).await,
         (Ok(mut response), Some(url)) => {
             match HeaderValue::from_str(&url) {
                 Ok(v) => {
@@ -614,6 +664,54 @@ async fn routed_generation(
     }
 }
 
+async fn postprocess_response(
+    response: Response<Body>,
+    postprocess: ResponsePostprocess,
+) -> Result<Response<Body>, ApiError> {
+    match postprocess {
+        ResponsePostprocess::None => Ok(response),
+        ResponsePostprocess::Rerank(options) => build_rerank_response(options, response).await,
+    }
+}
+
+async fn build_rerank_response(
+    options: RerankResponseOptions,
+    response: Response<Body>,
+) -> Result<Response<Body>, ApiError> {
+    if !response.status().is_success() {
+        return Ok(response);
+    }
+
+    let body_bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .map_err(|e| ApiError::Internal(anyhow::Error::new(e).context("read rerank body")))?;
+    let mut results: Vec<RerankResult> = serde_json::from_slice(&body_bytes).map_err(|e| {
+        tracing::error!(error = %e, "failed to decode upstream rerank results");
+        ApiError::Internal(
+            anyhow::Error::new(e).context("decode upstream rerank results for gateway response"),
+        )
+    })?;
+
+    if let Some(top_k) = options.top_k {
+        results.truncate(top_k);
+    }
+    if !options.return_documents {
+        for result in &mut results {
+            result.document = None;
+        }
+    }
+
+    let response = RerankResponse {
+        id: options.rid,
+        object: "rerank",
+        created: unix_timestamp_secs(),
+        model: options.model,
+        results,
+        usage: None,
+    };
+    Ok(Json(response).into_response())
+}
+
 /// Estimate prefill-token count from the raw request body for use as
 /// the active-load `prefill_load` counter. Returns 1 at minimum so
 /// a registered request always shows up as "load > 0" — under-counting
@@ -627,6 +725,28 @@ async fn routed_generation(
 /// matching — that count could be reused here).
 fn estimate_prefill_tokens(body: &Bytes) -> usize {
     (body.len() / CHARS_PER_TOKEN_ESTIMATE).max(1)
+}
+
+fn parse_rerank_response_options(body: &Bytes) -> Result<RerankResponseOptions, ApiError> {
+    serde_json::from_slice(body).map_err(|e| {
+        tracing::debug!(error = %e, "rerank request-probe deserialize failed");
+        ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
+    })
+}
+
+fn unknown_model() -> String {
+    "unknown".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Mint a fresh `bootstrap_room` for a PD-disagg request.
