@@ -74,6 +74,73 @@ impl PdDispatchMetadata {
     }
 }
 
+/// Prepared PD dispatch payload. This is the HTTP router's equivalent
+/// of the request-building output in sgl-model-gateway's pipeline: the
+/// body is already bootstrap-injected and the dispatch metadata is ready
+/// to decorate request/response headers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PdDispatchPlan {
+    metadata: PdDispatchMetadata,
+    body: Bytes,
+    bootstrap_room: u64,
+}
+
+impl PdDispatchPlan {
+    pub(crate) fn new(
+        decode_url: impl Into<String>,
+        bootstrap_host: impl Into<String>,
+        bootstrap_port: u16,
+        body: &Bytes,
+    ) -> Result<Self, ApiError> {
+        Self::from_bootstrap(
+            decode_url,
+            BootstrapMetadata::new(bootstrap_host, bootstrap_port),
+            body,
+        )
+    }
+
+    fn from_bootstrap(
+        decode_url: impl Into<String>,
+        bootstrap: BootstrapMetadata,
+        body: &Bytes,
+    ) -> Result<Self, ApiError> {
+        let injected_body = bootstrap.inject_into_body(body)?;
+        let bootstrap_room = bootstrap.room();
+        let mut metadata = PdDispatchMetadata::new(decode_url);
+        metadata.set_bootstrap(bootstrap);
+        Ok(Self {
+            metadata,
+            body: injected_body,
+            bootstrap_room,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_bootstrap(
+        decode_url: impl Into<String>,
+        bootstrap: BootstrapMetadata,
+        body: &Bytes,
+    ) -> Result<Self, ApiError> {
+        Self::from_bootstrap(decode_url, bootstrap, body)
+    }
+
+    pub(crate) fn body(&self) -> &Bytes {
+        &self.body
+    }
+
+    pub(crate) fn bootstrap_room(&self) -> u64 {
+        self.bootstrap_room
+    }
+
+    pub(crate) fn insert_request_headers(&self, headers: &mut HeaderMap) {
+        self.metadata.insert_request_headers(headers);
+    }
+
+    pub(crate) fn insert_response_headers(&self, headers: &mut HeaderMap) {
+        self.metadata.insert_response_headers(headers);
+    }
+}
+
 /// Per-request metadata injected into both sides of an SGLang
 /// disaggregated prefill/decode dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,6 +309,38 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("grpc://decode.local:30000")
         );
+        assert_eq!(
+            response_headers
+                .get(X_SGL_BOOTSTRAP_ROOM)
+                .and_then(|v| v.to_str().ok()),
+            Some("42")
+        );
+    }
+
+    #[test]
+    fn dispatch_plan_prepares_injected_body_and_observability_headers() {
+        let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
+        let bootstrap = BootstrapMetadata::with_room("prefill.local", 8200, 42);
+        let plan =
+            PdDispatchPlan::with_bootstrap("grpc://decode.local:30000", bootstrap, &body).unwrap();
+
+        assert_eq!(plan.bootstrap_room(), 42);
+        let parsed: serde_json::Value = serde_json::from_slice(plan.body()).unwrap();
+        assert_eq!(parsed["bootstrap_host"], "prefill.local");
+        assert_eq!(parsed["bootstrap_port"], 8200);
+        assert_eq!(parsed["bootstrap_room"], 42);
+
+        let mut request_headers = HeaderMap::new();
+        plan.insert_request_headers(&mut request_headers);
+        assert_eq!(
+            request_headers
+                .get(X_SGL_DECODE_URL)
+                .and_then(|v| v.to_str().ok()),
+            Some("grpc://decode.local:30000")
+        );
+
+        let mut response_headers = HeaderMap::new();
+        plan.insert_response_headers(&mut response_headers);
         assert_eq!(
             response_headers
                 .get(X_SGL_BOOTSTRAP_ROOM)

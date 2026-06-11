@@ -7,7 +7,7 @@ use crate::policies::SelectionContext;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{RequestOutcome, StaleRequestOutcome, WorkerModeLabel};
-use crate::server::routes::pd::{reject_batched_request, BootstrapMetadata, PdDispatchMetadata};
+use crate::server::routes::pd::{reject_batched_request, PdDispatchPlan};
 use crate::tokenizer::adapter;
 use crate::workers::{LoadGuard, Worker};
 use axum::body::{to_bytes, Body};
@@ -382,14 +382,8 @@ async fn routed_generation(
     } else {
         None
     };
-    let mut pd_dispatch_metadata: Option<PdDispatchMetadata> = decode_peer
-        .as_ref()
-        .map(|d| PdDispatchMetadata::new(d.url.clone()));
+    let mut pd_dispatch_plan: Option<PdDispatchPlan> = None;
     let mut request_headers = headers;
-    if let Some(metadata) = &pd_dispatch_metadata {
-        metadata.insert_request_headers(&mut request_headers);
-    }
-    let headers = request_headers;
 
     // Per-worker `active_requests` guard. The `ActiveLoadGuard` below
     // sits beside this one: both track in-flight load, but the
@@ -473,12 +467,17 @@ async fn routed_generation(
                         "PD prefill worker is missing disaggregation bootstrap_port"
                     ),
                 })?;
-        let bootstrap_metadata = BootstrapMetadata::new(worker.bootstrap_host(), bootstrap_port);
-        let bootstrap_room = bootstrap_metadata.room();
-        let injected_body = bootstrap_metadata.inject_into_body(&body)?;
-        if let Some(metadata) = &mut pd_dispatch_metadata {
-            metadata.set_bootstrap(bootstrap_metadata);
-        }
+        let plan = PdDispatchPlan::new(
+            decode_worker.url.clone(),
+            worker.bootstrap_host(),
+            bootstrap_port,
+            &body,
+        )?;
+        let bootstrap_room = plan.bootstrap_room();
+        plan.insert_request_headers(&mut request_headers);
+        let headers = request_headers;
+        let injected_body = plan.body().clone();
+        pd_dispatch_plan = Some(plan);
 
         let prefill_url = worker.url.clone();
         let prefill_breaker = Arc::clone(&worker.breaker);
@@ -562,7 +561,7 @@ async fn routed_generation(
             &worker.url,
             &worker.breaker,
             upstream_path,
-            &headers,
+            &request_headers,
             body,
             Some(stream_guards),
         );
@@ -585,9 +584,13 @@ async fn routed_generation(
         // future does not need them (it does not return until the
         // body is buffered).
         let _holds: (LoadGuard, _) = (guard, active_guard);
-        let fetch =
-            ctx.proxy
-                .forward_json_to(&worker.url, &worker.breaker, upstream_path, &headers, body);
+        let fetch = ctx.proxy.forward_json_to(
+            &worker.url,
+            &worker.breaker,
+            upstream_path,
+            &request_headers,
+            body,
+        );
         // Same `biased` order as the streaming arm.
         tokio::select! {
             biased;
@@ -630,8 +633,8 @@ async fn routed_generation(
     match result {
         Ok(response) => {
             let mut response = postprocess_response(response, postprocess).await?;
-            if let Some(metadata) = pd_dispatch_metadata {
-                metadata.insert_response_headers(response.headers_mut());
+            if let Some(plan) = pd_dispatch_plan {
+                plan.insert_response_headers(response.headers_mut());
             }
             Ok(response)
         }
