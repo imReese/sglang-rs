@@ -86,6 +86,24 @@ fn chat_request() -> Request<Body> {
         .unwrap()
 }
 
+fn generate_batch_request() -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/generate")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "input_ids": [[1, 2, 3], [4, 5, 6]],
+                "sampling_params": {
+                    "max_new_tokens": 2,
+                },
+                "stream": true,
+            }))
+            .unwrap(),
+        ))
+        .unwrap()
+}
+
 /// Pattern-B dispatch: prefill is `tokio::spawn`'d as a detached task
 /// so the client response can return as soon as decode is reachable —
 /// the prefill body is captured *eventually* but may not be present
@@ -128,6 +146,18 @@ fn bootstrap_port(v: &Value) -> Option<u16> {
 /// Helper: extract bootstrap_room as u64.
 fn bootstrap_room(v: &Value) -> Option<u64> {
     v.get("bootstrap_room").and_then(|x| x.as_u64())
+}
+
+fn bootstrap_host_array(v: &Value) -> Option<&Vec<Value>> {
+    v.get("bootstrap_host").and_then(|x| x.as_array())
+}
+
+fn bootstrap_port_array(v: &Value) -> Option<&Vec<Value>> {
+    v.get("bootstrap_port").and_then(|x| x.as_array())
+}
+
+fn bootstrap_room_array(v: &Value) -> Option<&Vec<Value>> {
+    v.get("bootstrap_room").and_then(|x| x.as_array())
 }
 
 /// PD-mode chat fans out to BOTH prefill and decode with identical
@@ -185,6 +215,50 @@ async fn pd_mode_chat_injects_bootstrap_fields_into_both_bodies() {
     // bootstrap_port on both sides == prefill's configured bootstrap_port.
     assert_eq!(bootstrap_port(&pj), Some(8997));
     assert_eq!(bootstrap_port(&dj), Some(8997));
+}
+
+#[tokio::test]
+async fn pd_mode_generate_batch_injects_per_item_bootstrap_fields() {
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx(vec![
+        WorkerSpec {
+            id: WorkerId("p1".into()),
+            url: prefill.url.clone(),
+            mode: WorkerMode::Prefill,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: Some(8997),
+        },
+        WorkerSpec {
+            id: WorkerId("d1".into()),
+            url: decode.url.clone(),
+            mode: WorkerMode::Decode,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+        },
+    ]);
+    let app = build_router(ctx);
+
+    let res = app.oneshot(generate_batch_request()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "decode side should 200");
+
+    let prefill_body = await_captured_body(&prefill, Duration::from_secs(2), "prefill").await;
+    let decode_body = await_captured_body(&decode, Duration::from_secs(2), "decode").await;
+    let pj = parse_body(&prefill_body);
+    let dj = parse_body(&decode_body);
+
+    for body in [&pj, &dj] {
+        let hosts = bootstrap_host_array(body).expect("batch body should carry host array");
+        let ports = bootstrap_port_array(body).expect("batch body should carry port array");
+        let rooms = bootstrap_room_array(body).expect("batch body should carry room array");
+        assert_eq!(hosts, &vec![json!("127.0.0.1"), json!("127.0.0.1")]);
+        assert_eq!(ports, &vec![json!(8997), json!(8997)]);
+        assert_eq!(rooms.len(), 2);
+        assert!(rooms
+            .iter()
+            .all(|room| room.as_u64().is_some_and(|room| room <= i64::MAX as u64)));
+    }
+    assert_eq!(bootstrap_room_array(&pj), bootstrap_room_array(&dj));
 }
 
 /// Plain-mode (non-PD) requests do NOT carry any `bootstrap_*` field.

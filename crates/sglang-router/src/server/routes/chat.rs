@@ -536,25 +536,80 @@ fn inject_bootstrap_fields(
             tracing::debug!(error = %e, "re-parse for bootstrap injection failed");
             ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
         })?;
-    obj.insert(
-        "bootstrap_host".to_string(),
-        serde_json::Value::String(bootstrap_host.to_string()),
-    );
-    obj.insert(
-        "bootstrap_port".to_string(),
-        match bootstrap_port {
-            Some(p) => serde_json::Value::Number(p.into()),
-            None => serde_json::Value::Null,
-        },
-    );
-    obj.insert(
-        "bootstrap_room".to_string(),
-        serde_json::Value::Number(bootstrap_room.into()),
-    );
+    if let Some(batch_size) = request_batch_size(&obj) {
+        obj.insert(
+            "bootstrap_host".to_string(),
+            serde_json::Value::Array(
+                (0..batch_size)
+                    .map(|_| serde_json::Value::String(bootstrap_host.to_string()))
+                    .collect(),
+            ),
+        );
+        obj.insert(
+            "bootstrap_port".to_string(),
+            serde_json::Value::Array(
+                (0..batch_size)
+                    .map(|_| bootstrap_port_value(bootstrap_port))
+                    .collect(),
+            ),
+        );
+        obj.insert(
+            "bootstrap_room".to_string(),
+            serde_json::Value::Array(
+                (0..batch_size)
+                    .map(|index| {
+                        let room = if index == 0 {
+                            bootstrap_room
+                        } else {
+                            generate_room_id()
+                        };
+                        serde_json::Value::Number(room.into())
+                    })
+                    .collect(),
+            ),
+        );
+    } else {
+        obj.insert(
+            "bootstrap_host".to_string(),
+            serde_json::Value::String(bootstrap_host.to_string()),
+        );
+        obj.insert(
+            "bootstrap_port".to_string(),
+            bootstrap_port_value(bootstrap_port),
+        );
+        obj.insert(
+            "bootstrap_room".to_string(),
+            serde_json::Value::Number(bootstrap_room.into()),
+        );
+    }
     let bytes = serde_json::to_vec(&obj).map_err(|e| {
         ApiError::Internal(anyhow::Error::new(e).context("re-serialize bootstrap-injected body"))
     })?;
     Ok(Bytes::from(bytes))
+}
+
+fn bootstrap_port_value(bootstrap_port: Option<u16>) -> serde_json::Value {
+    match bootstrap_port {
+        Some(p) => serde_json::Value::Number(p.into()),
+        None => serde_json::Value::Null,
+    }
+}
+
+fn request_batch_size(obj: &serde_json::Map<String, serde_json::Value>) -> Option<usize> {
+    if let Some(items) = obj.get("text").and_then(serde_json::Value::as_array) {
+        return Some(items.len());
+    }
+    if let Some(items) = obj.get("prompt").and_then(serde_json::Value::as_array) {
+        if items.iter().all(serde_json::Value::is_string) {
+            return Some(items.len());
+        }
+    }
+    if let Some(items) = obj.get("input_ids").and_then(serde_json::Value::as_array) {
+        if items.first().map_or(true, serde_json::Value::is_array) {
+            return Some(items.len());
+        }
+    }
+    None
 }
 
 fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
