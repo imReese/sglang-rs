@@ -307,6 +307,56 @@ async fn bootstrap_grpc_router_service_rejects_generation_for_unsupported_local_
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
 
+#[tokio::test]
+async fn bootstrap_grpc_router_service_routes_glm_moe_dsa_through_runtime_loader() {
+    let model_dir = temp_model_dir("server-glm-runtime-forward");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_complete_glm_moe_dsa_checkpoint(&model_dir);
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_dir.to_str().expect("temp model dir should be utf-8"),
+        "--grpc-mode",
+    ])
+    .expect("args should parse");
+    let service = build_bootstrap_grpc_router_service(&args);
+
+    let error = match service
+        .text_generate(Request::new(TextGenerateRequest {
+            text: "hello".to_string(),
+            sampling_params: Some(SamplingParams {
+                max_new_tokens: Some(1),
+                ..Default::default()
+            }),
+            options: Some(RequestOptions {
+                request_id: Some("glm-runtime-forward".to_string()),
+                stream: true,
+                data_parallel_rank: 0,
+                trace_headers: Default::default(),
+            }),
+            disaggregated_params: None,
+        }))
+        .await
+    {
+        Ok(_) => panic!("GLM runtime should not generate fake output before kernels exist"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), tonic::Code::Internal);
+    assert!(
+        error
+            .message()
+            .contains("GLM MoE DSA Rust forward kernels are not implemented"),
+        "unexpected error: {error:?}"
+    );
+    assert!(
+        error.message().contains("loaded 1 tensor-parallel rank(s)"),
+        "unexpected error: {error:?}"
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
 #[test]
 fn bootstrap_grpc_router_service_rejects_missing_deepseek_v4_model_root_tensor() {
     let model_dir = temp_model_dir("server-missing-deepseek-root");
@@ -1543,6 +1593,107 @@ fn write_complete_deepseek_v4_checkpoint(model_dir: &std::path::Path) {
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
             25,
         ],
+    )
+    .expect("shard should be written");
+}
+
+fn write_complete_glm_moe_dsa_checkpoint(model_dir: &std::path::Path) {
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "model_type": "glm_moe_dsa",
+  "num_hidden_layers": 1,
+  "hidden_size": 1,
+  "num_attention_heads": 1,
+  "num_key_value_heads": 1,
+  "head_dim": 1,
+  "n_routed_experts": 1,
+  "first_k_dense_replace": 0,
+  "moe_layer_freq": 1
+}"#,
+    )
+    .expect("config should be written");
+    write_safetensors_file(
+        &model_dir.join("model.safetensors"),
+        &[
+            ("model.embed_tokens.weight", "U8", &[1], [0, 1]),
+            ("model.norm.weight", "U8", &[1], [1, 2]),
+            ("lm_head.weight", "U8", &[1], [2, 3]),
+            (
+                "model.layers.0.self_attn.q_a_proj.weight",
+                "U8",
+                &[1],
+                [3, 4],
+            ),
+            (
+                "model.layers.0.self_attn.q_a_layernorm.weight",
+                "U8",
+                &[1],
+                [4, 5],
+            ),
+            (
+                "model.layers.0.self_attn.q_b_proj.weight",
+                "U8",
+                &[1],
+                [5, 6],
+            ),
+            (
+                "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
+                "U8",
+                &[1],
+                [6, 7],
+            ),
+            (
+                "model.layers.0.self_attn.kv_a_layernorm.weight",
+                "U8",
+                &[1],
+                [7, 8],
+            ),
+            (
+                "model.layers.0.self_attn.kv_b_proj.weight",
+                "U8",
+                &[1],
+                [8, 9],
+            ),
+            (
+                "model.layers.0.self_attn.o_proj.weight",
+                "U8",
+                &[1],
+                [9, 10],
+            ),
+            (
+                "model.layers.0.input_layernorm.weight",
+                "U8",
+                &[1],
+                [10, 11],
+            ),
+            (
+                "model.layers.0.post_attention_layernorm.weight",
+                "U8",
+                &[1],
+                [11, 12],
+            ),
+            ("model.layers.0.mlp.gate.weight", "U8", &[1], [12, 13]),
+            (
+                "model.layers.0.mlp.experts.0.gate_proj.weight",
+                "U8",
+                &[1],
+                [13, 14],
+            ),
+            (
+                "model.layers.0.mlp.experts.0.down_proj.weight",
+                "U8",
+                &[1],
+                [14, 15],
+            ),
+            (
+                "model.layers.0.mlp.experts.0.up_proj.weight",
+                "U8",
+                &[1],
+                [15, 16],
+            ),
+        ],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
     )
     .expect("shard should be written");
 }

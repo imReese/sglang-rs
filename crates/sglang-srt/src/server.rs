@@ -10,6 +10,10 @@ use crate::deepseek_runtime::{
     DeepSeekV4TensorShardLoadError,
 };
 use crate::engine::Engine;
+use crate::glm_runtime::{
+    GlmMoeDsaLoadedTensorParallelRuntime, GlmMoeDsaRuntime, GlmMoeDsaRuntimeError,
+    GlmMoeDsaTensorShardLoadError,
+};
 use crate::grpc::{GrpcRouterService, GrpcServeError, serve_grpc_router_with_shutdown};
 use crate::http::{
     HttpKvCacheInfo, HttpKvEventsInfo, HttpRouterService, HttpServeError, HttpServerInfo,
@@ -49,6 +53,7 @@ pub enum BootstrapForwardModel {
     Space,
     CpuEmbeddingLm(CpuEmbeddingLmModel),
     DeepSeekV4(DeepSeekV4LoadedTensorParallelRuntime),
+    GlmMoeDsa(GlmMoeDsaLoadedTensorParallelRuntime),
     UnsupportedLocalModelRuntime {
         model_path: PathBuf,
         model_type: Option<String>,
@@ -75,6 +80,10 @@ impl BootstrapForwardModel {
                 None if artifacts.config().model_type.as_deref() == Some("deepseek_v4") => {
                     let runtime = DeepSeekV4Runtime::from_local_model_artifacts(&artifacts)?;
                     Self::DeepSeekV4(runtime.load_tensor_parallel_shards(args.tp_size)?)
+                }
+                None if artifacts.config().model_type.as_deref() == Some("glm_moe_dsa") => {
+                    let runtime = GlmMoeDsaRuntime::from_local_model_artifacts(&artifacts)?;
+                    Self::GlmMoeDsa(runtime.load_tensor_parallel_shards(args.tp_size)?)
                 }
                 None => Self::UnsupportedLocalModelRuntime {
                     model_path: artifacts.model_path().to_path_buf(),
@@ -114,6 +123,13 @@ impl ForwardModel for BootstrapForwardModel {
                     plan.input_ids().len()
                 )))
             }
+            Self::GlmMoeDsa(runtime) => Err(ModelForwardError::Runtime(format!(
+                "GLM MoE DSA Rust forward kernels are not implemented; loaded {} tensor-parallel rank(s), {} tensor shard(s), and {} byte(s) across {} layer(s)",
+                runtime.rank_count(),
+                runtime.loaded_shard_count(),
+                runtime.loaded_byte_len(),
+                runtime.layer_count(),
+            ))),
             Self::UnsupportedLocalModelRuntime {
                 model_path,
                 model_type,
@@ -167,6 +183,8 @@ pub enum ServerLaunchError {
     MooncakeTransfer(MooncakeError),
     DeepSeekRuntime(DeepSeekRuntimeError),
     DeepSeekTensorShardLoad(DeepSeekV4TensorShardLoadError),
+    GlmRuntime(GlmMoeDsaRuntimeError),
+    GlmTensorShardLoad(GlmMoeDsaTensorShardLoadError),
     ServerTaskJoin(String),
     ZmqRoutePortCountMismatch {
         expected: usize,
@@ -204,6 +222,8 @@ impl PartialEq for ServerLaunchError {
             (Self::DeepSeekTensorShardLoad(left), Self::DeepSeekTensorShardLoad(right)) => {
                 left == right
             }
+            (Self::GlmRuntime(left), Self::GlmRuntime(right)) => left == right,
+            (Self::GlmTensorShardLoad(left), Self::GlmTensorShardLoad(right)) => left == right,
             (
                 Self::ZmqRoutePortCountMismatch {
                     expected: left_expected,
@@ -245,6 +265,10 @@ impl fmt::Display for ServerLaunchError {
             Self::DeepSeekRuntime(error) => write!(formatter, "DeepSeek runtime error: {error}"),
             Self::DeepSeekTensorShardLoad(error) => {
                 write!(formatter, "DeepSeek tensor shard load error: {error}")
+            }
+            Self::GlmRuntime(error) => write!(formatter, "GLM runtime error: {error}"),
+            Self::GlmTensorShardLoad(error) => {
+                write!(formatter, "GLM tensor shard load error: {error}")
             }
             Self::ServerTaskJoin(error) => write!(formatter, "server task failed to join: {error}"),
             Self::ZmqRoutePortCountMismatch { expected, actual } => write!(
@@ -308,6 +332,18 @@ impl From<DeepSeekRuntimeError> for ServerLaunchError {
 impl From<DeepSeekV4TensorShardLoadError> for ServerLaunchError {
     fn from(value: DeepSeekV4TensorShardLoadError) -> Self {
         Self::DeepSeekTensorShardLoad(value)
+    }
+}
+
+impl From<GlmMoeDsaRuntimeError> for ServerLaunchError {
+    fn from(value: GlmMoeDsaRuntimeError) -> Self {
+        Self::GlmRuntime(value)
+    }
+}
+
+impl From<GlmMoeDsaTensorShardLoadError> for ServerLaunchError {
+    fn from(value: GlmMoeDsaTensorShardLoadError) -> Self {
+        Self::GlmTensorShardLoad(value)
     }
 }
 
