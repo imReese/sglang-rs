@@ -29,7 +29,7 @@ use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
 use sgl_router::tokenizer::TokenizerRegistry;
-use sgl_router::workers::WorkerRegistry;
+use sgl_router::workers::{KvCacheLayoutInfo, WorkerRegistry};
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
@@ -59,15 +59,45 @@ fn config() -> Config {
 }
 
 fn build_ctx(specs: Vec<WorkerSpec>) -> Arc<AppContext> {
+    build_ctx_with_layouts(specs.into_iter().map(|spec| (spec, None)).collect())
+}
+
+fn build_ctx_with_layouts(specs: Vec<(WorkerSpec, Option<KvCacheLayoutInfo>)>) -> Arc<AppContext> {
     let cfg = config();
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
     let registry = Arc::new(WorkerRegistry::default());
-    for s in specs {
-        let _ = registry.add(s);
+    for (spec, layout) in specs {
+        let _ = registry.add_with_cb_and_kv_cache_layout(spec, None, layout);
     }
     let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
     Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
+}
+
+fn glm5_layout() -> KvCacheLayoutInfo {
+    KvCacheLayoutInfo {
+        dtype: "bfloat16".to_string(),
+        page_size: 64,
+        num_layers: 78,
+        kv_heads: 64,
+        head_dim: 64,
+        kv_tensors_per_token: 2,
+        bytes_per_token: 1_277_952,
+        page_size_bytes: 81_788_928,
+    }
+}
+
+fn smaller_layout() -> KvCacheLayoutInfo {
+    KvCacheLayoutInfo {
+        dtype: "bfloat16".to_string(),
+        page_size: 64,
+        num_layers: 40,
+        kv_heads: 8,
+        head_dim: 128,
+        kv_tensors_per_token: 2,
+        bytes_per_token: 163_840,
+        page_size_bytes: 10_485_760,
+    }
 }
 
 fn chat_request() -> Request<Body> {
@@ -442,6 +472,64 @@ async fn pd_mode_prefill_only_returns_no_decode_workers_available() {
     assert_eq!(
         res.headers().get("x-router-error-code").unwrap(),
         "no_decode_workers_available",
+    );
+}
+
+/// PD-mode prefill worker with decode peers whose runtime KV-cache
+/// layout does not match → 503 `no_decode_workers_available`. Pin:
+/// route-level PD pairing must honor the same layout compatibility
+/// rule as the resolver rather than forwarding to an incompatible
+/// decode worker just because it is otherwise healthy.
+#[tokio::test]
+async fn pd_mode_chat_returns_no_decode_when_kv_layouts_are_incompatible() {
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode_a = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode_b = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx_with_layouts(vec![
+        (
+            WorkerSpec {
+                id: WorkerId("p1".into()),
+                url: prefill.url.clone(),
+                mode: WorkerMode::Prefill,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: None,
+            },
+            Some(glm5_layout()),
+        ),
+        (
+            WorkerSpec {
+                id: WorkerId("d1".into()),
+                url: decode_a.url.clone(),
+                mode: WorkerMode::Decode,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: None,
+            },
+            Some(smaller_layout()),
+        ),
+        (
+            WorkerSpec {
+                id: WorkerId("d2".into()),
+                url: decode_b.url.clone(),
+                mode: WorkerMode::Decode,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: None,
+            },
+            Some(smaller_layout()),
+        ),
+    ]);
+    let app = build_router(ctx);
+
+    let res = app.oneshot(chat_request()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        res.headers().get("x-router-error-code").unwrap(),
+        "no_decode_workers_available",
+    );
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        body_str.contains("\"code\":\"no_decode_workers_available\""),
+        "body: {body_str}"
     );
 }
 

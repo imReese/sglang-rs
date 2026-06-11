@@ -371,7 +371,7 @@ async fn routed_generation(
     let decode_peer: Option<Arc<Worker>> = if worker.mode() == WorkerMode::Prefill {
         Some(
             resolver
-                .decode_with_affinity(&model_id, &worker.url)
+                .decode_with_affinity_for_prefill(&model_id, &worker)
                 .map_err(|e| match e {
                     PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers {
                         model: model_str.clone(),

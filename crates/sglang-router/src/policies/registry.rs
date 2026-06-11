@@ -200,6 +200,25 @@ impl PdPoolResolver {
         select_decode_with_affinity(prefill_url, &candidates)
             .ok_or(PdResolveError::NoDecodeWorkersAvailable)
     }
+
+    /// Pick a decode worker compatible with the selected prefill
+    /// worker's runtime KV-cache layout, then apply the normal host
+    /// affinity / load fallback rules. Missing layout metadata on
+    /// either side is treated as compatible so mixed-version clusters
+    /// can roll forward without dropping all decode candidates.
+    pub fn decode_with_affinity_for_prefill(
+        &self,
+        model: &ModelId,
+        prefill: &Worker,
+    ) -> Result<Arc<Worker>, PdResolveError> {
+        let candidates = self.decode_candidates(model)?;
+        let compatible = candidates
+            .into_iter()
+            .filter(|decode| kv_layout_compatible(prefill, decode))
+            .collect::<Vec<_>>();
+        select_decode_with_affinity(&prefill.url, &compatible)
+            .ok_or(PdResolveError::NoDecodeWorkersAvailable)
+    }
 }
 
 /// Pick a decode worker from `candidates` preferring the one whose URL
@@ -296,10 +315,18 @@ fn host_of(worker_url: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn kv_layout_compatible(prefill: &Worker, decode: &Worker) -> bool {
+    match (prefill.kv_cache_layout(), decode.kv_cache_layout()) {
+        (Some(prefill_layout), Some(decode_layout)) => prefill_layout == decode_layout,
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerId, WorkerSpec};
+    use crate::workers::KvCacheLayoutInfo;
 
     fn spec(id: &str, mode: WorkerMode, model: &str) -> WorkerSpec {
         WorkerSpec {
@@ -502,6 +529,43 @@ mod tests {
         }
     }
 
+    fn glm5_layout() -> KvCacheLayoutInfo {
+        KvCacheLayoutInfo {
+            dtype: "bfloat16".to_string(),
+            page_size: 64,
+            num_layers: 78,
+            kv_heads: 64,
+            head_dim: 64,
+            kv_tensors_per_token: 2,
+            bytes_per_token: 1_277_952,
+            page_size_bytes: 81_788_928,
+        }
+    }
+
+    fn smaller_layout() -> KvCacheLayoutInfo {
+        KvCacheLayoutInfo {
+            dtype: "bfloat16".to_string(),
+            page_size: 64,
+            num_layers: 40,
+            kv_heads: 8,
+            head_dim: 128,
+            kv_tensors_per_token: 2,
+            bytes_per_token: 163_840,
+            page_size_bytes: 10_485_760,
+        }
+    }
+
+    fn registry_with_layouts(
+        specs: Vec<(WorkerSpec, Option<KvCacheLayoutInfo>)>,
+    ) -> Arc<WorkerRegistry> {
+        let r = Arc::new(WorkerRegistry::default());
+        for (spec, layout) in specs {
+            r.add_with_cb_and_kv_cache_layout(spec, None, layout)
+                .expect("worker should register");
+        }
+        r
+    }
+
     /// Same-host affinity: a request that lands on `prefill@host_a`
     /// picks `decode@host_a` even when `decode@host_b` has lower load.
     /// Pin: the affinity branch wins over load tiebreak when both
@@ -522,6 +586,60 @@ mod tests {
         assert_eq!(
             chosen.url, "http://host_a:30001",
             "same-host decode peer must win over remote peer",
+        );
+    }
+
+    #[test]
+    fn decoder_affinity_skips_same_host_peer_with_incompatible_kv_layout() {
+        let prefill_spec = spec_with_url("p1", "http://host_a:30000", WorkerMode::Prefill, "m");
+        let r = registry_with_layouts(vec![
+            (prefill_spec.clone(), Some(glm5_layout())),
+            (
+                spec_with_url("d1", "http://host_a:30001", WorkerMode::Decode, "m"),
+                Some(smaller_layout()),
+            ),
+            (
+                spec_with_url("d2", "http://host_b:30001", WorkerMode::Decode, "m"),
+                Some(glm5_layout()),
+            ),
+        ]);
+        let resolver = PdPoolResolver::new(r.clone());
+        let prefill = r.get(&prefill_spec.id).expect("prefill should register");
+
+        let chosen = resolver
+            .decode_with_affinity_for_prefill(&ModelId("m".into()), &prefill)
+            .expect("compatible remote decode peer should be selected");
+
+        assert_eq!(
+            chosen.url, "http://host_b:30001",
+            "layout compatibility must beat same-host affinity"
+        );
+    }
+
+    #[test]
+    fn decoder_affinity_allows_legacy_workers_without_kv_layout_metadata() {
+        let prefill_spec = spec_with_url("p1", "http://host_a:30000", WorkerMode::Prefill, "m");
+        let r = registry_with_layouts(vec![
+            (prefill_spec.clone(), Some(glm5_layout())),
+            (
+                spec_with_url("d1", "http://host_a:30001", WorkerMode::Decode, "m"),
+                None,
+            ),
+            (
+                spec_with_url("d2", "http://host_b:30001", WorkerMode::Decode, "m"),
+                Some(smaller_layout()),
+            ),
+        ]);
+        let resolver = PdPoolResolver::new(r.clone());
+        let prefill = r.get(&prefill_spec.id).expect("prefill should register");
+
+        let chosen = resolver
+            .decode_with_affinity_for_prefill(&ModelId("m".into()), &prefill)
+            .expect("legacy decode peer without layout metadata remains eligible");
+
+        assert_eq!(
+            chosen.url, "http://host_a:30001",
+            "missing layout metadata should preserve backwards-compatible affinity"
         );
     }
 
