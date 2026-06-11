@@ -141,6 +141,47 @@ impl PdExecutionRequest {
     }
 }
 
+/// Prepared route dispatch request. This is the HTTP route's
+/// request-building stage: plain requests preserve the selected worker,
+/// headers, and body; PD requests reject unsupported batches, inject
+/// bootstrap metadata, and attach decode-affinity metadata before
+/// execution.
+#[derive(Debug, Clone)]
+pub(crate) enum RouteDispatchPlan {
+    Plain {
+        worker: Arc<Worker>,
+        headers: HeaderMap,
+        body: Bytes,
+    },
+    Pd {
+        request: PdExecutionRequest,
+        headers: HeaderMap,
+    },
+}
+
+impl RouteDispatchPlan {
+    pub(crate) fn prepare(
+        selection: RouteWorkerSelection,
+        upstream_path: &str,
+        mut headers: HeaderMap,
+        body: Bytes,
+    ) -> Result<Self, ApiError> {
+        match selection {
+            RouteWorkerSelection::Single { worker } => Ok(Self::Plain {
+                worker,
+                headers,
+                body,
+            }),
+            RouteWorkerSelection::Dual { pair } => {
+                reject_batched_request(upstream_path, &body)?;
+                let request = PdExecutionRequest::prepare(pair, &body)?;
+                request.insert_request_headers(&mut headers);
+                Ok(Self::Pd { request, headers })
+            }
+        }
+    }
+}
+
 /// Request-scoped PD dispatch metadata. This mirrors the role of
 /// sgl-model-gateway's dispatch metadata stage for the current HTTP
 /// router path: one object owns the decode affinity hint and the
@@ -571,6 +612,82 @@ mod tests {
             Some("grpc://decode.local:30000")
         );
         assert!(request.bootstrap_room() <= i64::MAX as u64);
+    }
+
+    #[test]
+    fn route_dispatch_plan_keeps_plain_request_unchanged() {
+        let worker = Arc::new(worker(
+            "plain",
+            "grpc://plain.local:30000",
+            WorkerMode::Plain,
+            None,
+        ));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("abc"));
+        let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
+        let selection = RouteWorkerSelection::Single {
+            worker: Arc::clone(&worker),
+        };
+
+        let plan =
+            RouteDispatchPlan::prepare(selection, "/v1/chat/completions", headers, body.clone())
+                .unwrap();
+
+        match plan {
+            RouteDispatchPlan::Plain {
+                worker: selected,
+                headers,
+                body: planned_body,
+            } => {
+                assert_eq!(selected.id, worker.id);
+                assert_eq!(planned_body, body);
+                assert_eq!(
+                    headers.get("x-request-id").and_then(|v| v.to_str().ok()),
+                    Some("abc")
+                );
+                assert!(headers.get(X_SGL_DECODE_URL).is_none());
+            }
+            RouteDispatchPlan::Pd { .. } => panic!("expected plain dispatch plan"),
+        }
+    }
+
+    #[test]
+    fn route_dispatch_plan_prepares_pd_execution_request_and_headers() {
+        let prefill = Arc::new(worker(
+            "prefill",
+            "http://prefill.local:30000",
+            WorkerMode::Prefill,
+            Some(8200),
+        ));
+        let decode = Arc::new(worker(
+            "decode",
+            "grpc://decode.local:30000",
+            WorkerMode::Decode,
+            None,
+        ));
+        let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
+        let selection = RouteWorkerSelection::Dual {
+            pair: PdWorkerPair::new(prefill, decode),
+        };
+
+        let plan =
+            RouteDispatchPlan::prepare(selection, "/v1/chat/completions", HeaderMap::new(), body)
+                .unwrap();
+
+        match plan {
+            RouteDispatchPlan::Pd { request, headers } => {
+                assert_eq!(request.prefill().id, WorkerId("prefill".into()));
+                assert_eq!(request.decode().id, WorkerId("decode".into()));
+                assert_eq!(
+                    headers.get(X_SGL_DECODE_URL).and_then(|v| v.to_str().ok()),
+                    Some("grpc://decode.local:30000")
+                );
+                let parsed: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+                assert_eq!(parsed["bootstrap_host"], "prefill.local");
+                assert_eq!(parsed["bootstrap_port"], 8200);
+            }
+            RouteDispatchPlan::Plain { .. } => panic!("expected PD dispatch plan"),
+        }
     }
 
     #[test]

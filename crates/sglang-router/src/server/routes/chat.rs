@@ -7,9 +7,7 @@ use crate::policies::SelectionContext;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{RequestOutcome, StaleRequestOutcome, WorkerModeLabel};
-use crate::server::routes::pd::{
-    reject_batched_request, PdDispatchPlan, PdExecutionRequest, RouteWorkerSelection,
-};
+use crate::server::routes::pd::{PdDispatchPlan, RouteDispatchPlan, RouteWorkerSelection};
 use crate::tokenizer::adapter;
 use crate::workers::LoadGuard;
 use axum::body::{to_bytes, Body};
@@ -372,7 +370,6 @@ async fn routed_generation(
         })?;
     let worker = Arc::clone(selection.primary_worker());
     let mut pd_dispatch_plan: Option<PdDispatchPlan> = None;
-    let mut request_headers = headers;
 
     // Per-worker `active_requests` guard. The `ActiveLoadGuard` below
     // sits beside this one: both track in-flight load, but the
@@ -408,9 +405,13 @@ async fn routed_generation(
         WorkerMode::Plain => WorkerModeLabel::Plain,
     };
     let metrics_model = model_str.clone();
+    let dispatch_plan = RouteDispatchPlan::prepare(selection, upstream_path, headers, body)?;
 
-    let result = match selection {
-        RouteWorkerSelection::Dual { pair: worker_pair } => {
+    let result = match dispatch_plan {
+        RouteDispatchPlan::Pd {
+            request: execution_request,
+            headers,
+        } => {
             // PD-disagg dispatch (Pattern B — spawn prefill, await decode).
             //
             // SGLang's HTTP-mode disagg-prefill requires three flat
@@ -447,11 +448,7 @@ async fn routed_generation(
             // `JoinSet` through `AppContext` for graceful shutdown drain;
             // the current implementation ships without one (matching SMG's
             // shutdown behaviour).
-            reject_batched_request(upstream_path, &body)?;
-            let execution_request = PdExecutionRequest::prepare(worker_pair, &body)?;
             let bootstrap_room = execution_request.bootstrap_room();
-            execution_request.insert_request_headers(&mut request_headers);
-            let headers = request_headers;
             let injected_body = execution_request.body().clone();
             pd_dispatch_plan = Some(execution_request.dispatch_plan().clone());
 
@@ -531,7 +528,11 @@ async fn routed_generation(
                 }
             }
         }
-        RouteWorkerSelection::Single { worker } if streaming => {
+        RouteDispatchPlan::Plain {
+            worker,
+            headers,
+            body,
+        } if streaming => {
             // Plain mode, streaming. Both guards ride the SSE pump until
             // the body completes — see the matching comment in the
             // non-streaming arm.
@@ -540,7 +541,7 @@ async fn routed_generation(
                 &worker.url,
                 &worker.breaker,
                 upstream_path,
-                &request_headers,
+                &headers,
                 body,
                 Some(stream_guards),
             );
@@ -556,7 +557,11 @@ async fn routed_generation(
                 _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
             }
         }
-        RouteWorkerSelection::Single { worker } => {
+        RouteDispatchPlan::Plain {
+            worker,
+            headers,
+            body,
+        } => {
             // Plain mode, non-streaming. The handler awaits the full
             // buffered response, so both guards live correctly in this
             // scope. The tuple binding exists only to extend the guards'
@@ -568,7 +573,7 @@ async fn routed_generation(
                 &worker.url,
                 &worker.breaker,
                 upstream_path,
-                &request_headers,
+                &headers,
                 body,
             );
             // Same `biased` order as the streaming arm.
