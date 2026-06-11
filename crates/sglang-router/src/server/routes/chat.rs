@@ -7,7 +7,7 @@ use crate::policies::SelectionContext;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{RequestOutcome, StaleRequestOutcome, WorkerModeLabel};
-use crate::server::routes::pd::{reject_batched_request, PdDispatchPlan, PdWorkerPair};
+use crate::server::routes::pd::{reject_batched_request, PdDispatchPlan, RouteWorkerSelection};
 use crate::tokenizer::adapter;
 use crate::workers::LoadGuard;
 use axum::body::{to_bytes, Body};
@@ -347,41 +347,28 @@ async fn routed_generation(
                 model: model_str.clone(),
             })?;
 
-    // PD-mode worker selection. When the selected prefill worker is
-    // part of a PD-disagg deployment, resolve the route-layer pair
-    // (`prefill`, `decode`) before request execution. This mirrors
-    // sgl-model-gateway's `WorkerSelection::Dual { prefill, decode }`
-    // boundary: worker pairing is a selection concern, while this
-    // handler only maps selection failures into HTTP errors and later
-    // executes the prepared pair.
+    // Route-local worker selection. This mirrors sgl-model-gateway's
+    // `WorkerSelection::{Single, Dual}` boundary: the policy picks a
+    // primary worker, then PD prefill selections are expanded into a
+    // prefill/decode pair before request execution.
     //
     // Plain-mode workers skip pair resolution entirely (no decode peer
     // to find). PD-mode requests that fail to resolve a
     // decode peer (`NoDecodeWorkersAvailable`) bubble up as 503 so
     // operators can alert on prefill-vs-decode pool imbalance.
-    let pd_worker_pair: Option<PdWorkerPair> = if worker.mode() == WorkerMode::Prefill {
-        Some(
-            PdWorkerPair::resolve_for_prefill(&resolver, &model_id, Arc::clone(&worker)).map_err(
-                |e| match e {
-                    PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers {
-                        model: model_str.clone(),
-                    },
-                    PdResolveError::NoDecodeWorkersAvailable => {
-                        ApiError::NoDecodeWorkersAvailable {
-                            model: model_str.clone(),
-                        }
-                    }
-                    PdResolveError::NoPrefillWorkersAvailable => {
-                        ApiError::NoPrefillWorkersAvailable {
-                            model: model_str.clone(),
-                        }
-                    }
-                },
-            )?,
-        )
-    } else {
-        None
-    };
+    let selection = RouteWorkerSelection::from_selected_worker(&resolver, &model_id, worker)
+        .map_err(|e| match e {
+            PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers {
+                model: model_str.clone(),
+            },
+            PdResolveError::NoDecodeWorkersAvailable => ApiError::NoDecodeWorkersAvailable {
+                model: model_str.clone(),
+            },
+            PdResolveError::NoPrefillWorkersAvailable => ApiError::NoPrefillWorkersAvailable {
+                model: model_str.clone(),
+            },
+        })?;
+    let worker = Arc::clone(selection.primary_worker());
     let mut pd_dispatch_plan: Option<PdDispatchPlan> = None;
     let mut request_headers = headers;
 
@@ -420,169 +407,174 @@ async fn routed_generation(
     };
     let metrics_model = model_str.clone();
 
-    let result = if let Some(worker_pair) = pd_worker_pair {
-        // PD-disagg dispatch (Pattern B — spawn prefill, await decode).
-        //
-        // SGLang's HTTP-mode disagg-prefill requires three flat
-        // top-level fields on the request body: `bootstrap_host`,
-        // `bootstrap_port` (the prefill worker's bootstrap-server
-        // address) and `bootstrap_room` (a per-request 63-bit u64 ID
-        // used by both sides to pair up the KV transfer). We inject
-        // these here and fan the same modified body to both the
-        // prefill and decode workers concurrently.
-        //
-        // **Why spawn-and-forget for prefill instead of
-        // `tokio::join!`?** All three peer SGLang-HTTP-PD routers
-        // (Dynamo / llm-d / aibrix) converged on this shape: the
-        // prefill request must outlive the client connection because
-        // tying prefill to the client future opens a cancel-race
-        // window where the engine's NIXL RPC teardown can leak KV
-        // block refs (NVBugs 5969206 in Dynamo). The detached task
-        // also keeps the LoadGuard + ActiveLoadGuard alive for the full
-        // prefill duration — KV transfer can run for tens of seconds
-        // even when the client gave up.
-        //
-        // No watchdog for fail-fast on prefill 5xx: llm-d / aibrix both
-        // ship without one. On prefill failure the client experiences
-        // the SGLang decode-side bootstrap_room timeout (~30–60 s by
-        // default) instead of an immediate 502. A follow-up can wire a
-        // `tokio::sync::watch` channel if telemetry shows it matters.
-        //
-        // **Scope of the "detached" guarantee.** The spawn protects
-        // against client disconnect — the handler future being dropped
-        // does NOT cancel the prefill HTTP request. It does NOT protect
-        // against router shutdown: when `AppContext` tears down, the
-        // tokio runtime cancels all unfinished tasks including this
-        // one. A future follow-up could thread a `TaskTracker` /
-        // `JoinSet` through `AppContext` for graceful shutdown drain;
-        // the current implementation ships without one (matching SMG's
-        // shutdown behaviour).
-        reject_batched_request(upstream_path, &body)?;
-        let plan = worker_pair.prepare_plan(&body)?;
-        let bootstrap_room = plan.bootstrap_room();
-        plan.insert_request_headers(&mut request_headers);
-        let headers = request_headers;
-        let injected_body = plan.body().clone();
-        pd_dispatch_plan = Some(plan);
+    let result = match selection {
+        RouteWorkerSelection::Dual { pair: worker_pair } => {
+            // PD-disagg dispatch (Pattern B — spawn prefill, await decode).
+            //
+            // SGLang's HTTP-mode disagg-prefill requires three flat
+            // top-level fields on the request body: `bootstrap_host`,
+            // `bootstrap_port` (the prefill worker's bootstrap-server
+            // address) and `bootstrap_room` (a per-request 63-bit u64 ID
+            // used by both sides to pair up the KV transfer). We inject
+            // these here and fan the same modified body to both the
+            // prefill and decode workers concurrently.
+            //
+            // **Why spawn-and-forget for prefill instead of
+            // `tokio::join!`?** All three peer SGLang-HTTP-PD routers
+            // (Dynamo / llm-d / aibrix) converged on this shape: the
+            // prefill request must outlive the client connection because
+            // tying prefill to the client future opens a cancel-race
+            // window where the engine's NIXL RPC teardown can leak KV
+            // block refs (NVBugs 5969206 in Dynamo). The detached task
+            // also keeps the LoadGuard + ActiveLoadGuard alive for the full
+            // prefill duration — KV transfer can run for tens of seconds
+            // even when the client gave up.
+            //
+            // No watchdog for fail-fast on prefill 5xx: llm-d / aibrix both
+            // ship without one. On prefill failure the client experiences
+            // the SGLang decode-side bootstrap_room timeout (~30–60 s by
+            // default) instead of an immediate 502. A follow-up can wire a
+            // `tokio::sync::watch` channel if telemetry shows it matters.
+            //
+            // **Scope of the "detached" guarantee.** The spawn protects
+            // against client disconnect — the handler future being dropped
+            // does NOT cancel the prefill HTTP request. It does NOT protect
+            // against router shutdown: when `AppContext` tears down, the
+            // tokio runtime cancels all unfinished tasks including this
+            // one. A future follow-up could thread a `TaskTracker` /
+            // `JoinSet` through `AppContext` for graceful shutdown drain;
+            // the current implementation ships without one (matching SMG's
+            // shutdown behaviour).
+            reject_batched_request(upstream_path, &body)?;
+            let plan = worker_pair.prepare_plan(&body)?;
+            let bootstrap_room = plan.bootstrap_room();
+            plan.insert_request_headers(&mut request_headers);
+            let headers = request_headers;
+            let injected_body = plan.body().clone();
+            pd_dispatch_plan = Some(plan);
 
-        let prefill_url = worker.url.clone();
-        let prefill_breaker = Arc::clone(&worker.breaker);
-        let prefill_headers = headers.clone();
-        let prefill_body = injected_body.clone();
-        let prefill_proxy = Arc::clone(&ctx.proxy);
-        let prefill_holds: (LoadGuard, _) = (guard, active_guard);
-        tokio::spawn(async move {
-            // The tuple binding extends both guards' lifetime to the
-            // end of this async block, which lasts until the prefill
-            // HTTP request returns (success / error / engine-side
-            // bootstrap_room timeout). The result is logged and
-            // swallowed — no channel back to the client. See the big
-            // comment above for the rationale.
-            let _hold = prefill_holds;
-            match prefill_proxy
-                .forward_json_to(
-                    &prefill_url,
-                    &prefill_breaker,
+            let prefill_worker = worker_pair.prefill();
+            let prefill_url = prefill_worker.url.clone();
+            let prefill_breaker = Arc::clone(&prefill_worker.breaker);
+            let prefill_headers = headers.clone();
+            let prefill_body = injected_body.clone();
+            let prefill_proxy = Arc::clone(&ctx.proxy);
+            let prefill_holds: (LoadGuard, _) = (guard, active_guard);
+            tokio::spawn(async move {
+                // The tuple binding extends both guards' lifetime to the
+                // end of this async block, which lasts until the prefill
+                // HTTP request returns (success / error / engine-side
+                // bootstrap_room timeout). The result is logged and
+                // swallowed — no channel back to the client. See the big
+                // comment above for the rationale.
+                let _hold = prefill_holds;
+                match prefill_proxy
+                    .forward_json_to(
+                        &prefill_url,
+                        &prefill_breaker,
+                        upstream_path,
+                        &prefill_headers,
+                        prefill_body,
+                    )
+                    .await
+                {
+                    Ok(_) => tracing::debug!(
+                        prefill_url = %prefill_url,
+                        bootstrap_room,
+                        "prefill side completed",
+                    ),
+                    Err(e) => tracing::warn!(
+                        prefill_url = %prefill_url,
+                        bootstrap_room,
+                        error = %e,
+                        "prefill request failed; decode will time out on bootstrap_room",
+                    ),
+                }
+            });
+
+            // Synchronously await the decode worker. Its response is what
+            // the client sees. The decode side gets its own LoadGuard so
+            // per-worker `active_requests` reflects decode-pool load for
+            // cache-aware-zmq decisions on the decode side.
+            let decode_worker = worker_pair.decode();
+            let decode_guard = decode_worker.load_guard();
+            if streaming {
+                let stream_guards: Box<dyn Send + 'static> = Box::new(decode_guard);
+                let fetch = ctx.proxy.forward_streaming_to(
+                    &decode_worker.url,
+                    &decode_worker.breaker,
                     upstream_path,
-                    &prefill_headers,
-                    prefill_body,
-                )
-                .await
-            {
-                Ok(_) => tracing::debug!(
-                    prefill_url = %prefill_url,
-                    bootstrap_room,
-                    "prefill side completed",
-                ),
-                Err(e) => tracing::warn!(
-                    prefill_url = %prefill_url,
-                    bootstrap_room,
-                    error = %e,
-                    "prefill request failed; decode will time out on bootstrap_room",
-                ),
+                    &headers,
+                    injected_body,
+                    Some(stream_guards),
+                );
+                tokio::select! {
+                    biased;
+                    r = fetch => r,
+                    _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
+                }
+            } else {
+                let _decode_hold = decode_guard;
+                let fetch = ctx.proxy.forward_json_to(
+                    &decode_worker.url,
+                    &decode_worker.breaker,
+                    upstream_path,
+                    &headers,
+                    injected_body,
+                );
+                tokio::select! {
+                    biased;
+                    r = fetch => r,
+                    _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
+                }
             }
-        });
-
-        // Synchronously await the decode worker. Its response is what
-        // the client sees. The decode side gets its own LoadGuard so
-        // per-worker `active_requests` reflects decode-pool load for
-        // cache-aware-zmq decisions on the decode side.
-        let decode_worker = worker_pair.decode();
-        let decode_guard = decode_worker.load_guard();
-        if streaming {
-            let stream_guards: Box<dyn Send + 'static> = Box::new(decode_guard);
+        }
+        RouteWorkerSelection::Single { worker } if streaming => {
+            // Plain mode, streaming. Both guards ride the SSE pump until
+            // the body completes — see the matching comment in the
+            // non-streaming arm.
+            let stream_guards: Box<dyn Send + 'static> = Box::new((guard, active_guard));
             let fetch = ctx.proxy.forward_streaming_to(
-                &decode_worker.url,
-                &decode_worker.breaker,
+                &worker.url,
+                &worker.breaker,
                 upstream_path,
-                &headers,
-                injected_body,
+                &request_headers,
+                body,
                 Some(stream_guards),
             );
+            // Bias `fetch` over the cancellation branch: a successful
+            // response that completes in the same poll as the token firing
+            // MUST win (returning 504 for a request that already has
+            // headers is a correctness regression). The cancellation
+            // branch only matters when fetch is still pending — at that
+            // point biasing the order is a wash.
             tokio::select! {
                 biased;
                 r = fetch => r,
                 _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
             }
-        } else {
-            let _decode_hold = decode_guard;
+        }
+        RouteWorkerSelection::Single { worker } => {
+            // Plain mode, non-streaming. The handler awaits the full
+            // buffered response, so both guards live correctly in this
+            // scope. The tuple binding exists only to extend the guards'
+            // lifetime to the end of the function — the `forward_json_to`
+            // future does not need them (it does not return until the
+            // body is buffered).
+            let _holds: (LoadGuard, _) = (guard, active_guard);
             let fetch = ctx.proxy.forward_json_to(
-                &decode_worker.url,
-                &decode_worker.breaker,
+                &worker.url,
+                &worker.breaker,
                 upstream_path,
-                &headers,
-                injected_body,
+                &request_headers,
+                body,
             );
+            // Same `biased` order as the streaming arm.
             tokio::select! {
                 biased;
                 r = fetch => r,
                 _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
             }
-        }
-    } else if streaming {
-        // Plain mode, streaming. Both guards ride the SSE pump until
-        // the body completes — see the matching comment in the
-        // non-streaming arm.
-        let stream_guards: Box<dyn Send + 'static> = Box::new((guard, active_guard));
-        let fetch = ctx.proxy.forward_streaming_to(
-            &worker.url,
-            &worker.breaker,
-            upstream_path,
-            &request_headers,
-            body,
-            Some(stream_guards),
-        );
-        // Bias `fetch` over the cancellation branch: a successful
-        // response that completes in the same poll as the token firing
-        // MUST win (returning 504 for a request that already has
-        // headers is a correctness regression). The cancellation
-        // branch only matters when fetch is still pending — at that
-        // point biasing the order is a wash.
-        tokio::select! {
-            biased;
-            r = fetch => r,
-            _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
-        }
-    } else {
-        // Plain mode, non-streaming. The handler awaits the full
-        // buffered response, so both guards live correctly in this
-        // scope. The tuple binding exists only to extend the guards'
-        // lifetime to the end of the function — the `forward_json_to`
-        // future does not need them (it does not return until the
-        // body is buffered).
-        let _holds: (LoadGuard, _) = (guard, active_guard);
-        let fetch = ctx.proxy.forward_json_to(
-            &worker.url,
-            &worker.breaker,
-            upstream_path,
-            &request_headers,
-            body,
-        );
-        // Same `biased` order as the streaming arm.
-        tokio::select! {
-            biased;
-            r = fetch => r,
-            _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
         }
     };
 

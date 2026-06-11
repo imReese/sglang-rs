@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::discovery::ModelId;
+use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::server::error::ApiError;
 use crate::workers::Worker;
@@ -44,6 +44,10 @@ impl PdWorkerPair {
         &self.decode
     }
 
+    pub(crate) fn prefill(&self) -> &Arc<Worker> {
+        &self.prefill
+    }
+
     pub(crate) fn prepare_plan(&self, body: &Bytes) -> Result<PdDispatchPlan, ApiError> {
         let bootstrap_port =
             self.prefill
@@ -60,6 +64,39 @@ impl PdWorkerPair {
             bootstrap_port,
             body,
         )
+    }
+}
+
+/// Route-local worker selection boundary. This mirrors
+/// sgl-model-gateway's `WorkerSelection::{Single, Dual}` shape without
+/// forcing the HTTP route path to adopt the full stage pipeline in one
+/// jump.
+#[derive(Debug, Clone)]
+pub(crate) enum RouteWorkerSelection {
+    Single { worker: Arc<Worker> },
+    Dual { pair: PdWorkerPair },
+}
+
+impl RouteWorkerSelection {
+    pub(crate) fn from_selected_worker(
+        resolver: &PdPoolResolver,
+        model: &ModelId,
+        worker: Arc<Worker>,
+    ) -> Result<Self, PdResolveError> {
+        if worker.mode() == WorkerMode::Prefill {
+            Ok(Self::Dual {
+                pair: PdWorkerPair::resolve_for_prefill(resolver, model, worker)?,
+            })
+        } else {
+            Ok(Self::Single { worker })
+        }
+    }
+
+    pub(crate) fn primary_worker(&self) -> &Arc<Worker> {
+        match self {
+            Self::Single { worker } => worker,
+            Self::Dual { pair } => pair.prefill(),
+        }
     }
 }
 
@@ -499,6 +536,66 @@ mod tests {
         let pair = PdWorkerPair::resolve_for_prefill(&resolver, &model, selected_prefill).unwrap();
 
         assert_eq!(pair.decode().id, WorkerId("decode-same-host".into()));
+    }
+
+    #[test]
+    fn route_worker_selection_keeps_plain_workers_single() {
+        let model = ModelId("tiny".into());
+        let registry = Arc::new(WorkerRegistry::default());
+        let resolver = PdPoolResolver::new(Arc::clone(&registry));
+        let plain = Arc::new(worker(
+            "plain",
+            "grpc://plain.local:30000",
+            WorkerMode::Plain,
+            None,
+        ));
+
+        let selection =
+            RouteWorkerSelection::from_selected_worker(&resolver, &model, Arc::clone(&plain))
+                .unwrap();
+
+        assert_eq!(selection.primary_worker().id, WorkerId("plain".into()));
+        assert!(matches!(selection, RouteWorkerSelection::Single { .. }));
+    }
+
+    #[test]
+    fn route_worker_selection_turns_prefill_into_dual_pair() {
+        let model = ModelId("tiny".into());
+        let registry = Arc::new(WorkerRegistry::default());
+        registry
+            .add(worker_spec(
+                "prefill",
+                "grpc://host-a.local:30000",
+                WorkerMode::Prefill,
+                Some(8200),
+            ))
+            .unwrap();
+        registry
+            .add(worker_spec(
+                "decode",
+                "grpc://host-a.local:30001",
+                WorkerMode::Decode,
+                None,
+            ))
+            .unwrap();
+
+        let resolver = PdPoolResolver::new(Arc::clone(&registry));
+        let selected_prefill = registry
+            .workers_for_mode(&model, WorkerMode::Prefill)
+            .pop()
+            .unwrap();
+
+        let selection =
+            RouteWorkerSelection::from_selected_worker(&resolver, &model, selected_prefill)
+                .unwrap();
+
+        assert_eq!(selection.primary_worker().id, WorkerId("prefill".into()));
+        match selection {
+            RouteWorkerSelection::Dual { pair } => {
+                assert_eq!(pair.decode().id, WorkerId("decode".into()));
+            }
+            RouteWorkerSelection::Single { .. } => panic!("expected PD worker pair"),
+        }
     }
 
     /// `generate_room_id` MUST return values in `[0, i64::MAX]`. The
