@@ -71,6 +71,77 @@ async fn http_server_accepts_model_and_generate_requests() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_accepts_streaming_generate_requests() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "glm-http-stream-generate",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let service = build_bootstrap_http_router_service(&args);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let response = request_raw_with_retry(
+        addr,
+        "POST",
+        "/generate",
+        Some(r#"{"text":"hello","sampling_params":{"max_new_tokens":2},"stream":true}"#),
+    )
+    .await;
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "streaming generate should succeed, got response: {response}"
+    );
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("content-type: text/event-stream"),
+        "streaming generate must return SSE content-type, got response: {response}"
+    );
+    let events = parse_sse_data(&response);
+    assert_eq!(events.last().map(String::as_str), Some("[DONE]"));
+    let chunks = events
+        .iter()
+        .filter(|event| event.as_str() != "[DONE]")
+        .map(|event| serde_json::from_str::<Value>(event))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("SSE data chunks should be JSON");
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| chunk["request_id"].is_string() && chunk["text"].is_string()),
+        "expected native generate stream chunks, got {chunks:?}"
+    );
+    assert!(
+        chunks.iter().any(|chunk| chunk["finish_reason"] == "stop"),
+        "expected final stop chunk, got {chunks:?}"
+    );
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_server_accepts_non_streaming_chat_completions_for_sgl_router() {
     let args = ServerArgs::parse_from([
         "serve",

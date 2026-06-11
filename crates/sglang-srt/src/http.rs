@@ -215,7 +215,7 @@ where
 async fn generate<T, W>(
     State(service): State<HttpRouterService<T, W>>,
     Json(payload): Json<Value>,
-) -> impl IntoResponse
+) -> Response
 where
     T: Tokenizer + Send + 'static,
     W: WorkerExecutor + Send + 'static,
@@ -226,9 +226,11 @@ where
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "error": { "message": error } })),
-            );
+            )
+                .into_response();
         }
     };
+    let stream = request.stream;
     if request.disaggregated_params.is_some() && !service.allow_disaggregated_requests {
         return (
             StatusCode::NOT_IMPLEMENTED,
@@ -237,7 +239,8 @@ where
                     "message": "disaggregated HTTP generate requires a PD transfer-enabled runtime"
                 }
             })),
-        );
+        )
+            .into_response();
     }
 
     let response = {
@@ -254,11 +257,15 @@ where
 
     match response {
         Ok(mut responses) => {
+            if stream {
+                return http_generate_stream_response_from_router_responses(responses);
+            }
             let Some(response) = responses.pop() else {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({ "error": { "message": "generation produced no response" } })),
-                );
+                )
+                    .into_response();
             };
             match response.body {
                 RouterGenerateResponseBody::Complete(complete) => (
@@ -274,24 +281,82 @@ where
                             "cached_tokens": complete.cached_tokens,
                         }
                     })),
-                ),
+                )
+                    .into_response(),
                 RouterGenerateResponseBody::Chunk(_) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(
                         json!({ "error": { "message": "non-stream HTTP generate returned a stream chunk" } }),
                     ),
-                ),
+                )
+                    .into_response(),
                 RouterGenerateResponseBody::Error(error) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(json!({ "error": { "message": error.message } })),
-                ),
+                )
+                    .into_response(),
             }
         }
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": { "message": error.to_string() } })),
-        ),
+        )
+            .into_response(),
     }
+}
+
+fn http_generate_stream_response_from_router_responses(
+    responses: Vec<RouterGenerateResponse>,
+) -> Response {
+    let mut body = String::new();
+    for response in responses {
+        let json = match response.body {
+            RouterGenerateResponseBody::Chunk(chunk) => json!({
+                "request_id": response.request_id,
+                "text": chunk.text,
+                "output_ids": chunk.token_ids,
+                "usage": {
+                    "prompt_tokens": chunk.prompt_tokens,
+                    "completion_tokens": chunk.completion_tokens,
+                    "cached_tokens": chunk.cached_tokens,
+                }
+            }),
+            RouterGenerateResponseBody::Complete(complete) => json!({
+                "request_id": response.request_id,
+                "text": complete.text,
+                "output_ids": complete.output_ids,
+                "finish_reason": complete.finish_reason,
+                "usage": {
+                    "prompt_tokens": complete.prompt_tokens,
+                    "completion_tokens": complete.completion_tokens,
+                    "cached_tokens": complete.cached_tokens,
+                }
+            }),
+            RouterGenerateResponseBody::Error(error) => json!({
+                "error": {
+                    "message": error.message,
+                }
+            }),
+        };
+        let Ok(json) = serde_json::to_string(&json) else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": { "message": "serialize SGLang generate stream JSON" } })),
+            )
+                .into_response();
+        };
+        body.push_str("data: ");
+        body.push_str(&json);
+        body.push_str("\n\n");
+    }
+    body.push_str("data: [DONE]\n\n");
+
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        HeaderName::from_static("content-type"),
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response
 }
 
 async fn chat_completions<T, W>(
@@ -485,7 +550,7 @@ fn http_generate_payload_to_router_request(
         text,
         sampling_params,
         disaggregated_params,
-        stream: false,
+        stream: optional_bool(&payload, "stream")?.unwrap_or(false),
         data_parallel_rank,
         ..Default::default()
     })
