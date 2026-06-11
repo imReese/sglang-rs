@@ -7,11 +7,12 @@ use crate::policies::SelectionContext;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{RequestOutcome, StaleRequestOutcome, WorkerModeLabel};
+use crate::server::routes::pd::{reject_batched_request, BootstrapMetadata, X_SGL_DECODE_URL};
 use crate::tokenizer::adapter;
 use crate::workers::{LoadGuard, Worker};
 use axum::body::{to_bytes, Body};
 use axum::extract::State;
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
+use axum::http::{HeaderMap, HeaderValue, Response};
 use axum::response::IntoResponse;
 use axum::Json;
 use bytes::Bytes;
@@ -20,17 +21,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-/// Observability header carrying the decode-pool URL selected via host
-/// affinity for a PD-disaggregated request. The router fans the
-/// bootstrap-injected request body to BOTH the prefill and the decode
-/// worker concurrently; this header lets the prefill log the chosen
-/// peer, and is mirrored onto the response so sidecars / tests can
-/// observe affinity without sniffing the proxy hop. The `x-sgl-`
-/// prefix matches `x-sgl-router-error-code` so router-emitted metadata
-/// stays grouped.
-const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url");
-const X_SGL_BOOTSTRAP_ROOM: HeaderName = HeaderName::from_static("x-sgl-bootstrap-room");
 
 /// Coarse char-count → token-count divisor used to estimate prefill load
 /// from the request body when no real tokenizer count is available. Four
@@ -393,7 +383,7 @@ async fn routed_generation(
         None
     };
     let decode_hint_url: Option<String> = decode_peer.as_ref().map(|d| d.url.clone());
-    let mut bootstrap_room_hint: Option<u64> = None;
+    let mut bootstrap_metadata_hint: Option<BootstrapMetadata> = None;
     let mut request_headers = headers;
     if let Some(url) = &decode_hint_url {
         match HeaderValue::from_str(url) {
@@ -489,7 +479,7 @@ async fn routed_generation(
         // `JoinSet` through `AppContext` for graceful shutdown drain;
         // the current implementation ships without one (matching SMG's
         // shutdown behaviour).
-        reject_pd_batched_request(upstream_path, &body)?;
+        reject_batched_request(upstream_path, &body)?;
         let bootstrap_port =
             worker
                 .bootstrap_port()
@@ -499,14 +489,10 @@ async fn routed_generation(
                         "PD prefill worker is missing disaggregation bootstrap_port"
                     ),
                 })?;
-        let bootstrap_room = generate_room_id();
-        bootstrap_room_hint = Some(bootstrap_room);
-        let injected_body = inject_bootstrap_fields(
-            &body,
-            worker.bootstrap_host(),
-            bootstrap_port,
-            bootstrap_room,
-        )?;
+        let bootstrap_metadata = BootstrapMetadata::new(worker.bootstrap_host(), bootstrap_port);
+        let bootstrap_room = bootstrap_metadata.room();
+        let injected_body = bootstrap_metadata.inject_into_body(&body)?;
+        bootstrap_metadata_hint = Some(bootstrap_metadata);
 
         let prefill_url = worker.url.clone();
         let prefill_breaker = Arc::clone(&worker.breaker);
@@ -673,10 +659,8 @@ async fn routed_generation(
                     }
                 }
             }
-            if let Some(room) = bootstrap_room_hint {
-                if let Ok(v) = HeaderValue::from_str(&room.to_string()) {
-                    response.headers_mut().insert(X_SGL_BOOTSTRAP_ROOM, v);
-                }
+            if let Some(metadata) = bootstrap_metadata_hint {
+                metadata.insert_response_header(response.headers_mut());
             }
             Ok(response)
         }
@@ -826,99 +810,6 @@ fn unix_timestamp_secs() -> u64 {
         .as_secs()
 }
 
-/// Mint a fresh `bootstrap_room` for a PD-disagg request.
-///
-/// SGLang's disagg-prefill stores the room as a signed `i64` internally
-/// (see `python/sglang/srt/disaggregation/utils.py` — `bootstrap_room`
-/// metadata buffer is allocated as `torch.int64`). Generating in
-/// `[0, i64::MAX]` keeps the value safely positive when reinterpreted
-/// signed. Mirrors SMG's `pd_types::generate_room_id`, Dynamo's
-/// `rand::random_range(0..=i64::MAX.cast_unsigned())`, and SGLang's
-/// own Python-side `random.randint(0, 2**63 - 1)`.
-fn generate_room_id() -> u64 {
-    rand::random::<u64>() & (i64::MAX as u64)
-}
-
-/// Inject the three flat top-level fields SGLang's HTTP disagg-prefill
-/// validator requires:
-///
-/// * `bootstrap_host` — the prefill worker's hostname; decode connects
-///   to this address for the KV transfer.
-/// * `bootstrap_port` — the prefill worker's bootstrap server port
-///   (required; the caller rejects misconfigured prefill workers before
-///   injection).
-/// * `bootstrap_room` — a 63-bit random `u64` identifying this request
-///   on both prefill and decode sides.
-///
-/// The body must already be a JSON object (the chat handler's
-/// `parse_probe` guarantees this); we re-parse into a `Map` here to
-/// mutate top-level keys without walking nested values into a full
-/// `serde_json::Value`. A malformed body is mapped to
-/// `ApiError::BadRequest` — the parse_probe layer should already have
-/// caught this, but defending against TOCTOU keeps the error path
-/// honest.
-fn inject_bootstrap_fields(
-    body: &Bytes,
-    bootstrap_host: &str,
-    bootstrap_port: u16,
-    bootstrap_room: u64,
-) -> Result<Bytes, ApiError> {
-    let mut obj: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(body)
-        .map_err(|e| {
-            tracing::debug!(error = %e, "re-parse for bootstrap injection failed");
-            ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
-        })?;
-    obj.insert(
-        "bootstrap_host".to_string(),
-        serde_json::Value::String(bootstrap_host.to_string()),
-    );
-    obj.insert(
-        "bootstrap_port".to_string(),
-        serde_json::Value::Number(bootstrap_port.into()),
-    );
-    obj.insert(
-        "bootstrap_room".to_string(),
-        serde_json::Value::Number(bootstrap_room.into()),
-    );
-    let bytes = serde_json::to_vec(&obj).map_err(|e| {
-        ApiError::Internal(anyhow::Error::new(e).context("re-serialize bootstrap-injected body"))
-    })?;
-    Ok(Bytes::from(bytes))
-}
-
-fn reject_pd_batched_request(upstream_path: &str, body: &Bytes) -> Result<(), ApiError> {
-    let obj: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_slice(body).map_err(|e| {
-            tracing::debug!(error = %e, "re-parse for PD batch detection failed");
-            ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
-        })?;
-
-    if request_batch_size(&obj).is_some() {
-        return Err(ApiError::BadRequest(format!(
-            "PD mode does not support batched {upstream_path} requests"
-        )));
-    }
-
-    Ok(())
-}
-
-fn request_batch_size(obj: &serde_json::Map<String, serde_json::Value>) -> Option<usize> {
-    if let Some(items) = obj.get("text").and_then(serde_json::Value::as_array) {
-        return Some(items.len());
-    }
-    if let Some(items) = obj.get("prompt").and_then(serde_json::Value::as_array) {
-        if items.iter().all(serde_json::Value::is_string) {
-            return Some(items.len());
-        }
-    }
-    if let Some(items) = obj.get("input_ids").and_then(serde_json::Value::as_array) {
-        if items.first().map_or(true, serde_json::Value::is_array) {
-            return Some(items.len());
-        }
-    }
-    None
-}
-
 fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
     // We deliberately do NOT echo the serde error into the client-visible
     // message — that risks leaking field-level detail and is also of little
@@ -974,41 +865,6 @@ fn select_model(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `generate_room_id` MUST return values in `[0, i64::MAX]`. The
-    /// SGLang prefill stores `bootstrap_room` as `torch.int64`; a u64
-    /// with the top bit set would wrap negative on the engine side.
-    /// Sample many times to defend against future refactors of the
-    /// mask (e.g. someone "simplifying" to plain `rand::random::<u64>()`).
-    #[test]
-    fn generate_room_id_stays_in_63_bit_range() {
-        for _ in 0..10_000 {
-            let r = generate_room_id();
-            assert!(
-                r <= i64::MAX as u64,
-                "generate_room_id() returned {r} > i64::MAX; would wrap negative as torch.int64",
-            );
-        }
-    }
-
-    #[test]
-    fn inject_bootstrap_fields_includes_required_port() {
-        let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
-        let injected = inject_bootstrap_fields(&body, "host", 8997, 42).unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&injected).unwrap();
-        assert_eq!(
-            parsed.get("bootstrap_port"),
-            Some(&serde_json::Value::Number(8997.into()))
-        );
-        assert_eq!(
-            parsed.get("bootstrap_host"),
-            Some(&serde_json::Value::String("host".into()))
-        );
-        assert_eq!(
-            parsed.get("bootstrap_room"),
-            Some(&serde_json::Value::Number(42.into()))
-        );
-    }
 
     #[test]
     fn parse_probe_reads_stream_bool_from_object() {
