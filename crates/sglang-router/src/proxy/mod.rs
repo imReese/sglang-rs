@@ -233,7 +233,7 @@ impl Proxy {
         path: &str,
         body: Bytes,
     ) -> Result<Response<Body>, ApiError> {
-        if path != "/v1/chat/completions" {
+        if path != "/v1/chat/completions" && path != "/v1/completions" {
             breaker.record_failure();
             return Err(ApiError::WorkerMisconfigured {
                 worker: worker_url.to_string(),
@@ -267,21 +267,30 @@ impl Proxy {
                     ))
                 })?;
             let mut client = SglangServiceClient::new(channel);
-            let mut stream = client
-                .chat_complete(GrpcRequest::new(OpenAiJsonRequest {
-                    json: body.to_vec(),
-                    options: None,
-                }))
-                .await
-                .map_err(GrpcForwardError::Status)?
-                .into_inner();
+            let request = OpenAiJsonRequest {
+                json: body.to_vec(),
+                options: None,
+            };
+            let mut stream = match path {
+                "/v1/chat/completions" => client
+                    .chat_complete(GrpcRequest::new(request))
+                    .await
+                    .map_err(GrpcForwardError::Status)?
+                    .into_inner(),
+                "/v1/completions" => client
+                    .complete(GrpcRequest::new(request))
+                    .await
+                    .map_err(GrpcForwardError::Status)?
+                    .into_inner(),
+                _ => unreachable!("validated gRPC JSON path"),
+            };
             let first = stream
                 .message()
                 .await
                 .map_err(GrpcForwardError::Status)?
                 .ok_or_else(|| {
                     GrpcForwardError::Status(tonic::Status::internal(
-                        "gRPC ChatComplete returned no response",
+                        "gRPC OpenAI JSON RPC returned no response",
                     ))
                 })?;
             Ok::<_, GrpcForwardError>(first.json)
@@ -417,7 +426,7 @@ impl Proxy {
         body: Bytes,
         stream_guards: Option<Box<dyn Send + 'static>>,
     ) -> Result<Response<Body>, ApiError> {
-        if path != "/v1/chat/completions" {
+        if path != "/v1/chat/completions" && path != "/v1/completions" {
             breaker.record_failure();
             return Err(ApiError::WorkerMisconfigured {
                 worker: worker_url.to_string(),
@@ -450,14 +459,23 @@ impl Proxy {
                     ))
                 })?;
             let mut client = SglangServiceClient::new(channel);
-            client
-                .chat_complete(GrpcRequest::new(OpenAiJsonRequest {
-                    json: body.to_vec(),
-                    options: None,
-                }))
-                .await
-                .map_err(GrpcForwardError::Status)
-                .map(|response| response.into_inner())
+            let request = OpenAiJsonRequest {
+                json: body.to_vec(),
+                options: None,
+            };
+            match path {
+                "/v1/chat/completions" => client
+                    .chat_complete(GrpcRequest::new(request))
+                    .await
+                    .map_err(GrpcForwardError::Status)
+                    .map(|response| response.into_inner()),
+                "/v1/completions" => client
+                    .complete(GrpcRequest::new(request))
+                    .await
+                    .map_err(GrpcForwardError::Status)
+                    .map(|response| response.into_inner()),
+                _ => unreachable!("validated gRPC streaming path"),
+            }
         };
 
         let stream = match tokio::time::timeout(self.request_timeout, fut).await {

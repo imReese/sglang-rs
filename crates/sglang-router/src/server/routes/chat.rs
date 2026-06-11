@@ -75,6 +75,25 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
+    openai_generation(ctx, headers, body, "/v1/chat/completions").await
+}
+
+/// POST /v1/completions — same OpenAI-compatible routing path as chat
+/// completions, but forwarded to the worker's completions endpoint/RPC.
+pub async fn completions(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    openai_generation(ctx, headers, body, "/v1/completions").await
+}
+
+async fn openai_generation(
+    ctx: Arc<AppContext>,
+    headers: HeaderMap,
+    body: Bytes,
+    upstream_path: &'static str,
+) -> Result<Response<Body>, ApiError> {
     let probe = parse_probe(&body)?;
     let streaming = probe.stream.unwrap_or(false);
     let model_str = probe
@@ -271,7 +290,7 @@ pub async fn chat_completions(
                 .forward_json_to(
                     &prefill_url,
                     &prefill_breaker,
-                    "/v1/chat/completions",
+                    upstream_path,
                     &prefill_headers,
                     prefill_body,
                 )
@@ -301,7 +320,7 @@ pub async fn chat_completions(
             let fetch = ctx.proxy.forward_streaming_to(
                 &decode_worker.url,
                 &decode_worker.breaker,
-                "/v1/chat/completions",
+                upstream_path,
                 &headers,
                 injected_body,
                 Some(stream_guards),
@@ -316,7 +335,7 @@ pub async fn chat_completions(
             let fetch = ctx.proxy.forward_json_to(
                 &decode_worker.url,
                 &decode_worker.breaker,
-                "/v1/chat/completions",
+                upstream_path,
                 &headers,
                 injected_body,
             );
@@ -334,7 +353,7 @@ pub async fn chat_completions(
         let fetch = ctx.proxy.forward_streaming_to(
             &worker.url,
             &worker.breaker,
-            "/v1/chat/completions",
+            upstream_path,
             &headers,
             body,
             Some(stream_guards),
@@ -358,13 +377,9 @@ pub async fn chat_completions(
         // future does not need them (it does not return until the
         // body is buffered).
         let _holds: (LoadGuard, _) = (guard, active_guard);
-        let fetch = ctx.proxy.forward_json_to(
-            &worker.url,
-            &worker.breaker,
-            "/v1/chat/completions",
-            &headers,
-            body,
-        );
+        let fetch =
+            ctx.proxy
+                .forward_json_to(&worker.url, &worker.breaker, upstream_path, &headers, body);
         // Same `biased` order as the streaming arm.
         tokio::select! {
             biased;
