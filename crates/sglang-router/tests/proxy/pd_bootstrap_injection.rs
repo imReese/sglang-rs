@@ -19,6 +19,7 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use bytes::Bytes;
+use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use sgl_router::config::{
     ActiveLoadConfig, Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig,
@@ -164,18 +165,6 @@ fn bootstrap_room(v: &Value) -> Option<u64> {
     v.get("bootstrap_room").and_then(|x| x.as_u64())
 }
 
-fn bootstrap_host_array(v: &Value) -> Option<&Vec<Value>> {
-    v.get("bootstrap_host").and_then(|x| x.as_array())
-}
-
-fn bootstrap_port_array(v: &Value) -> Option<&Vec<Value>> {
-    v.get("bootstrap_port").and_then(|x| x.as_array())
-}
-
-fn bootstrap_room_array(v: &Value) -> Option<&Vec<Value>> {
-    v.get("bootstrap_room").and_then(|x| x.as_array())
-}
-
 /// PD-mode chat fans out to BOTH prefill and decode with identical
 /// bootstrap fields injected into both bodies.
 #[tokio::test]
@@ -234,7 +223,46 @@ async fn pd_mode_chat_injects_bootstrap_fields_into_both_bodies() {
 }
 
 #[tokio::test]
-async fn pd_mode_generate_batch_injects_per_item_bootstrap_fields() {
+async fn pd_mode_prefill_without_bootstrap_port_is_rejected_before_dispatch() {
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx(vec![
+        WorkerSpec {
+            id: WorkerId("p1".into()),
+            url: prefill.url.clone(),
+            mode: WorkerMode::Prefill,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+        },
+        WorkerSpec {
+            id: WorkerId("d1".into()),
+            url: decode.url.clone(),
+            mode: WorkerMode::Decode,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+        },
+    ]);
+    let app = build_router(ctx);
+
+    let res = app.oneshot(chat_request()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        res.headers().get("x-router-error-code").unwrap(),
+        "worker_misconfigured",
+    );
+
+    assert!(
+        prefill.captured.lock().unwrap().last_body.is_none(),
+        "misconfigured prefill worker must not receive a bootstrap request",
+    );
+    assert!(
+        decode.captured.lock().unwrap().last_body.is_none(),
+        "decode worker must not receive a request with bootstrap_port=null",
+    );
+}
+
+#[tokio::test]
+async fn pd_mode_generate_batch_is_rejected_before_dispatch() {
     let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx(vec![
@@ -256,25 +284,22 @@ async fn pd_mode_generate_batch_injects_per_item_bootstrap_fields() {
     let app = build_router(ctx);
 
     let res = app.oneshot(generate_batch_request()).await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK, "decode side should 200");
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 
-    let prefill_body = await_captured_body(&prefill, Duration::from_secs(2), "prefill").await;
-    let decode_body = await_captured_body(&decode, Duration::from_secs(2), "decode").await;
-    let pj = parse_body(&prefill_body);
-    let dj = parse_body(&decode_body);
-
-    for body in [&pj, &dj] {
-        let hosts = bootstrap_host_array(body).expect("batch body should carry host array");
-        let ports = bootstrap_port_array(body).expect("batch body should carry port array");
-        let rooms = bootstrap_room_array(body).expect("batch body should carry room array");
-        assert_eq!(hosts, &vec![json!("127.0.0.1"), json!("127.0.0.1")]);
-        assert_eq!(ports, &vec![json!(8997), json!(8997)]);
-        assert_eq!(rooms.len(), 2);
-        assert!(rooms
-            .iter()
-            .all(|room| room.as_u64().is_some_and(|room| room <= i64::MAX as u64)));
-    }
-    assert_eq!(bootstrap_room_array(&pj), bootstrap_room_array(&dj));
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        body_str.contains("PD mode does not support batched /generate requests"),
+        "body: {body_str}"
+    );
+    assert!(
+        prefill.captured.lock().unwrap().last_body.is_none(),
+        "unsupported PD batch request must not reach prefill",
+    );
+    assert!(
+        decode.captured.lock().unwrap().last_body.is_none(),
+        "unsupported PD batch request must not reach decode",
+    );
 }
 
 #[tokio::test]

@@ -487,11 +487,21 @@ async fn routed_generation(
         // `JoinSet` through `AppContext` for graceful shutdown drain;
         // the current implementation ships without one (matching SMG's
         // shutdown behaviour).
+        reject_pd_batched_request(upstream_path, &body)?;
+        let bootstrap_port =
+            worker
+                .bootstrap_port()
+                .ok_or_else(|| ApiError::WorkerMisconfigured {
+                    worker: worker.url.clone(),
+                    source: anyhow::anyhow!(
+                        "PD prefill worker is missing disaggregation bootstrap_port"
+                    ),
+                })?;
         let bootstrap_room = generate_room_id();
         let injected_body = inject_bootstrap_fields(
             &body,
             worker.bootstrap_host(),
-            worker.bootstrap_port(),
+            bootstrap_port,
             bootstrap_room,
         )?;
 
@@ -826,8 +836,8 @@ fn generate_room_id() -> u64 {
 /// * `bootstrap_host` — the prefill worker's hostname; decode connects
 ///   to this address for the KV transfer.
 /// * `bootstrap_port` — the prefill worker's bootstrap server port
-///   (may be `null` if the worker is misconfigured; the engine will
-///   reject the request with a clear error).
+///   (required; the caller rejects misconfigured prefill workers before
+///   injection).
 /// * `bootstrap_room` — a 63-bit random `u64` identifying this request
 ///   on both prefill and decode sides.
 ///
@@ -841,7 +851,7 @@ fn generate_room_id() -> u64 {
 fn inject_bootstrap_fields(
     body: &Bytes,
     bootstrap_host: &str,
-    bootstrap_port: Option<u16>,
+    bootstrap_port: u16,
     bootstrap_room: u64,
 ) -> Result<Bytes, ApiError> {
     let mut obj: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(body)
@@ -849,63 +859,38 @@ fn inject_bootstrap_fields(
             tracing::debug!(error = %e, "re-parse for bootstrap injection failed");
             ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
         })?;
-    if let Some(batch_size) = request_batch_size(&obj) {
-        obj.insert(
-            "bootstrap_host".to_string(),
-            serde_json::Value::Array(
-                (0..batch_size)
-                    .map(|_| serde_json::Value::String(bootstrap_host.to_string()))
-                    .collect(),
-            ),
-        );
-        obj.insert(
-            "bootstrap_port".to_string(),
-            serde_json::Value::Array(
-                (0..batch_size)
-                    .map(|_| bootstrap_port_value(bootstrap_port))
-                    .collect(),
-            ),
-        );
-        obj.insert(
-            "bootstrap_room".to_string(),
-            serde_json::Value::Array(
-                (0..batch_size)
-                    .map(|index| {
-                        let room = if index == 0 {
-                            bootstrap_room
-                        } else {
-                            generate_room_id()
-                        };
-                        serde_json::Value::Number(room.into())
-                    })
-                    .collect(),
-            ),
-        );
-    } else {
-        obj.insert(
-            "bootstrap_host".to_string(),
-            serde_json::Value::String(bootstrap_host.to_string()),
-        );
-        obj.insert(
-            "bootstrap_port".to_string(),
-            bootstrap_port_value(bootstrap_port),
-        );
-        obj.insert(
-            "bootstrap_room".to_string(),
-            serde_json::Value::Number(bootstrap_room.into()),
-        );
-    }
+    obj.insert(
+        "bootstrap_host".to_string(),
+        serde_json::Value::String(bootstrap_host.to_string()),
+    );
+    obj.insert(
+        "bootstrap_port".to_string(),
+        serde_json::Value::Number(bootstrap_port.into()),
+    );
+    obj.insert(
+        "bootstrap_room".to_string(),
+        serde_json::Value::Number(bootstrap_room.into()),
+    );
     let bytes = serde_json::to_vec(&obj).map_err(|e| {
         ApiError::Internal(anyhow::Error::new(e).context("re-serialize bootstrap-injected body"))
     })?;
     Ok(Bytes::from(bytes))
 }
 
-fn bootstrap_port_value(bootstrap_port: Option<u16>) -> serde_json::Value {
-    match bootstrap_port {
-        Some(p) => serde_json::Value::Number(p.into()),
-        None => serde_json::Value::Null,
+fn reject_pd_batched_request(upstream_path: &str, body: &Bytes) -> Result<(), ApiError> {
+    let obj: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(body).map_err(|e| {
+            tracing::debug!(error = %e, "re-parse for PD batch detection failed");
+            ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
+        })?;
+
+    if request_batch_size(&obj).is_some() {
+        return Err(ApiError::BadRequest(format!(
+            "PD mode does not support batched {upstream_path} requests"
+        )));
     }
+
+    Ok(())
 }
 
 fn request_batch_size(obj: &serde_json::Map<String, serde_json::Value>) -> Option<usize> {
@@ -997,17 +982,15 @@ mod tests {
         }
     }
 
-    /// When the prefill worker has no `bootstrap_port` configured
-    /// (a misconfiguration the engine will reject loudly), the
-    /// injected field MUST be JSON `null` — not omitted, not 0.
-    /// SGLang's validator distinguishes "missing field" from
-    /// "null field" in some code paths.
     #[test]
-    fn inject_bootstrap_fields_emits_null_for_missing_port() {
+    fn inject_bootstrap_fields_includes_required_port() {
         let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
-        let injected = inject_bootstrap_fields(&body, "host", None, 42).unwrap();
+        let injected = inject_bootstrap_fields(&body, "host", 8997, 42).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&injected).unwrap();
-        assert_eq!(parsed.get("bootstrap_port"), Some(&serde_json::Value::Null));
+        assert_eq!(
+            parsed.get("bootstrap_port"),
+            Some(&serde_json::Value::Number(8997.into()))
+        );
         assert_eq!(
             parsed.get("bootstrap_host"),
             Some(&serde_json::Value::String("host".into()))
