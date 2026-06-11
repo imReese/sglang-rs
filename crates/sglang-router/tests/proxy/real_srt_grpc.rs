@@ -158,6 +158,7 @@ async fn router_chat_completions_reaches_real_rust_srt_grpc_worker() {
         .method("POST")
         .uri("/v1/chat/completions")
         .header("content-type", "application/json")
+        .header("x-request-id", "chat-header-id")
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "model": "tiny",
@@ -178,6 +179,7 @@ async fn router_chat_completions_reaches_real_rust_srt_grpc_worker() {
         .to_bytes();
     let body: serde_json::Value =
         serde_json::from_slice(&body).expect("response should be OpenAI chat JSON");
+    assert_eq!(body["id"], "chatcmpl-chat-header-id");
     assert_eq!(body["object"], "chat.completion");
     assert_eq!(body["model"], "tiny");
     assert_eq!(body["choices"][0]["message"]["role"], "assistant");
@@ -301,6 +303,7 @@ async fn router_completions_reaches_real_rust_srt_grpc_worker() {
         .method("POST")
         .uri("/v1/completions")
         .header("content-type", "application/json")
+        .header("x-request-id", "completion-header-id")
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "model": "tiny",
@@ -321,6 +324,7 @@ async fn router_completions_reaches_real_rust_srt_grpc_worker() {
         .to_bytes();
     let body: serde_json::Value =
         serde_json::from_slice(&body).expect("response should be OpenAI completion JSON");
+    assert_eq!(body["id"], "cmpl-completion-header-id");
     assert_eq!(body["object"], "text_completion");
     assert_eq!(body["model"], "tiny");
     assert_eq!(body["choices"][0]["text"], "  ");

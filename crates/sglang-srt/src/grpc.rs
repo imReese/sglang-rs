@@ -623,11 +623,14 @@ where
         &self,
         request: Request<OpenAiJsonRequest>,
     ) -> Result<Response<Self::ChatCompleteStream>, Status> {
-        let payload: Value = serde_json::from_slice(&request.into_inner().json)
+        let request = request.into_inner();
+        let options = request.options.unwrap_or_default();
+        let payload: Value = serde_json::from_slice(&request.json)
             .map_err(|e| Status::invalid_argument(format!("invalid OpenAI JSON payload: {e}")))?;
         let model = self.model_info()?.served_model_name;
-        let request = crate::http::http_chat_payload_to_router_request(payload, &model)
+        let mut request = crate::http::http_chat_payload_to_router_request(payload, &model)
             .map_err(Status::invalid_argument)?;
+        apply_openai_json_options_to_router_request(&mut request, options);
         let stream = request.stream;
 
         let responses = self
@@ -657,11 +660,14 @@ where
         &self,
         request: Request<OpenAiJsonRequest>,
     ) -> Result<Response<Self::CompleteStream>, Status> {
-        let payload: Value = serde_json::from_slice(&request.into_inner().json)
+        let request = request.into_inner();
+        let options = request.options.unwrap_or_default();
+        let payload: Value = serde_json::from_slice(&request.json)
             .map_err(|e| Status::invalid_argument(format!("invalid OpenAI JSON payload: {e}")))?;
         let model = self.model_info()?.served_model_name;
-        let request = crate::http::http_completion_payload_to_router_request(payload, &model)
+        let mut request = crate::http::http_completion_payload_to_router_request(payload, &model)
             .map_err(Status::invalid_argument)?;
+        apply_openai_json_options_to_router_request(&mut request, options);
         let stream = request.stream;
 
         let responses = self
@@ -801,6 +807,24 @@ fn host_from_addr(addr: &str) -> Option<&str> {
     addr.rsplit_once(':')
         .map(|(host, _)| host)
         .filter(|host| !host.is_empty())
+}
+
+fn apply_openai_json_options_to_router_request(
+    request: &mut RouterTextGenerateRequest,
+    options: crate::proto::sglang::runtime::v1::RequestOptions,
+) {
+    if request.request_id.is_empty() {
+        request.request_id = options.request_id.unwrap_or_default();
+    }
+    if !request.stream {
+        request.stream = options.stream;
+    }
+    if request.data_parallel_rank == 0 {
+        request.data_parallel_rank = options.data_parallel_rank;
+    }
+    request
+        .trace_headers
+        .extend(options.trace_headers.into_iter());
 }
 
 fn proto_generate_request_to_router_request(

@@ -325,6 +325,18 @@ fn generate_json_object(body: &[u8]) -> Result<serde_json::Map<String, Value>, t
         .ok_or_else(|| grpc_generate_status("/generate body must be a JSON object"))
 }
 
+fn openai_json_request_options_from_body(
+    body: &[u8],
+    headers: &HeaderMap,
+) -> Result<ProtoRequestOptions, tonic::Status> {
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|e| grpc_generate_status(format!("invalid OpenAI JSON: {e}")))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| grpc_generate_status("OpenAI JSON body must be a JSON object"))?;
+    request_options_from_json(object, headers)
+}
+
 enum NativeGenerateRequest {
     Text(ProtoTextGenerateRequest),
     Tokenized(ProtoGenerateRequest),
@@ -605,9 +617,11 @@ impl Proxy {
                     ))
                 })?;
             let mut client = SglangServiceClient::new(channel);
+            let options = openai_json_request_options_from_body(&body, headers)
+                .map_err(GrpcForwardError::Status)?;
             let request = OpenAiJsonRequest {
                 json: body.to_vec(),
-                options: None,
+                options: Some(options),
             };
             let mut stream = match path {
                 "/v1/chat/completions" => client
@@ -901,9 +915,11 @@ impl Proxy {
                     ))
                 })?;
             let mut client = SglangServiceClient::new(channel);
+            let options = openai_json_request_options_from_body(&body, headers)
+                .map_err(GrpcForwardError::Status)?;
             let request = OpenAiJsonRequest {
                 json: body.to_vec(),
-                options: None,
+                options: Some(options),
             };
             match path {
                 "/v1/chat/completions" => client
