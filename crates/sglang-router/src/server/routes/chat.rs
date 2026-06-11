@@ -30,6 +30,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// prefix matches `x-sgl-router-error-code` so router-emitted metadata
 /// stays grouped.
 const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url");
+const X_SGL_BOOTSTRAP_ROOM: HeaderName = HeaderName::from_static("x-sgl-bootstrap-room");
 
 /// Coarse char-count → token-count divisor used to estimate prefill load
 /// from the request body when no real tokenizer count is available. Four
@@ -392,6 +393,7 @@ async fn routed_generation(
         None
     };
     let decode_hint_url: Option<String> = decode_peer.as_ref().map(|d| d.url.clone());
+    let mut bootstrap_room_hint: Option<u64> = None;
     let mut request_headers = headers;
     if let Some(url) = &decode_hint_url {
         match HeaderValue::from_str(url) {
@@ -498,6 +500,7 @@ async fn routed_generation(
                     ),
                 })?;
         let bootstrap_room = generate_room_id();
+        bootstrap_room_hint = Some(bootstrap_room);
         let injected_body = inject_bootstrap_fields(
             &body,
             worker.bootstrap_host(),
@@ -645,33 +648,39 @@ async fn routed_generation(
     ctx.metrics
         .record_request(&metrics_worker_url, &metrics_model, metrics_mode, outcome);
 
-    // Mirror the upstream `x-sgl-decode-url` hint onto the response so
-    // external tests / sidecars can observe PD decode affinity without
-    // sniffing the proxy hop. The request-side header was set above for
-    // the prefill worker; copying it here makes the affinity observable
-    // end-to-end. Plain-mode requests skip this (no decode peer was
-    // resolved). A malformed URL was already rejected at the
-    // request-side parse — we only reach this branch when the URL was
-    // header-valid, so the second parse is safe.
-    match (result, decode_hint_url) {
-        (Ok(response), None) => postprocess_response(response, postprocess).await,
-        (Ok(mut response), Some(url)) => {
-            match HeaderValue::from_str(&url) {
-                Ok(v) => {
-                    response.headers_mut().insert(X_SGL_DECODE_URL, v);
+    // Mirror PD-dispatch metadata onto successful upstream responses so
+    // external tests / sidecars can observe decode affinity and the
+    // bootstrap room without sniffing the proxy hop. Plain-mode requests
+    // skip this (no decode peer was resolved). A malformed decode URL
+    // was already rejected at the request-side parse — we only reach
+    // this branch when the URL was header-valid, so the second parse is
+    // defensive only.
+    match result {
+        Ok(response) => {
+            let mut response = postprocess_response(response, postprocess).await?;
+            if let Some(url) = decode_hint_url {
+                match HeaderValue::from_str(&url) {
+                    Ok(v) => {
+                        response.headers_mut().insert(X_SGL_DECODE_URL, v);
+                    }
+                    Err(e) => {
+                        // Already-validated upstream; defensive log only.
+                        tracing::warn!(
+                            decode_url = %url,
+                            error = %e,
+                            "decode worker URL rejected by header parser on response; omitting response-side hint",
+                        );
+                    }
                 }
-                Err(e) => {
-                    // Already-validated upstream; defensive log only.
-                    tracing::warn!(
-                        decode_url = %url,
-                        error = %e,
-                        "decode worker URL rejected by header parser on response; omitting response-side hint",
-                    );
+            }
+            if let Some(room) = bootstrap_room_hint {
+                if let Ok(v) = HeaderValue::from_str(&room.to_string()) {
+                    response.headers_mut().insert(X_SGL_BOOTSTRAP_ROOM, v);
                 }
             }
             Ok(response)
         }
-        (other, _) => other,
+        Err(error) => Err(error),
     }
 }
 

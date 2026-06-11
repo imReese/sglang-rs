@@ -191,6 +191,14 @@ async fn pd_mode_chat_injects_bootstrap_fields_into_both_bodies() {
 
     let res = app.oneshot(chat_request()).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK, "decode side should 200");
+    let response_room = res
+        .headers()
+        .get("x-sgl-bootstrap-room")
+        .expect("PD response should expose the bootstrap room")
+        .to_str()
+        .expect("bootstrap room header should be ASCII")
+        .parse::<u64>()
+        .expect("bootstrap room header should be an unsigned integer");
 
     let prefill_body = await_captured_body(&prefill, Duration::from_secs(2), "prefill").await;
     let decode_body = await_captured_body(&decode, Duration::from_secs(2), "decode").await;
@@ -203,6 +211,10 @@ async fn pd_mode_chat_injects_bootstrap_fields_into_both_bodies() {
     assert_eq!(
         p_room, d_room,
         "prefill and decode must share the same bootstrap_room"
+    );
+    assert_eq!(
+        response_room, p_room,
+        "response header should expose the same bootstrap_room sent to both PD workers"
     );
 
     // Room must be in [0, i64::MAX]: the SGLang prefill stores it as

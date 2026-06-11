@@ -731,6 +731,18 @@ async fn router_pd_chat_reaches_real_rust_srt_grpc_mooncake_workers() {
         StatusCode::INTERNAL_SERVER_ERROR,
         "the default build should reach the unlinked Mooncake gRPC runtime, not fail in router dispatch"
     );
+    let bootstrap_room = response
+        .headers()
+        .get("x-sgl-bootstrap-room")
+        .expect("PD gRPC response should expose the bootstrap room")
+        .to_str()
+        .expect("bootstrap room header should be ASCII")
+        .parse::<u64>()
+        .expect("bootstrap room header should be an unsigned integer");
+    assert!(
+        bootstrap_room <= i64::MAX as u64,
+        "bootstrap_room {bootstrap_room} exceeds signed 63-bit range"
+    );
     let body = response
         .into_body()
         .collect()
