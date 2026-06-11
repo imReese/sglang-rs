@@ -71,6 +71,52 @@ async fn http_server_accepts_model_and_generate_requests() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_accepts_tokenized_generate_requests() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "glm-http-tokenized",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let service = build_bootstrap_http_router_service(&args);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let generated = post_json_with_retry(
+        addr,
+        "/generate",
+        r#"{"input_ids":[71,72],"original_text":"hi","sampling_params":{"max_new_tokens":2}}"#,
+    )
+    .await;
+
+    assert_eq!(generated["output_ids"], serde_json::json!([32, 32]));
+    assert_eq!(generated["finish_reason"], "stop");
+    assert_eq!(generated["usage"]["prompt_tokens"], 2);
+    assert_eq!(generated["usage"]["completion_tokens"], 2);
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_server_accepts_streaming_generate_requests() {
     let args = ServerArgs::parse_from([
         "serve",

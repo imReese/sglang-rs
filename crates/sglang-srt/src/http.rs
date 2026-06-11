@@ -12,8 +12,9 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 
 use crate::router::{
-    RouterDisaggregatedParams, RouterGenerateResponse, RouterGenerateResponseBody,
-    RouterGetModelInfoResponse, RouterRuntime, RouterSamplingParams, RouterTextGenerateRequest,
+    RouterDisaggregatedParams, RouterGenerateRequest, RouterGenerateResponse,
+    RouterGenerateResponseBody, RouterGetModelInfoResponse, RouterRuntime, RouterSamplingParams,
+    RouterTextGenerateRequest, RouterTokenizedInput,
 };
 use crate::tokenizer::Tokenizer;
 use crate::types::BootstrapRoom;
@@ -231,8 +232,8 @@ where
                 .into_response();
         }
     };
-    let stream = request.stream;
-    if request.disaggregated_params.is_some() && !service.allow_disaggregated_requests {
+    let stream = request.stream();
+    if request.disaggregated_params().is_some() && !service.allow_disaggregated_requests {
         return (
             StatusCode::NOT_IMPLEMENTED,
             Json(json!({
@@ -249,10 +250,25 @@ where
             .runtime
             .lock()
             .expect("HTTP router runtime lock should be held");
-        if service.max_transfer_polls == 0 {
-            runtime.generate_text_stream(request)
-        } else {
-            runtime.generate_text_stream_with_transfer_polling(request, service.max_transfer_polls)
+        match request {
+            HttpGenerateRequest::Text(request) => {
+                if service.max_transfer_polls == 0 {
+                    runtime.generate_text_stream(request)
+                } else {
+                    runtime.generate_text_stream_with_transfer_polling(
+                        request,
+                        service.max_transfer_polls,
+                    )
+                }
+            }
+            HttpGenerateRequest::Tokenized(request) => {
+                if service.max_transfer_polls == 0 {
+                    runtime.generate_stream(request)
+                } else {
+                    runtime
+                        .generate_stream_with_transfer_polling(request, service.max_transfer_polls)
+                }
+            }
         }
     };
 
@@ -696,7 +712,36 @@ fn http_completion_stream_response_from_router_responses(
     response
 }
 
-fn http_generate_payload_to_router_request(
+enum HttpGenerateRequest {
+    Text(RouterTextGenerateRequest),
+    Tokenized(RouterGenerateRequest),
+}
+
+impl HttpGenerateRequest {
+    fn stream(&self) -> bool {
+        match self {
+            Self::Text(request) => request.stream,
+            Self::Tokenized(request) => request.stream,
+        }
+    }
+
+    fn disaggregated_params(&self) -> Option<&RouterDisaggregatedParams> {
+        match self {
+            Self::Text(request) => request.disaggregated_params.as_ref(),
+            Self::Tokenized(request) => request.disaggregated_params.as_ref(),
+        }
+    }
+}
+
+fn http_generate_payload_to_router_request(payload: Value) -> Result<HttpGenerateRequest, String> {
+    if payload.get("input_ids").is_some() {
+        return http_generate_payload_to_router_token_request(payload)
+            .map(HttpGenerateRequest::Tokenized);
+    }
+    http_generate_payload_to_router_text_request(payload).map(HttpGenerateRequest::Text)
+}
+
+fn http_generate_payload_to_router_text_request(
     payload: Value,
 ) -> Result<RouterTextGenerateRequest, String> {
     let text = payload
@@ -719,6 +764,52 @@ fn http_generate_payload_to_router_request(
     Ok(RouterTextGenerateRequest {
         request_id,
         text,
+        sampling_params,
+        disaggregated_params,
+        stream: optional_bool(&payload, "stream")?.unwrap_or(false),
+        data_parallel_rank,
+        ..Default::default()
+    })
+}
+
+fn http_generate_payload_to_router_token_request(
+    payload: Value,
+) -> Result<RouterGenerateRequest, String> {
+    let input_ids = payload
+        .get("input_ids")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "input_ids must be an array".to_string())?
+        .iter()
+        .map(|value| {
+            let Some(raw) = value.as_u64() else {
+                return Err("input_ids entries must be unsigned integers".to_string());
+            };
+            u32::try_from(raw).map_err(|_| "input_ids entry is out of u32 range".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let original_text = payload
+        .get("original_text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let request_id = payload
+        .get("request_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let sampling_params = payload
+        .get("sampling_params")
+        .map(json_to_sampling_params)
+        .transpose()?;
+    let disaggregated_params = json_to_disaggregated_params(&payload)?;
+    let data_parallel_rank = optional_i32(&payload, "data_parallel_rank")?.unwrap_or_default();
+
+    Ok(RouterGenerateRequest {
+        request_id,
+        tokenized: Some(RouterTokenizedInput {
+            original_text,
+            input_ids,
+        }),
         sampling_params,
         disaggregated_params,
         stream: optional_bool(&payload, "stream")?.unwrap_or(false),
