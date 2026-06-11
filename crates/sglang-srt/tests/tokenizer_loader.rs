@@ -1,7 +1,12 @@
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use sglang_srt::tokenizer::{HfTokenizer, RuntimeTokenizer, Tokenizer};
+
+static HF_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn hf_tokenizer_loads_tokenizer_json_from_model_directory() {
@@ -79,6 +84,25 @@ fn runtime_tokenizer_loads_repo_id_from_huggingface_cache_snapshot() {
     fs::remove_dir_all(hub_dir).expect("temp hub dir should be removed");
 }
 
+#[test]
+fn runtime_tokenizer_downloads_repo_id_tokenizer_when_cache_is_missing() {
+    let _env_guard = HF_ENV_LOCK
+        .lock()
+        .expect("HF env lock should not be poisoned");
+    let hf_home = temp_model_dir("hf-tokenizer-download-home");
+    let endpoint = start_fake_hf_file_endpoint("tokenizer.json", word_level_tokenizer_json());
+    let _hf_home = EnvVarRestore::set("HF_HOME", &hf_home);
+    let _hf_hub_cache = EnvVarRestore::set("HUGGINGFACE_HUB_CACHE", hf_home.join("hub"));
+    let _hf_endpoint = EnvVarRestore::set("HF_ENDPOINT", endpoint);
+
+    let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path("zai-org/GLM-5-FP8", None)
+        .expect("runtime tokenizer should download repo tokenizer metadata");
+
+    assert_eq!(tokenizer.encode("hello world"), vec![1, 2]);
+
+    fs::remove_dir_all(hf_home).expect("temp HF home should be removed");
+}
+
 fn word_level_tokenizer_json() -> &'static str {
     r#"{
   "version": "1.0",
@@ -101,6 +125,103 @@ fn word_level_tokenizer_json() -> &'static str {
     "unk_token": "[UNK]"
   }
 }"#
+}
+
+struct EnvVarRestore {
+    name: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarRestore {
+    fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(name);
+        unsafe {
+            std::env::set_var(name, value);
+        }
+        Self { name, previous }
+    }
+}
+
+impl Drop for EnvVarRestore {
+    fn drop(&mut self) {
+        if let Some(value) = &self.previous {
+            unsafe {
+                std::env::set_var(self.name, value);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(self.name);
+            }
+        }
+    }
+}
+
+fn start_fake_hf_file_endpoint(filename: &'static str, contents: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("fake HF endpoint should bind");
+    let addr = listener
+        .local_addr()
+        .expect("fake HF endpoint should have address");
+
+    std::thread::spawn(move || {
+        for request_id in 0..2 {
+            let (mut stream, _) = listener.accept().expect("fake HF request should connect");
+            let request = read_http_request(&mut stream);
+            assert!(
+                request.starts_with(&format!("GET /zai-org/GLM-5-FP8/resolve/main/{filename} ")),
+                "unexpected fake HF request: {request:?}"
+            );
+
+            let body = if request_id == 0 {
+                &contents.as_bytes()[..1]
+            } else {
+                contents.as_bytes()
+            };
+            let status = if request_id == 0 {
+                "206 Partial Content"
+            } else {
+                "200 OK"
+            };
+            let content_range = if request_id == 0 {
+                format!("bytes 0-0/{}", contents.len())
+            } else {
+                format!("bytes 0-{}/{}", contents.len() - 1, contents.len())
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\n\
+                 x-repo-commit: abc123\r\n\
+                 etag: \"{filename}\"\r\n\
+                 content-range: {content_range}\r\n\
+                 content-length: {}\r\n\
+                 connection: close\r\n\
+                 \r\n",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("fake HF response headers should write");
+            stream
+                .write_all(body)
+                .expect("fake HF response body should write");
+        }
+    });
+
+    format!("http://{addr}")
+}
+
+fn read_http_request(stream: &mut TcpStream) -> String {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 1];
+    while stream
+        .read(&mut buffer)
+        .expect("fake HF request should read")
+        == 1
+    {
+        request.push(buffer[0]);
+        if request.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    String::from_utf8(request).expect("fake HF request should be utf8")
 }
 
 fn temp_model_dir(name: &str) -> PathBuf {

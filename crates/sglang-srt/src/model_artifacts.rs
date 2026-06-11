@@ -2413,24 +2413,30 @@ fn download_hf_model_config(model_id: &Path) -> Result<PathBuf, ModelArtifactErr
     let model_id = model_id
         .to_str()
         .expect("looks_like_hf_model_id should only accept UTF-8 repo ids");
-    let mut builder = if let Some(cache) = std::env::var_os("HUGGINGFACE_HUB_CACHE") {
-        hf_hub::api::sync::ApiBuilder::from_cache(hf_hub::Cache::new(PathBuf::from(cache)))
-    } else {
-        hf_hub::api::sync::ApiBuilder::from_env()
-    };
-    builder = builder.with_progress(false);
-    let api = builder
-        .build()
-        .map_err(|error| ModelArtifactError::ReadModelConfig {
+    let api = hf_hub_api_builder_from_env().build().map_err(|error| {
+        ModelArtifactError::ReadModelConfig {
             path: PathBuf::from(model_id).join("config.json"),
             message: format!("failed to initialize Hugging Face Hub client: {error}"),
-        })?;
+        }
+    })?;
     api.model(model_id.to_string())
         .get("config.json")
         .map_err(|error| ModelArtifactError::ReadModelConfig {
             path: PathBuf::from(model_id).join("config.json"),
             message: format!("failed to fetch Hugging Face config.json: {error}"),
         })
+}
+
+pub(crate) fn hf_hub_api_builder_from_env() -> hf_hub::api::sync::ApiBuilder {
+    let mut builder = if let Some(cache) = std::env::var_os("HUGGINGFACE_HUB_CACHE") {
+        hf_hub::api::sync::ApiBuilder::from_cache(hf_hub::Cache::new(PathBuf::from(cache)))
+    } else {
+        hf_hub::api::sync::ApiBuilder::from_env()
+    };
+    if let Ok(endpoint) = std::env::var("HF_ENDPOINT") {
+        builder = builder.with_endpoint(endpoint);
+    }
+    builder.with_progress(false)
 }
 
 fn read_usize_field(

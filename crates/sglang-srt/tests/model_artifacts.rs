@@ -1650,6 +1650,7 @@ fn hf_model_config_downloads_repo_id_config_when_cache_is_missing() {
     let hf_home = temp_model_dir("hf-config-download-home");
     let endpoint = start_fake_hf_config_endpoint(glm_moe_dsa_config_json());
     let _hf_home = EnvVarRestore::set("HF_HOME", &hf_home);
+    let _hf_hub_cache = EnvVarRestore::set("HUGGINGFACE_HUB_CACHE", hf_home.join("hub"));
     let _hf_endpoint = EnvVarRestore::set("HF_ENDPOINT", endpoint);
 
     let config = HfModelConfig::from_model_path("zai-org/GLM-5-FP8")
