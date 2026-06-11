@@ -1603,6 +1603,36 @@ fn hf_model_config_treats_null_optional_moe_fields_as_absent() {
 }
 
 #[test]
+fn hf_model_config_parses_glm_moe_routing_fields() {
+    let model_dir = temp_model_dir("glm-moe-routing-config");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "model_type": "glm_moe_dsa",
+  "num_hidden_layers": 1,
+  "n_routed_experts": 2,
+  "num_experts_per_tok": 1,
+  "norm_topk_prob": false,
+  "routed_scaling_factor": 2.0
+}"#,
+    )
+    .expect("config should be written");
+
+    let config = HfModelConfig::from_model_path(&model_dir)
+        .expect("GLM MoE routing config fields should parse");
+
+    assert_eq!(config.num_experts_per_tok, Some(1));
+    assert_eq!(config.norm_topk_prob, Some(false));
+    assert_eq!(
+        config.routed_scaling_factor.map(|value| value.get()),
+        Some(2.0)
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
 fn hf_model_config_loads_repo_id_from_huggingface_cache_snapshot() {
     let hub_dir = temp_model_dir("hf-cache-hub");
     let snapshot_dir = hub_dir

@@ -21,6 +21,9 @@ pub struct GlmMoeDsaRuntime {
     layers: Vec<GlmMoeDsaLayerTensorDescriptors>,
     kv_cache_layout: KvCacheModelLayout,
     rms_norm_eps_bits: u32,
+    num_experts_per_tok: usize,
+    norm_topk_prob: bool,
+    routed_scaling_factor_bits: u32,
 }
 
 impl GlmMoeDsaRuntime {
@@ -53,6 +56,14 @@ impl GlmMoeDsaRuntime {
                 .map(|value| value.get() as f32)
                 .unwrap_or(1e-6)
                 .to_bits(),
+            num_experts_per_tok: artifacts.config().num_experts_per_tok.unwrap_or(1),
+            norm_topk_prob: artifacts.config().norm_topk_prob.unwrap_or(false),
+            routed_scaling_factor_bits: artifacts
+                .config()
+                .routed_scaling_factor
+                .map(|value| value.get() as f32)
+                .unwrap_or(1.0)
+                .to_bits(),
         })
     }
 
@@ -78,6 +89,18 @@ impl GlmMoeDsaRuntime {
 
     pub fn rms_norm_eps(&self) -> f32 {
         f32::from_bits(self.rms_norm_eps_bits)
+    }
+
+    pub fn num_experts_per_tok(&self) -> usize {
+        self.num_experts_per_tok
+    }
+
+    pub fn norm_topk_prob(&self) -> bool {
+        self.norm_topk_prob
+    }
+
+    pub fn routed_scaling_factor(&self) -> f32 {
+        f32::from_bits(self.routed_scaling_factor_bits)
     }
 
     pub fn tensor_parallel_placement_plan(
@@ -824,6 +847,9 @@ pub struct GlmMoeDsaF32TensorParallelRuntime {
     tensor_parallel_size: usize,
     layer_count: usize,
     rms_norm_eps: f32,
+    num_experts_per_tok: usize,
+    norm_topk_prob: bool,
+    routed_scaling_factor: f32,
     ranks: Vec<GlmMoeDsaF32TensorRank>,
 }
 
@@ -841,6 +867,9 @@ impl GlmMoeDsaF32TensorParallelRuntime {
             tensor_parallel_size: runtime.tensor_parallel_size(),
             layer_count: runtime.layer_count(),
             rms_norm_eps: runtime.runtime.rms_norm_eps(),
+            num_experts_per_tok: runtime.runtime.num_experts_per_tok(),
+            norm_topk_prob: runtime.runtime.norm_topk_prob(),
+            routed_scaling_factor: runtime.runtime.routed_scaling_factor(),
             ranks,
         })
     }
@@ -859,6 +888,18 @@ impl GlmMoeDsaF32TensorParallelRuntime {
 
     pub fn rms_norm_eps(&self) -> f32 {
         self.rms_norm_eps
+    }
+
+    pub fn num_experts_per_tok(&self) -> usize {
+        self.num_experts_per_tok
+    }
+
+    pub fn norm_topk_prob(&self) -> bool {
+        self.norm_topk_prob
+    }
+
+    pub fn routed_scaling_factor(&self) -> f32 {
+        self.routed_scaling_factor
     }
 
     pub fn ranks(&self) -> &[GlmMoeDsaF32TensorRank] {
@@ -911,6 +952,96 @@ impl GlmMoeDsaF32TensorParallelRuntime {
         } else {
             Err(GlmMoeDsaF32KernelError::MissingTensor {
                 tensor_name: format!("model.layers.{layer_id}.mlp.gate_proj.weight"),
+            })
+        }
+    }
+
+    pub fn moe_mlp_output(
+        &self,
+        layer_id: usize,
+        hidden: &[f32],
+    ) -> Result<Vec<f32>, GlmMoeDsaF32KernelError> {
+        let router_logits = self.moe_router_logits(layer_id, hidden)?;
+        let topk = topk_softmax_weights(
+            &router_logits,
+            self.num_experts_per_tok,
+            self.norm_topk_prob,
+            layer_id,
+        )?;
+
+        let mut output = Vec::<f32>::new();
+        for (expert_id, route_weight) in topk {
+            let expert_output = self.routed_expert_output(layer_id, expert_id, hidden)?;
+            if output.is_empty() {
+                output.resize(expert_output.len(), 0.0);
+            } else if output.len() != expert_output.len() {
+                return Err(GlmMoeDsaF32KernelError::HiddenSizeMismatch {
+                    tensor_name: format!(
+                        "model.layers.{layer_id}.mlp.experts.{expert_id}.down_proj.weight"
+                    ),
+                    expected: output.len(),
+                    actual: expert_output.len(),
+                });
+            }
+            let scale = route_weight * self.routed_scaling_factor;
+            for (output, expert_value) in output.iter_mut().zip(expert_output) {
+                *output += scale * expert_value;
+            }
+        }
+
+        Ok(output)
+    }
+
+    fn moe_router_logits(
+        &self,
+        layer_id: usize,
+        hidden: &[f32],
+    ) -> Result<Vec<f32>, GlmMoeDsaF32KernelError> {
+        for rank in &self.ranks {
+            if let Some(logits) = rank.moe_router_logits(layer_id, hidden)? {
+                return Ok(logits);
+            }
+        }
+
+        Err(GlmMoeDsaF32KernelError::MissingTensor {
+            tensor_name: format!("model.layers.{layer_id}.mlp.gate.weight"),
+        })
+    }
+
+    fn routed_expert_output(
+        &self,
+        layer_id: usize,
+        expert_id: usize,
+        hidden: &[f32],
+    ) -> Result<Vec<f32>, GlmMoeDsaF32KernelError> {
+        let mut output = Vec::<f32>::new();
+        let mut saw_rank = false;
+        for rank in &self.ranks {
+            let contribution = rank.routed_expert_partial_output(layer_id, expert_id, hidden)?;
+            if output.is_empty() {
+                output.resize(contribution.len(), 0.0);
+            } else if output.len() != contribution.len() {
+                return Err(GlmMoeDsaF32KernelError::HiddenSizeMismatch {
+                    tensor_name: format!(
+                        "model.layers.{layer_id}.mlp.experts.{expert_id}.down_proj.weight"
+                    ),
+                    expected: output.len(),
+                    actual: contribution.len(),
+                });
+            }
+            for (output, contribution) in output.iter_mut().zip(contribution) {
+                *output += contribution;
+            }
+            saw_rank = true;
+        }
+
+        if saw_rank {
+            Ok(output)
+        } else {
+            Err(GlmMoeDsaF32KernelError::MissingTensor {
+                tensor_name: format!(
+                    "model.layers.{layer_id}.mlp.experts.{expert_id}.gate_proj.weight"
+                ),
             })
         }
     }
@@ -1026,6 +1157,61 @@ impl GlmMoeDsaF32TensorRank {
         let gate_name = format!("model.layers.{layer_id}.mlp.gate_proj.weight");
         let up_name = format!("model.layers.{layer_id}.mlp.up_proj.weight");
         let down_name = format!("model.layers.{layer_id}.mlp.down_proj.weight");
+        let gate = self.tensor_shard(&gate_name).ok_or_else(|| {
+            GlmMoeDsaF32KernelError::MissingTensor {
+                tensor_name: gate_name.clone(),
+            }
+        })?;
+        let up =
+            self.tensor_shard(&up_name)
+                .ok_or_else(|| GlmMoeDsaF32KernelError::MissingTensor {
+                    tensor_name: up_name.clone(),
+                })?;
+        let down = self.tensor_shard(&down_name).ok_or_else(|| {
+            GlmMoeDsaF32KernelError::MissingTensor {
+                tensor_name: down_name.clone(),
+            }
+        })?;
+
+        let gate_values = gate.output_parallel_matvec(hidden)?;
+        let up_values = up.output_parallel_matvec(hidden)?;
+        if gate_values.len() != up_values.len() {
+            return Err(GlmMoeDsaF32KernelError::HiddenSizeMismatch {
+                tensor_name: up_name,
+                expected: gate_values.len(),
+                actual: up_values.len(),
+            });
+        }
+        let activated = gate_values
+            .iter()
+            .zip(&up_values)
+            .map(|(gate, up)| silu(*gate) * up)
+            .collect::<Vec<_>>();
+        down.row_parallel_matvec_contribution(&activated)
+    }
+
+    fn moe_router_logits(
+        &self,
+        layer_id: usize,
+        hidden: &[f32],
+    ) -> Result<Option<Vec<f32>>, GlmMoeDsaF32KernelError> {
+        let gate_name = format!("model.layers.{layer_id}.mlp.gate.weight");
+        let Some(gate) = self.tensor_shard(&gate_name) else {
+            return Ok(None);
+        };
+
+        gate.output_parallel_matvec(hidden).map(Some)
+    }
+
+    fn routed_expert_partial_output(
+        &self,
+        layer_id: usize,
+        expert_id: usize,
+        hidden: &[f32],
+    ) -> Result<Vec<f32>, GlmMoeDsaF32KernelError> {
+        let gate_name = format!("model.layers.{layer_id}.mlp.experts.{expert_id}.gate_proj.weight");
+        let up_name = format!("model.layers.{layer_id}.mlp.experts.{expert_id}.up_proj.weight");
+        let down_name = format!("model.layers.{layer_id}.mlp.experts.{expert_id}.down_proj.weight");
         let gate = self.tensor_shard(&gate_name).ok_or_else(|| {
             GlmMoeDsaF32KernelError::MissingTensor {
                 tensor_name: gate_name.clone(),
@@ -1339,6 +1525,11 @@ pub enum GlmMoeDsaF32KernelError {
         expected_axis: usize,
         actual_axis: usize,
     },
+    InvalidTopK {
+        layer_id: usize,
+        top_k: usize,
+        expert_count: usize,
+    },
 }
 
 impl fmt::Display for GlmMoeDsaF32KernelError {
@@ -1391,6 +1582,14 @@ impl fmt::Display for GlmMoeDsaF32KernelError {
                 formatter,
                 "f32 tensor {tensor_name} expected selection axis {expected_axis} but got {actual_axis}"
             ),
+            Self::InvalidTopK {
+                layer_id,
+                top_k,
+                expert_count,
+            } => write!(
+                formatter,
+                "GLM layer {layer_id} requested top_k {top_k} for {expert_count} routed expert(s)"
+            ),
         }
     }
 }
@@ -1421,6 +1620,49 @@ fn apply_rms_norm(
 
 fn silu(value: f32) -> f32 {
     value / (1.0 + (-value).exp())
+}
+
+fn topk_softmax_weights(
+    logits: &[f32],
+    top_k: usize,
+    renormalize: bool,
+    layer_id: usize,
+) -> Result<Vec<(usize, f32)>, GlmMoeDsaF32KernelError> {
+    if top_k == 0 || top_k > logits.len() {
+        return Err(GlmMoeDsaF32KernelError::InvalidTopK {
+            layer_id,
+            top_k,
+            expert_count: logits.len(),
+        });
+    }
+
+    let max_logit = logits
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, |max, value| max.max(value));
+    let exp_values = logits
+        .iter()
+        .map(|logit| (*logit - max_logit).exp())
+        .collect::<Vec<_>>();
+    let exp_sum = exp_values.iter().sum::<f32>();
+    let mut weights = exp_values
+        .into_iter()
+        .enumerate()
+        .map(|(expert_id, exp_value)| (expert_id, exp_value / exp_sum))
+        .collect::<Vec<_>>();
+    weights.sort_by(|(left_id, left), (right_id, right)| {
+        right.total_cmp(left).then_with(|| left_id.cmp(right_id))
+    });
+    weights.truncate(top_k);
+
+    if renormalize {
+        let selected_sum = weights.iter().map(|(_, weight)| *weight).sum::<f32>();
+        for (_, weight) in &mut weights {
+            *weight /= selected_sum;
+        }
+    }
+
+    Ok(weights)
 }
 
 impl From<ModelArtifactError> for GlmMoeDsaRuntimeError {
