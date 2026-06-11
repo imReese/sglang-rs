@@ -9,7 +9,7 @@ use crate::server::error::ApiError;
 use crate::server::metrics::{RequestOutcome, StaleRequestOutcome, WorkerModeLabel};
 use crate::server::routes::pd::{reject_batched_request, PdDispatchPlan, PdWorkerPair};
 use crate::tokenizer::adapter;
-use crate::workers::{LoadGuard, Worker};
+use crate::workers::LoadGuard;
 use axum::body::{to_bytes, Body};
 use axum::extract::State;
 use axum::http::{HeaderMap, Response};
@@ -347,23 +347,22 @@ async fn routed_generation(
                 model: model_str.clone(),
             })?;
 
-    // PD-mode decoder affinity. When the selected prefill worker is
-    // part of a PD-disagg deployment, also resolve the matching decode
-    // peer (same host where possible, falling back to min-load via
-    // `select_decode_with_affinity`). Both workers receive the SAME
-    // request body — augmented with the three flat `bootstrap_*`
-    // fields below — so the SGLang engine can match incoming KV
-    // transfers via `bootstrap_room`.
+    // PD-mode worker selection. When the selected prefill worker is
+    // part of a PD-disagg deployment, resolve the route-layer pair
+    // (`prefill`, `decode`) before request execution. This mirrors
+    // sgl-model-gateway's `WorkerSelection::Dual { prefill, decode }`
+    // boundary: worker pairing is a selection concern, while this
+    // handler only maps selection failures into HTTP errors and later
+    // executes the prepared pair.
     //
-    // Plain-mode workers skip the decode resolution entirely (no
-    // decode peer to find). PD-mode requests that fail to resolve a
+    // Plain-mode workers skip pair resolution entirely (no decode peer
+    // to find). PD-mode requests that fail to resolve a
     // decode peer (`NoDecodeWorkersAvailable`) bubble up as 503 so
     // operators can alert on prefill-vs-decode pool imbalance.
-    let decode_peer: Option<Arc<Worker>> = if worker.mode() == WorkerMode::Prefill {
+    let pd_worker_pair: Option<PdWorkerPair> = if worker.mode() == WorkerMode::Prefill {
         Some(
-            resolver
-                .decode_with_affinity_for_prefill(&model_id, &worker)
-                .map_err(|e| match e {
+            PdWorkerPair::resolve_for_prefill(&resolver, &model_id, Arc::clone(&worker)).map_err(
+                |e| match e {
                     PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers {
                         model: model_str.clone(),
                     },
@@ -377,7 +376,8 @@ async fn routed_generation(
                             model: model_str.clone(),
                         }
                     }
-                })?,
+                },
+            )?,
         )
     } else {
         None
@@ -420,8 +420,7 @@ async fn routed_generation(
     };
     let metrics_model = model_str.clone();
 
-    let result = if let Some(decode_worker) = decode_peer {
-        let worker_pair = PdWorkerPair::new(Arc::clone(&worker), decode_worker);
+    let result = if let Some(worker_pair) = pd_worker_pair {
         // PD-disagg dispatch (Pattern B — spawn prefill, await decode).
         //
         // SGLang's HTTP-mode disagg-prefill requires three flat

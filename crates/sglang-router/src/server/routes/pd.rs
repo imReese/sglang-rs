@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::discovery::ModelId;
+use crate::policies::registry::{PdPoolResolver, PdResolveError};
 use crate::server::error::ApiError;
 use crate::workers::Worker;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
@@ -27,6 +29,15 @@ pub(crate) struct PdWorkerPair {
 impl PdWorkerPair {
     pub(crate) fn new(prefill: Arc<Worker>, decode: Arc<Worker>) -> Self {
         Self { prefill, decode }
+    }
+
+    pub(crate) fn resolve_for_prefill(
+        resolver: &PdPoolResolver,
+        model: &ModelId,
+        prefill: Arc<Worker>,
+    ) -> Result<Self, PdResolveError> {
+        let decode = resolver.decode_with_affinity_for_prefill(model, &prefill)?;
+        Ok(Self::new(prefill, decode))
     }
 
     pub(crate) fn decode(&self) -> &Arc<Worker> {
@@ -302,6 +313,8 @@ fn request_batch_size(obj: &serde_json::Map<String, serde_json::Value>) -> Optio
 mod tests {
     use super::*;
     use crate::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+    use crate::policies::registry::PdPoolResolver;
+    use crate::workers::registry::WorkerRegistry;
     use crate::workers::Worker;
     use axum::http::HeaderMap;
     use bytes::Bytes;
@@ -315,6 +328,21 @@ mod tests {
             model_ids: vec![ModelId("tiny".into())],
             bootstrap_port,
         })
+    }
+
+    fn worker_spec(
+        id: &str,
+        url: &str,
+        mode: WorkerMode,
+        bootstrap_port: Option<u16>,
+    ) -> WorkerSpec {
+        WorkerSpec {
+            id: WorkerId(id.into()),
+            url: url.into(),
+            mode,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port,
+        }
     }
 
     #[test]
@@ -431,6 +459,46 @@ mod tests {
             headers.get(X_SGL_DECODE_URL).and_then(|v| v.to_str().ok()),
             Some("grpc://decode.local:30000")
         );
+    }
+
+    #[test]
+    fn worker_pair_resolves_decode_peer_for_selected_prefill() {
+        let model = ModelId("tiny".into());
+        let registry = Arc::new(WorkerRegistry::default());
+        registry
+            .add(worker_spec(
+                "prefill",
+                "grpc://host-a.local:30000",
+                WorkerMode::Prefill,
+                Some(8200),
+            ))
+            .unwrap();
+        registry
+            .add(worker_spec(
+                "decode-same-host",
+                "grpc://host-a.local:30001",
+                WorkerMode::Decode,
+                None,
+            ))
+            .unwrap();
+        registry
+            .add(worker_spec(
+                "decode-other-host",
+                "grpc://host-b.local:30000",
+                WorkerMode::Decode,
+                None,
+            ))
+            .unwrap();
+
+        let resolver = PdPoolResolver::new(Arc::clone(&registry));
+        let selected_prefill = registry
+            .workers_for_mode(&model, WorkerMode::Prefill)
+            .pop()
+            .unwrap();
+
+        let pair = PdWorkerPair::resolve_for_prefill(&resolver, &model, selected_prefill).unwrap();
+
+        assert_eq!(pair.decode().id, WorkerId("decode-same-host".into()));
     }
 
     /// `generate_room_id` MUST return values in `[0, i64::MAX]`. The
