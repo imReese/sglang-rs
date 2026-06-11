@@ -231,6 +231,44 @@ fn glm_moe_dsa_f32_runtime_computes_tensor_parallel_dense_mlp_output() {
 }
 
 #[test]
+fn glm_moe_dsa_f32_runtime_computes_dense_feed_forward_layer_output() {
+    let model_dir = temp_model_dir("glm-runtime-f32-dense-feed-forward-layer");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_glm_moe_dsa_dense_mlp_fixture(&model_dir);
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("GLM artifacts should load");
+    let runtime =
+        GlmMoeDsaRuntime::from_local_model_artifacts(&artifacts).expect("runtime should build");
+    let f32_runtime = runtime
+        .load_tensor_parallel_shards(2)
+        .expect("all TP rank shards should load")
+        .decode_f32_tensor_parallel_shards()
+        .expect("F32 cache should decode");
+
+    let output = f32_runtime
+        .feed_forward_layer_output(0, &[1.0, 1.0], Some(&[3.0, 1.0]))
+        .expect("dense feed-forward layer should compute");
+
+    let residual = [4.0_f32, 2.0_f32];
+    let inv_rms = ((residual[0] * residual[0] + residual[1] * residual[1]) / 2.0_f32)
+        .sqrt()
+        .recip();
+    let normalized = [residual[0] * inv_rms, residual[1] * inv_rms];
+    let activation0 = silu(normalized[0]) * (2.0 * normalized[0]);
+    let activation1 = silu(normalized[1]) * (3.0 * normalized[1]);
+    assert_close(
+        output.hidden_states(),
+        &[
+            5.0 * activation0 + 7.0 * activation1,
+            11.0 * activation0 + 13.0 * activation1,
+        ],
+    );
+    assert_close(output.residual(), &residual);
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
 fn glm_moe_dsa_f32_runtime_computes_tensor_parallel_moe_mlp_output() {
     let model_dir = temp_model_dir("glm-runtime-f32-moe-mlp");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");

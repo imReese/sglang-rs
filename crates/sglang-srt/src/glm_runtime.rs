@@ -850,7 +850,46 @@ pub struct GlmMoeDsaF32TensorParallelRuntime {
     num_experts_per_tok: usize,
     norm_topk_prob: bool,
     routed_scaling_factor: f32,
+    feed_forward_kinds: Vec<GlmMoeDsaF32FeedForwardKind>,
     ranks: Vec<GlmMoeDsaF32TensorRank>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GlmMoeDsaF32FeedForwardKind {
+    Dense,
+    Moe,
+}
+
+impl From<&GlmMoeDsaFeedForwardTensorDescriptors> for GlmMoeDsaF32FeedForwardKind {
+    fn from(descriptors: &GlmMoeDsaFeedForwardTensorDescriptors) -> Self {
+        match descriptors {
+            GlmMoeDsaFeedForwardTensorDescriptors::Dense { .. } => Self::Dense,
+            GlmMoeDsaFeedForwardTensorDescriptors::Moe { .. } => Self::Moe,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlmMoeDsaF32LayerOutput {
+    hidden_states: Vec<f32>,
+    residual: Vec<f32>,
+}
+
+impl GlmMoeDsaF32LayerOutput {
+    fn new(hidden_states: Vec<f32>, residual: Vec<f32>) -> Self {
+        Self {
+            hidden_states,
+            residual,
+        }
+    }
+
+    pub fn hidden_states(&self) -> &[f32] {
+        &self.hidden_states
+    }
+
+    pub fn residual(&self) -> &[f32] {
+        &self.residual
+    }
 }
 
 impl GlmMoeDsaF32TensorParallelRuntime {
@@ -870,6 +909,12 @@ impl GlmMoeDsaF32TensorParallelRuntime {
             num_experts_per_tok: runtime.runtime.num_experts_per_tok(),
             norm_topk_prob: runtime.runtime.norm_topk_prob(),
             routed_scaling_factor: runtime.runtime.routed_scaling_factor(),
+            feed_forward_kinds: runtime
+                .runtime
+                .layers()
+                .iter()
+                .map(|layer| GlmMoeDsaF32FeedForwardKind::from(layer.feed_forward()))
+                .collect(),
             ranks,
         })
     }
@@ -954,6 +999,40 @@ impl GlmMoeDsaF32TensorParallelRuntime {
                 tensor_name: format!("model.layers.{layer_id}.mlp.gate_proj.weight"),
             })
         }
+    }
+
+    pub fn feed_forward_layer_output(
+        &self,
+        layer_id: usize,
+        attention_output: &[f32],
+        residual: Option<&[f32]>,
+    ) -> Result<GlmMoeDsaF32LayerOutput, GlmMoeDsaF32KernelError> {
+        let feed_forward_kind = self.feed_forward_kind(layer_id)?;
+        let mut residual_out = attention_output.to_vec();
+        if let Some(residual) = residual {
+            if residual.len() != attention_output.len() {
+                return Err(GlmMoeDsaF32KernelError::HiddenSizeMismatch {
+                    tensor_name: format!("model.layers.{layer_id}.post_attention_layernorm.weight"),
+                    expected: attention_output.len(),
+                    actual: residual.len(),
+                });
+            }
+            for (output, residual) in residual_out.iter_mut().zip(residual) {
+                *output += residual;
+            }
+        }
+
+        let mut mlp_input = residual_out.clone();
+        let norm_name = format!("model.layers.{layer_id}.post_attention_layernorm.weight");
+        let norm_weight = self.layer_norm_weight(&norm_name)?;
+        apply_rms_norm(&norm_name, &mut mlp_input, norm_weight, self.rms_norm_eps)?;
+
+        let hidden_states = match feed_forward_kind {
+            GlmMoeDsaF32FeedForwardKind::Dense => self.dense_mlp_output(layer_id, &mlp_input)?,
+            GlmMoeDsaF32FeedForwardKind::Moe => self.moe_mlp_output(layer_id, &mlp_input)?,
+        };
+
+        Ok(GlmMoeDsaF32LayerOutput::new(hidden_states, residual_out))
     }
 
     pub fn moe_mlp_output(
@@ -1104,15 +1183,31 @@ impl GlmMoeDsaF32TensorParallelRuntime {
     }
 
     fn final_norm_weight(&self) -> Result<&[f32], GlmMoeDsaF32KernelError> {
+        self.layer_norm_weight("model.norm.weight")
+    }
+
+    fn layer_norm_weight(&self, tensor_name: &str) -> Result<&[f32], GlmMoeDsaF32KernelError> {
         for rank in &self.ranks {
-            if let Some(norm) = rank.tensor_shard("model.norm.weight") {
+            if let Some(norm) = rank.tensor_shard(tensor_name) {
                 return norm.vector_values();
             }
         }
 
         Err(GlmMoeDsaF32KernelError::MissingTensor {
-            tensor_name: "model.norm.weight".to_string(),
+            tensor_name: tensor_name.to_string(),
         })
+    }
+
+    fn feed_forward_kind(
+        &self,
+        layer_id: usize,
+    ) -> Result<GlmMoeDsaF32FeedForwardKind, GlmMoeDsaF32KernelError> {
+        self.feed_forward_kinds.get(layer_id).copied().ok_or(
+            GlmMoeDsaF32KernelError::LayerOutOfBounds {
+                layer_id,
+                layer_count: self.layer_count,
+            },
+        )
     }
 }
 
@@ -1530,6 +1625,10 @@ pub enum GlmMoeDsaF32KernelError {
         top_k: usize,
         expert_count: usize,
     },
+    LayerOutOfBounds {
+        layer_id: usize,
+        layer_count: usize,
+    },
 }
 
 impl fmt::Display for GlmMoeDsaF32KernelError {
@@ -1589,6 +1688,13 @@ impl fmt::Display for GlmMoeDsaF32KernelError {
             } => write!(
                 formatter,
                 "GLM layer {layer_id} requested top_k {top_k} for {expert_count} routed expert(s)"
+            ),
+            Self::LayerOutOfBounds {
+                layer_id,
+                layer_count,
+            } => write!(
+                formatter,
+                "GLM layer id {layer_id} is outside loaded layer count {layer_count}"
             ),
         }
     }
