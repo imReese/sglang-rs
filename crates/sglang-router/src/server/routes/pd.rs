@@ -100,6 +100,47 @@ impl RouteWorkerSelection {
     }
 }
 
+/// Prepared HTTP PD execution request. This is the small request
+/// execution boundary for the current route path: it keeps the selected
+/// worker pair beside the bootstrap-injected dispatch plan so the
+/// handler can execute prefill/decode without rebuilding either side.
+#[derive(Debug, Clone)]
+pub(crate) struct PdExecutionRequest {
+    pair: PdWorkerPair,
+    plan: PdDispatchPlan,
+}
+
+impl PdExecutionRequest {
+    pub(crate) fn prepare(pair: PdWorkerPair, body: &Bytes) -> Result<Self, ApiError> {
+        let plan = pair.prepare_plan(body)?;
+        Ok(Self { pair, plan })
+    }
+
+    pub(crate) fn prefill(&self) -> &Arc<Worker> {
+        self.pair.prefill()
+    }
+
+    pub(crate) fn decode(&self) -> &Arc<Worker> {
+        self.pair.decode()
+    }
+
+    pub(crate) fn body(&self) -> &Bytes {
+        self.plan.body()
+    }
+
+    pub(crate) fn bootstrap_room(&self) -> u64 {
+        self.plan.bootstrap_room()
+    }
+
+    pub(crate) fn dispatch_plan(&self) -> &PdDispatchPlan {
+        &self.plan
+    }
+
+    pub(crate) fn insert_request_headers(&self, headers: &mut HeaderMap) {
+        self.plan.insert_request_headers(headers);
+    }
+}
+
 /// Request-scoped PD dispatch metadata. This mirrors the role of
 /// sgl-model-gateway's dispatch metadata stage for the current HTTP
 /// router path: one object owns the decode affinity hint and the
@@ -496,6 +537,40 @@ mod tests {
             headers.get(X_SGL_DECODE_URL).and_then(|v| v.to_str().ok()),
             Some("grpc://decode.local:30000")
         );
+    }
+
+    #[test]
+    fn execution_request_keeps_pair_and_prepared_dispatch_body_together() {
+        let prefill = Arc::new(worker(
+            "prefill",
+            "http://prefill.local:30000",
+            WorkerMode::Prefill,
+            Some(8200),
+        ));
+        let decode = Arc::new(worker(
+            "decode",
+            "grpc://decode.local:30000",
+            WorkerMode::Decode,
+            None,
+        ));
+        let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
+        let pair = PdWorkerPair::new(prefill, decode);
+
+        let request = PdExecutionRequest::prepare(pair, &body).unwrap();
+
+        assert_eq!(request.prefill().id, WorkerId("prefill".into()));
+        assert_eq!(request.decode().id, WorkerId("decode".into()));
+        let parsed: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+        assert_eq!(parsed["bootstrap_host"], "prefill.local");
+        assert_eq!(parsed["bootstrap_port"], 8200);
+
+        let mut headers = HeaderMap::new();
+        request.insert_request_headers(&mut headers);
+        assert_eq!(
+            headers.get(X_SGL_DECODE_URL).and_then(|v| v.to_str().ok()),
+            Some("grpc://decode.local:30000")
+        );
+        assert!(request.bootstrap_room() <= i64::MAX as u64);
     }
 
     #[test]

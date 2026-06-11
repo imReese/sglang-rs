@@ -7,7 +7,9 @@ use crate::policies::SelectionContext;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{RequestOutcome, StaleRequestOutcome, WorkerModeLabel};
-use crate::server::routes::pd::{reject_batched_request, PdDispatchPlan, RouteWorkerSelection};
+use crate::server::routes::pd::{
+    reject_batched_request, PdDispatchPlan, PdExecutionRequest, RouteWorkerSelection,
+};
 use crate::tokenizer::adapter;
 use crate::workers::LoadGuard;
 use axum::body::{to_bytes, Body};
@@ -446,14 +448,14 @@ async fn routed_generation(
             // the current implementation ships without one (matching SMG's
             // shutdown behaviour).
             reject_batched_request(upstream_path, &body)?;
-            let plan = worker_pair.prepare_plan(&body)?;
-            let bootstrap_room = plan.bootstrap_room();
-            plan.insert_request_headers(&mut request_headers);
+            let execution_request = PdExecutionRequest::prepare(worker_pair, &body)?;
+            let bootstrap_room = execution_request.bootstrap_room();
+            execution_request.insert_request_headers(&mut request_headers);
             let headers = request_headers;
-            let injected_body = plan.body().clone();
-            pd_dispatch_plan = Some(plan);
+            let injected_body = execution_request.body().clone();
+            pd_dispatch_plan = Some(execution_request.dispatch_plan().clone());
 
-            let prefill_worker = worker_pair.prefill();
+            let prefill_worker = execution_request.prefill();
             let prefill_url = prefill_worker.url.clone();
             let prefill_breaker = Arc::clone(&prefill_worker.breaker);
             let prefill_headers = headers.clone();
@@ -496,7 +498,7 @@ async fn routed_generation(
             // the client sees. The decode side gets its own LoadGuard so
             // per-worker `active_requests` reflects decode-pool load for
             // cache-aware-zmq decisions on the decode side.
-            let decode_worker = worker_pair.decode();
+            let decode_worker = execution_request.decode();
             let decode_guard = decode_worker.load_guard();
             if streaming {
                 let stream_guards: Box<dyn Send + 'static> = Box::new(decode_guard);
