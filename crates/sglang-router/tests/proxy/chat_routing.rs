@@ -127,6 +127,76 @@ async fn rerank_plain_mode_proxies_without_bootstrap_fields() {
 }
 
 #[tokio::test]
+async fn embeddings_plain_mode_proxies_without_bootstrap_fields() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/embeddings")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "input": "rust router",
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let captured = worker
+        .captured
+        .lock()
+        .unwrap()
+        .last_body
+        .clone()
+        .expect("worker should capture embeddings body");
+    let v: serde_json::Value = serde_json::from_slice(&captured).unwrap();
+    assert_eq!(v["input"], "rust router");
+    assert!(v.get("bootstrap_host").is_none());
+    assert!(v.get("bootstrap_port").is_none());
+    assert!(v.get("bootstrap_room").is_none());
+}
+
+#[tokio::test]
+async fn classify_plain_mode_proxies_without_bootstrap_fields() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/classify")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "input": "rust router",
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let captured = worker
+        .captured
+        .lock()
+        .unwrap()
+        .last_body
+        .clone()
+        .expect("worker should capture classify body");
+    let v: serde_json::Value = serde_json::from_slice(&captured).unwrap();
+    assert_eq!(v["input"], "rust router");
+    assert!(v.get("bootstrap_host").is_none());
+    assert!(v.get("bootstrap_port").is_none());
+    assert!(v.get("bootstrap_room").is_none());
+}
+
+#[tokio::test]
 async fn non_streaming_upstream_unreachable_returns_502_unreachable() {
     // Bind a port, drop it — guarantees a closed/refused TCP destination.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

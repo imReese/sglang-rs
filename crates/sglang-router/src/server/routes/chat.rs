@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::discovery::{ModelId, WorkerMode};
-use crate::policies::registry::{PdPoolResolver, PdResolveError};
+use crate::policies::registry::{PdPoolResolver, PdPools, PdResolveError};
 use crate::policies::SelectionContext;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
@@ -140,10 +140,126 @@ pub async fn rerank(
     .await
 }
 
+/// POST /v1/embeddings — plain-mode gateway-compatible proxy. SGLang's
+/// HTTP PD router rejects embeddings in PD mode, so this route only
+/// dispatches to plain workers.
+pub async fn embeddings(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    routed_plain_json(
+        ctx,
+        headers,
+        body,
+        "/v1/embeddings",
+        "PD mode does not support /v1/embeddings",
+    )
+    .await
+}
+
+/// POST /v1/classify — plain-mode gateway-compatible proxy. As with
+/// embeddings, the upstream HTTP PD router treats classify as
+/// unsupported for PD deployments.
+pub async fn classify(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    routed_plain_json(
+        ctx,
+        headers,
+        body,
+        "/v1/classify",
+        "PD mode does not support /v1/classify",
+    )
+    .await
+}
+
 #[derive(Clone, Copy)]
 enum ModelSelection {
     RequireBodyModel,
     BodyModelOrSingleConfigured,
+}
+
+async fn routed_plain_json(
+    ctx: Arc<AppContext>,
+    headers: HeaderMap,
+    body: Bytes,
+    upstream_path: &'static str,
+    pd_unsupported_message: &'static str,
+) -> Result<Response<Body>, ApiError> {
+    let probe = parse_probe(&body)?;
+    let model_str = select_model(&ctx, probe.model, ModelSelection::RequireBodyModel)?;
+    let model_id = ModelId(model_str.clone());
+
+    let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry));
+    let workers = match resolver.resolve(&model_id) {
+        Ok(PdPools::Plain { workers }) => workers,
+        Ok(PdPools::Pd { .. }) => {
+            return Err(ApiError::BadRequest(pd_unsupported_message.to_string()));
+        }
+        Err(PdResolveError::NoHealthyWorkers) => {
+            return Err(ApiError::NoHealthyWorkers { model: model_str });
+        }
+        Err(PdResolveError::NoPrefillWorkersAvailable) => {
+            return Err(ApiError::NoPrefillWorkersAvailable { model: model_str });
+        }
+        Err(PdResolveError::NoDecodeWorkersAvailable) => {
+            return Err(ApiError::NoDecodeWorkersAvailable { model: model_str });
+        }
+    };
+
+    let policy = ctx
+        .policies
+        .get(&model_id)
+        .ok_or_else(|| ApiError::ModelNotFound(model_str.clone()))?;
+    let selection_ctx = SelectionContext::new(&model_id, Some(&body));
+    let worker =
+        policy
+            .select(&workers, &selection_ctx)
+            .ok_or_else(|| ApiError::PolicySelectionFailed {
+                model: model_str.clone(),
+            })?;
+
+    let guard = worker.load_guard();
+    let active_load = estimate_prefill_tokens(&body);
+    let active_guard =
+        ctx.active_load
+            .register(worker.id.clone(), worker.url.clone(), active_load, 0);
+    let stale_token = active_guard.cancel_token().clone();
+    let metrics_worker_url = worker.url.clone();
+    let metrics_model = model_str.clone();
+
+    let result = {
+        let _holds: (LoadGuard, _) = (guard, active_guard);
+        let fetch =
+            ctx.proxy
+                .forward_json_to(&worker.url, &worker.breaker, upstream_path, &headers, body);
+        tokio::select! {
+            biased;
+            r = fetch => r,
+            _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
+        }
+    };
+
+    let outcome = match &result {
+        Ok(_) => RequestOutcome::Success,
+        Err(ApiError::StaleRequestExpired { .. }) => {
+            ctx.metrics
+                .record_stale_request(StaleRequestOutcome::Expired);
+            RequestOutcome::Cancelled
+        }
+        Err(_) => RequestOutcome::Error,
+    };
+    ctx.metrics.record_request(
+        &metrics_worker_url,
+        &metrics_model,
+        WorkerModeLabel::Plain,
+        outcome,
+    );
+
+    result
 }
 
 async fn routed_generation(
