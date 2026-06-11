@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use tonic::Request;
@@ -22,11 +23,14 @@ use sglang_srt::server::{
 };
 use sglang_srt::tokenizer::TokenizerError;
 use sglang_srt::transfer::{
-    DecodeBootstrapRegistry, DisaggregationMode, MooncakeBatchId, MooncakeBatchReleaser,
-    MooncakeError, MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeTransferRequest,
-    MooncakeTransferStatus, MooncakeTransferStatusCode, MooncakeTransferStatusReader,
-    MooncakeTransferSubmitter, MooncakeTransferTarget, PdConfigError, TransferBackend,
+    DecodeBootstrapRegistry, DisaggregationMode, KvCacheModelLayout, MooncakeBatchId,
+    MooncakeBatchReleaser, MooncakeError, MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor,
+    MooncakeTransferRequest, MooncakeTransferStatus, MooncakeTransferStatusCode,
+    MooncakeTransferStatusReader, MooncakeTransferSubmitter, MooncakeTransferTarget, PdConfig,
+    PdConfigError, TransferBackend,
 };
+
+static HF_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn grpc_listen_addr_uses_server_host_and_port() {
@@ -1154,6 +1158,41 @@ async fn launch_grpc_server_requires_kv_model_layout_for_mooncake_decode() {
 }
 
 #[test]
+fn pd_config_derives_mooncake_decode_layout_from_hf_repo_config_download() {
+    let _env_guard = HF_ENV_LOCK
+        .lock()
+        .expect("HF env lock should not be poisoned");
+    let hf_home = temp_model_dir("server-hf-config-download-home");
+    let endpoint = start_fake_hf_config_endpoint(glm_moe_dsa_config_json());
+    let _hf_home = EnvVarRestore::set("HF_HOME", &hf_home);
+    let _hf_endpoint = EnvVarRestore::set("HF_ENDPOINT", endpoint);
+
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "zai-org/GLM-5-FP8",
+        "--grpc-mode",
+        "--disaggregation-mode",
+        "decode",
+        "--disaggregation-transfer-backend",
+        "mooncake",
+        "--kv-cache-dtype",
+        "bfloat16",
+    ])
+    .expect("args should parse");
+
+    let config = PdConfig::from_server_args(&args)
+        .expect("pd config should download cached HF config metadata");
+
+    assert_eq!(
+        config.kv_cache_model_layout,
+        Some(KvCacheModelLayout::multi_tensor(78, 64, 64, 2))
+    );
+
+    fs::remove_dir_all(hf_home).expect("temp HF home should be removed");
+}
+
+#[test]
 fn prefill_mooncake_zmq_endpoints_follow_launch_host_and_port_range() {
     let args = ServerArgs::parse_from([
         "serve",
@@ -1531,6 +1570,113 @@ fn write_safetensors_file(
     bytes.extend_from_slice(header.as_bytes());
     bytes.extend_from_slice(payload);
     fs::write(path, bytes)
+}
+
+struct EnvVarRestore {
+    name: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarRestore {
+    fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(name);
+        unsafe {
+            std::env::set_var(name, value);
+        }
+        Self { name, previous }
+    }
+}
+
+impl Drop for EnvVarRestore {
+    fn drop(&mut self) {
+        if let Some(value) = &self.previous {
+            unsafe {
+                std::env::set_var(self.name, value);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(self.name);
+            }
+        }
+    }
+}
+
+fn start_fake_hf_config_endpoint(config: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("fake HF endpoint should bind");
+    let addr = listener
+        .local_addr()
+        .expect("fake HF endpoint should have address");
+
+    std::thread::spawn(move || {
+        for request_id in 0..2 {
+            let (mut stream, _) = listener.accept().expect("fake HF request should connect");
+            let request = read_http_request(&mut stream);
+            assert!(
+                request.starts_with("GET /zai-org/GLM-5-FP8/resolve/main/config.json "),
+                "unexpected fake HF request: {request:?}"
+            );
+
+            let body = if request_id == 0 {
+                &config.as_bytes()[..1]
+            } else {
+                config.as_bytes()
+            };
+            let status = if request_id == 0 {
+                "206 Partial Content"
+            } else {
+                "200 OK"
+            };
+            let content_range = if request_id == 0 {
+                format!("bytes 0-0/{}", config.len())
+            } else {
+                format!("bytes 0-{}/{}", config.len() - 1, config.len())
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\n\
+                 x-repo-commit: abc123\r\n\
+                 etag: \"config-json\"\r\n\
+                 content-range: {content_range}\r\n\
+                 content-length: {}\r\n\
+                 connection: close\r\n\
+                 \r\n",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("fake HF response headers should write");
+            stream
+                .write_all(body)
+                .expect("fake HF response body should write");
+        }
+    });
+
+    format!("http://{addr}")
+}
+
+fn read_http_request(stream: &mut TcpStream) -> String {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 1];
+    while stream
+        .read(&mut buffer)
+        .expect("fake HF request should read")
+        == 1
+    {
+        request.push(buffer[0]);
+        if request.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    String::from_utf8(request).expect("fake HF request should be utf8")
+}
+
+fn glm_moe_dsa_config_json() -> &'static str {
+    r#"{
+  "model_type": "glm_moe_dsa",
+  "num_hidden_layers": 78,
+  "num_attention_heads": 64,
+  "num_key_value_heads": 64,
+  "head_dim": 64
+}"#
 }
 
 fn temp_model_dir(name: &str) -> PathBuf {

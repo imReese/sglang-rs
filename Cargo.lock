@@ -4206,6 +4206,7 @@ name = "sglang-srt"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "hf-hub",
  "prost",
  "rand 0.10.1",
  "serde",
