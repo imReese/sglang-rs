@@ -6,7 +6,9 @@ use tonic::transport::Channel;
 use sglang_srt::cli::ServerArgs;
 use sglang_srt::grpc::serve_grpc_router_with_shutdown;
 use sglang_srt::proto::sglang::runtime::v1::sglang_service_client::SglangServiceClient;
-use sglang_srt::proto::sglang::runtime::v1::{GetModelInfoRequest, HealthCheckRequest};
+use sglang_srt::proto::sglang::runtime::v1::{
+    GetModelInfoRequest, GetServerInfoRequest, HealthCheckRequest,
+};
 use sglang_srt::server::build_bootstrap_grpc_router_service;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -22,6 +24,16 @@ async fn grpc_server_accepts_generated_client_requests() {
         "--port",
         "0",
         "--grpc-mode",
+        "--kv-cache-dtype",
+        "bfloat16",
+        "--kv-cache-num-layers",
+        "78",
+        "--kv-cache-kv-heads",
+        "64",
+        "--kv-cache-head-dim",
+        "64",
+        "--page-size",
+        "64",
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
@@ -51,6 +63,43 @@ async fn grpc_server_accepts_generated_client_requests() {
     assert_eq!(health.message, "ready");
     assert_eq!(model_info.model_path, "meta-llama/Llama-3.1-8B-Instruct");
     assert_eq!(model_info.served_model_name, "llama3");
+    let server_info = client
+        .get_server_info(GetServerInfoRequest {})
+        .await
+        .expect("server info should execute")
+        .into_inner();
+    assert_eq!(
+        server_info.attributes.get("kv_cache.dtype"),
+        Some(&"bfloat16".to_string())
+    );
+    assert_eq!(
+        server_info.attributes.get("kv_cache.page_size"),
+        Some(&"64".to_string())
+    );
+    assert_eq!(
+        server_info.attributes.get("kv_cache.num_layers"),
+        Some(&"78".to_string())
+    );
+    assert_eq!(
+        server_info.attributes.get("kv_cache.kv_heads"),
+        Some(&"64".to_string())
+    );
+    assert_eq!(
+        server_info.attributes.get("kv_cache.head_dim"),
+        Some(&"64".to_string())
+    );
+    assert_eq!(
+        server_info.attributes.get("kv_cache.kv_tensors_per_token"),
+        Some(&"2".to_string())
+    );
+    assert_eq!(
+        server_info.attributes.get("kv_cache.bytes_per_token"),
+        Some(&(78 * 2 * 64 * 64 * 2).to_string())
+    );
+    assert_eq!(
+        server_info.attributes.get("kv_cache.page_size_bytes"),
+        Some(&(64 * 78 * 2 * 64 * 64 * 2).to_string())
+    );
 
     shutdown_tx
         .send(())

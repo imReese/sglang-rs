@@ -112,6 +112,16 @@ impl KvCacheDtype {
         }
     }
 
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Bfloat16 => "bfloat16",
+            Self::Fp8E4M3 => "fp8_e4m3",
+            Self::Fp8E5M2 => "fp8_e5m2",
+            Self::Fp4E2M1 => "fp4_e2m1",
+        }
+    }
+
     pub fn bytes_per_element(&self) -> Option<usize> {
         match self {
             Self::Auto => None,
@@ -120,6 +130,18 @@ impl KvCacheDtype {
             Self::Fp4E2M1 => None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KvCacheRuntimeLayout {
+    pub dtype: KvCacheDtype,
+    pub page_size: usize,
+    pub num_layers: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub kv_tensors_per_token: usize,
+    pub bytes_per_token: usize,
+    pub page_size_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -521,6 +543,29 @@ impl PdConfig {
             disable_radix_cache: args.disable_radix_cache,
             tool_call_parser: args.tool_call_parser.clone(),
         })
+    }
+
+    pub fn kv_cache_runtime_layout(&self) -> Result<Option<KvCacheRuntimeLayout>, PdConfigError> {
+        let Some(model_layout) = self.kv_cache_model_layout else {
+            return Ok(None);
+        };
+
+        let bytes_per_token = model_layout.token_size_bytes(self.kv_cache_dtype)?;
+        let page_size_bytes = self
+            .page_size
+            .checked_mul(bytes_per_token)
+            .ok_or(PdConfigError::KvCacheLayoutOverflow)?;
+
+        Ok(Some(KvCacheRuntimeLayout {
+            dtype: self.kv_cache_dtype,
+            page_size: self.page_size,
+            num_layers: model_layout.num_layers,
+            kv_heads: model_layout.kv_heads,
+            head_dim: model_layout.head_dim,
+            kv_tensors_per_token: model_layout.kv_tensors_per_token,
+            bytes_per_token,
+            page_size_bytes,
+        }))
     }
 }
 

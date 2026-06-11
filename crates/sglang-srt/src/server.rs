@@ -12,7 +12,7 @@ use crate::deepseek_runtime::{
 use crate::engine::Engine;
 use crate::grpc::{GrpcRouterService, GrpcServeError, serve_grpc_router_with_shutdown};
 use crate::http::{
-    HttpKvEventsInfo, HttpRouterService, HttpServeError, HttpServerInfo,
+    HttpKvCacheInfo, HttpKvEventsInfo, HttpRouterService, HttpServeError, HttpServerInfo,
     serve_http_router_with_shutdown,
 };
 use crate::model_artifacts::{HfModelConfig, LocalModelArtifacts, ModelArtifactError};
@@ -360,6 +360,7 @@ fn http_server_info_from_args(args: &ServerArgs) -> HttpServerInfo {
             None
         },
         kv_events: None,
+        kv_cache: None,
     };
 
     if let Some(ports) = args.disaggregation_zmq_ports {
@@ -377,7 +378,24 @@ fn http_server_info_from_args(args: &ServerArgs) -> HttpServerInfo {
         }
     }
 
+    server_info.kv_cache = http_kv_cache_info_from_args(args);
     server_info
+}
+
+fn http_kv_cache_info_from_args(args: &ServerArgs) -> Option<HttpKvCacheInfo> {
+    let pd_config = PdConfig::from_server_args(args).ok()?;
+    let layout = pd_config.kv_cache_runtime_layout().ok()??;
+
+    Some(HttpKvCacheInfo {
+        dtype: layout.dtype.as_str().to_string(),
+        page_size: u64::try_from(layout.page_size).ok()?,
+        num_layers: u64::try_from(layout.num_layers).ok()?,
+        kv_heads: u64::try_from(layout.kv_heads).ok()?,
+        head_dim: u64::try_from(layout.head_dim).ok()?,
+        kv_tensors_per_token: u64::try_from(layout.kv_tensors_per_token).ok()?,
+        bytes_per_token: u64::try_from(layout.bytes_per_token).ok()?,
+        page_size_bytes: u64::try_from(layout.page_size_bytes).ok()?,
+    })
 }
 
 pub fn register_prefill_mooncake_routes_from_args(

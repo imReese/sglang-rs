@@ -912,6 +912,14 @@ async fn http_prefill_server_reports_router_server_info_with_kv_events() {
         "1",
         "--page-size",
         "64",
+        "--kv-cache-dtype",
+        "bfloat16",
+        "--kv-cache-num-layers",
+        "78",
+        "--kv-cache-kv-heads",
+        "64",
+        "--kv-cache-head-dim",
+        "64",
         "--disaggregation-mode",
         "prefill",
         "--disaggregation-transfer-backend",
@@ -949,6 +957,20 @@ async fn http_prefill_server_reports_router_server_info_with_kv_events() {
     assert_eq!(server_info["kv_events"]["topic"], "");
     assert_eq!(server_info["kv_events"]["block_size"], 64);
     assert_eq!(server_info["kv_events"]["dp_size"], 1);
+    assert_eq!(server_info["kv_cache"]["dtype"], "bfloat16");
+    assert_eq!(server_info["kv_cache"]["page_size"], 64);
+    assert_eq!(server_info["kv_cache"]["num_layers"], 78);
+    assert_eq!(server_info["kv_cache"]["kv_heads"], 64);
+    assert_eq!(server_info["kv_cache"]["head_dim"], 64);
+    assert_eq!(server_info["kv_cache"]["kv_tensors_per_token"], 2);
+    assert_eq!(
+        server_info["kv_cache"]["bytes_per_token"],
+        78 * 2 * 64 * 64 * 2
+    );
+    assert_eq!(
+        server_info["kv_cache"]["page_size_bytes"],
+        64 * 78 * 2 * 64 * 64 * 2
+    );
 
     shutdown_tx
         .send(())

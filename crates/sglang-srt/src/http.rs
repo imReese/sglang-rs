@@ -46,6 +46,7 @@ pub struct HttpServerInfo {
     pub disaggregation_mode: String,
     pub disaggregation_bootstrap_port: Option<u16>,
     pub kv_events: Option<HttpKvEventsInfo>,
+    pub kv_cache: Option<HttpKvCacheInfo>,
 }
 
 impl Default for HttpServerInfo {
@@ -54,6 +55,7 @@ impl Default for HttpServerInfo {
             disaggregation_mode: "null".to_string(),
             disaggregation_bootstrap_port: None,
             kv_events: None,
+            kv_cache: None,
         }
     }
 }
@@ -66,6 +68,18 @@ pub struct HttpKvEventsInfo {
     pub topic: String,
     pub block_size: u32,
     pub dp_size: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HttpKvCacheInfo {
+    pub dtype: String,
+    pub page_size: u64,
+    pub num_layers: u64,
+    pub kv_heads: u64,
+    pub head_dim: u64,
+    pub kv_tensors_per_token: u64,
+    pub bytes_per_token: u64,
+    pub page_size_bytes: u64,
 }
 
 impl<T, W> HttpRouterService<T, W> {
@@ -223,6 +237,18 @@ where
             "topic": kv_events.topic,
             "block_size": kv_events.block_size,
             "dp_size": kv_events.dp_size,
+        });
+    }
+    if let Some(kv_cache) = service.server_info.kv_cache {
+        body["kv_cache"] = json!({
+            "dtype": kv_cache.dtype,
+            "page_size": kv_cache.page_size,
+            "num_layers": kv_cache.num_layers,
+            "kv_heads": kv_cache.kv_heads,
+            "head_dim": kv_cache.head_dim,
+            "kv_tensors_per_token": kv_cache.kv_tensors_per_token,
+            "bytes_per_token": kv_cache.bytes_per_token,
+            "page_size_bytes": kv_cache.page_size_bytes,
         });
     }
 

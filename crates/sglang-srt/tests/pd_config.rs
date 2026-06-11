@@ -247,6 +247,43 @@ fn pd_config_carries_cli_kv_model_geometry_for_mooncake_layout() {
 }
 
 #[test]
+fn pd_config_exposes_runtime_kv_layout_for_control_plane_metadata() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "zai-org/GLM-5-FP8",
+        "--disaggregation-mode",
+        "prefill",
+        "--kv-cache-dtype",
+        "bfloat16",
+        "--kv-cache-num-layers",
+        "78",
+        "--kv-cache-kv-heads",
+        "64",
+        "--kv-cache-head-dim",
+        "64",
+        "--page-size",
+        "64",
+    ])
+    .expect("args should parse");
+
+    let config = PdConfig::from_server_args(&args).expect("pd config should normalize");
+    let layout = config
+        .kv_cache_runtime_layout()
+        .expect("runtime KV layout should calculate")
+        .expect("explicit KV model geometry should produce runtime layout");
+
+    assert_eq!(layout.dtype, KvCacheDtype::Bfloat16);
+    assert_eq!(layout.page_size, 64);
+    assert_eq!(layout.num_layers, 78);
+    assert_eq!(layout.kv_heads, 64);
+    assert_eq!(layout.head_dim, 64);
+    assert_eq!(layout.kv_tensors_per_token, 2);
+    assert_eq!(layout.bytes_per_token, 78 * 2 * 64 * 64 * 2);
+    assert_eq!(layout.page_size_bytes, 64 * 78 * 2 * 64 * 64 * 2);
+}
+
+#[test]
 fn pd_config_derives_deepseek_v4_kv_layout_from_model_config() {
     let model_dir = temp_model_dir("deepseek-v4-kv-layout");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");
