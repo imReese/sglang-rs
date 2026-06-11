@@ -882,6 +882,39 @@ impl GlmMoeDsaF32TensorParallelRuntime {
             .collect()
     }
 
+    pub fn dense_mlp_output(
+        &self,
+        layer_id: usize,
+        hidden: &[f32],
+    ) -> Result<Vec<f32>, GlmMoeDsaF32KernelError> {
+        let mut output = Vec::<f32>::new();
+        let mut saw_rank = false;
+        for rank in &self.ranks {
+            let contribution = rank.dense_mlp_partial_output(layer_id, hidden)?;
+            if output.is_empty() {
+                output.resize(contribution.len(), 0.0);
+            } else if output.len() != contribution.len() {
+                return Err(GlmMoeDsaF32KernelError::HiddenSizeMismatch {
+                    tensor_name: format!("model.layers.{layer_id}.mlp.down_proj.weight"),
+                    expected: output.len(),
+                    actual: contribution.len(),
+                });
+            }
+            for (output, contribution) in output.iter_mut().zip(contribution) {
+                *output += contribution;
+            }
+            saw_rank = true;
+        }
+
+        if saw_rank {
+            Ok(output)
+        } else {
+            Err(GlmMoeDsaF32KernelError::MissingTensor {
+                tensor_name: format!("model.layers.{layer_id}.mlp.gate_proj.weight"),
+            })
+        }
+    }
+
     fn embedding_lm_head_logits_for_token(
         &self,
         token_id: u32,
@@ -984,6 +1017,47 @@ impl GlmMoeDsaF32TensorRank {
         })?;
         lm_head.vocab_parallel_matvec(hidden)
     }
+
+    fn dense_mlp_partial_output(
+        &self,
+        layer_id: usize,
+        hidden: &[f32],
+    ) -> Result<Vec<f32>, GlmMoeDsaF32KernelError> {
+        let gate_name = format!("model.layers.{layer_id}.mlp.gate_proj.weight");
+        let up_name = format!("model.layers.{layer_id}.mlp.up_proj.weight");
+        let down_name = format!("model.layers.{layer_id}.mlp.down_proj.weight");
+        let gate = self.tensor_shard(&gate_name).ok_or_else(|| {
+            GlmMoeDsaF32KernelError::MissingTensor {
+                tensor_name: gate_name.clone(),
+            }
+        })?;
+        let up =
+            self.tensor_shard(&up_name)
+                .ok_or_else(|| GlmMoeDsaF32KernelError::MissingTensor {
+                    tensor_name: up_name.clone(),
+                })?;
+        let down = self.tensor_shard(&down_name).ok_or_else(|| {
+            GlmMoeDsaF32KernelError::MissingTensor {
+                tensor_name: down_name.clone(),
+            }
+        })?;
+
+        let gate_values = gate.output_parallel_matvec(hidden)?;
+        let up_values = up.output_parallel_matvec(hidden)?;
+        if gate_values.len() != up_values.len() {
+            return Err(GlmMoeDsaF32KernelError::HiddenSizeMismatch {
+                tensor_name: up_name,
+                expected: gate_values.len(),
+                actual: up_values.len(),
+            });
+        }
+        let activated = gate_values
+            .iter()
+            .zip(&up_values)
+            .map(|(gate, up)| silu(*gate) * up)
+            .collect::<Vec<_>>();
+        down.row_parallel_matvec_contribution(&activated)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1065,6 +1139,89 @@ impl GlmMoeDsaF32TensorShard {
                     .map(|(weight, value)| weight * value)
                     .sum();
                 (global_row_start + row_index, logit)
+            })
+            .collect())
+    }
+
+    fn output_parallel_matvec(&self, hidden: &[f32]) -> Result<Vec<f32>, GlmMoeDsaF32KernelError> {
+        let [rows, columns] = self.shape.as_slice() else {
+            return Err(GlmMoeDsaF32KernelError::TensorRankMismatch {
+                tensor_name: self.tensor_name.clone(),
+                expected_rank: 2,
+                shape: self.shape.clone(),
+            });
+        };
+        if *columns != hidden.len() {
+            return Err(GlmMoeDsaF32KernelError::HiddenSizeMismatch {
+                tensor_name: self.tensor_name.clone(),
+                expected: *columns,
+                actual: hidden.len(),
+            });
+        }
+        match &self.selection {
+            GlmMoeDsaTensorShardSelection::Full
+            | GlmMoeDsaTensorShardSelection::Slice { axis: 0, .. } => {}
+            GlmMoeDsaTensorShardSelection::Slice { axis, .. } => {
+                return Err(GlmMoeDsaF32KernelError::TensorSelectionMismatch {
+                    tensor_name: self.tensor_name.clone(),
+                    expected_axis: 0,
+                    actual_axis: *axis,
+                });
+            }
+        }
+
+        Ok(self
+            .values
+            .chunks_exact(*columns)
+            .take(*rows)
+            .map(|row| {
+                row.iter()
+                    .zip(hidden)
+                    .map(|(weight, value)| weight * value)
+                    .sum()
+            })
+            .collect())
+    }
+
+    fn row_parallel_matvec_contribution(
+        &self,
+        hidden: &[f32],
+    ) -> Result<Vec<f32>, GlmMoeDsaF32KernelError> {
+        let [rows, columns] = self.shape.as_slice() else {
+            return Err(GlmMoeDsaF32KernelError::TensorRankMismatch {
+                tensor_name: self.tensor_name.clone(),
+                expected_rank: 2,
+                shape: self.shape.clone(),
+            });
+        };
+        if *columns != hidden.len() {
+            return Err(GlmMoeDsaF32KernelError::HiddenSizeMismatch {
+                tensor_name: self.tensor_name.clone(),
+                expected: *columns,
+                actual: hidden.len(),
+            });
+        }
+        match &self.selection {
+            GlmMoeDsaTensorShardSelection::Full
+            | GlmMoeDsaTensorShardSelection::Slice { axis: 1, .. } => {}
+            GlmMoeDsaTensorShardSelection::Slice { axis, .. } => {
+                return Err(GlmMoeDsaF32KernelError::TensorSelectionMismatch {
+                    tensor_name: self.tensor_name.clone(),
+                    expected_axis: 1,
+                    actual_axis: *axis,
+                });
+            }
+        }
+
+        Ok(self
+            .values
+            .chunks_exact(*columns)
+            .take(*rows)
+            .map(|row| {
+                row.iter()
+                    .zip(hidden)
+                    .map(|(weight, value)| weight * value)
+                    .sum()
             })
             .collect())
     }
@@ -1260,6 +1417,10 @@ fn apply_rms_norm(
         *value *= inv_rms * weight;
     }
     Ok(())
+}
+
+fn silu(value: f32) -> f32 {
+    value / (1.0 + (-value).exp())
 }
 
 impl From<ModelArtifactError> for GlmMoeDsaRuntimeError {
