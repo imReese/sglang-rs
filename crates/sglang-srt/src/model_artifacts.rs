@@ -78,6 +78,9 @@ impl LocalModelArtifacts {
             Some("deepseek_v4") => {
                 checkpoint.deepseek_model_weights()?;
             }
+            Some("glm_moe_dsa") => {
+                checkpoint.glm_moe_dsa_model_weights()?;
+            }
             _ => {}
         }
         Ok(())
@@ -316,6 +319,17 @@ impl LocalModelCheckpointCatalog {
         Ok(weights)
     }
 
+    pub fn glm_moe_dsa_model_weights(
+        &self,
+    ) -> Result<GlmMoeDsaModelCheckpointWeights, ModelArtifactError> {
+        Ok(GlmMoeDsaModelCheckpointWeights {
+            token_embeddings: self
+                .required_glm_moe_dsa_model_tensor("model.embed_tokens.weight")?,
+            final_norm: self.required_glm_moe_dsa_model_tensor("model.norm.weight")?,
+            lm_head: self.required_glm_moe_dsa_model_tensor("lm_head.weight")?,
+        })
+    }
+
     pub fn deepseek_layer_weights(
         &self,
         layer_id: usize,
@@ -393,6 +407,24 @@ impl LocalModelCheckpointCatalog {
             })
     }
 
+    fn required_glm_moe_dsa_model_tensor(
+        &self,
+        tensor_name: &str,
+    ) -> Result<GlmMoeDsaModelTensorSpan, ModelArtifactError> {
+        self.safetensors
+            .tensor_span(tensor_name)?
+            .map(|span| GlmMoeDsaModelTensorSpan {
+                tensor_name: tensor_name.to_string(),
+                span,
+            })
+            .ok_or_else(|| {
+                invalid_safetensors_data(
+                    &self.model_path,
+                    format!("missing GLM-DSA model tensor {tensor_name}"),
+                )
+            })
+    }
+
     fn validate_deepseek_hc_head_shapes(
         &self,
         weights: &DeepSeekModelCheckpointWeights<'_>,
@@ -442,6 +474,33 @@ impl LocalModelCheckpointCatalog {
 pub struct DeepSeekModelTensorSpan {
     pub tensor_name: String,
     pub span: SafetensorsTensorSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GlmMoeDsaModelTensorSpan {
+    pub tensor_name: String,
+    pub span: SafetensorsTensorSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GlmMoeDsaModelCheckpointWeights {
+    token_embeddings: GlmMoeDsaModelTensorSpan,
+    final_norm: GlmMoeDsaModelTensorSpan,
+    lm_head: GlmMoeDsaModelTensorSpan,
+}
+
+impl GlmMoeDsaModelCheckpointWeights {
+    pub fn token_embeddings(&self) -> &GlmMoeDsaModelTensorSpan {
+        &self.token_embeddings
+    }
+
+    pub fn final_norm(&self) -> &GlmMoeDsaModelTensorSpan {
+        &self.final_norm
+    }
+
+    pub fn lm_head(&self) -> &GlmMoeDsaModelTensorSpan {
+        &self.lm_head
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

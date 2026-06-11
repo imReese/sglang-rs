@@ -457,8 +457,46 @@ fn local_model_artifacts_dispatches_checkpoint_validation_by_model_type() {
         .validate_checkpoint_for_supported_model()
         .expect("unknown model dispatch should keep generic artifact validation");
 
+    let glm_dir = temp_model_dir("glm-moe-dsa-dispatch-validation");
+    fs::create_dir_all(&glm_dir).expect("temp model dir should be created");
+    fs::write(
+        glm_dir.join("config.json"),
+        r#"{
+  "model_type": "glm_moe_dsa",
+  "num_hidden_layers": 0
+}"#,
+    )
+    .expect("config should be written");
+    write_safetensors_file(
+        &glm_dir.join("model.safetensors"),
+        &[
+            ("model.embed_tokens.weight", "U8", &[1], [0, 1]),
+            ("model.norm.weight", "U8", &[1], [1, 2]),
+        ],
+        &[1, 2],
+    )
+    .expect("shard should be written");
+    let glm_artifacts =
+        LocalModelArtifacts::from_model_path(&glm_dir).expect("GLM local artifacts should load");
+
+    let error = glm_artifacts
+        .validate_checkpoint_for_supported_model()
+        .expect_err("GLM-DSA dispatch should enforce CausalLM checkpoint roots");
+
+    assert!(
+        matches!(
+            error,
+            ModelArtifactError::InvalidSafetensorsData { ref path, ref message }
+                if path == &glm_dir
+                    && message.contains("missing GLM-DSA model tensor")
+                    && message.contains("lm_head.weight")
+        ),
+        "unexpected error: {error:?}"
+    );
+
     fs::remove_dir_all(deepseek_dir).expect("temp model dir should be removed");
     fs::remove_dir_all(generic_dir).expect("temp model dir should be removed");
+    fs::remove_dir_all(glm_dir).expect("temp model dir should be removed");
 }
 
 #[test]
