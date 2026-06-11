@@ -7,6 +7,7 @@ use crate::policies::SelectionContext;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{RequestOutcome, StaleRequestOutcome, WorkerModeLabel};
+use crate::tokenizer::adapter;
 use crate::workers::{LoadGuard, Worker};
 use axum::body::{to_bytes, Body};
 use axum::extract::State;
@@ -271,7 +272,7 @@ async fn routed_plain_json(
             })?;
 
     let guard = worker.load_guard();
-    let active_load = estimate_prefill_tokens(&body);
+    let active_load = estimate_prefill_tokens(&ctx, &model_id, &body);
     let active_guard =
         ctx.active_load
             .register(worker.id.clone(), worker.url.clone(), active_load, 0);
@@ -427,7 +428,7 @@ async fn routed_generation(
     // future decode-side scheduler — current decode selection is
     // host-affinity only.
     let guard = worker.load_guard();
-    let prefill_load = estimate_prefill_tokens(&body);
+    let prefill_load = estimate_prefill_tokens(&ctx, &model_id, &body);
     let active_guard =
         ctx.active_load
             .register(worker.id.clone(), worker.url.clone(), prefill_load, 0);
@@ -712,19 +713,76 @@ async fn build_rerank_response(
     Ok(Json(response).into_response())
 }
 
-/// Estimate prefill-token count from the raw request body for use as
-/// the active-load `prefill_load` counter. Returns 1 at minimum so
-/// a registered request always shows up as "load > 0" — under-counting
-/// to zero would hide the request from the cache-aware policy's
-/// load-imbalance fast-path.
-///
-/// This is a coarse approximation: we count the body length in bytes
-/// and divide by [`CHARS_PER_TOKEN_ESTIMATE`]. A future improvement is
-/// to thread the tokenizer's actual token count through (the
-/// cache-aware-zmq policy already tokenizes the prompt for tree
-/// matching — that count could be reused here).
-fn estimate_prefill_tokens(body: &Bytes) -> usize {
+/// Estimate prefill-token count from the raw request body for use as the
+/// active-load `prefill_load` counter. Prefer the model tokenizer so
+/// cache-aware and load-aware policies see token units; fall back to the
+/// upstream char-count heuristic for non-generation request shapes.
+fn estimate_prefill_tokens(ctx: &AppContext, model_id: &ModelId, body: &Bytes) -> usize {
+    if let Some(text) = extract_prefill_text(body) {
+        if let Some(tokenizer) = ctx.tokenizers.get(&model_id.0) {
+            match adapter::encode(&tokenizer, &text) {
+                Ok(token_ids) if !token_ids.is_empty() => return token_ids.len(),
+                Ok(_) => {}
+                Err(error) => tracing::debug!(
+                    model = %model_id,
+                    error = %error,
+                    "active-load tokenizer count failed; falling back to body-size estimate",
+                ),
+            }
+        }
+    }
+
     (body.len() / CHARS_PER_TOKEN_ESTIMATE).max(1)
+}
+
+fn extract_prefill_text(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    if let Some(prompt) = value.get("prompt").and_then(|prompt| prompt.as_str()) {
+        return Some(prompt.to_string());
+    }
+    if let Some(prompts) = value.get("prompt").and_then(|prompt| prompt.as_array()) {
+        let parts = prompts
+            .iter()
+            .filter_map(|prompt| prompt.as_str())
+            .collect::<Vec<_>>();
+        if !parts.is_empty() {
+            return Some(parts.join("\n"));
+        }
+    }
+    if let Some(messages) = value
+        .get("messages")
+        .and_then(|messages| messages.as_array())
+    {
+        let mut text = String::new();
+        for message in messages {
+            match message.get("content") {
+                Some(serde_json::Value::String(content)) => {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(content);
+                }
+                Some(serde_json::Value::Array(parts)) => {
+                    for part in parts {
+                        if let Some(content) = part.get("text").and_then(|text| text.as_str()) {
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(content);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !text.is_empty() {
+            return Some(text);
+        }
+    }
+    value
+        .get("text")
+        .and_then(|text| text.as_str())
+        .map(ToString::to_string)
 }
 
 fn parse_rerank_response_options(body: &Bytes) -> Result<RerankResponseOptions, ApiError> {

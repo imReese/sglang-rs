@@ -10,7 +10,7 @@ use sgl_router::policies::factory::build_registry_with_defaults as build_policy_
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
-use sgl_router::tokenizer::TokenizerRegistry;
+use sgl_router::tokenizer::{adapter, TokenizerRegistry};
 use sgl_router::workers::{Worker, WorkerRegistry};
 
 use axum::body::Body;
@@ -1296,6 +1296,68 @@ async fn streaming_active_load_persists_for_body_lifetime() {
         0,
         "prefill_load must be 0 after stream drains",
     );
+}
+
+#[tokio::test]
+async fn streaming_active_load_uses_tokenizer_count_for_prefill_load() {
+    let chunks: Vec<&'static str> = vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
+        chunks,
+        Duration::from_millis(80),
+    )
+    .await;
+
+    let cfg = config_for(&worker.url);
+    let registry = Arc::new(WorkerRegistry::default());
+    let _ = registry.add(WorkerSpec {
+        id: WorkerId("w1".into()),
+        url: worker.url.clone(),
+        mode: WorkerMode::Plain,
+        model_ids: vec![ModelId("tiny".into())],
+        bootstrap_port: None,
+    });
+    let policies = Arc::new(build_policy_registry(&cfg).unwrap());
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let expected_tokens = adapter::encode(
+        &tokenizers
+            .get("tiny")
+            .expect("tiny tokenizer should be loaded"),
+        "hello world",
+    )
+    .expect("tiny tokenizer should encode prompt")
+    .len();
+    let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
+    let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
+    let active_load = Arc::clone(&ctx.active_load);
+    let app = build_router(ctx);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hello world"}],
+                "stream": true,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let w_id = WorkerId("w1".into());
+    assert_eq!(
+        active_load.prefill_load(&w_id),
+        expected_tokens,
+        "prefill_load should use actual tokenizer token count while the stream is active",
+    );
+
+    let _ = res.into_body().collect().await.unwrap().to_bytes();
 }
 
 /// Task A: a streaming client that disconnects mid-stream still drops
