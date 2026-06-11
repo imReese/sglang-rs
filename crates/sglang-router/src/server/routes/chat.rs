@@ -75,7 +75,14 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
-    openai_generation(ctx, headers, body, "/v1/chat/completions").await
+    routed_generation(
+        ctx,
+        headers,
+        body,
+        "/v1/chat/completions",
+        ModelSelection::RequireBodyModel,
+    )
+    .await
 }
 
 /// POST /v1/completions — same OpenAI-compatible routing path as chat
@@ -85,20 +92,51 @@ pub async fn completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response<Body>, ApiError> {
-    openai_generation(ctx, headers, body, "/v1/completions").await
+    routed_generation(
+        ctx,
+        headers,
+        body,
+        "/v1/completions",
+        ModelSelection::RequireBodyModel,
+    )
+    .await
 }
 
-async fn openai_generation(
+/// POST /generate — SGLang-native text generation. The native endpoint
+/// historically omits `model`, so single-model router configs infer the
+/// target model from config while multi-model configs require an explicit
+/// `model` field to avoid ambiguous dispatch.
+pub async fn generate(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    routed_generation(
+        ctx,
+        headers,
+        body,
+        "/generate",
+        ModelSelection::BodyModelOrSingleConfigured,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum ModelSelection {
+    RequireBodyModel,
+    BodyModelOrSingleConfigured,
+}
+
+async fn routed_generation(
     ctx: Arc<AppContext>,
     headers: HeaderMap,
     body: Bytes,
     upstream_path: &'static str,
+    model_selection: ModelSelection,
 ) -> Result<Response<Body>, ApiError> {
     let probe = parse_probe(&body)?;
     let streaming = probe.stream.unwrap_or(false);
-    let model_str = probe
-        .model
-        .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?;
+    let model_str = select_model(&ctx, probe.model, model_selection)?;
     let model_id = ModelId(model_str.clone());
 
     // PD pool isolation: for PD-mode deployments, prefill traffic
@@ -544,6 +582,31 @@ fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
         ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
     })?;
     Ok(probe)
+}
+
+fn select_model(
+    ctx: &AppContext,
+    model: Option<String>,
+    selection: ModelSelection,
+) -> Result<String, ApiError> {
+    if let Some(model) = model {
+        return Ok(model);
+    }
+
+    match selection {
+        ModelSelection::RequireBodyModel => {
+            Err(ApiError::BadRequest("missing `model` field".into()))
+        }
+        ModelSelection::BodyModelOrSingleConfigured => {
+            if ctx.config.models.len() == 1 {
+                Ok(ctx.config.models[0].id.clone())
+            } else {
+                Err(ApiError::BadRequest(
+                    "missing `model` field for multi-model native generate".into(),
+                ))
+            }
+        }
+    }
 }
 
 #[cfg(test)]

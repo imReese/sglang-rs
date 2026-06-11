@@ -415,6 +415,158 @@ async fn router_streaming_completions_reaches_real_rust_srt_grpc_worker() {
         .expect("gRPC server should stop cleanly");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn router_generate_reaches_real_rust_srt_grpc_worker() {
+    let addr = unused_local_addr();
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "tiny",
+        "--host",
+        &addr.ip().to_string(),
+        "--port",
+        &addr.port().to_string(),
+        "--grpc-mode",
+        "--num-reserved-decode-tokens",
+        "8",
+    ])
+    .expect("gRPC SRT args should parse");
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(launch_grpc_server_with_shutdown(args, async move {
+        let _ = shutdown_rx.await;
+    }));
+    wait_for_grpc_health(addr).await;
+
+    let app = build_router(build_ctx_with_grpc_worker(addr));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/generate")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "text": "hi",
+                "sampling_params": {
+                    "max_new_tokens": 2,
+                },
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+
+    let response = app.oneshot(request).await.expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("router response body should collect")
+        .to_bytes();
+    let body: serde_json::Value =
+        serde_json::from_slice(&body).expect("response should be SGLang generate JSON");
+    assert!(body["request_id"].is_string());
+    assert_eq!(body["text"], "  ");
+    assert_eq!(body["output_ids"], json!([32, 32]));
+    assert_eq!(body["finish_reason"], "stop");
+    assert_eq!(body["usage"]["prompt_tokens"], 2);
+    assert_eq!(body["usage"]["completion_tokens"], 2);
+
+    shutdown_tx
+        .send(())
+        .expect("gRPC worker should still be running");
+    server
+        .await
+        .expect("gRPC server task should join")
+        .expect("gRPC server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn router_streaming_generate_reaches_real_rust_srt_grpc_worker() {
+    let addr = unused_local_addr();
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "tiny",
+        "--host",
+        &addr.ip().to_string(),
+        "--port",
+        &addr.port().to_string(),
+        "--grpc-mode",
+        "--num-reserved-decode-tokens",
+        "8",
+    ])
+    .expect("gRPC SRT args should parse");
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(launch_grpc_server_with_shutdown(args, async move {
+        let _ = shutdown_rx.await;
+    }));
+    wait_for_grpc_health(addr).await;
+
+    let app = build_router(build_ctx_with_grpc_worker(addr));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/generate")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "text": "hi",
+                "sampling_params": {
+                    "max_new_tokens": 2,
+                },
+                "stream": true,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+
+    let response = app.oneshot(request).await.expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("router SSE body should collect")
+        .to_bytes();
+    let events = crate::common::streaming::parse_sse_data(&body);
+    assert_eq!(events.last().map(String::as_str), Some("[DONE]"));
+    let chunks = events
+        .iter()
+        .filter(|event| event.as_str() != "[DONE]")
+        .map(|event| serde_json::from_str::<serde_json::Value>(event))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("SSE data chunks should be JSON");
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| chunk["request_id"].is_string() && chunk["text"].is_string()),
+        "expected native generate stream chunks, got {chunks:?}"
+    );
+    assert!(
+        chunks.iter().any(|chunk| chunk["finish_reason"] == "stop"),
+        "expected final stop chunk, got {chunks:?}"
+    );
+
+    shutdown_tx
+        .send(())
+        .expect("gRPC worker should still be running");
+    server
+        .await
+        .expect("gRPC server task should join")
+        .expect("gRPC server should stop cleanly");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn router_pd_chat_reaches_real_rust_srt_grpc_mooncake_workers() {
     let prefill_addr = unused_local_addr();

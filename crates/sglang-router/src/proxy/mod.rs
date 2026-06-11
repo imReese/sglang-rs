@@ -15,8 +15,14 @@ use bytes::Bytes;
 use futures::StreamExt;
 use reqwest::{Client, Url};
 use serde_json::json;
+use serde_json::Value;
+use sglang_srt::proto::sglang::runtime::v1::generate_response::Body as ProtoGenerateResponseBody;
 use sglang_srt::proto::sglang::runtime::v1::sglang_service_client::SglangServiceClient;
-use sglang_srt::proto::sglang::runtime::v1::{OpenAiJsonRequest, OpenAiJsonResponse};
+use sglang_srt::proto::sglang::runtime::v1::{
+    DisaggregatedParams as ProtoDisaggregatedParams, GenerateResponse as ProtoGenerateResponse,
+    OpenAiJsonRequest, OpenAiJsonResponse, RequestOptions as ProtoRequestOptions,
+    SamplingParams as ProtoSamplingParams, TextGenerateRequest as ProtoTextGenerateRequest,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use tonic::Code;
@@ -97,6 +103,250 @@ fn grpc_status_response(status: tonic::Status) -> Response<Body> {
         HeaderValue::from_static("application/json"),
     );
     out
+}
+
+fn grpc_generate_status(message: impl Into<String>) -> tonic::Status {
+    tonic::Status::invalid_argument(message.into())
+}
+
+fn value_as_i32(value: &Value, field: &'static str) -> Result<i32, tonic::Status> {
+    let Some(raw) = value.as_i64() else {
+        return Err(grpc_generate_status(format!("{field} must be an integer")));
+    };
+    i32::try_from(raw).map_err(|_| grpc_generate_status(format!("{field} is out of i32 range")))
+}
+
+fn value_as_u32(value: &Value, field: &'static str) -> Result<u32, tonic::Status> {
+    let Some(raw) = value.as_u64() else {
+        return Err(grpc_generate_status(format!(
+            "{field} must be an unsigned integer"
+        )));
+    };
+    u32::try_from(raw).map_err(|_| grpc_generate_status(format!("{field} is out of u32 range")))
+}
+
+fn optional_i32_field(
+    object: &serde_json::Map<String, Value>,
+    field: &'static str,
+) -> Result<Option<i32>, tonic::Status> {
+    object
+        .get(field)
+        .map(|value| value_as_i32(value, field))
+        .transpose()
+}
+
+fn optional_f32_field(
+    object: &serde_json::Map<String, Value>,
+    field: &'static str,
+) -> Result<Option<f32>, tonic::Status> {
+    object
+        .get(field)
+        .map(|value| {
+            value
+                .as_f64()
+                .map(|raw| raw as f32)
+                .ok_or_else(|| grpc_generate_status(format!("{field} must be a number")))
+        })
+        .transpose()
+}
+
+fn optional_bool_field(
+    object: &serde_json::Map<String, Value>,
+    field: &'static str,
+) -> Result<Option<bool>, tonic::Status> {
+    object
+        .get(field)
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| grpc_generate_status(format!("{field} must be a boolean")))
+        })
+        .transpose()
+}
+
+fn optional_string_field(
+    object: &serde_json::Map<String, Value>,
+    field: &'static str,
+) -> Result<Option<String>, tonic::Status> {
+    object
+        .get(field)
+        .map(|value| {
+            value
+                .as_str()
+                .map(ToString::to_string)
+                .ok_or_else(|| grpc_generate_status(format!("{field} must be a string")))
+        })
+        .transpose()
+}
+
+fn proto_sampling_params_from_json(
+    payload: &serde_json::Map<String, Value>,
+) -> Result<Option<ProtoSamplingParams>, tonic::Status> {
+    let Some(value) = payload.get("sampling_params") else {
+        return Ok(None);
+    };
+    let Some(object) = value.as_object() else {
+        return Err(grpc_generate_status("sampling_params must be an object"));
+    };
+
+    let stop = match object.get("stop") {
+        Some(Value::String(item)) => vec![item.clone()],
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(ToString::to_string)
+                    .ok_or_else(|| grpc_generate_status("stop entries must be strings"))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => {
+            return Err(grpc_generate_status(
+                "stop must be a string or string array",
+            ))
+        }
+        None => Vec::new(),
+    };
+    let stop_token_ids = match object.get("stop_token_ids") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| value_as_u32(item, "stop_token_ids"))
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err(grpc_generate_status("stop_token_ids must be an array")),
+        None => Vec::new(),
+    };
+    let seed = object
+        .get("seed")
+        .map(|value| {
+            value
+                .as_i64()
+                .ok_or_else(|| grpc_generate_status("seed must be an integer"))
+        })
+        .transpose()?;
+
+    Ok(Some(ProtoSamplingParams {
+        max_new_tokens: optional_i32_field(object, "max_new_tokens")?,
+        temperature: optional_f32_field(object, "temperature")?,
+        top_p: optional_f32_field(object, "top_p")?,
+        top_k: optional_i32_field(object, "top_k")?,
+        min_p: optional_f32_field(object, "min_p")?,
+        frequency_penalty: optional_f32_field(object, "frequency_penalty")?,
+        presence_penalty: optional_f32_field(object, "presence_penalty")?,
+        repetition_penalty: optional_f32_field(object, "repetition_penalty")?,
+        stop_token_id: optional_i32_field(object, "stop_token_id")?,
+        stop,
+        n: optional_i32_field(object, "n")?,
+        best_of: optional_i32_field(object, "best_of")?,
+        seed,
+        stop_token_ids,
+        ignore_eos: optional_bool_field(object, "ignore_eos")?,
+    }))
+}
+
+fn proto_disaggregated_params_from_json(
+    payload: &serde_json::Map<String, Value>,
+) -> Result<Option<ProtoDisaggregatedParams>, tonic::Status> {
+    let has_flat = payload.contains_key("bootstrap_host")
+        || payload.contains_key("bootstrap_port")
+        || payload.contains_key("bootstrap_room");
+    let object = if has_flat {
+        payload
+    } else {
+        let Some(value) = payload.get("disaggregated_params") else {
+            return Ok(None);
+        };
+        value
+            .as_object()
+            .ok_or_else(|| grpc_generate_status("disaggregated_params must be an object"))?
+    };
+
+    let bootstrap_host = object
+        .get("bootstrap_host")
+        .and_then(Value::as_str)
+        .ok_or_else(|| grpc_generate_status("bootstrap_host must be a string"))?
+        .to_string();
+    let bootstrap_port = object
+        .get("bootstrap_port")
+        .ok_or_else(|| grpc_generate_status("bootstrap_port is required"))
+        .and_then(|value| value_as_u32(value, "bootstrap_port"))?;
+    let bootstrap_room = object
+        .get("bootstrap_room")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| grpc_generate_status("bootstrap_room must be an unsigned integer"))?;
+
+    Ok(Some(ProtoDisaggregatedParams {
+        bootstrap_host,
+        bootstrap_port,
+        bootstrap_room,
+    }))
+}
+
+fn proto_text_generate_request_from_json(
+    body: &[u8],
+) -> Result<ProtoTextGenerateRequest, tonic::Status> {
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|e| grpc_generate_status(format!("invalid /generate JSON: {e}")))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| grpc_generate_status("/generate body must be a JSON object"))?;
+    let text = object
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or_else(|| grpc_generate_status("missing text"))?
+        .to_string();
+
+    Ok(ProtoTextGenerateRequest {
+        text,
+        sampling_params: proto_sampling_params_from_json(object)?,
+        options: Some(ProtoRequestOptions {
+            request_id: optional_string_field(object, "request_id")?,
+            stream: optional_bool_field(object, "stream")?.unwrap_or(false),
+            data_parallel_rank: optional_i32_field(object, "data_parallel_rank")?
+                .unwrap_or_default(),
+            trace_headers: Default::default(),
+        }),
+        disaggregated_params: proto_disaggregated_params_from_json(object)?,
+    })
+}
+
+fn proto_generate_response_to_json(
+    response: ProtoGenerateResponse,
+) -> Result<Vec<u8>, anyhow::Error> {
+    let body = match response.body {
+        Some(ProtoGenerateResponseBody::Chunk(chunk)) => json!({
+            "request_id": response.request_id,
+            "text": chunk.text,
+            "output_ids": chunk.token_ids,
+            "usage": {
+                "prompt_tokens": chunk.prompt_tokens,
+                "completion_tokens": chunk.completion_tokens,
+                "cached_tokens": chunk.cached_tokens,
+            }
+        }),
+        Some(ProtoGenerateResponseBody::Complete(complete)) => json!({
+            "request_id": response.request_id,
+            "text": complete.text,
+            "output_ids": complete.output_ids,
+            "finish_reason": complete.finish_reason,
+            "usage": {
+                "prompt_tokens": complete.prompt_tokens,
+                "completion_tokens": complete.completion_tokens,
+                "cached_tokens": complete.cached_tokens,
+            }
+        }),
+        Some(ProtoGenerateResponseBody::Error(error)) => json!({
+            "error": {
+                "message": error.message,
+                "code": error.code,
+            }
+        }),
+        None => json!({
+            "error": {
+                "message": "gRPC GenerateResponse returned no body",
+            }
+        }),
+    };
+
+    serde_json::to_vec(&body).context("serialize generate JSON")
 }
 
 #[derive(Debug)]
@@ -233,6 +483,11 @@ impl Proxy {
         path: &str,
         body: Bytes,
     ) -> Result<Response<Body>, ApiError> {
+        if path == "/generate" {
+            return self
+                .forward_grpc_generate_json_to(worker_url, breaker, body)
+                .await;
+        }
         if path != "/v1/chat/completions" && path != "/v1/completions" {
             breaker.record_failure();
             return Err(ApiError::WorkerMisconfigured {
@@ -294,6 +549,90 @@ impl Proxy {
                     ))
                 })?;
             Ok::<_, GrpcForwardError>(first.json)
+        };
+
+        let json = match tokio::time::timeout(self.request_timeout, fut).await {
+            Ok(Ok(json)) => json,
+            Ok(Err(GrpcForwardError::Status(status))) => {
+                let response = grpc_status_response(status);
+                if response.status().is_server_error() {
+                    breaker.record_failure();
+                } else {
+                    breaker.record_success();
+                }
+                return Ok(response);
+            }
+            Ok(Err(GrpcForwardError::Transport(source))) => {
+                breaker.record_failure();
+                return Err(ApiError::UpstreamUnreachable {
+                    worker: parsed,
+                    source,
+                });
+            }
+            Err(_) => {
+                breaker.record_failure();
+                return Err(ApiError::UpstreamTimeout { worker: parsed });
+            }
+        };
+
+        breaker.record_success();
+        let mut out = Response::new(Body::from(json));
+        out.headers_mut().insert(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("application/json"),
+        );
+        Ok(out)
+    }
+
+    async fn forward_grpc_generate_json_to(
+        &self,
+        worker_url: &str,
+        breaker: &CircuitBreaker,
+        body: Bytes,
+    ) -> Result<Response<Body>, ApiError> {
+        let parsed = parse_worker_url(worker_url, breaker)?;
+        let endpoint = grpc_endpoint_from_worker_url(&parsed).ok_or_else(|| {
+            breaker.record_failure();
+            ApiError::WorkerMisconfigured {
+                worker: worker_url.to_string(),
+                source: anyhow::anyhow!("unsupported gRPC worker URL scheme {}", parsed.scheme()),
+            }
+        })?;
+
+        let fut = async {
+            let request =
+                proto_text_generate_request_from_json(&body).map_err(GrpcForwardError::Status)?;
+            let channel = tonic::transport::Endpoint::from_shared(endpoint.clone())
+                .map_err(|e| {
+                    GrpcForwardError::Transport(anyhow::anyhow!(
+                        "invalid gRPC endpoint {endpoint}: {e}"
+                    ))
+                })?
+                .connect_timeout(self.request_timeout)
+                .timeout(self.request_timeout)
+                .connect()
+                .await
+                .map_err(|e| {
+                    GrpcForwardError::Transport(anyhow::anyhow!(
+                        "connect gRPC worker {endpoint}: {e}"
+                    ))
+                })?;
+            let mut client = SglangServiceClient::new(channel);
+            let mut stream = client
+                .text_generate(GrpcRequest::new(request))
+                .await
+                .map_err(GrpcForwardError::Status)?
+                .into_inner();
+            let first = stream
+                .message()
+                .await
+                .map_err(GrpcForwardError::Status)?
+                .ok_or_else(|| {
+                    GrpcForwardError::Status(tonic::Status::internal(
+                        "gRPC TextGenerate returned no response",
+                    ))
+                })?;
+            proto_generate_response_to_json(first).map_err(GrpcForwardError::Transport)
         };
 
         let json = match tokio::time::timeout(self.request_timeout, fut).await {
@@ -426,6 +765,11 @@ impl Proxy {
         body: Bytes,
         stream_guards: Option<Box<dyn Send + 'static>>,
     ) -> Result<Response<Body>, ApiError> {
+        if path == "/generate" {
+            return self
+                .forward_grpc_generate_streaming_to(worker_url, breaker, body, stream_guards)
+                .await;
+        }
         if path != "/v1/chat/completions" && path != "/v1/completions" {
             breaker.record_failure();
             return Err(ApiError::WorkerMisconfigured {
@@ -514,6 +858,98 @@ impl Proxy {
         let body = sse::json_bytes_stream_to_sse_body(
             stream.map(|item: Result<OpenAiJsonResponse, tonic::Status>| {
                 item.map(|response| response.json)
+            }),
+            stream_guards,
+            on_complete,
+        );
+        let mut out = Response::new(body);
+        out.headers_mut().insert(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("text/event-stream"),
+        );
+        Ok(out)
+    }
+
+    async fn forward_grpc_generate_streaming_to(
+        &self,
+        worker_url: &str,
+        breaker: &Arc<CircuitBreaker>,
+        body: Bytes,
+        stream_guards: Option<Box<dyn Send + 'static>>,
+    ) -> Result<Response<Body>, ApiError> {
+        let parsed = parse_worker_url(worker_url, breaker)?;
+        let endpoint = grpc_endpoint_from_worker_url(&parsed).ok_or_else(|| {
+            breaker.record_failure();
+            ApiError::WorkerMisconfigured {
+                worker: worker_url.to_string(),
+                source: anyhow::anyhow!("unsupported gRPC worker URL scheme {}", parsed.scheme()),
+            }
+        })?;
+
+        let fut = async {
+            let request =
+                proto_text_generate_request_from_json(&body).map_err(GrpcForwardError::Status)?;
+            let channel = tonic::transport::Endpoint::from_shared(endpoint.clone())
+                .map_err(|e| {
+                    GrpcForwardError::Transport(anyhow::anyhow!(
+                        "invalid gRPC endpoint {endpoint}: {e}"
+                    ))
+                })?
+                .connect_timeout(self.request_timeout)
+                .connect()
+                .await
+                .map_err(|e| {
+                    GrpcForwardError::Transport(anyhow::anyhow!(
+                        "connect gRPC worker {endpoint}: {e}"
+                    ))
+                })?;
+            let mut client = SglangServiceClient::new(channel);
+            client
+                .text_generate(GrpcRequest::new(request))
+                .await
+                .map_err(GrpcForwardError::Status)
+                .map(|response| response.into_inner())
+        };
+
+        let stream = match tokio::time::timeout(self.request_timeout, fut).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(GrpcForwardError::Status(status))) => {
+                let response = grpc_status_response(status);
+                if response.status().is_server_error() {
+                    breaker.record_failure();
+                } else {
+                    breaker.record_success();
+                }
+                return Ok(response);
+            }
+            Ok(Err(GrpcForwardError::Transport(source))) => {
+                breaker.record_failure();
+                return Err(ApiError::UpstreamUnreachable {
+                    worker: parsed,
+                    source,
+                });
+            }
+            Err(_) => {
+                breaker.record_failure();
+                return Err(ApiError::UpstreamTimeout { worker: parsed });
+            }
+        };
+
+        let breaker_for_hook = Arc::clone(breaker);
+        let on_complete: Option<Box<dyn FnOnce(bool) + Send + 'static>> =
+            Some(Box::new(move |ok| {
+                if ok {
+                    breaker_for_hook.record_success();
+                } else {
+                    breaker_for_hook.record_failure();
+                }
+            }));
+        let body = sse::json_bytes_stream_to_sse_body(
+            stream.map(|item: Result<ProtoGenerateResponse, tonic::Status>| {
+                item.and_then(|response| {
+                    proto_generate_response_to_json(response)
+                        .map_err(|e| tonic::Status::internal(e.to_string()))
+                })
             }),
             stream_guards,
             on_complete,

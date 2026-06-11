@@ -59,5 +59,11 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
                 .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
                 .layer(middleware::from_fn(log_413)),
         )
+        .route(
+            "/generate",
+            post(crate::server::routes::chat::generate)
+                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
         .with_state(ctx)
 }
