@@ -24,6 +24,7 @@ use sglang_srt::proto::sglang::runtime::v1::{
     RequestOptions as ProtoRequestOptions, SamplingParams as ProtoSamplingParams,
     TextGenerateRequest as ProtoTextGenerateRequest,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tonic::Code;
@@ -180,14 +181,37 @@ fn optional_string_field(
         .transpose()
 }
 
+fn request_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(HeaderName::from_static("x-request-id"))
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn grpc_trace_headers_from_http_headers(headers: &HeaderMap) -> HashMap<String, String> {
+    headers
+        .iter()
+        .filter(|(name, _)| should_forward_request_header(name))
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
+        .collect()
+}
+
 fn request_options_from_json(
     object: &serde_json::Map<String, Value>,
+    headers: &HeaderMap,
 ) -> Result<ProtoRequestOptions, tonic::Status> {
     Ok(ProtoRequestOptions {
-        request_id: optional_string_field(object, "request_id")?,
+        request_id: optional_string_field(object, "request_id")?
+            .or_else(|| request_id_from_headers(headers)),
         stream: optional_bool_field(object, "stream")?.unwrap_or(false),
         data_parallel_rank: optional_i32_field(object, "data_parallel_rank")?.unwrap_or_default(),
-        trace_headers: Default::default(),
+        trace_headers: grpc_trace_headers_from_http_headers(headers),
     })
 }
 
@@ -308,20 +332,22 @@ enum NativeGenerateRequest {
 
 fn proto_native_generate_request_from_json(
     body: &[u8],
+    headers: &HeaderMap,
 ) -> Result<NativeGenerateRequest, tonic::Status> {
     let object = generate_json_object(body)?;
     if object.contains_key("input_ids") {
         return Ok(NativeGenerateRequest::Tokenized(
-            proto_generate_request_from_json_object(&object)?,
+            proto_generate_request_from_json_object(&object, headers)?,
         ));
     }
     Ok(NativeGenerateRequest::Text(
-        proto_text_generate_request_from_json_object(&object)?,
+        proto_text_generate_request_from_json_object(&object, headers)?,
     ))
 }
 
 fn proto_text_generate_request_from_json_object(
     object: &serde_json::Map<String, Value>,
+    headers: &HeaderMap,
 ) -> Result<ProtoTextGenerateRequest, tonic::Status> {
     let text = object
         .get("text")
@@ -332,13 +358,14 @@ fn proto_text_generate_request_from_json_object(
     Ok(ProtoTextGenerateRequest {
         text,
         sampling_params: proto_sampling_params_from_json(object)?,
-        options: Some(request_options_from_json(object)?),
+        options: Some(request_options_from_json(object, headers)?),
         disaggregated_params: proto_disaggregated_params_from_json(object)?,
     })
 }
 
 fn proto_generate_request_from_json_object(
     object: &serde_json::Map<String, Value>,
+    headers: &HeaderMap,
 ) -> Result<ProtoGenerateRequest, tonic::Status> {
     let input_ids = object
         .get("input_ids")
@@ -358,7 +385,7 @@ fn proto_generate_request_from_json_object(
         input_ids,
         original_text,
         sampling_params: proto_sampling_params_from_json(object)?,
-        options: Some(request_options_from_json(object)?),
+        options: Some(request_options_from_json(object, headers)?),
         disaggregated_params: proto_disaggregated_params_from_json(object)?,
     })
 }
@@ -477,7 +504,7 @@ impl Proxy {
         }
         if is_grpc_worker_url(worker_url) {
             return self
-                .forward_grpc_json_to(worker_url, breaker, path, body)
+                .forward_grpc_json_to(worker_url, breaker, path, headers, body)
                 .await;
         }
         let worker_url = parse_worker_url(worker_url, breaker)?;
@@ -536,11 +563,12 @@ impl Proxy {
         worker_url: &str,
         breaker: &CircuitBreaker,
         path: &str,
+        headers: &HeaderMap,
         body: Bytes,
     ) -> Result<Response<Body>, ApiError> {
         if path == "/generate" {
             return self
-                .forward_grpc_generate_json_to(worker_url, breaker, body)
+                .forward_grpc_generate_json_to(worker_url, breaker, headers, body)
                 .await;
         }
         if path != "/v1/chat/completions" && path != "/v1/completions" {
@@ -643,6 +671,7 @@ impl Proxy {
         &self,
         worker_url: &str,
         breaker: &CircuitBreaker,
+        headers: &HeaderMap,
         body: Bytes,
     ) -> Result<Response<Body>, ApiError> {
         let parsed = parse_worker_url(worker_url, breaker)?;
@@ -655,8 +684,8 @@ impl Proxy {
         })?;
 
         let fut = async {
-            let request =
-                proto_native_generate_request_from_json(&body).map_err(GrpcForwardError::Status)?;
+            let request = proto_native_generate_request_from_json(&body, headers)
+                .map_err(GrpcForwardError::Status)?;
             let channel = tonic::transport::Endpoint::from_shared(endpoint.clone())
                 .map_err(|e| {
                     GrpcForwardError::Transport(anyhow::anyhow!(
@@ -757,7 +786,7 @@ impl Proxy {
         }
         if is_grpc_worker_url(worker_url) {
             return self
-                .forward_grpc_streaming_to(worker_url, breaker, path, body, stream_guards)
+                .forward_grpc_streaming_to(worker_url, breaker, path, headers, body, stream_guards)
                 .await;
         }
         let worker_url = parse_worker_url(worker_url, breaker)?;
@@ -824,12 +853,19 @@ impl Proxy {
         worker_url: &str,
         breaker: &Arc<CircuitBreaker>,
         path: &str,
+        headers: &HeaderMap,
         body: Bytes,
         stream_guards: Option<Box<dyn Send + 'static>>,
     ) -> Result<Response<Body>, ApiError> {
         if path == "/generate" {
             return self
-                .forward_grpc_generate_streaming_to(worker_url, breaker, body, stream_guards)
+                .forward_grpc_generate_streaming_to(
+                    worker_url,
+                    breaker,
+                    headers,
+                    body,
+                    stream_guards,
+                )
                 .await;
         }
         if path != "/v1/chat/completions" && path != "/v1/completions" {
@@ -936,6 +972,7 @@ impl Proxy {
         &self,
         worker_url: &str,
         breaker: &Arc<CircuitBreaker>,
+        headers: &HeaderMap,
         body: Bytes,
         stream_guards: Option<Box<dyn Send + 'static>>,
     ) -> Result<Response<Body>, ApiError> {
@@ -949,8 +986,8 @@ impl Proxy {
         })?;
 
         let fut = async {
-            let request =
-                proto_native_generate_request_from_json(&body).map_err(GrpcForwardError::Status)?;
+            let request = proto_native_generate_request_from_json(&body, headers)
+                .map_err(GrpcForwardError::Status)?;
             let channel = tonic::transport::Endpoint::from_shared(endpoint.clone())
                 .map_err(|e| {
                     GrpcForwardError::Transport(anyhow::anyhow!(

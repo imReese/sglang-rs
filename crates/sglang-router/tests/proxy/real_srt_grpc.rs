@@ -445,6 +445,7 @@ async fn router_generate_reaches_real_rust_srt_grpc_worker() {
         .method("POST")
         .uri("/generate")
         .header("content-type", "application/json")
+        .header("x-request-id", "native-generate-header-id")
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "text": "hi",
@@ -466,7 +467,7 @@ async fn router_generate_reaches_real_rust_srt_grpc_worker() {
         .to_bytes();
     let body: serde_json::Value =
         serde_json::from_slice(&body).expect("response should be SGLang generate JSON");
-    assert!(body["request_id"].is_string());
+    assert_eq!(body["request_id"], "native-generate-header-id");
     assert_eq!(body["text"], "  ");
     assert_eq!(body["output_ids"], json!([32, 32]));
     assert_eq!(body["finish_reason"], "stop");
@@ -597,6 +598,7 @@ async fn router_generate_accepts_tokenized_input_ids_for_real_rust_srt_grpc_work
         .method("POST")
         .uri("/generate")
         .header("content-type", "application/json")
+        .header("x-request-id", "native-tokenized-header-id")
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "input_ids": [71, 72],
@@ -619,7 +621,7 @@ async fn router_generate_accepts_tokenized_input_ids_for_real_rust_srt_grpc_work
         .to_bytes();
     let body: serde_json::Value =
         serde_json::from_slice(&body).expect("response should be SGLang generate JSON");
-    assert!(body["request_id"].is_string());
+    assert_eq!(body["request_id"], "native-tokenized-header-id");
     assert_eq!(body["output_ids"], json!([32, 32]));
     assert_eq!(body["finish_reason"], "stop");
     assert_eq!(body["usage"]["prompt_tokens"], 2);
