@@ -61,7 +61,7 @@ pub fn bytes_stream_to_body<S, E>(
     on_complete: Option<Box<dyn FnOnce(bool) + Send + 'static>>,
 ) -> Body
 where
-    S: futures::Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
+    S: futures::Stream<Item = Result<Bytes, E>> + Send + 'static,
     E: std::fmt::Display + Send + Sync + 'static,
 {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
@@ -78,7 +78,7 @@ where
             // underscore suppresses the "unused variable" lint while
             // keeping intent explicit.
             let _hold = stream_guards;
-            let mut s = stream;
+            let mut s = Box::pin(stream);
             while let Some(chunk) = s.next().await {
                 let item: Result<Bytes, std::io::Error> = chunk.map_err(|e| {
                     let msg = e.to_string();
@@ -126,6 +126,37 @@ where
         }
     });
     Body::from_stream(ReceiverStream::new(rx))
+}
+
+/// Convert a stream of JSON payload bytes into OpenAI-compatible SSE frames.
+///
+/// Each upstream item is wrapped as `data: <json>\n\n`; when the upstream
+/// stream ends cleanly the bridge emits the OpenAI `[DONE]` sentinel. This is
+/// used by gRPC workers whose `ChatComplete` RPC streams protobuf messages
+/// containing raw OpenAI JSON chunks rather than already-framed SSE bytes.
+pub fn json_bytes_stream_to_sse_body<S, E>(
+    stream: S,
+    stream_guards: Option<Box<dyn Send + 'static>>,
+    on_complete: Option<Box<dyn FnOnce(bool) + Send + 'static>>,
+) -> Body
+where
+    S: futures::Stream<Item = Result<Vec<u8>, E>> + Send + Unpin + 'static,
+    E: std::fmt::Display + Send + Sync + 'static,
+{
+    let stream = stream.map(|item| {
+        item.map_err(|e| std::io::Error::other(e.to_string()))
+            .map(|json| {
+                let mut frame = Vec::with_capacity(json.len() + b"data: \n\n".len());
+                frame.extend_from_slice(b"data: ");
+                frame.extend_from_slice(&json);
+                frame.extend_from_slice(b"\n\n");
+                Bytes::from(frame)
+            })
+    });
+    let done = futures::stream::once(async {
+        Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: [DONE]\n\n"))
+    });
+    bytes_stream_to_body(stream.chain(done), stream_guards, on_complete)
 }
 
 #[cfg(test)]

@@ -255,6 +255,48 @@ fn openai_chat_response_from_router_responses(
     Ok(OpenAiJsonResponse { json })
 }
 
+fn openai_chat_stream_response_from_router_response(
+    response: RouterGenerateResponse,
+    model: &str,
+) -> Result<OpenAiJsonResponse, Status> {
+    let json = match response.body {
+        RouterGenerateResponseBody::Chunk(chunk) => json!({
+            "id": format!("chatcmpl-{}", response.request_id),
+            "object": "chat.completion.chunk",
+            "model": model,
+            "choices": [{
+                "index": chunk.index,
+                "delta": {
+                    "content": chunk.text,
+                },
+                "finish_reason": Value::Null,
+            }],
+        }),
+        RouterGenerateResponseBody::Complete(complete) => json!({
+            "id": format!("chatcmpl-{}", response.request_id),
+            "object": "chat.completion.chunk",
+            "model": model,
+            "choices": [{
+                "index": complete.index,
+                "delta": {},
+                "finish_reason": complete.finish_reason,
+            }],
+            "usage": {
+                "prompt_tokens": complete.prompt_tokens,
+                "completion_tokens": complete.completion_tokens,
+                "cached_tokens": complete.cached_tokens,
+            }
+        }),
+        RouterGenerateResponseBody::Error(error) => {
+            return Err(Status::internal(error.message));
+        }
+    };
+
+    let json = serde_json::to_vec(&json)
+        .map_err(|e| Status::internal(format!("serialize OpenAI chat stream JSON: {e}")))?;
+    Ok(OpenAiJsonResponse { json })
+}
+
 fn unimplemented_rpc(name: &'static str) -> Status {
     Status::unimplemented(format!(
         "{name} is not implemented in the Rust gRPC runtime yet"
@@ -502,9 +544,7 @@ where
         let model = self.model_info()?.served_model_name;
         let request = crate::http::http_chat_payload_to_router_request(payload, &model)
             .map_err(Status::invalid_argument)?;
-        if request.stream {
-            return Err(unimplemented_rpc("ChatComplete streaming"));
-        }
+        let stream = request.stream;
 
         let responses = self
             .runtime
@@ -512,6 +552,16 @@ where
             .map_err(|_| Status::internal("router runtime mutex poisoned"))?
             .generate_text_stream_with_transfer_polling(request, self.max_transfer_polls)
             .map_err(router_runtime_error_to_status)?;
+
+        if stream {
+            let stream = responses
+                .into_iter()
+                .map(|response| openai_chat_stream_response_from_router_response(response, &model))
+                .collect::<Vec<_>>();
+            return Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
+                stream,
+            ))));
+        }
 
         let response = openai_chat_response_from_router_responses(responses, &model)?;
         Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(

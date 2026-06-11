@@ -338,6 +338,63 @@ async fn grpc_chat_complete_returns_openai_chat_json() {
 }
 
 #[tokio::test]
+async fn grpc_chat_complete_streams_openai_chat_chunks() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "tiny",
+        "--grpc-mode",
+    ])
+    .expect("args should parse");
+    let runtime = RouterRuntime::new(Engine::new(
+        ByteTokenizer,
+        Scheduler::new(GrpcTwoStepWorker),
+    ));
+    let service = GrpcRouterService::with_server_args(runtime, &args);
+    let payload = serde_json::json!({
+        "model": "tiny",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 2,
+        "stream": true,
+    });
+
+    let mut stream = service
+        .chat_complete(Request::new(OpenAiJsonRequest {
+            json: serde_json::to_vec(&payload).expect("payload should serialize"),
+            options: None,
+        }))
+        .await
+        .expect("streaming chat complete should execute")
+        .into_inner();
+    let first = stream
+        .next()
+        .await
+        .expect("first chat chunk")
+        .expect("first chat chunk ok");
+    let second = stream
+        .next()
+        .await
+        .expect("final chat chunk")
+        .expect("final chat chunk ok");
+    assert!(stream.next().await.is_none());
+
+    let first: serde_json::Value =
+        serde_json::from_slice(&first.json).expect("first chunk should be JSON");
+    assert_eq!(first["object"], "chat.completion.chunk");
+    assert_eq!(first["model"], "tiny");
+    assert!(first["choices"][0]["delta"].get("content").is_some());
+    assert!(first["choices"][0]["finish_reason"].is_null());
+
+    let second: serde_json::Value =
+        serde_json::from_slice(&second.json).expect("final chunk should be JSON");
+    assert_eq!(second["object"], "chat.completion.chunk");
+    assert_eq!(second["model"], "tiny");
+    assert_eq!(second["choices"][0]["finish_reason"], "stop");
+}
+
+#[tokio::test]
 async fn grpc_generate_can_poll_pd_transfer_before_decode() {
     let worker = KvTransferModelWorker::new(
         GrpcTwoStepWorker,

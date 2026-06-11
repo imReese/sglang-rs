@@ -12,10 +12,11 @@ use anyhow::Context;
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
 use bytes::Bytes;
+use futures::StreamExt;
 use reqwest::{Client, Url};
 use serde_json::json;
 use sglang_srt::proto::sglang::runtime::v1::sglang_service_client::SglangServiceClient;
-use sglang_srt::proto::sglang::runtime::v1::OpenAiJsonRequest;
+use sglang_srt::proto::sglang::runtime::v1::{OpenAiJsonRequest, OpenAiJsonResponse};
 use std::sync::Arc;
 use std::time::Duration;
 use tonic::Code;
@@ -344,6 +345,11 @@ impl Proxy {
                 worker: worker_url.to_string(),
             });
         }
+        if is_grpc_worker_url(worker_url) {
+            return self
+                .forward_grpc_streaming_to(worker_url, breaker, path, body, stream_guards)
+                .await;
+        }
         let worker_url = parse_worker_url(worker_url, breaker)?;
         let url = worker_url.join(path).map_err(|e| {
             ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
@@ -399,6 +405,105 @@ impl Proxy {
             HeaderName::from_static("content-type"),
             HeaderValue::from_str(&content_type)
                 .unwrap_or_else(|_| HeaderValue::from_static("application/json")),
+        );
+        Ok(out)
+    }
+
+    async fn forward_grpc_streaming_to(
+        &self,
+        worker_url: &str,
+        breaker: &Arc<CircuitBreaker>,
+        path: &str,
+        body: Bytes,
+        stream_guards: Option<Box<dyn Send + 'static>>,
+    ) -> Result<Response<Body>, ApiError> {
+        if path != "/v1/chat/completions" {
+            breaker.record_failure();
+            return Err(ApiError::WorkerMisconfigured {
+                worker: worker_url.to_string(),
+                source: anyhow::anyhow!("gRPC worker transport does not support path {path}"),
+            });
+        }
+
+        let parsed = parse_worker_url(worker_url, breaker)?;
+        let endpoint = grpc_endpoint_from_worker_url(&parsed).ok_or_else(|| {
+            breaker.record_failure();
+            ApiError::WorkerMisconfigured {
+                worker: worker_url.to_string(),
+                source: anyhow::anyhow!("unsupported gRPC worker URL scheme {}", parsed.scheme()),
+            }
+        })?;
+
+        let fut = async {
+            let channel = tonic::transport::Endpoint::from_shared(endpoint.clone())
+                .map_err(|e| {
+                    GrpcForwardError::Transport(anyhow::anyhow!(
+                        "invalid gRPC endpoint {endpoint}: {e}"
+                    ))
+                })?
+                .connect_timeout(self.request_timeout)
+                .connect()
+                .await
+                .map_err(|e| {
+                    GrpcForwardError::Transport(anyhow::anyhow!(
+                        "connect gRPC worker {endpoint}: {e}"
+                    ))
+                })?;
+            let mut client = SglangServiceClient::new(channel);
+            client
+                .chat_complete(GrpcRequest::new(OpenAiJsonRequest {
+                    json: body.to_vec(),
+                    options: None,
+                }))
+                .await
+                .map_err(GrpcForwardError::Status)
+                .map(|response| response.into_inner())
+        };
+
+        let stream = match tokio::time::timeout(self.request_timeout, fut).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(GrpcForwardError::Status(status))) => {
+                let response = grpc_status_response(status);
+                if response.status().is_server_error() {
+                    breaker.record_failure();
+                } else {
+                    breaker.record_success();
+                }
+                return Ok(response);
+            }
+            Ok(Err(GrpcForwardError::Transport(source))) => {
+                breaker.record_failure();
+                return Err(ApiError::UpstreamUnreachable {
+                    worker: parsed,
+                    source,
+                });
+            }
+            Err(_) => {
+                breaker.record_failure();
+                return Err(ApiError::UpstreamTimeout { worker: parsed });
+            }
+        };
+
+        let breaker_for_hook = Arc::clone(breaker);
+        let on_complete: Option<Box<dyn FnOnce(bool) + Send + 'static>> =
+            Some(Box::new(move |ok| {
+                if ok {
+                    breaker_for_hook.record_success();
+                } else {
+                    breaker_for_hook.record_failure();
+                }
+            }));
+        let body = sse::json_bytes_stream_to_sse_body(
+            stream.map(|item: Result<OpenAiJsonResponse, tonic::Status>| {
+                item.map(|response| response.json)
+            }),
+            stream_guards,
+            on_complete,
+        );
+        let mut out = Response::new(body);
+        out.headers_mut().insert(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("text/event-stream"),
         );
         Ok(out)
     }
