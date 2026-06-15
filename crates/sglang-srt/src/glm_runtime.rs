@@ -1051,6 +1051,21 @@ impl GlmMoeDsaF32TensorParallelRuntime {
             .collect()
     }
 
+    pub fn transformer_lm_head_logits(
+        &self,
+        batch: &ModelWorkerBatch,
+    ) -> Result<Vec<Vec<f32>>, GlmMoeDsaF32KernelError> {
+        batch
+            .request_offsets()
+            .iter()
+            .zip(batch.input_token_counts())
+            .map(|(offset, token_count)| {
+                let input_end = *offset + *token_count;
+                self.transformer_lm_head_logits_for_request(&batch.input_ids()[*offset..input_end])
+            })
+            .collect()
+    }
+
     pub fn attention_projection_output(
         &self,
         layer_id: usize,
@@ -1308,6 +1323,73 @@ impl GlmMoeDsaF32TensorParallelRuntime {
             self.rms_norm_eps,
         )?;
 
+        self.lm_head_logits_for_hidden(&hidden)
+    }
+
+    fn transformer_lm_head_logits_for_request(
+        &self,
+        input_ids: &[u32],
+    ) -> Result<Vec<f32>, GlmMoeDsaF32KernelError> {
+        if input_ids.is_empty() {
+            return Err(GlmMoeDsaF32KernelError::TokenCountMismatch {
+                tensor_name: "model.embed_tokens.weight".to_string(),
+                expected: 1,
+                actual: 0,
+            });
+        }
+
+        let mut hidden_states = input_ids
+            .iter()
+            .copied()
+            .map(|token_id| self.token_embedding(token_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut residuals = None::<Vec<Vec<f32>>>;
+
+        for layer_id in 0..self.layer_count {
+            let layer_output =
+                self.transformer_layer_output(layer_id, &hidden_states, residuals.as_deref())?;
+            hidden_states = layer_output
+                .iter()
+                .map(|output| output.hidden_states().to_vec())
+                .collect();
+            residuals = Some(
+                layer_output
+                    .iter()
+                    .map(|output| output.residual().to_vec())
+                    .collect(),
+            );
+        }
+
+        let last_token_index = hidden_states.len() - 1;
+        let mut hidden = hidden_states[last_token_index].clone();
+        if let Some(residuals) = residuals {
+            let residual = &residuals[last_token_index];
+            if residual.len() != hidden.len() {
+                return Err(GlmMoeDsaF32KernelError::HiddenSizeMismatch {
+                    tensor_name: "model.norm.weight".to_string(),
+                    expected: hidden.len(),
+                    actual: residual.len(),
+                });
+            }
+            for (hidden, residual) in hidden.iter_mut().zip(residual) {
+                *hidden += residual;
+            }
+        }
+
+        let norm_weight = self.final_norm_weight()?;
+        apply_rms_norm(
+            "model.norm.weight",
+            &mut hidden,
+            norm_weight,
+            self.rms_norm_eps,
+        )?;
+        self.lm_head_logits_for_hidden(&hidden)
+    }
+
+    fn lm_head_logits_for_hidden(
+        &self,
+        hidden: &[f32],
+    ) -> Result<Vec<f32>, GlmMoeDsaF32KernelError> {
         let mut logits = Vec::<Option<f32>>::new();
         for rank in &self.ranks {
             for (token_id, logit) in rank.lm_head_partial_logits(&hidden)? {

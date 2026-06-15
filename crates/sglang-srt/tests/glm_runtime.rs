@@ -320,6 +320,53 @@ fn glm_moe_dsa_f32_runtime_computes_dense_transformer_layer_output() {
 }
 
 #[test]
+fn glm_moe_dsa_f32_runtime_computes_transformer_lm_head_logits_for_batch() {
+    let model_dir = temp_model_dir("glm-runtime-f32-transformer-logits");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_glm_moe_dsa_attention_output_fixture(&model_dir);
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("GLM artifacts should load");
+    let runtime =
+        GlmMoeDsaRuntime::from_local_model_artifacts(&artifacts).expect("runtime should build");
+    let f32_runtime = runtime
+        .load_tensor_parallel_shards(2)
+        .expect("all TP rank shards should load")
+        .decode_f32_tensor_parallel_shards()
+        .expect("F32 cache should decode");
+    let mut scheduler = Scheduler::new(NoopWorker);
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("glm-transformer-a"),
+        vec![0],
+        SamplingParams::new(1),
+    ));
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("glm-transformer-b"),
+        vec![0, 1],
+        SamplingParams::new(1),
+    ));
+    let batch = scheduler
+        .next_prefill_batch(8)
+        .expect("prefill batch should be available");
+    let worker_batch = ModelWorkerBatch::from_schedule_batch(&batch);
+
+    let logits = f32_runtime
+        .transformer_lm_head_logits(&worker_batch)
+        .expect("transformer/lm_head logits should compute");
+
+    assert_eq!(logits.len(), 2);
+    assert_close(
+        &logits[0],
+        &expected_dense_transformer_final_logits([6.0, 13.0]),
+    );
+    assert_close(
+        &logits[1],
+        &expected_dense_transformer_final_logits([4.0, 6.0]),
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
 fn glm_moe_dsa_f32_runtime_computes_tensor_parallel_dense_mlp_output() {
     let model_dir = temp_model_dir("glm-runtime-f32-dense-mlp");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");
@@ -740,10 +787,10 @@ fn write_glm_moe_dsa_attention_output_fixture(model_dir: &Path) {
         (
             "model.embed_tokens.weight",
             vec![2, 2],
-            vec![0.0, 0.0, 0.0, 0.0],
+            vec![1.0, 1.0, 1.0, -1.0],
         ),
         ("model.norm.weight", vec![2], vec![1.0, 1.0]),
-        ("lm_head.weight", vec![2, 2], vec![0.0, 0.0, 0.0, 0.0]),
+        ("lm_head.weight", vec![2, 2], vec![1.0, 0.0, 0.0, 1.0]),
         (
             "model.layers.0.self_attn.q_a_proj.weight",
             vec![2, 2],
@@ -1056,6 +1103,21 @@ fn write_glm_moe_dsa_moe_mlp_fixture(model_dir: &Path) {
 
 fn silu(value: f32) -> f32 {
     value / (1.0 + (-value).exp())
+}
+
+fn expected_dense_transformer_final_logits(residual: [f32; 2]) -> Vec<f32> {
+    let residual_rms = ((residual[0] * residual[0] + residual[1] * residual[1]) / 2.0).sqrt();
+    let normalized = [residual[0] / residual_rms, residual[1] / residual_rms];
+    let activation0 = silu(normalized[0]) * (2.0 * normalized[0]);
+    let activation1 = silu(normalized[1]) * (3.0 * normalized[1]);
+    let hidden = [
+        5.0 * activation0 + 7.0 * activation1,
+        11.0 * activation0 + 13.0 * activation1,
+    ];
+    let final_hidden = [hidden[0] + residual[0], hidden[1] + residual[1]];
+    let final_rms =
+        ((final_hidden[0] * final_hidden[0] + final_hidden[1] * final_hidden[1]) / 2.0).sqrt();
+    vec![final_hidden[0] / final_rms, final_hidden[1] / final_rms]
 }
 
 fn assert_close(actual: &[f32], expected: &[f32]) {

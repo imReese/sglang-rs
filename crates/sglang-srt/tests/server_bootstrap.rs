@@ -1616,110 +1616,124 @@ fn write_complete_glm_moe_dsa_forward_checkpoint(model_dir: &std::path::Path) {
   "model_type": "glm_moe_dsa",
   "vocab_size": 3,
   "num_hidden_layers": 1,
-  "hidden_size": 4,
+  "hidden_size": 2,
+  "intermediate_size": 2,
   "num_attention_heads": 2,
   "num_key_value_heads": 2,
-  "head_dim": 2,
+  "head_dim": 1,
+  "qk_nope_head_dim": 1,
+  "qk_rope_head_dim": 0,
+  "v_head_dim": 1,
   "rms_norm_eps": 0.0,
   "n_routed_experts": 1,
-  "first_k_dense_replace": 0,
+  "first_k_dense_replace": 1,
   "moe_layer_freq": 1
 }"#,
     )
     .expect("config should be written");
 
-    let root_values: [f32; 28] = [
-        0.0, 0.0, 0.0, 0.0, // [UNK] embedding
-        1.0, 0.0, 0.0, 0.0, // hello embedding
-        0.0, 0.0, 1.0, 0.0, // world embedding
-        1.0, 1.0, 1.0, 1.0, // final norm
-        1.0, 0.0, 0.0, 0.0, // [UNK] lm_head
-        2.0, 0.0, 0.0, 0.0, // hello lm_head
-        3.0, 0.0, 0.0, 0.0, // world lm_head
+    let values = [
+        0.0, 0.0, // [UNK] embedding
+        1.0, 1.0, // hello embedding
+        1.0, -1.0, // world embedding
+        1.0, 1.0, // final norm
+        0.0, 0.0, // [UNK] lm_head
+        1.5, 0.0, // hello lm_head
+        0.0, 1.0, // world lm_head
+        1.0, 0.0, 0.0, 1.0, // q_a_proj
+        1.0, 1.0, // q_a_layernorm
+        1.0, 0.0, 0.0, 1.0, // q_b_proj
+        1.0, 0.0, 0.0, 1.0, // kv_a_proj_with_mqa
+        1.0, 1.0, // kv_a_layernorm
+        1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, // kv_b_proj
+        2.0, 3.0, 5.0, 7.0, // o_proj
+        1.0, 1.0, // input_layernorm
+        1.0, 1.0, // post_attention_layernorm
+        1.0, 0.0, 0.0, 1.0, // mlp.gate_proj
+        2.0, 0.0, 0.0, 3.0, // mlp.up_proj
+        5.0, 7.0, 11.0, 13.0, // mlp.down_proj
     ];
-    let mut payload = root_values
+    let payload = values
         .into_iter()
         .flat_map(f32::to_le_bytes)
         .collect::<Vec<_>>();
-    payload.resize(164, 0);
     write_safetensors_file(
         &model_dir.join("model.safetensors"),
         &[
-            ("model.embed_tokens.weight", "F32", &[3, 4], [0, 48]),
-            ("model.norm.weight", "F32", &[4], [48, 64]),
-            ("lm_head.weight", "F32", &[3, 4], [64, 112]),
+            ("model.embed_tokens.weight", "F32", &[3, 2], [0, 24]),
+            ("model.norm.weight", "F32", &[2], [24, 32]),
+            ("lm_head.weight", "F32", &[3, 2], [32, 56]),
             (
                 "model.layers.0.self_attn.q_a_proj.weight",
                 "F32",
-                &[1],
-                [112, 116],
+                &[2, 2],
+                [56, 72],
             ),
             (
                 "model.layers.0.self_attn.q_a_layernorm.weight",
                 "F32",
-                &[1],
-                [116, 120],
+                &[2],
+                [72, 80],
             ),
             (
                 "model.layers.0.self_attn.q_b_proj.weight",
                 "F32",
-                &[1],
-                [120, 124],
+                &[2, 2],
+                [80, 96],
             ),
             (
                 "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
                 "F32",
-                &[1],
-                [124, 128],
+                &[2, 2],
+                [96, 112],
             ),
             (
                 "model.layers.0.self_attn.kv_a_layernorm.weight",
                 "F32",
-                &[1],
-                [128, 132],
+                &[2],
+                [112, 120],
             ),
             (
                 "model.layers.0.self_attn.kv_b_proj.weight",
                 "F32",
-                &[1],
-                [132, 136],
+                &[4, 2],
+                [120, 152],
             ),
             (
                 "model.layers.0.self_attn.o_proj.weight",
                 "F32",
-                &[1],
-                [136, 140],
+                &[2, 2],
+                [152, 168],
             ),
             (
                 "model.layers.0.input_layernorm.weight",
                 "F32",
-                &[1],
-                [140, 144],
+                &[2],
+                [168, 176],
             ),
             (
                 "model.layers.0.post_attention_layernorm.weight",
                 "F32",
-                &[1],
-                [144, 148],
-            ),
-            ("model.layers.0.mlp.gate.weight", "F32", &[1], [148, 152]),
-            (
-                "model.layers.0.mlp.experts.0.gate_proj.weight",
-                "F32",
-                &[1],
-                [152, 156],
+                &[2],
+                [176, 184],
             ),
             (
-                "model.layers.0.mlp.experts.0.down_proj.weight",
+                "model.layers.0.mlp.gate_proj.weight",
                 "F32",
-                &[1],
-                [156, 160],
+                &[2, 2],
+                [184, 200],
             ),
             (
-                "model.layers.0.mlp.experts.0.up_proj.weight",
+                "model.layers.0.mlp.up_proj.weight",
                 "F32",
-                &[1],
-                [160, 164],
+                &[2, 2],
+                [200, 216],
+            ),
+            (
+                "model.layers.0.mlp.down_proj.weight",
+                "F32",
+                &[2, 2],
+                [216, 232],
             ),
         ],
         &payload,

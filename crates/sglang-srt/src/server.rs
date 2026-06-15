@@ -131,7 +131,7 @@ impl ForwardModel for BootstrapForwardModel {
             }
             Self::GlmMoeDsa(runtime) => ModelForwardOutput::new(
                 runtime
-                    .embedding_lm_head_logits(batch)
+                    .transformer_lm_head_logits(batch)
                     .map_err(|error| ModelForwardError::Runtime(error.to_string()))?,
             ),
             Self::UnsupportedLocalModelRuntime {
