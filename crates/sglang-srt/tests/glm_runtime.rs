@@ -33,6 +33,26 @@ impl ModelWorker for NoopWorker {
     }
 }
 
+#[derive(Default)]
+struct FirstTokenWorker;
+
+impl ModelWorker for FirstTokenWorker {
+    fn generate_batch(
+        &mut self,
+        batch: &sglang_srt::scheduler::ScheduleBatch,
+    ) -> BatchGeneratedTokens {
+        BatchGeneratedTokens::from_batch(
+            batch,
+            batch
+                .requests()
+                .iter()
+                .map(|_| GeneratedToken::unfinished(vec![1]))
+                .collect(),
+        )
+        .expect("generated tokens should match batch")
+    }
+}
+
 #[test]
 fn glm_moe_dsa_runtime_builds_tensor_parallel_placement_plan() {
     let model_dir = temp_model_dir("glm-runtime-placement-plan");
@@ -386,6 +406,50 @@ fn glm_moe_dsa_f32_runtime_computes_transformer_lm_head_logits_for_batch() {
     );
     assert_close(
         &logits[1],
+        &expected_dense_transformer_final_logits([4.0, 6.0]),
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn glm_moe_dsa_f32_runtime_uses_decode_sequence_history_for_transformer_logits() {
+    let model_dir = temp_model_dir("glm-runtime-f32-transformer-decode-history");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_glm_moe_dsa_attention_output_fixture(&model_dir);
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("GLM artifacts should load");
+    let runtime =
+        GlmMoeDsaRuntime::from_local_model_artifacts(&artifacts).expect("runtime should build");
+    let f32_runtime = runtime
+        .load_tensor_parallel_shards(2)
+        .expect("all TP rank shards should load")
+        .decode_f32_tensor_parallel_shards()
+        .expect("F32 cache should decode");
+    let mut scheduler = Scheduler::new(FirstTokenWorker);
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("glm-transformer-decode"),
+        vec![0],
+        SamplingParams::new(2),
+    ));
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should dispatch first token");
+    let decode_batch = scheduler
+        .next_decode_batch(1)
+        .expect("decode batch should be available");
+    let worker_batch = ModelWorkerBatch::from_schedule_batch(&decode_batch);
+
+    let logits = f32_runtime
+        .transformer_lm_head_logits(&worker_batch)
+        .expect("decode transformer/lm_head logits should compute from history");
+
+    assert_eq!(worker_batch.input_ids(), &[1]);
+    assert_eq!(worker_batch.positions(), &[1]);
+    assert_eq!(worker_batch.sequence_token_ids(), &[0, 1]);
+    assert_eq!(logits.len(), 1);
+    assert_close(
+        &logits[0],
         &expected_dense_transformer_final_logits([4.0, 6.0]),
     );
 

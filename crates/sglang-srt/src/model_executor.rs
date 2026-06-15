@@ -20,6 +20,9 @@ pub struct ModelWorkerBatch {
     input_ids: Vec<u32>,
     positions: Vec<usize>,
     sequence_lengths: Vec<usize>,
+    sequence_token_ids: Vec<u32>,
+    sequence_offsets: Vec<usize>,
+    sequence_token_counts: Vec<usize>,
     request_offsets: Vec<usize>,
     cached_token_counts: Vec<usize>,
     input_token_counts: Vec<usize>,
@@ -37,6 +40,9 @@ impl ModelWorkerBatch {
             input_ids: Vec::new(),
             positions: Vec::new(),
             sequence_lengths: Vec::with_capacity(batch.batch_size()),
+            sequence_token_ids: Vec::new(),
+            sequence_offsets: Vec::with_capacity(batch.batch_size()),
+            sequence_token_counts: Vec::with_capacity(batch.batch_size()),
             request_offsets: Vec::with_capacity(batch.batch_size()),
             cached_token_counts: Vec::with_capacity(batch.batch_size()),
             input_token_counts: Vec::with_capacity(batch.batch_size()),
@@ -71,6 +77,18 @@ impl ModelWorkerBatch {
 
     pub fn sequence_lengths(&self) -> &[usize] {
         &self.sequence_lengths
+    }
+
+    pub fn sequence_token_ids(&self) -> &[u32] {
+        &self.sequence_token_ids
+    }
+
+    pub fn sequence_offsets(&self) -> &[usize] {
+        &self.sequence_offsets
+    }
+
+    pub fn sequence_token_counts(&self) -> &[usize] {
+        &self.sequence_token_counts
     }
 
     pub fn request_offsets(&self) -> &[usize] {
@@ -128,6 +146,10 @@ impl ModelWorkerBatch {
     fn push_prefill_request(&mut self, request: &ScheduledRequest) {
         let prefix_len = request.prefix_cache_pages().len();
         let uncached_input_ids = request.uncached_input_ids();
+        self.sequence_offsets.push(self.sequence_token_ids.len());
+        self.sequence_token_ids
+            .extend_from_slice(request.input_ids());
+        self.sequence_token_counts.push(request.input_ids().len());
 
         self.input_ids.extend_from_slice(uncached_input_ids);
         self.input_token_counts.push(uncached_input_ids.len());
@@ -140,6 +162,13 @@ impl ModelWorkerBatch {
 
     fn push_decode_request(&mut self, request: &ScheduledRequest) {
         let decode_token = request.output_ids().last().copied().unwrap_or_default();
+        self.sequence_offsets.push(self.sequence_token_ids.len());
+        self.sequence_token_ids
+            .extend_from_slice(request.input_ids());
+        self.sequence_token_ids
+            .extend_from_slice(request.output_ids());
+        self.sequence_token_counts
+            .push(request.input_ids().len() + request.output_ids().len());
 
         self.input_ids.push(decode_token);
         self.input_token_counts.push(1);

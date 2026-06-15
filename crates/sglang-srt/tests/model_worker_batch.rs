@@ -140,6 +140,9 @@ fn model_worker_batch_for_decode_uses_last_output_token_and_next_position() {
     assert_eq!(worker_batch.request_offsets(), &[0]);
     assert_eq!(worker_batch.cached_token_counts(), &[0]);
     assert_eq!(worker_batch.input_token_counts(), &[1]);
+    assert_eq!(worker_batch.sequence_token_ids(), &[1, 2, 3, 99]);
+    assert_eq!(worker_batch.sequence_offsets(), &[0]);
+    assert_eq!(worker_batch.sequence_token_counts(), &[4]);
 }
 
 #[test]

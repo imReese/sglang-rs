@@ -1085,14 +1085,15 @@ impl GlmMoeDsaF32TensorParallelRuntime {
         batch: &ModelWorkerBatch,
     ) -> Result<Vec<Vec<f32>>, GlmMoeDsaF32KernelError> {
         batch
-            .request_offsets()
+            .sequence_offsets()
             .iter()
-            .zip(batch.input_token_counts())
-            .map(|(offset, token_count)| {
-                let input_end = *offset + *token_count;
+            .zip(batch.sequence_token_counts())
+            .map(|(offset, sequence_token_count)| {
+                let input_end = *offset + *sequence_token_count;
+                let positions = (0..*sequence_token_count).collect::<Vec<_>>();
                 self.transformer_lm_head_logits_for_request(
-                    &batch.input_ids()[*offset..input_end],
-                    &batch.positions()[*offset..input_end],
+                    &batch.sequence_token_ids()[*offset..input_end],
+                    &positions,
                 )
             })
             .collect()
