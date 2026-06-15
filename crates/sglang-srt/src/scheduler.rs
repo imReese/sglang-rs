@@ -28,6 +28,7 @@ pub struct ScheduledRequest {
     input_ids: Vec<u32>,
     output_ids: Vec<u32>,
     allocated_cache_pages: Vec<CachePageId>,
+    sequence_cache_pages: Vec<CachePageId>,
     sampling: SamplingParams,
     disaggregated_params: Option<DisaggregatedParams>,
     data_parallel_rank: i32,
@@ -43,6 +44,7 @@ impl ScheduledRequest {
             input_ids,
             output_ids: Vec::new(),
             allocated_cache_pages: Vec::new(),
+            sequence_cache_pages: Vec::new(),
             sampling,
             disaggregated_params: None,
             data_parallel_rank: 0,
@@ -118,6 +120,10 @@ impl ScheduledRequest {
         &self.allocated_cache_pages
     }
 
+    pub fn sequence_cache_pages(&self) -> &[CachePageId] {
+        &self.sequence_cache_pages
+    }
+
     pub fn cached_token_count(&self) -> usize {
         self.prefix_match.matched_token_count
     }
@@ -132,6 +138,26 @@ impl ScheduledRequest {
 
     fn set_allocated_cache_pages(&mut self, cache_pages: Vec<CachePageId>) {
         self.allocated_cache_pages = cache_pages;
+    }
+
+    fn set_sequence_cache_pages(&mut self, cache_pages: Vec<CachePageId>) {
+        self.sequence_cache_pages = cache_pages;
+    }
+
+    fn append_sequence_cache_pages(&mut self, cache_pages: &[CachePageId]) {
+        self.sequence_cache_pages.extend_from_slice(cache_pages);
+    }
+
+    fn clear_forward_cache_allocation(&mut self) {
+        let allocated_page_count = self.allocated_cache_pages.len();
+        if allocated_page_count > 0 {
+            self.sequence_cache_pages.truncate(
+                self.sequence_cache_pages
+                    .len()
+                    .saturating_sub(allocated_page_count),
+            );
+        }
+        self.allocated_cache_pages.clear();
     }
 
     fn append_output_ids(&mut self, output_ids: &[u32]) {
@@ -423,13 +449,18 @@ impl<W> Scheduler<W> {
         request: &mut ScheduledRequest,
     ) -> Result<(), SchedulerError> {
         let prefix_match = self.prefix_cache.match_prefix(request.input_ids());
-        request.apply_prefix_match(prefix_match);
-        let uncached_token_count = request.uncached_input_ids().len();
+        let uncached_token_count = prefix_match.remaining_input_ids.len();
         let allocated_cache_pages = match self.cache_page_allocator.as_mut() {
             Some(allocator) => allocator.allocate(uncached_token_count)?,
             None => Vec::new(),
         };
+        let mut sequence_cache_pages =
+            Vec::with_capacity(prefix_match.cache_pages.len() + allocated_cache_pages.len());
+        sequence_cache_pages.extend_from_slice(&prefix_match.cache_pages);
+        sequence_cache_pages.extend_from_slice(&allocated_cache_pages);
+        request.apply_prefix_match(prefix_match);
         request.set_allocated_cache_pages(allocated_cache_pages);
+        request.set_sequence_cache_pages(sequence_cache_pages);
         request.set_stage(RequestStage::PrefillForward);
         Ok(())
     }
@@ -448,6 +479,7 @@ impl<W> Scheduler<W> {
         self.waiting_queue.push_front(failed_request);
         for mut request in prepared_requests.into_iter().rev() {
             request.set_allocated_cache_pages(Vec::new());
+            request.set_sequence_cache_pages(Vec::new());
             request.set_stage(RequestStage::PrefillWaiting);
             self.waiting_queue.push_front(request);
         }
@@ -493,11 +525,48 @@ impl<W> Scheduler<W> {
                 .decode_queue
                 .pop_front()
                 .ok_or(SchedulerError::EmptyQueue)?;
+            if let Err(error) = self.prepare_decode_request(&mut request) {
+                self.restore_failed_decode_attempt(requests, request);
+                return Err(error);
+            }
             request.set_stage(RequestStage::DecodeForward);
             requests.push(request);
         }
 
         Ok(ScheduleBatch::decode(requests))
+    }
+
+    fn prepare_decode_request(
+        &mut self,
+        request: &mut ScheduledRequest,
+    ) -> Result<(), SchedulerError> {
+        let allocated_cache_pages = match self.cache_page_allocator.as_mut() {
+            Some(allocator) => allocator.allocate(1)?,
+            None => Vec::new(),
+        };
+        request.set_allocated_cache_pages(allocated_cache_pages);
+        let allocated_cache_pages = request.allocated_cache_pages().to_vec();
+        request.append_sequence_cache_pages(&allocated_cache_pages);
+        Ok(())
+    }
+
+    fn restore_failed_decode_attempt(
+        &mut self,
+        prepared_requests: Vec<ScheduledRequest>,
+        failed_request: ScheduledRequest,
+    ) {
+        if let Some(allocator) = self.cache_page_allocator.as_mut() {
+            for request in prepared_requests.iter() {
+                allocator.release(request.allocated_cache_pages());
+            }
+        }
+
+        self.decode_queue.push_front(failed_request);
+        for mut request in prepared_requests.into_iter().rev() {
+            request.clear_forward_cache_allocation();
+            request.set_stage(RequestStage::DecodeWaiting);
+            self.decode_queue.push_front(request);
+        }
     }
 }
 
@@ -579,6 +648,10 @@ where
                 .decode_queue
                 .pop_front()
                 .ok_or(SchedulerError::EmptyQueue)?;
+            if let Err(error) = self.prepare_decode_request(&mut request) {
+                self.restore_failed_decode_attempt(requests, request);
+                return Err(error);
+            }
             request.set_stage(RequestStage::DecodeForward);
             requests.push(request);
         }
@@ -626,10 +699,6 @@ where
     }
 
     fn release_failed_batch_cache_pages(&mut self, batch: &ScheduleBatch) {
-        if batch.forward_mode() != ForwardMode::Prefill {
-            return;
-        }
-
         let Some(allocator) = self.cache_page_allocator.as_mut() else {
             return;
         };

@@ -511,7 +511,7 @@ async fn grpc_generate_can_poll_pd_transfer_before_decode() {
     );
     let service = GrpcRouterService::from_engine(Engine::new(
         ByteTokenizer,
-        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(2)),
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(3)),
     ))
     .with_max_transfer_polls(1);
 
@@ -574,7 +574,7 @@ async fn grpc_text_generate_can_poll_pd_transfer_before_decode() {
     );
     let service = GrpcRouterService::from_engine(Engine::new(
         ByteTokenizer,
-        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(2)),
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(3)),
     ))
     .with_max_transfer_polls(1);
 

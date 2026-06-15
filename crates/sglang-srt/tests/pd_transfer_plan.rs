@@ -443,7 +443,7 @@ fn transfer_model_worker_propagates_transfer_failure_and_scheduler_releases_page
         },
     );
     let mut scheduler =
-        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(2));
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(3));
     scheduler.enqueue(
         ScheduledRequest::new(
             RequestId::from("pd-transfer-fail"),
@@ -464,7 +464,7 @@ fn transfer_model_worker_propagates_transfer_failure_and_scheduler_releases_page
                 .to_string()
         ))
     );
-    assert_eq!(scheduler.available_cache_pages(), Some(2));
+    assert_eq!(scheduler.available_cache_pages(), Some(3));
     assert_eq!(
         scheduler
             .worker()
@@ -492,7 +492,7 @@ fn transfer_model_worker_blocks_default_decode_dispatch_until_kv_success() {
         ),
     );
     let mut scheduler =
-        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(2));
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(3));
     scheduler.enqueue(
         ScheduledRequest::new(
             RequestId::from("pd-decode-wait"),
@@ -621,7 +621,7 @@ fn engine_token_generation_waits_when_pd_decode_kv_is_not_ready() {
         ),
     );
     let scheduler =
-        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(2));
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(3));
     let mut engine = Engine::new(ByteTokenizer::default(), scheduler);
 
     let error = engine
@@ -659,7 +659,7 @@ fn engine_poll_transfers_updates_registry_and_unblocks_decode_dispatch() {
         ),
     );
     let scheduler =
-        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(2));
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(3));
     let mut engine = Engine::new(ByteTokenizer::default(), scheduler);
 
     let error = engine
@@ -708,7 +708,7 @@ fn engine_token_generation_can_poll_transfer_and_continue_decode() {
         ),
     );
     let scheduler =
-        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(2));
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(3));
     let mut engine = Engine::new(ByteTokenizer::default(), scheduler);
 
     let output = engine
@@ -748,7 +748,7 @@ fn router_runtime_poll_transfers_exposes_control_plane_counts() {
         ),
     );
     let scheduler =
-        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(2));
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(3));
     let engine = Engine::new(ByteTokenizer::default(), scheduler);
     let mut runtime = RouterRuntime::new(engine);
 
@@ -810,7 +810,7 @@ fn router_runtime_stream_can_poll_transfer_and_continue_decode() {
         ),
     );
     let scheduler =
-        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(2));
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(3));
     let engine = Engine::new(ByteTokenizer::default(), scheduler);
     let mut runtime = RouterRuntime::new(engine);
 

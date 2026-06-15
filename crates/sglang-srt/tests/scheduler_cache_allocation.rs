@@ -1,6 +1,8 @@
 use sglang_srt::cache::{CacheAllocationError, CachePageAllocator, CachePageId, RadixCache};
 use sglang_srt::model_executor::ModelWorkerBatch;
-use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler, SchedulerError};
+use sglang_srt::scheduler::{
+    ForwardMode, ScheduleBatch, ScheduledRequest, Scheduler, SchedulerError,
+};
 use sglang_srt::types::{DisaggregatedParams, FAKE_BOOTSTRAP_HOST, RequestId, SamplingParams};
 use sglang_srt::worker::{
     BatchGeneratedTokens, FallibleModelWorker, GeneratedToken, ModelWorker, WorkerExecutionError,
@@ -57,6 +59,34 @@ impl FallibleModelWorker for FailingWorker {
     }
 }
 
+#[derive(Default)]
+struct DecodeFailingWorker;
+
+impl FallibleModelWorker for DecodeFailingWorker {
+    fn try_generate_batch(
+        &mut self,
+        batch: &ScheduleBatch,
+    ) -> Result<BatchGeneratedTokens, WorkerExecutionError> {
+        if batch.forward_mode() == ForwardMode::Decode {
+            return Err(WorkerOutputError::BatchSizeMismatch {
+                request_count: batch.batch_size(),
+                output_count: 0,
+            }
+            .into());
+        }
+
+        Ok(BatchGeneratedTokens::from_batch(
+            batch,
+            batch
+                .requests()
+                .iter()
+                .map(|_| GeneratedToken::unfinished(vec![0]))
+                .collect(),
+        )
+        .expect("output shape should match batch"))
+    }
+}
+
 #[test]
 fn prefill_batch_allocates_cache_pages_for_uncached_tokens() {
     let mut scheduler = Scheduler::with_cache_resources(
@@ -105,6 +135,52 @@ fn model_worker_batch_exposes_flattened_output_cache_pages_for_prefill() {
             CachePageId::from(2)
         ]
     );
+}
+
+#[test]
+fn decode_batch_allocates_output_cache_page_and_keeps_sequence_cache_pages() {
+    let mut scheduler = Scheduler::with_cache_resources(
+        UnfinishedWorker,
+        RadixCache::default(),
+        CachePageAllocator::new(4),
+    );
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("req-decode-cache-page"),
+        vec![1, 2],
+        SamplingParams::new(3),
+    ));
+
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should dispatch and leave request in decode");
+
+    let batch = scheduler
+        .next_decode_batch(1)
+        .expect("decode batch should allocate a cache page");
+    let worker_batch = ModelWorkerBatch::from_schedule_batch(&batch);
+
+    assert_eq!(
+        batch.requests()[0].allocated_cache_pages(),
+        &[CachePageId::from(2)]
+    );
+    assert_eq!(
+        batch.requests()[0].sequence_cache_pages(),
+        &[
+            CachePageId::from(0),
+            CachePageId::from(1),
+            CachePageId::from(2)
+        ]
+    );
+    assert_eq!(worker_batch.out_cache_pages(), &[CachePageId::from(2)]);
+    assert_eq!(
+        worker_batch.sequence_cache_pages(),
+        &[
+            CachePageId::from(0),
+            CachePageId::from(1),
+            CachePageId::from(2)
+        ]
+    );
+    assert_eq!(scheduler.available_cache_pages(), Some(1));
 }
 
 #[test]
@@ -191,6 +267,35 @@ fn worker_failure_releases_prefill_cache_pages() {
         "worker execution error: worker output error: batch output count (0) must match request count (1)"
     );
     assert_eq!(scheduler.available_cache_pages(), Some(3));
+}
+
+#[test]
+fn worker_failure_releases_decode_output_cache_page() {
+    let mut scheduler = Scheduler::with_cache_resources(
+        DecodeFailingWorker,
+        RadixCache::default(),
+        CachePageAllocator::new(3),
+    );
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("req-decode-fail"),
+        vec![1, 2],
+        SamplingParams::new(3),
+    ));
+
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should dispatch and leave request in decode");
+    assert_eq!(scheduler.available_cache_pages(), Some(1));
+
+    let error = scheduler
+        .dispatch_decode_batch(1)
+        .expect_err("decode worker failure should be returned");
+
+    assert_eq!(
+        error.to_string(),
+        "worker execution error: worker output error: batch output count (0) must match request count (1)"
+    );
+    assert_eq!(scheduler.available_cache_pages(), Some(1));
 }
 
 #[test]

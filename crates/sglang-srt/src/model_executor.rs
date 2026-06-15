@@ -23,6 +23,7 @@ pub struct ModelWorkerBatch {
     sequence_token_ids: Vec<u32>,
     sequence_offsets: Vec<usize>,
     sequence_token_counts: Vec<usize>,
+    sequence_cache_pages: Vec<CachePageId>,
     request_offsets: Vec<usize>,
     cached_token_counts: Vec<usize>,
     input_token_counts: Vec<usize>,
@@ -43,6 +44,7 @@ impl ModelWorkerBatch {
             sequence_token_ids: Vec::new(),
             sequence_offsets: Vec::with_capacity(batch.batch_size()),
             sequence_token_counts: Vec::with_capacity(batch.batch_size()),
+            sequence_cache_pages: Vec::new(),
             request_offsets: Vec::with_capacity(batch.batch_size()),
             cached_token_counts: Vec::with_capacity(batch.batch_size()),
             input_token_counts: Vec::with_capacity(batch.batch_size()),
@@ -89,6 +91,10 @@ impl ModelWorkerBatch {
 
     pub fn sequence_token_counts(&self) -> &[usize] {
         &self.sequence_token_counts
+    }
+
+    pub fn sequence_cache_pages(&self) -> &[CachePageId] {
+        &self.sequence_cache_pages
     }
 
     pub fn request_offsets(&self) -> &[usize] {
@@ -150,6 +156,8 @@ impl ModelWorkerBatch {
         self.sequence_token_ids
             .extend_from_slice(request.input_ids());
         self.sequence_token_counts.push(request.input_ids().len());
+        self.sequence_cache_pages
+            .extend_from_slice(request.sequence_cache_pages());
 
         self.input_ids.extend_from_slice(uncached_input_ids);
         self.input_token_counts.push(uncached_input_ids.len());
@@ -169,9 +177,13 @@ impl ModelWorkerBatch {
             .extend_from_slice(request.output_ids());
         self.sequence_token_counts
             .push(request.input_ids().len() + request.output_ids().len());
+        self.sequence_cache_pages
+            .extend_from_slice(request.sequence_cache_pages());
 
         self.input_ids.push(decode_token);
         self.input_token_counts.push(1);
+        self.out_cache_pages
+            .extend_from_slice(request.allocated_cache_pages());
         self.positions
             .push(request.input_ids().len() + request.output_ids().len() - 1);
         self.sequence_lengths
