@@ -268,6 +268,32 @@ fn glm_moe_dsa_f32_runtime_computes_tensor_parallel_causal_attention_output() {
 }
 
 #[test]
+fn glm_moe_dsa_f32_runtime_applies_rope_to_causal_attention_scores() {
+    let model_dir = temp_model_dir("glm-runtime-f32-attention-rope");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_glm_moe_dsa_rope_attention_fixture(&model_dir);
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("GLM artifacts should load");
+    let runtime =
+        GlmMoeDsaRuntime::from_local_model_artifacts(&artifacts).expect("runtime should build");
+    let f32_runtime = runtime
+        .load_tensor_parallel_shards(1)
+        .expect("single TP rank shard should load")
+        .decode_f32_tensor_parallel_shards()
+        .expect("F32 cache should decode");
+
+    let output = f32_runtime
+        .attention_output(0, &[vec![1.0, 0.0], vec![0.0, 1.0]])
+        .expect("causal attention output should compute");
+
+    assert_eq!(output.len(), 2);
+    assert_close(&output[0], &[-10.0, 0.0]);
+    assert_close(&output[1], &[expected_rope_attention_value(), 0.0]);
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
 fn glm_moe_dsa_f32_runtime_computes_dense_transformer_layer_output() {
     let model_dir = temp_model_dir("glm-runtime-f32-dense-transformer-layer");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");
@@ -760,6 +786,114 @@ fn write_glm_moe_dsa_attention_projection_fixture(model_dir: &Path) {
         .expect("safetensors shard should be written");
 }
 
+fn write_glm_moe_dsa_rope_attention_fixture(model_dir: &Path) {
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "model_type": "glm_moe_dsa",
+  "vocab_size": 2,
+  "num_hidden_layers": 1,
+  "hidden_size": 2,
+  "intermediate_size": 2,
+  "num_attention_heads": 1,
+  "num_key_value_heads": 1,
+  "head_dim": 3,
+  "qk_nope_head_dim": 1,
+  "qk_rope_head_dim": 2,
+  "v_head_dim": 1,
+  "rms_norm_eps": 0.0,
+  "n_routed_experts": 1,
+  "first_k_dense_replace": 1,
+  "moe_layer_freq": 1
+}"#,
+    )
+    .expect("config should be written");
+
+    let tensors = [
+        (
+            "model.embed_tokens.weight",
+            vec![2, 2],
+            vec![0.0, 0.0, 0.0, 0.0],
+        ),
+        ("model.norm.weight", vec![2], vec![1.0, 1.0]),
+        ("lm_head.weight", vec![2, 2], vec![0.0, 0.0, 0.0, 0.0]),
+        (
+            "model.layers.0.self_attn.q_a_proj.weight",
+            vec![2, 2],
+            vec![1.0, 0.0, 0.0, 1.0],
+        ),
+        (
+            "model.layers.0.self_attn.q_a_layernorm.weight",
+            vec![2],
+            vec![1.0, 1.0],
+        ),
+        (
+            "model.layers.0.self_attn.q_b_proj.weight",
+            vec![3, 2],
+            vec![0.0, 0.0, 0.0, std::f32::consts::FRAC_1_SQRT_2, 0.0, 0.0],
+        ),
+        (
+            "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
+            vec![3, 2],
+            vec![-1.0, 1.0, 1.0, 1.0, 0.0, 0.0],
+        ),
+        (
+            "model.layers.0.self_attn.kv_a_layernorm.weight",
+            vec![1],
+            vec![1.0],
+        ),
+        (
+            "model.layers.0.self_attn.kv_b_proj.weight",
+            vec![2, 1],
+            vec![0.0, 10.0],
+        ),
+        (
+            "model.layers.0.self_attn.o_proj.weight",
+            vec![2, 1],
+            vec![1.0, 0.0],
+        ),
+        (
+            "model.layers.0.input_layernorm.weight",
+            vec![2],
+            vec![1.0, 1.0],
+        ),
+        (
+            "model.layers.0.post_attention_layernorm.weight",
+            vec![2],
+            vec![1.0, 1.0],
+        ),
+        (
+            "model.layers.0.mlp.gate_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.mlp.up_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.mlp.down_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+    ];
+    let mut cursor = 0_usize;
+    let mut metadata = Vec::new();
+    let mut payload = Vec::new();
+    for (name, shape, values) in tensors {
+        let start = cursor;
+        for value in values.into_iter().map(|value| value as f32) {
+            payload.extend_from_slice(&value.to_le_bytes());
+            cursor += 4;
+        }
+        metadata.push((name, "F32", shape, [start, cursor]));
+    }
+
+    write_safetensors_file(&model_dir.join("model.safetensors"), &metadata, &payload)
+        .expect("safetensors shard should be written");
+}
+
 fn write_glm_moe_dsa_attention_output_fixture(model_dir: &Path) {
     fs::write(
         model_dir.join("config.json"),
@@ -1118,6 +1252,19 @@ fn expected_dense_transformer_final_logits(residual: [f32; 2]) -> Vec<f32> {
     let final_rms =
         ((final_hidden[0] * final_hidden[0] + final_hidden[1] * final_hidden[1]) / 2.0).sqrt();
     vec![final_hidden[0] / final_rms, final_hidden[1] / final_rms]
+}
+
+fn expected_rope_attention_value() -> f32 {
+    let scale = (3.0_f32).sqrt().recip();
+    let key0_score = 1.0_f32.cos() * scale;
+    let key1_score = scale;
+    let max_score = key0_score.max(key1_score);
+    let key0_exp = (key0_score - max_score).exp();
+    let key1_exp = (key1_score - max_score).exp();
+    let exp_sum = key0_exp + key1_exp;
+    let key0_weight = key0_exp / exp_sum;
+    let key1_weight = key1_exp / exp_sum;
+    key0_weight * -10.0 + key1_weight * 10.0
 }
 
 fn assert_close(actual: &[f32], expected: &[f32]) {

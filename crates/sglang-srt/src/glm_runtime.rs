@@ -21,6 +21,7 @@ pub struct GlmMoeDsaRuntime {
     layers: Vec<GlmMoeDsaLayerTensorDescriptors>,
     kv_cache_layout: KvCacheModelLayout,
     rms_norm_eps_bits: u32,
+    rope_theta_bits: u32,
     num_experts_per_tok: usize,
     norm_topk_prob: bool,
     routed_scaling_factor_bits: u32,
@@ -57,6 +58,12 @@ impl GlmMoeDsaRuntime {
                 .map(|value| value.get() as f32)
                 .unwrap_or(1e-6)
                 .to_bits(),
+            rope_theta_bits: artifacts
+                .config()
+                .rope_theta
+                .map(|value| value.get() as f32)
+                .unwrap_or(10000.0)
+                .to_bits(),
             num_experts_per_tok: artifacts.config().num_experts_per_tok.unwrap_or(1),
             norm_topk_prob: artifacts.config().norm_topk_prob.unwrap_or(false),
             routed_scaling_factor_bits: artifacts
@@ -91,6 +98,10 @@ impl GlmMoeDsaRuntime {
 
     pub fn rms_norm_eps(&self) -> f32 {
         f32::from_bits(self.rms_norm_eps_bits)
+    }
+
+    pub fn rope_theta(&self) -> f32 {
+        f32::from_bits(self.rope_theta_bits)
     }
 
     pub fn num_experts_per_tok(&self) -> usize {
@@ -889,6 +900,7 @@ pub struct GlmMoeDsaF32TensorParallelRuntime {
     tensor_parallel_size: usize,
     layer_count: usize,
     rms_norm_eps: f32,
+    rope_theta: f32,
     num_experts_per_tok: usize,
     norm_topk_prob: bool,
     routed_scaling_factor: f32,
@@ -940,15 +952,23 @@ pub struct GlmMoeDsaF32AttentionProjectionOutput {
     q_lora: Vec<f32>,
     q: Vec<f32>,
     kv_lora: Vec<f32>,
+    k_rope: Vec<f32>,
     kv: Vec<f32>,
 }
 
 impl GlmMoeDsaF32AttentionProjectionOutput {
-    fn new(q_lora: Vec<f32>, q: Vec<f32>, kv_lora: Vec<f32>, kv: Vec<f32>) -> Self {
+    fn new(
+        q_lora: Vec<f32>,
+        q: Vec<f32>,
+        kv_lora: Vec<f32>,
+        k_rope: Vec<f32>,
+        kv: Vec<f32>,
+    ) -> Self {
         Self {
             q_lora,
             q,
             kv_lora,
+            k_rope,
             kv,
         }
     }
@@ -963,6 +983,10 @@ impl GlmMoeDsaF32AttentionProjectionOutput {
 
     pub fn kv_lora(&self) -> &[f32] {
         &self.kv_lora
+    }
+
+    pub fn k_rope(&self) -> &[f32] {
+        &self.k_rope
     }
 
     pub fn kv(&self) -> &[f32] {
@@ -984,6 +1008,7 @@ impl GlmMoeDsaF32TensorParallelRuntime {
             tensor_parallel_size: runtime.tensor_parallel_size(),
             layer_count: runtime.layer_count(),
             rms_norm_eps: runtime.runtime.rms_norm_eps(),
+            rope_theta: runtime.runtime.rope_theta(),
             num_experts_per_tok: runtime.runtime.num_experts_per_tok(),
             norm_topk_prob: runtime.runtime.norm_topk_prob(),
             routed_scaling_factor: runtime.runtime.routed_scaling_factor(),
@@ -1012,6 +1037,10 @@ impl GlmMoeDsaF32TensorParallelRuntime {
 
     pub fn rms_norm_eps(&self) -> f32 {
         self.rms_norm_eps
+    }
+
+    pub fn rope_theta(&self) -> f32 {
+        self.rope_theta
     }
 
     pub fn num_experts_per_tok(&self) -> usize {
@@ -1061,7 +1090,10 @@ impl GlmMoeDsaF32TensorParallelRuntime {
             .zip(batch.input_token_counts())
             .map(|(offset, token_count)| {
                 let input_end = *offset + *token_count;
-                self.transformer_lm_head_logits_for_request(&batch.input_ids()[*offset..input_end])
+                self.transformer_lm_head_logits_for_request(
+                    &batch.input_ids()[*offset..input_end],
+                    &batch.positions()[*offset..input_end],
+                )
             })
             .collect()
     }
@@ -1081,18 +1113,30 @@ impl GlmMoeDsaF32TensorParallelRuntime {
             &q_lora,
         )?;
 
-        let kv_lora = self.replicated_projection_with_norm(
-            &format!("model.layers.{layer_id}.self_attn.kv_a_proj_with_mqa.weight"),
-            &format!("model.layers.{layer_id}.self_attn.kv_a_layernorm.weight"),
-            hidden,
-        )?;
+        let kv_projection_name =
+            format!("model.layers.{layer_id}.self_attn.kv_a_proj_with_mqa.weight");
+        let kv_norm_name = format!("model.layers.{layer_id}.self_attn.kv_a_layernorm.weight");
+        let kv_a = self.replicated_projection(&kv_projection_name, hidden)?;
+        let kv_lora_width = self.layer_norm_weight(&kv_norm_name)?.len();
+        let expected_kv_a_width = kv_lora_width + self.attention_shape.qk_rope_head_dim;
+        if kv_a.len() != expected_kv_a_width {
+            return Err(GlmMoeDsaF32KernelError::HiddenSizeMismatch {
+                tensor_name: kv_projection_name,
+                expected: expected_kv_a_width,
+                actual: kv_a.len(),
+            });
+        }
+        let mut kv_lora = kv_a[..kv_lora_width].to_vec();
+        let norm_weight = self.layer_norm_weight(&kv_norm_name)?;
+        apply_rms_norm(&kv_norm_name, &mut kv_lora, norm_weight, self.rms_norm_eps)?;
+        let k_rope = kv_a[kv_lora_width..].to_vec();
         let kv = self.column_parallel_projection(
             &format!("model.layers.{layer_id}.self_attn.kv_b_proj.weight"),
             &kv_lora,
         )?;
 
         Ok(GlmMoeDsaF32AttentionProjectionOutput::new(
-            q_lora, q, kv_lora, kv,
+            q_lora, q, kv_lora, k_rope, kv,
         ))
     }
 
@@ -1101,11 +1145,21 @@ impl GlmMoeDsaF32TensorParallelRuntime {
         layer_id: usize,
         hidden_states: &[Vec<f32>],
     ) -> Result<Vec<Vec<f32>>, GlmMoeDsaF32KernelError> {
+        let positions = (0..hidden_states.len()).collect::<Vec<_>>();
+        self.attention_output_with_positions(layer_id, hidden_states, &positions)
+    }
+
+    fn attention_output_with_positions(
+        &self,
+        layer_id: usize,
+        hidden_states: &[Vec<f32>],
+        positions: &[usize],
+    ) -> Result<Vec<Vec<f32>>, GlmMoeDsaF32KernelError> {
         let projections = hidden_states
             .iter()
             .map(|hidden| self.attention_projection_output(layer_id, hidden))
             .collect::<Result<Vec<_>, _>>()?;
-        let attention_values = self.causal_attention_values(layer_id, &projections)?;
+        let attention_values = self.causal_attention_values(layer_id, &projections, positions)?;
         attention_values
             .iter()
             .map(|values| {
@@ -1121,6 +1175,17 @@ impl GlmMoeDsaF32TensorParallelRuntime {
         &self,
         layer_id: usize,
         hidden_states: &[Vec<f32>],
+        residuals: Option<&[Vec<f32>]>,
+    ) -> Result<Vec<GlmMoeDsaF32LayerOutput>, GlmMoeDsaF32KernelError> {
+        let positions = (0..hidden_states.len()).collect::<Vec<_>>();
+        self.transformer_layer_output_with_positions(layer_id, hidden_states, &positions, residuals)
+    }
+
+    fn transformer_layer_output_with_positions(
+        &self,
+        layer_id: usize,
+        hidden_states: &[Vec<f32>],
+        positions: &[usize],
         residuals: Option<&[Vec<f32>]>,
     ) -> Result<Vec<GlmMoeDsaF32LayerOutput>, GlmMoeDsaF32KernelError> {
         if let Some(residuals) = residuals {
@@ -1143,7 +1208,8 @@ impl GlmMoeDsaF32TensorParallelRuntime {
             attention_residual.push(residual);
         }
 
-        let attention_output = self.attention_output(layer_id, &attention_input)?;
+        let attention_output =
+            self.attention_output_with_positions(layer_id, &attention_input, positions)?;
         attention_output
             .iter()
             .zip(&attention_residual)
@@ -1329,12 +1395,20 @@ impl GlmMoeDsaF32TensorParallelRuntime {
     fn transformer_lm_head_logits_for_request(
         &self,
         input_ids: &[u32],
+        positions: &[usize],
     ) -> Result<Vec<f32>, GlmMoeDsaF32KernelError> {
         if input_ids.is_empty() {
             return Err(GlmMoeDsaF32KernelError::TokenCountMismatch {
                 tensor_name: "model.embed_tokens.weight".to_string(),
                 expected: 1,
                 actual: 0,
+            });
+        }
+        if positions.len() != input_ids.len() {
+            return Err(GlmMoeDsaF32KernelError::TokenCountMismatch {
+                tensor_name: "model.layers.0.self_attn.rotary_emb".to_string(),
+                expected: input_ids.len(),
+                actual: positions.len(),
             });
         }
 
@@ -1346,8 +1420,12 @@ impl GlmMoeDsaF32TensorParallelRuntime {
         let mut residuals = None::<Vec<Vec<f32>>>;
 
         for layer_id in 0..self.layer_count {
-            let layer_output =
-                self.transformer_layer_output(layer_id, &hidden_states, residuals.as_deref())?;
+            let layer_output = self.transformer_layer_output_with_positions(
+                layer_id,
+                &hidden_states,
+                positions,
+                residuals.as_deref(),
+            )?;
             hidden_states = layer_output
                 .iter()
                 .map(|output| output.hidden_states().to_vec())
@@ -1485,6 +1563,22 @@ impl GlmMoeDsaF32TensorParallelRuntime {
         })
     }
 
+    fn replicated_projection(
+        &self,
+        projection_name: &str,
+        hidden: &[f32],
+    ) -> Result<Vec<f32>, GlmMoeDsaF32KernelError> {
+        for rank in &self.ranks {
+            if let Some(projection) = rank.tensor_shard(projection_name) {
+                return projection.output_parallel_matvec(hidden);
+            }
+        }
+
+        Err(GlmMoeDsaF32KernelError::MissingTensor {
+            tensor_name: projection_name.to_string(),
+        })
+    }
+
     fn column_parallel_projection(
         &self,
         tensor_name: &str,
@@ -1583,11 +1677,26 @@ impl GlmMoeDsaF32TensorParallelRuntime {
         &self,
         layer_id: usize,
         projections: &[GlmMoeDsaF32AttentionProjectionOutput],
+        positions: &[usize],
     ) -> Result<Vec<Vec<f32>>, GlmMoeDsaF32KernelError> {
         let shape = self.attention_shape;
         let query_width = shape.query_width();
         let kv_width = shape.kv_width();
         let value_width = shape.value_width();
+        if positions.len() != projections.len() {
+            return Err(GlmMoeDsaF32KernelError::TokenCountMismatch {
+                tensor_name: format!("model.layers.{layer_id}.self_attn.rotary_emb"),
+                expected: projections.len(),
+                actual: positions.len(),
+            });
+        }
+        if shape.qk_rope_head_dim % 2 != 0 {
+            return Err(GlmMoeDsaF32KernelError::HiddenSizeMismatch {
+                tensor_name: format!("model.layers.{layer_id}.self_attn.rotary_emb"),
+                expected: shape.qk_rope_head_dim + 1,
+                actual: shape.qk_rope_head_dim,
+            });
+        }
 
         for projection in projections {
             if projection.q().len() != query_width {
@@ -1604,6 +1713,15 @@ impl GlmMoeDsaF32TensorParallelRuntime {
                     actual: projection.kv().len(),
                 });
             }
+            if projection.k_rope().len() != shape.qk_rope_head_dim {
+                return Err(GlmMoeDsaF32KernelError::HiddenSizeMismatch {
+                    tensor_name: format!(
+                        "model.layers.{layer_id}.self_attn.kv_a_proj_with_mqa.weight"
+                    ),
+                    expected: shape.qk_rope_head_dim,
+                    actual: projection.k_rope().len(),
+                });
+            }
         }
 
         let scale = (shape.qk_head_dim() as f32).sqrt().recip();
@@ -1617,6 +1735,8 @@ impl GlmMoeDsaF32TensorParallelRuntime {
                             &projections[token_index],
                             &projections[key_index],
                             head_index,
+                            positions[token_index],
+                            positions[key_index],
                         ) * scale
                     })
                     .collect::<Vec<_>>();
@@ -1645,16 +1765,30 @@ impl GlmMoeDsaF32TensorParallelRuntime {
         query_projection: &GlmMoeDsaF32AttentionProjectionOutput,
         key_projection: &GlmMoeDsaF32AttentionProjectionOutput,
         head_index: usize,
+        query_position: usize,
+        key_position: usize,
     ) -> f32 {
         let shape = self.attention_shape;
         let query_start = head_index * shape.qk_head_dim();
         let query_nope = &query_projection.q()[query_start..query_start + shape.qk_nope_head_dim];
         let key = key_for_head(key_projection, shape, head_index);
-        query_nope
+        let nope_score = query_nope
             .iter()
             .zip(key)
             .map(|(query, key)| query * key)
-            .sum()
+            .sum::<f32>();
+
+        let query_rope_start = query_start + shape.qk_nope_head_dim;
+        let query_rope =
+            &query_projection.q()[query_rope_start..query_rope_start + shape.qk_rope_head_dim];
+        nope_score
+            + rotary_dot_product(
+                query_rope,
+                key_projection.k_rope(),
+                query_position,
+                key_position,
+                self.rope_theta,
+            )
     }
 
     fn layer_norm_weight(&self, tensor_name: &str) -> Result<&[f32], GlmMoeDsaF32KernelError> {
@@ -2289,6 +2423,40 @@ fn value_for_head(
     let head_start = head_index * head_width;
     let value_start = head_start + shape.qk_nope_head_dim;
     &projection.kv()[value_start..value_start + shape.v_head_dim]
+}
+
+fn rotary_dot_product(
+    query: &[f32],
+    key: &[f32],
+    query_position: usize,
+    key_position: usize,
+    rope_theta: f32,
+) -> f32 {
+    if query.is_empty() {
+        return 0.0;
+    }
+
+    let query = apply_rotary_embedding(query, query_position, rope_theta);
+    let key = apply_rotary_embedding(key, key_position, rope_theta);
+    query.iter().zip(key).map(|(query, key)| query * key).sum()
+}
+
+fn apply_rotary_embedding(values: &[f32], position: usize, rope_theta: f32) -> Vec<f32> {
+    let rotary_dim = values.len();
+    let mut output = vec![0.0; rotary_dim];
+    for pair_index in 0..rotary_dim / 2 {
+        let even_index = pair_index * 2;
+        let odd_index = even_index + 1;
+        let inv_freq = rope_theta.powf(-(even_index as f32) / rotary_dim as f32);
+        let angle = position as f32 * inv_freq;
+        let cos = angle.cos();
+        let sin = angle.sin();
+        let even = values[even_index];
+        let odd = values[odd_index];
+        output[even_index] = even * cos - odd * sin;
+        output[odd_index] = odd * cos + even * sin;
+    }
+    output
 }
 
 fn softmax(logits: &[f32]) -> Vec<f32> {

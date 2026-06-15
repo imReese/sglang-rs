@@ -75,6 +75,10 @@ fn local_model_artifacts_loads_deepseek_v4_config_and_indexed_safetensors() {
         Some(1e-6)
     );
     assert_eq!(
+        artifacts.config().rope_theta.map(|value| value.get()),
+        Some(1_000_000.0)
+    );
+    assert_eq!(
         artifacts.config().hc_eps.map(|value| value.get()),
         Some(1e-6)
     );
@@ -3109,6 +3113,7 @@ fn deepseek_v4_config_json() -> &'static str {
   "hc_mult": 4,
   "hc_sinkhorn_iters": 20,
   "rms_norm_eps": 1e-6,
+  "rope_theta": 1000000.0,
   "hc_eps": 1e-6,
   "tie_word_embeddings": false,
   "num_key_value_heads": 1,
