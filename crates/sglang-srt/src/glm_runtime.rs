@@ -16,7 +16,10 @@ use crate::model_artifacts::{
 use crate::model_executor::{
     ForwardModel, ModelForwardError, ModelForwardOutput, ModelWorkerBatch,
 };
-use crate::transfer::{KvCacheModelLayout, PdConfigError};
+use crate::transfer::{
+    KvCacheModelLayout, KvCachePageSnapshotImporter, KvCachePageSnapshotProvider,
+    KvCacheTransferError, PdConfigError,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GlmMoeDsaRuntime {
@@ -1128,6 +1131,30 @@ impl GlmMoeDsaF32CachedForwardModel {
         }
 
         Ok(())
+    }
+}
+
+impl KvCachePageSnapshotProvider for GlmMoeDsaF32CachedForwardModel {
+    type Snapshot = GlmMoeDsaF32KvPageSnapshot;
+
+    fn export_kv_cache_pages(
+        &self,
+        cache_pages: &[CachePageId],
+    ) -> Result<Vec<Self::Snapshot>, KvCacheTransferError> {
+        GlmMoeDsaF32CachedForwardModel::export_kv_cache_pages(self, cache_pages)
+            .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))
+    }
+}
+
+impl KvCachePageSnapshotImporter for GlmMoeDsaF32CachedForwardModel {
+    type Snapshot = GlmMoeDsaF32KvPageSnapshot;
+
+    fn import_kv_cache_pages(
+        &mut self,
+        snapshots: Vec<Self::Snapshot>,
+    ) -> Result<(), KvCacheTransferError> {
+        GlmMoeDsaF32CachedForwardModel::import_kv_cache_pages(self, snapshots)
+            .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))
     }
 }
 

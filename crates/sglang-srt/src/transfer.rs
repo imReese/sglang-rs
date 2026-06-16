@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use crate::cache::CachePageId;
 use crate::cli::{ServerArgs, ZmqPortRange};
 use crate::model_artifacts::{HfModelConfig, resolve_model_path};
-use crate::model_executor::ModelWorkerBatch;
+use crate::model_executor::{ModelRunner, ModelWorkerBatch};
 use crate::scheduler::{ForwardMode, ScheduleBatch, ScheduledRequest};
 use crate::types::{BootstrapRoom, DisaggregatedParams, RequestId};
 use crate::worker::{
@@ -1049,6 +1049,52 @@ pub trait DecodeBootstrapPublisher {
     ) -> Result<DecodeBootstrapMetadataPublishSummary, String>;
 }
 
+pub trait KvCachePageSnapshotProvider {
+    type Snapshot;
+
+    fn export_kv_cache_pages(
+        &self,
+        cache_pages: &[CachePageId],
+    ) -> Result<Vec<Self::Snapshot>, KvCacheTransferError>;
+}
+
+pub trait KvCachePageSnapshotImporter {
+    type Snapshot;
+
+    fn import_kv_cache_pages(
+        &mut self,
+        snapshots: Vec<Self::Snapshot>,
+    ) -> Result<(), KvCacheTransferError>;
+}
+
+impl<M, S> KvCachePageSnapshotProvider for ModelRunner<M, S>
+where
+    M: KvCachePageSnapshotProvider,
+{
+    type Snapshot = M::Snapshot;
+
+    fn export_kv_cache_pages(
+        &self,
+        cache_pages: &[CachePageId],
+    ) -> Result<Vec<Self::Snapshot>, KvCacheTransferError> {
+        self.model().export_kv_cache_pages(cache_pages)
+    }
+}
+
+impl<M, S> KvCachePageSnapshotImporter for ModelRunner<M, S>
+where
+    M: KvCachePageSnapshotImporter,
+{
+    type Snapshot = M::Snapshot;
+
+    fn import_kv_cache_pages(
+        &mut self,
+        snapshots: Vec<Self::Snapshot>,
+    ) -> Result<(), KvCacheTransferError> {
+        self.model_mut().import_kv_cache_pages(snapshots)
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct NoopDecodeBootstrapPublisher;
 
@@ -1231,6 +1277,26 @@ impl<W, E, P> KvTransferModelWorker<W, E, P> {
 
     pub fn last_transfer_summary(&self) -> Option<&KvCacheTransferSummary> {
         self.last_transfer_summary.as_ref()
+    }
+
+    pub fn export_kv_cache_pages(
+        &self,
+        cache_pages: &[CachePageId],
+    ) -> Result<Vec<W::Snapshot>, KvCacheTransferError>
+    where
+        W: KvCachePageSnapshotProvider,
+    {
+        self.worker.export_kv_cache_pages(cache_pages)
+    }
+
+    pub fn import_kv_cache_pages(
+        &mut self,
+        snapshots: Vec<W::Snapshot>,
+    ) -> Result<(), KvCacheTransferError>
+    where
+        W: KvCachePageSnapshotImporter,
+    {
+        self.worker.import_kv_cache_pages(snapshots)
     }
 }
 
