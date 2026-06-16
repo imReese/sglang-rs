@@ -1036,6 +1036,32 @@ impl GlmMoeDsaF32KvPageStore {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct GlmMoeDsaF32KvPageSnapshot {
+    layer_id: usize,
+    cache_page: CachePageId,
+    position: usize,
+    projection: GlmMoeDsaF32AttentionProjectionOutput,
+}
+
+impl GlmMoeDsaF32KvPageSnapshot {
+    pub fn layer_id(&self) -> usize {
+        self.layer_id
+    }
+
+    pub fn cache_page(&self) -> CachePageId {
+        self.cache_page
+    }
+
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    pub fn projection(&self) -> &GlmMoeDsaF32AttentionProjectionOutput {
+        &self.projection
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct GlmMoeDsaF32CachedForwardModel {
     runtime: GlmMoeDsaF32TensorParallelRuntime,
     kv_cache: GlmMoeDsaF32KvPageStore,
@@ -1055,6 +1081,53 @@ impl GlmMoeDsaF32CachedForwardModel {
 
     pub fn kv_cache_contains(&self, layer_id: usize, cache_page: CachePageId) -> bool {
         self.kv_cache.contains(layer_id, cache_page)
+    }
+
+    pub fn export_kv_cache_pages(
+        &self,
+        cache_pages: &[CachePageId],
+    ) -> Result<Vec<GlmMoeDsaF32KvPageSnapshot>, GlmMoeDsaF32KernelError> {
+        let mut snapshots = Vec::with_capacity(self.runtime.layer_count() * cache_pages.len());
+        for layer_id in 0..self.runtime.layer_count() {
+            for cache_page in cache_pages {
+                let Some(entry) = self.kv_cache.get(layer_id, *cache_page) else {
+                    return Err(GlmMoeDsaF32KernelError::MissingKvCachePage {
+                        layer_id,
+                        cache_page: cache_page.as_usize(),
+                    });
+                };
+                snapshots.push(GlmMoeDsaF32KvPageSnapshot {
+                    layer_id,
+                    cache_page: *cache_page,
+                    position: entry.position,
+                    projection: entry.projection.clone(),
+                });
+            }
+        }
+
+        Ok(snapshots)
+    }
+
+    pub fn import_kv_cache_pages(
+        &mut self,
+        snapshots: impl IntoIterator<Item = GlmMoeDsaF32KvPageSnapshot>,
+    ) -> Result<(), GlmMoeDsaF32KernelError> {
+        for snapshot in snapshots {
+            if snapshot.layer_id >= self.runtime.layer_count() {
+                return Err(GlmMoeDsaF32KernelError::LayerOutOfBounds {
+                    layer_id: snapshot.layer_id,
+                    layer_count: self.runtime.layer_count(),
+                });
+            }
+            self.kv_cache.insert(
+                snapshot.layer_id,
+                snapshot.cache_page,
+                snapshot.position,
+                snapshot.projection,
+            );
+        }
+
+        Ok(())
     }
 }
 

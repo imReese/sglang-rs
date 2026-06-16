@@ -616,6 +616,62 @@ fn glm_moe_dsa_cached_forward_model_populates_and_reuses_kv_pages_for_decode() {
 }
 
 #[test]
+fn glm_moe_dsa_cached_forward_model_imports_transferred_prefix_pages_for_decode() {
+    let model_dir = temp_model_dir("glm-runtime-f32-cached-forward-transfer-import");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_glm_moe_dsa_attention_output_fixture(&model_dir);
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("GLM artifacts should load");
+    let runtime =
+        GlmMoeDsaRuntime::from_local_model_artifacts(&artifacts).expect("runtime should build");
+    let f32_runtime = runtime
+        .load_tensor_parallel_shards(2)
+        .expect("all TP rank shards should load")
+        .decode_f32_tensor_parallel_shards()
+        .expect("F32 cache should decode");
+    let mut decode_model = GlmMoeDsaF32CachedForwardModel::new(f32_runtime.clone());
+    let mut prefill_scheduler = Scheduler::with_cache_resources(
+        ModelRunner::new(GlmMoeDsaF32CachedForwardModel::new(f32_runtime)),
+        RadixCache::default(),
+        CachePageAllocator::new(3),
+    );
+    prefill_scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("glm-transferred-prefix-decode"),
+        vec![0],
+        SamplingParams::new(2),
+    ));
+    prefill_scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should populate its local page");
+
+    let transferred_pages = prefill_scheduler
+        .worker()
+        .model()
+        .export_kv_cache_pages(&[CachePageId::from(0)])
+        .expect("prefill should export the page selected by the transfer plan");
+    decode_model
+        .import_kv_cache_pages(transferred_pages)
+        .expect("decode worker should import transferred KV pages");
+
+    let decode_batch = prefill_scheduler
+        .next_decode_batch(1)
+        .expect("decode batch should be available");
+    let worker_batch = ModelWorkerBatch::from_schedule_batch(&decode_batch);
+    let decode_output = decode_model
+        .forward(&worker_batch)
+        .expect("decode should read the imported prefix page");
+
+    assert!(decode_model.kv_cache_contains(0, CachePageId::from(0)));
+    assert!(decode_model.kv_cache_contains(0, CachePageId::from(1)));
+    assert_close(
+        &decode_output.logits()[0],
+        &expected_dense_transformer_final_logits([4.0, 6.0]),
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
 fn glm_moe_dsa_f32_runtime_computes_tensor_parallel_dense_mlp_output() {
     let model_dir = temp_model_dir("glm-runtime-f32-dense-mlp");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");
