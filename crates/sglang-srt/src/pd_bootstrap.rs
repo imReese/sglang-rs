@@ -4,7 +4,7 @@ use std::future::Future;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -47,13 +47,20 @@ impl PrefillBootstrapService {
 pub struct MooncakeBootstrapKvCacheTransferExecutor<E> {
     bootstrap_service: PrefillBootstrapService,
     inner: E,
+    metadata_wait_timeout: Duration,
+    metadata_poll_interval: Duration,
 }
 
 impl<E> MooncakeBootstrapKvCacheTransferExecutor<E> {
+    const DEFAULT_METADATA_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+    const DEFAULT_METADATA_POLL_INTERVAL: Duration = Duration::from_millis(2);
+
     pub fn new(bootstrap_service: PrefillBootstrapService, inner: E) -> Self {
         Self {
             bootstrap_service,
             inner,
+            metadata_wait_timeout: Self::DEFAULT_METADATA_WAIT_TIMEOUT,
+            metadata_poll_interval: Self::DEFAULT_METADATA_POLL_INTERVAL,
         }
     }
 
@@ -68,6 +75,36 @@ impl<E> MooncakeBootstrapKvCacheTransferExecutor<E> {
     pub fn inner_mut(&mut self) -> &mut E {
         &mut self.inner
     }
+
+    pub fn with_metadata_wait_timeout(mut self, timeout: Duration) -> Self {
+        self.metadata_wait_timeout = timeout;
+        self
+    }
+
+    fn remote_kv_layouts_for_room(
+        &self,
+        room: BootstrapRoom,
+    ) -> Result<Vec<(String, MooncakeRemoteKvLayout)>, KvCacheTransferError> {
+        let deadline = Instant::now() + self.metadata_wait_timeout;
+        loop {
+            let result = {
+                let state = self
+                    .bootstrap_service
+                    .state()
+                    .lock()
+                    .expect("prefill bootstrap state lock should be held");
+                state.remote_kv_layouts_for_room(room)
+            };
+
+            match result {
+                Ok(layouts) => return Ok(layouts),
+                Err(error) if Instant::now() >= deadline => {
+                    return Err(KvCacheTransferError::Runtime(error.to_string()));
+                }
+                Err(_) => std::thread::sleep(self.metadata_poll_interval),
+            }
+        }
+    }
 }
 
 impl<S, R> KvCacheTransferExecutor
@@ -80,16 +117,7 @@ where
         &mut self,
         span: &crate::transfer::KvCacheTransferSpan,
     ) -> Result<(), KvCacheTransferError> {
-        let remote_layouts = {
-            let state = self
-                .bootstrap_service
-                .state()
-                .lock()
-                .expect("prefill bootstrap state lock should be held");
-            state
-                .remote_kv_layouts_for_room(span.bootstrap_room())
-                .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?
-        };
+        let remote_layouts = self.remote_kv_layouts_for_room(span.bootstrap_room())?;
         for (session_id, layout) in remote_layouts {
             self.inner
                 .insert_remote_kv_session_layout(span.bootstrap_room(), session_id, layout);

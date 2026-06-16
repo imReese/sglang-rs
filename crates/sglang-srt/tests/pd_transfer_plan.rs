@@ -22,6 +22,7 @@ use sglang_srt::types::{
     BootstrapRoom, DisaggregatedParams, RequestId, SamplingParams, TokenGenerateRequest,
 };
 use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker, WorkerExecutionError};
+use std::time::Duration;
 
 #[derive(Default)]
 struct FinishedWorker;
@@ -401,6 +402,58 @@ fn transfer_model_worker_publishes_decode_bootstrap_metadata_from_allocated_page
         }
     );
     assert_eq!(worker.transfer_executor().seen_rooms, vec![84]);
+}
+
+#[test]
+fn transfer_model_worker_decode_side_bootstrap_only_publishes_without_transfer_submit() {
+    let worker = KvTransferModelWorker::new(
+        UnfinishedWorker,
+        DecodeBootstrapRegistry::default(),
+        RecordingTransferExecutor::default(),
+    )
+    .with_decode_bootstrap_publisher(RecordingDecodeBootstrapPublisher::default())
+    .with_decode_side_bootstrap_only();
+    let mut scheduler =
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(4));
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("pd-decode-bootstrap-only"),
+            vec![1, 2, 3],
+            SamplingParams::new(2),
+        )
+        .with_disaggregated_params(Some(DisaggregatedParams {
+            bootstrap_host: "10.0.0.8".to_string(),
+            bootstrap_port: 8200,
+            bootstrap_room: 85,
+        }))
+        .with_data_parallel_rank(3),
+    );
+
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("decode-side prefill dispatch should publish bootstrap metadata");
+
+    let worker = scheduler.worker();
+    assert_eq!(worker.decode_bootstrap_publisher().published.len(), 1);
+    assert!(
+        worker.transfer_executor().seen_rooms.is_empty(),
+        "decode side must not submit Mooncake transfers"
+    );
+    assert_eq!(
+        worker
+            .registry()
+            .get(85)
+            .expect("decode-side session should be registered")
+            .status(),
+        KvPoll::Success
+    );
+    assert_eq!(
+        worker
+            .last_transfer_summary()
+            .expect("bootstrap-only summary should be recorded")
+            .submitted_spans(),
+        0
+    );
 }
 
 #[test]
@@ -1246,6 +1299,59 @@ fn mooncake_bootstrap_executor_refreshes_remote_layouts_before_submit() {
     assert_eq!(submitted_requests[0][0].target_offset, 0x9000 + 4 * 128);
     assert_eq!(submitted_requests[0][1].target_id, 7);
     assert_eq!(submitted_requests[0][1].target_offset, 0x9000 + 5 * 128);
+}
+
+#[test]
+fn mooncake_bootstrap_executor_waits_for_delayed_remote_layouts_before_submit() {
+    let transfer_plan =
+        transfer_plan_for_request("pd-mooncake-bootstrap-wait", &[62, 63], None, 35);
+    let mut registry = registry_with_session("pd-mooncake-bootstrap-wait", 35);
+    let bootstrap_service = PrefillBootstrapService::default();
+    let delayed_service = bootstrap_service.clone();
+    let delayed_insert = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(25));
+        let mut state = delayed_service
+            .state()
+            .lock()
+            .expect("bootstrap state lock should be held");
+        state
+            .ingest_mooncake_bootstrap_frame(&kv_args_frame("session-delayed", &[0xb000], 128))
+            .expect("KVArgs frame should parse");
+        state
+            .ingest_mooncake_bootstrap_frame(&transfer_metadata_frame(
+                35,
+                "session-delayed",
+                &[6, 7],
+            ))
+            .expect("transfer metadata frame should parse");
+    });
+    let inner = MooncakeKvCacheTransferExecutor::with_target_resolver(
+        RecordingMooncakeSubmitter::default(),
+        MooncakeKvCacheLayout {
+            source_base_addr: 0x2200,
+            page_size_bytes: 128,
+            target_base_offset: 0xdead_0000,
+        },
+        SessionTargetResolver {
+            targets: vec![("session-delayed".to_string(), 8)],
+        },
+    );
+    let mut executor = MooncakeBootstrapKvCacheTransferExecutor::new(bootstrap_service, inner)
+        .with_metadata_wait_timeout(Duration::from_secs(1));
+
+    execute_kv_cache_transfer_plan(&mut registry, &mut executor, &transfer_plan)
+        .expect("bootstrap-backed Mooncake executor should wait for delayed metadata");
+    delayed_insert
+        .join()
+        .expect("delayed bootstrap metadata insert should join");
+
+    let submitted_requests = &executor.inner().submitter().submitted_requests;
+    assert_eq!(submitted_requests.len(), 1);
+    assert_eq!(submitted_requests[0].len(), 2);
+    assert_eq!(submitted_requests[0][0].target_id, 8);
+    assert_eq!(submitted_requests[0][0].target_offset, 0xb000 + 6 * 128);
+    assert_eq!(submitted_requests[0][1].target_id, 8);
+    assert_eq!(submitted_requests[0][1].target_offset, 0xb000 + 7 * 128);
 }
 
 #[test]

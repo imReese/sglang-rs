@@ -1080,13 +1080,11 @@ struct GlmMoeDsaF32TransferPageStore {
 
 impl GlmMoeDsaF32CachedForwardModel {
     pub fn new(runtime: GlmMoeDsaF32TensorParallelRuntime) -> Self {
+        let transfer_pages = GlmMoeDsaF32TransferPageStore::initial_for_runtime(&runtime);
         Self {
             runtime,
             kv_cache: GlmMoeDsaF32KvPageStore::default(),
-            transfer_pages: GlmMoeDsaF32TransferPageStore {
-                page_size_bytes: 1,
-                pages: Vec::new(),
-            },
+            transfer_pages,
         }
     }
 
@@ -1142,6 +1140,30 @@ impl GlmMoeDsaF32CachedForwardModel {
             );
         }
 
+        Ok(())
+    }
+
+    #[cfg(feature = "mooncake-link")]
+    pub(crate) fn reserve_transfer_pages(
+        &mut self,
+        page_count: usize,
+    ) -> Result<(), KvCacheTransferError> {
+        let page_size_bytes = self
+            .runtime
+            .zero_transfer_page_size_bytes()
+            .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
+        let byte_len = page_count
+            .max(1)
+            .checked_mul(page_size_bytes)
+            .ok_or_else(|| {
+                KvCacheTransferError::Runtime(
+                    "GLM transfer KV page backing store length overflowed".to_string(),
+                )
+            })?;
+        self.transfer_pages.page_size_bytes = page_size_bytes;
+        if self.transfer_pages.pages.len() < byte_len {
+            self.transfer_pages.pages.resize(byte_len, 0);
+        }
         Ok(())
     }
 
@@ -1229,6 +1251,18 @@ impl GlmMoeDsaF32CachedForwardModel {
             append_f32_slice_bytes(&mut page, entry.projection.kv());
         }
         Ok(page)
+    }
+}
+
+impl GlmMoeDsaF32TransferPageStore {
+    fn initial_for_runtime(runtime: &GlmMoeDsaF32TensorParallelRuntime) -> Self {
+        let page_size_bytes = runtime
+            .zero_transfer_page_size_bytes()
+            .expect("GLM runtime should expose transfer page dimensions");
+        Self {
+            page_size_bytes,
+            pages: vec![0; page_size_bytes],
+        }
     }
 }
 
@@ -1353,6 +1387,37 @@ impl GlmMoeDsaF32TensorParallelRuntime {
 
     pub fn attention_shape(&self) -> GlmMoeDsaAttentionShape {
         self.attention_shape
+    }
+
+    fn zero_transfer_page_size_bytes(&self) -> Result<usize, GlmMoeDsaF32KernelError> {
+        let mut f32_values = 0_usize;
+        for layer_id in 0..self.layer_count {
+            let q_lora_width = self
+                .layer_norm_weight(&format!(
+                    "model.layers.{layer_id}.self_attn.q_a_layernorm.weight"
+                ))?
+                .len();
+            let kv_lora_width = self
+                .layer_norm_weight(&format!(
+                    "model.layers.{layer_id}.self_attn.kv_a_layernorm.weight"
+                ))?
+                .len();
+            f32_values = f32_values
+                .checked_add(q_lora_width)
+                .and_then(|value| value.checked_add(self.attention_shape.query_width()))
+                .and_then(|value| value.checked_add(kv_lora_width))
+                .and_then(|value| value.checked_add(self.attention_shape.qk_rope_head_dim))
+                .and_then(|value| value.checked_add(self.attention_shape.kv_width()))
+                .ok_or_else(|| GlmMoeDsaF32KernelError::Runtime {
+                    message: "GLM transfer page size overflowed".to_string(),
+                })?;
+        }
+        f32_values
+            .checked_mul(std::mem::size_of::<f32>())
+            .filter(|bytes| *bytes > 0)
+            .ok_or_else(|| GlmMoeDsaF32KernelError::Runtime {
+                message: "GLM transfer page size must be non-zero".to_string(),
+            })
     }
 
     pub fn ranks(&self) -> &[GlmMoeDsaF32TensorRank] {
@@ -2821,6 +2886,9 @@ pub enum GlmMoeDsaF32KernelError {
         layer_id: usize,
         layer_count: usize,
     },
+    Runtime {
+        message: String,
+    },
 }
 
 impl fmt::Display for GlmMoeDsaF32KernelError {
@@ -2910,6 +2978,7 @@ impl fmt::Display for GlmMoeDsaF32KernelError {
                 formatter,
                 "GLM layer id {layer_id} is outside loaded layer count {layer_count}"
             ),
+            Self::Runtime { message } => write!(formatter, "{message}"),
         }
     }
 }

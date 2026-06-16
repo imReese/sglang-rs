@@ -738,6 +738,34 @@ fn glm_moe_dsa_transfer_worker_forwards_kv_page_snapshots_to_inner_model_runner(
 }
 
 #[test]
+fn glm_cached_forward_model_exposes_nonzero_mooncake_kv_memory_before_prefill() {
+    let model_dir = temp_model_dir("glm-runtime-initial-mooncake-kv-memory");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_glm_moe_dsa_attention_output_fixture(&model_dir);
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("GLM artifacts should load");
+    let runtime =
+        GlmMoeDsaRuntime::from_local_model_artifacts(&artifacts).expect("runtime should build");
+    let f32_runtime = runtime
+        .load_tensor_parallel_shards(2)
+        .expect("all TP rank shards should load")
+        .decode_f32_tensor_parallel_shards()
+        .expect("F32 cache should decode");
+    let model = GlmMoeDsaF32CachedForwardModel::new(f32_runtime);
+
+    let memory = model
+        .mooncake_kv_cache_memory()
+        .expect("GLM model should expose initial KV memory");
+
+    assert!(!memory.regions().is_empty());
+    assert!(memory.regions()[0].base_addr > 0);
+    assert_eq!(memory.regions()[0].byte_len, memory.page_size_bytes());
+    assert!(memory.page_size_bytes() > 0);
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
 fn glm_cached_forward_model_exposes_nonzero_mooncake_kv_memory_after_prefill() {
     let model_dir = temp_model_dir("glm-runtime-mooncake-kv-memory");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");

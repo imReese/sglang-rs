@@ -1349,6 +1349,7 @@ pub struct KvTransferModelWorker<W, E, P = NoopDecodeBootstrapPublisher> {
     registry: DecodeBootstrapRegistry,
     transfer_executor: E,
     decode_bootstrap_publisher: P,
+    submit_prefill_transfers: bool,
     last_transfer_summary: Option<KvCacheTransferSummary>,
 }
 
@@ -1359,6 +1360,7 @@ impl<W, E> KvTransferModelWorker<W, E> {
             registry,
             transfer_executor,
             decode_bootstrap_publisher: NoopDecodeBootstrapPublisher,
+            submit_prefill_transfers: true,
             last_transfer_summary: None,
         }
     }
@@ -1406,8 +1408,14 @@ impl<W, E, P> KvTransferModelWorker<W, E, P> {
             registry: self.registry,
             transfer_executor: self.transfer_executor,
             decode_bootstrap_publisher,
+            submit_prefill_transfers: self.submit_prefill_transfers,
             last_transfer_summary: self.last_transfer_summary,
         }
+    }
+
+    pub fn with_decode_side_bootstrap_only(mut self) -> Self {
+        self.submit_prefill_transfers = false;
+        self
     }
 
     pub fn last_transfer_summary(&self) -> Option<&KvCacheTransferSummary> {
@@ -1472,6 +1480,17 @@ where
                         "KV transfer bootstrap registration failed: {error}"
                     ))
                 })?;
+            if !self.submit_prefill_transfers {
+                let transfer_summary = self
+                    .mark_prefill_bootstrap_sessions_ready_without_submit(&transfer_plan)
+                    .map_err(|error| {
+                        WorkerExecutionError::Runtime(format!(
+                            "KV transfer bootstrap registration failed: {error}"
+                        ))
+                    })?;
+                self.last_transfer_summary = Some(transfer_summary);
+                return Ok(output);
+            }
             let transfer_summary = execute_kv_cache_transfer_plan(
                 &mut self.registry,
                 &mut self.transfer_executor,
@@ -1547,6 +1566,21 @@ impl<W, E, P> KvTransferModelWorker<W, E, P> {
         }
 
         Ok(())
+    }
+
+    fn mark_prefill_bootstrap_sessions_ready_without_submit(
+        &mut self,
+        transfer_plan: &KvCacheTransferPlan,
+    ) -> Result<KvCacheTransferSummary, DecodeBootstrapRegistryError> {
+        let mut summary = KvCacheTransferSummary::default();
+        for span in transfer_plan.spans() {
+            self.registry
+                .update_status(span.bootstrap_room(), KvPoll::Success)?;
+            if span.is_noop() {
+                summary.noop_spans += 1;
+            }
+        }
+        Ok(summary)
     }
 }
 
@@ -2609,13 +2643,14 @@ impl LinkedMooncakeTransferEngine {
         let local_server = CString::new(config.session_id.as_str())?;
         let host = CString::new(config.hostname.as_str())?;
 
+        let auto_discover = if config.protocol == "tcp" { 0 } else { 1 };
         let handle = unsafe {
             createTransferEngine(
                 metadata.as_ptr(),
                 local_server.as_ptr(),
                 host.as_ptr(),
                 u64::from(config.rpc_port),
-                1,
+                auto_discover,
             )
         };
         if handle.is_null() {

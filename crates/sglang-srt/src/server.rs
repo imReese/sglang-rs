@@ -1,3 +1,5 @@
+#[cfg(feature = "mooncake-link")]
+use std::ffi::c_void;
 use std::fmt;
 use std::future::Future;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -48,7 +50,8 @@ use crate::transfer::{
 };
 #[cfg(feature = "mooncake-link")]
 use crate::transfer::{
-    MooncakeSessionTargetResolver, MooncakeTransferEngineConfig, SharedLinkedMooncakeTransferEngine,
+    MooncakeBufferEntry, MooncakeSessionTargetResolver, MooncakeTransferEngineConfig,
+    SharedLinkedMooncakeTransferEngine,
 };
 use crate::worker::WorkerExecutor;
 
@@ -100,6 +103,37 @@ impl BootstrapForwardModel {
                 },
             },
         )
+    }
+
+    #[cfg(feature = "mooncake-link")]
+    fn reserve_mooncake_kv_cache_pages(
+        &mut self,
+        page_count: usize,
+    ) -> Result<(), ServerLaunchError> {
+        match self {
+            Self::GlmMoeDsa(model) => model
+                .reserve_transfer_pages(page_count)
+                .map_err(|error| ServerLaunchError::KvCacheTransfer(error.to_string())),
+            Self::UnsupportedLocalModelRuntime {
+                model_path,
+                model_type,
+            } => Err(ServerLaunchError::UnsupportedMooncakeKvMemory {
+                model_path: model_path.display().to_string(),
+                model_type: model_type.clone(),
+            }),
+            Self::Space => Err(ServerLaunchError::UnsupportedMooncakeKvMemory {
+                model_path: "<bootstrap>".to_string(),
+                model_type: Some("space".to_string()),
+            }),
+            Self::CpuEmbeddingLm(_) => Err(ServerLaunchError::UnsupportedMooncakeKvMemory {
+                model_path: "<bootstrap>".to_string(),
+                model_type: Some("cpu_embedding_lm".to_string()),
+            }),
+            Self::DeepSeekV4(_) => Err(ServerLaunchError::UnsupportedMooncakeKvMemory {
+                model_path: "<bootstrap>".to_string(),
+                model_type: Some("deepseek_v4".to_string()),
+            }),
+        }
     }
 }
 
@@ -655,6 +689,7 @@ where
         registry,
         transfer_executor,
         crate::transfer::NoopDecodeBootstrapPublisher,
+        false,
     )
 }
 
@@ -663,18 +698,42 @@ pub fn try_build_bootstrap_pd_http_router_service_with_decode_publisher<E, P>(
     registry: DecodeBootstrapRegistry,
     transfer_executor: E,
     decode_bootstrap_publisher: P,
+    decode_side_bootstrap_only: bool,
 ) -> Result<BootstrapPdHttpRouterService<E, P>, ServerLaunchError>
 where
     E: KvCacheTransferExecutor,
     P: DecodeBootstrapPublisher,
 {
     validate_local_model_artifacts_if_present(args)?;
-    let worker = KvTransferModelWorker::new(
-        ModelRunner::new(BootstrapForwardModel::from_server_args(args)?),
+    let model = BootstrapForwardModel::from_server_args(args)?;
+    try_build_bootstrap_pd_http_router_service_from_model_with_decode_publisher(
+        args,
+        model,
         registry,
         transfer_executor,
+        decode_bootstrap_publisher,
+        decode_side_bootstrap_only,
     )
-    .with_decode_bootstrap_publisher(decode_bootstrap_publisher);
+}
+
+fn try_build_bootstrap_pd_http_router_service_from_model_with_decode_publisher<E, P>(
+    args: &ServerArgs,
+    model: BootstrapForwardModel,
+    registry: DecodeBootstrapRegistry,
+    transfer_executor: E,
+    decode_bootstrap_publisher: P,
+    decode_side_bootstrap_only: bool,
+) -> Result<BootstrapPdHttpRouterService<E, P>, ServerLaunchError>
+where
+    E: KvCacheTransferExecutor,
+    P: DecodeBootstrapPublisher,
+{
+    let mut worker =
+        KvTransferModelWorker::new(ModelRunner::new(model), registry, transfer_executor)
+            .with_decode_bootstrap_publisher(decode_bootstrap_publisher);
+    if decode_side_bootstrap_only {
+        worker = worker.with_decode_side_bootstrap_only();
+    }
     let scheduler = Scheduler::with_cache_resources(
         worker,
         RadixCache::default(),
@@ -771,12 +830,14 @@ where
     )
 }
 
+#[cfg(not(feature = "mooncake-link"))]
 fn launch_mooncake_prefill_kv_layout(
     model: &BootstrapForwardModel,
 ) -> Result<MooncakeKvCacheLayout, ServerLaunchError> {
     Ok(mooncake_kv_memory_from_bootstrap_model(model)?.prefill_layout(0))
 }
 
+#[cfg(not(feature = "mooncake-link"))]
 fn launch_mooncake_decode_kv_layout(
     model: &BootstrapForwardModel,
 ) -> Result<MooncakeKvCacheLayout, ServerLaunchError> {
@@ -814,6 +875,26 @@ fn mooncake_kv_memory_from_bootstrap_model(
             })
         }
     }
+}
+
+#[cfg(feature = "mooncake-link")]
+fn prepare_linked_mooncake_kv_memory(
+    model: &mut BootstrapForwardModel,
+    engine: &SharedLinkedMooncakeTransferEngine,
+    page_count: usize,
+) -> Result<TransferableKvCacheMemory, ServerLaunchError> {
+    model.reserve_mooncake_kv_cache_pages(page_count)?;
+    let memory = mooncake_kv_memory_from_bootstrap_model(model)?;
+    let mut buffers = memory
+        .regions()
+        .iter()
+        .map(|region| MooncakeBufferEntry {
+            addr: region.base_addr as *mut c_void,
+            length: region.byte_len,
+        })
+        .collect::<Vec<_>>();
+    engine.register_memory_batch(&mut buffers, "cpu:0")?;
+    Ok(memory)
 }
 
 #[cfg(not(feature = "mooncake-link"))]
@@ -869,6 +950,7 @@ fn try_build_launch_mooncake_decode_http_router_service(
             kv_cache_layout,
             format!("{}:{}", prefill_mooncake_route_rank_ip(args), args.port),
         ),
+        true,
     )
 }
 
@@ -940,6 +1022,7 @@ fn try_build_launch_mooncake_decode_grpc_router_service(
             kv_cache_layout,
             format!("{}:{}", prefill_mooncake_route_rank_ip(args), args.port),
         ),
+        true,
     )
 }
 
@@ -959,23 +1042,28 @@ fn try_build_launch_mooncake_prefill_http_router_service(
     >,
     ServerLaunchError,
 > {
-    let model = BootstrapForwardModel::from_server_args(args)?;
+    let mut model = BootstrapForwardModel::from_server_args(args)?;
     let engine_config = MooncakeTransferEngineConfig::from_pd_config_for_rank(
         prefill_mooncake_route_rank_ip(args),
         0,
         pd_config,
     );
     let engine = SharedLinkedMooncakeTransferEngine::new(&engine_config)?;
+    let kv_memory =
+        prepare_linked_mooncake_kv_memory(&mut model, &engine, args.num_reserved_decode_tokens)?;
     let target_resolver = MooncakeSessionTargetResolver::new(engine.clone(), Vec::new());
     let transfer_executor = MooncakeKvCacheTransferExecutor::with_target_resolver(
         engine,
-        launch_mooncake_prefill_kv_layout(&model)?,
+        kv_memory.prefill_layout(0),
         target_resolver,
     );
-    try_build_bootstrap_mooncake_prefill_http_router_service(
+    try_build_bootstrap_pd_http_router_service_from_model_with_decode_publisher(
         args,
-        bootstrap_service,
-        transfer_executor,
+        model,
+        DecodeBootstrapRegistry::default(),
+        MooncakeBootstrapKvCacheTransferExecutor::new(bootstrap_service, transfer_executor),
+        crate::transfer::NoopDecodeBootstrapPublisher,
+        false,
     )
 }
 
@@ -993,7 +1081,7 @@ fn try_build_launch_mooncake_decode_http_router_service(
     >,
     ServerLaunchError,
 > {
-    let model = BootstrapForwardModel::from_server_args(args)?;
+    let mut model = BootstrapForwardModel::from_server_args(args)?;
     let engine_config = MooncakeTransferEngineConfig::from_pd_config_for_rank(
         prefill_mooncake_route_rank_ip(args),
         0,
@@ -1001,18 +1089,22 @@ fn try_build_launch_mooncake_decode_http_router_service(
     );
     let engine = SharedLinkedMooncakeTransferEngine::new(&engine_config)?;
     let mooncake_session_id = engine.local_endpoint()?;
+    let kv_memory =
+        prepare_linked_mooncake_kv_memory(&mut model, &engine, args.num_reserved_decode_tokens)?;
     let target_resolver = MooncakeSessionTargetResolver::new(engine.clone(), Vec::new());
-    let kv_cache_layout = launch_mooncake_decode_kv_layout(&model)?;
+    let kv_cache_layout = kv_memory.prefill_layout(0);
     let transfer_executor = MooncakeKvCacheTransferExecutor::with_target_resolver(
         engine,
         kv_cache_layout,
         target_resolver,
     );
-    try_build_bootstrap_pd_http_router_service_with_decode_publisher(
+    try_build_bootstrap_pd_http_router_service_from_model_with_decode_publisher(
         args,
+        model,
         DecodeBootstrapRegistry::default(),
         transfer_executor,
         launch_mooncake_decode_bootstrap_publisher(args, kv_cache_layout, mooncake_session_id),
+        true,
     )
 }
 
@@ -1032,23 +1124,28 @@ fn try_build_launch_mooncake_prefill_grpc_router_service(
     >,
     ServerLaunchError,
 > {
-    let model = BootstrapForwardModel::from_server_args(args)?;
+    let mut model = BootstrapForwardModel::from_server_args(args)?;
     let engine_config = MooncakeTransferEngineConfig::from_pd_config_for_rank(
         prefill_mooncake_route_rank_ip(args),
         0,
         pd_config,
     );
     let engine = SharedLinkedMooncakeTransferEngine::new(&engine_config)?;
+    let kv_memory =
+        prepare_linked_mooncake_kv_memory(&mut model, &engine, args.num_reserved_decode_tokens)?;
     let target_resolver = MooncakeSessionTargetResolver::new(engine.clone(), Vec::new());
     let transfer_executor = MooncakeKvCacheTransferExecutor::with_target_resolver(
         engine,
-        launch_mooncake_prefill_kv_layout(&model)?,
+        kv_memory.prefill_layout(0),
         target_resolver,
     );
-    try_build_bootstrap_mooncake_prefill_grpc_router_service(
+    try_build_bootstrap_pd_grpc_router_service_from_model_with_decode_publisher(
         args,
-        bootstrap_service,
-        transfer_executor,
+        model,
+        DecodeBootstrapRegistry::default(),
+        MooncakeBootstrapKvCacheTransferExecutor::new(bootstrap_service, transfer_executor),
+        crate::transfer::NoopDecodeBootstrapPublisher,
+        false,
     )
 }
 
@@ -1066,7 +1163,7 @@ fn try_build_launch_mooncake_decode_grpc_router_service(
     >,
     ServerLaunchError,
 > {
-    let model = BootstrapForwardModel::from_server_args(args)?;
+    let mut model = BootstrapForwardModel::from_server_args(args)?;
     let engine_config = MooncakeTransferEngineConfig::from_pd_config_for_rank(
         prefill_mooncake_route_rank_ip(args),
         0,
@@ -1074,18 +1171,22 @@ fn try_build_launch_mooncake_decode_grpc_router_service(
     );
     let engine = SharedLinkedMooncakeTransferEngine::new(&engine_config)?;
     let mooncake_session_id = engine.local_endpoint()?;
+    let kv_memory =
+        prepare_linked_mooncake_kv_memory(&mut model, &engine, args.num_reserved_decode_tokens)?;
     let target_resolver = MooncakeSessionTargetResolver::new(engine.clone(), Vec::new());
-    let kv_cache_layout = launch_mooncake_decode_kv_layout(&model)?;
+    let kv_cache_layout = kv_memory.prefill_layout(0);
     let transfer_executor = MooncakeKvCacheTransferExecutor::with_target_resolver(
         engine,
         kv_cache_layout,
         target_resolver,
     );
-    try_build_bootstrap_pd_grpc_router_service_with_decode_publisher(
+    try_build_bootstrap_pd_grpc_router_service_from_model_with_decode_publisher(
         args,
+        model,
         DecodeBootstrapRegistry::default(),
         transfer_executor,
         launch_mooncake_decode_bootstrap_publisher(args, kv_cache_layout, mooncake_session_id),
+        true,
     )
 }
 
@@ -1114,6 +1215,7 @@ where
         registry,
         transfer_executor,
         crate::transfer::NoopDecodeBootstrapPublisher,
+        false,
     )
 }
 
@@ -1122,18 +1224,42 @@ pub fn try_build_bootstrap_pd_grpc_router_service_with_decode_publisher<E, P>(
     registry: DecodeBootstrapRegistry,
     transfer_executor: E,
     decode_bootstrap_publisher: P,
+    decode_side_bootstrap_only: bool,
 ) -> Result<BootstrapPdGrpcRouterService<E, P>, ServerLaunchError>
 where
     E: KvCacheTransferExecutor,
     P: DecodeBootstrapPublisher,
 {
     validate_local_model_artifacts_if_present(args)?;
-    let worker = KvTransferModelWorker::new(
-        ModelRunner::new(BootstrapForwardModel::from_server_args(args)?),
+    let model = BootstrapForwardModel::from_server_args(args)?;
+    try_build_bootstrap_pd_grpc_router_service_from_model_with_decode_publisher(
+        args,
+        model,
         registry,
         transfer_executor,
+        decode_bootstrap_publisher,
+        decode_side_bootstrap_only,
     )
-    .with_decode_bootstrap_publisher(decode_bootstrap_publisher);
+}
+
+fn try_build_bootstrap_pd_grpc_router_service_from_model_with_decode_publisher<E, P>(
+    args: &ServerArgs,
+    model: BootstrapForwardModel,
+    registry: DecodeBootstrapRegistry,
+    transfer_executor: E,
+    decode_bootstrap_publisher: P,
+    decode_side_bootstrap_only: bool,
+) -> Result<BootstrapPdGrpcRouterService<E, P>, ServerLaunchError>
+where
+    E: KvCacheTransferExecutor,
+    P: DecodeBootstrapPublisher,
+{
+    let mut worker =
+        KvTransferModelWorker::new(ModelRunner::new(model), registry, transfer_executor)
+            .with_decode_bootstrap_publisher(decode_bootstrap_publisher);
+    if decode_side_bootstrap_only {
+        worker = worker.with_decode_side_bootstrap_only();
+    }
     let scheduler = Scheduler::with_cache_resources(
         worker,
         RadixCache::default(),
