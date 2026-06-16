@@ -3,7 +3,7 @@ use std::fmt;
 
 use sha2::{Digest, Sha256};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct CachePageId(usize);
 
 impl CachePageId {

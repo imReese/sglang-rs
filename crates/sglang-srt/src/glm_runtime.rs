@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::PathBuf;
 
+use crate::cache::CachePageId;
 use crate::model_artifacts::{
     GlmMoeDsaLayerCheckpointWeights, GlmMoeDsaLayerFeedForwardCheckpointWeights,
     GlmMoeDsaModelCheckpointWeights, GlmMoeDsaModelTensorSpan, LocalModelArtifacts,
@@ -994,6 +996,43 @@ impl GlmMoeDsaF32AttentionProjectionOutput {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GlmMoeDsaF32KvPageStore {
+    entries: HashMap<(usize, CachePageId), GlmMoeDsaF32KvPageEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct GlmMoeDsaF32KvPageEntry {
+    position: usize,
+    projection: GlmMoeDsaF32AttentionProjectionOutput,
+}
+
+impl GlmMoeDsaF32KvPageStore {
+    pub fn contains(&self, layer_id: usize, cache_page: CachePageId) -> bool {
+        self.entries.contains_key(&(layer_id, cache_page))
+    }
+
+    fn insert(
+        &mut self,
+        layer_id: usize,
+        cache_page: CachePageId,
+        position: usize,
+        projection: GlmMoeDsaF32AttentionProjectionOutput,
+    ) {
+        self.entries.insert(
+            (layer_id, cache_page),
+            GlmMoeDsaF32KvPageEntry {
+                position,
+                projection,
+            },
+        );
+    }
+
+    fn get(&self, layer_id: usize, cache_page: CachePageId) -> Option<&GlmMoeDsaF32KvPageEntry> {
+        self.entries.get(&(layer_id, cache_page))
+    }
+}
+
 impl GlmMoeDsaF32TensorParallelRuntime {
     fn from_loaded_runtime(
         runtime: &GlmMoeDsaLoadedTensorParallelRuntime,
@@ -1148,6 +1187,71 @@ impl GlmMoeDsaF32TensorParallelRuntime {
     ) -> Result<Vec<Vec<f32>>, GlmMoeDsaF32KernelError> {
         let positions = (0..hidden_states.len()).collect::<Vec<_>>();
         self.attention_output_with_positions(layer_id, hidden_states, &positions)
+    }
+
+    pub fn attention_output_with_kv_cache(
+        &self,
+        layer_id: usize,
+        hidden_states: &[Vec<f32>],
+        positions: &[usize],
+        out_cache_pages: &[CachePageId],
+        sequence_cache_pages: &[CachePageId],
+        kv_cache: &mut GlmMoeDsaF32KvPageStore,
+    ) -> Result<Vec<Vec<f32>>, GlmMoeDsaF32KernelError> {
+        if positions.len() != hidden_states.len() {
+            return Err(GlmMoeDsaF32KernelError::TokenCountMismatch {
+                tensor_name: format!("model.layers.{layer_id}.self_attn.rotary_emb"),
+                expected: hidden_states.len(),
+                actual: positions.len(),
+            });
+        }
+        if out_cache_pages.len() != hidden_states.len() {
+            return Err(GlmMoeDsaF32KernelError::TokenCountMismatch {
+                tensor_name: format!("model.layers.{layer_id}.self_attn.kv_cache"),
+                expected: hidden_states.len(),
+                actual: out_cache_pages.len(),
+            });
+        }
+
+        for ((hidden, position), cache_page) in hidden_states
+            .iter()
+            .zip(positions)
+            .zip(out_cache_pages.iter().copied())
+        {
+            let projection = self.attention_projection_output(layer_id, hidden)?;
+            kv_cache.insert(layer_id, cache_page, *position, projection);
+        }
+
+        let mut projections = Vec::with_capacity(sequence_cache_pages.len());
+        let mut sequence_positions = Vec::with_capacity(sequence_cache_pages.len());
+        for cache_page in sequence_cache_pages {
+            let Some(entry) = kv_cache.get(layer_id, *cache_page) else {
+                return Err(GlmMoeDsaF32KernelError::MissingKvCachePage {
+                    layer_id,
+                    cache_page: cache_page.as_usize(),
+                });
+            };
+            projections.push(entry.projection.clone());
+            sequence_positions.push(entry.position);
+        }
+
+        let outputs = self.causal_attention_values(layer_id, &projections, &sequence_positions)?;
+        let output_start = outputs.len().checked_sub(hidden_states.len()).ok_or(
+            GlmMoeDsaF32KernelError::TokenCountMismatch {
+                tensor_name: format!("model.layers.{layer_id}.self_attn.kv_cache"),
+                expected: hidden_states.len(),
+                actual: outputs.len(),
+            },
+        )?;
+        outputs[output_start..]
+            .iter()
+            .map(|values| {
+                self.row_parallel_projection(
+                    &format!("model.layers.{layer_id}.self_attn.o_proj.weight"),
+                    values,
+                )
+            })
+            .collect()
     }
 
     fn attention_output_with_positions(
@@ -2277,6 +2381,10 @@ pub enum GlmMoeDsaF32KernelError {
         expected: usize,
         actual: usize,
     },
+    MissingKvCachePage {
+        layer_id: usize,
+        cache_page: usize,
+    },
     TensorSelectionMismatch {
         tensor_name: String,
         expected_axis: usize,
@@ -2349,6 +2457,13 @@ impl fmt::Display for GlmMoeDsaF32KernelError {
             } => write!(
                 formatter,
                 "f32 tensor {tensor_name} expected {expected} token(s) but got {actual}"
+            ),
+            Self::MissingKvCachePage {
+                layer_id,
+                cache_page,
+            } => write!(
+                formatter,
+                "missing GLM layer {layer_id} KV cache page {cache_page}"
             ),
             Self::TensorSelectionMismatch {
                 tensor_name,

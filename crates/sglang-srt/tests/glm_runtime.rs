@@ -1,9 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use sglang_srt::cache::CachePageId;
 use sglang_srt::glm_runtime::{
-    GlmMoeDsaF32KernelError, GlmMoeDsaFeedForwardTensorDescriptors, GlmMoeDsaRuntime,
-    GlmMoeDsaTensorPlacementKind, GlmMoeDsaTensorShardSelection,
+    GlmMoeDsaF32KernelError, GlmMoeDsaF32KvPageStore, GlmMoeDsaFeedForwardTensorDescriptors,
+    GlmMoeDsaRuntime, GlmMoeDsaTensorPlacementKind, GlmMoeDsaTensorShardSelection,
 };
 use sglang_srt::model_artifacts::LocalModelArtifacts;
 use sglang_srt::model_artifacts::SafetensorsTensorDecodeError;
@@ -309,6 +310,98 @@ fn glm_moe_dsa_f32_runtime_applies_rope_to_causal_attention_scores() {
     assert_eq!(output.len(), 2);
     assert_close(&output[0], &[-10.0, 0.0]);
     assert_close(&output[1], &[expected_rope_attention_value(), 0.0]);
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn glm_moe_dsa_f32_runtime_reuses_kv_page_store_for_decode_attention() {
+    let model_dir = temp_model_dir("glm-runtime-f32-attention-kv-cache");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_glm_moe_dsa_attention_output_fixture(&model_dir);
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("GLM artifacts should load");
+    let runtime =
+        GlmMoeDsaRuntime::from_local_model_artifacts(&artifacts).expect("runtime should build");
+    let f32_runtime = runtime
+        .load_tensor_parallel_shards(2)
+        .expect("all TP rank shards should load")
+        .decode_f32_tensor_parallel_shards()
+        .expect("F32 cache should decode");
+    let mut kv_cache = GlmMoeDsaF32KvPageStore::default();
+
+    let full_output = f32_runtime
+        .attention_output(0, &[vec![1.0, 1.0], vec![1.0, -1.0], vec![1.0, 0.0]])
+        .expect("full attention output should compute");
+    f32_runtime
+        .attention_output_with_kv_cache(
+            0,
+            &[vec![1.0, 1.0], vec![1.0, -1.0]],
+            &[0, 1],
+            &[CachePageId::from(0), CachePageId::from(1)],
+            &[CachePageId::from(0), CachePageId::from(1)],
+            &mut kv_cache,
+        )
+        .expect("prefill attention should populate KV cache");
+
+    let decode_output = f32_runtime
+        .attention_output_with_kv_cache(
+            0,
+            &[vec![1.0, 0.0]],
+            &[2],
+            &[CachePageId::from(2)],
+            &[
+                CachePageId::from(0),
+                CachePageId::from(1),
+                CachePageId::from(2),
+            ],
+            &mut kv_cache,
+        )
+        .expect("decode attention should reuse cached prefix pages");
+
+    assert_eq!(decode_output.len(), 1);
+    assert_close(&decode_output[0], &full_output[2]);
+    assert!(kv_cache.contains(0, CachePageId::from(0)));
+    assert!(kv_cache.contains(0, CachePageId::from(1)));
+    assert!(kv_cache.contains(0, CachePageId::from(2)));
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn glm_moe_dsa_f32_runtime_reports_missing_kv_page_for_cached_attention() {
+    let model_dir = temp_model_dir("glm-runtime-f32-attention-kv-cache-missing");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_glm_moe_dsa_attention_output_fixture(&model_dir);
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("GLM artifacts should load");
+    let runtime =
+        GlmMoeDsaRuntime::from_local_model_artifacts(&artifacts).expect("runtime should build");
+    let f32_runtime = runtime
+        .load_tensor_parallel_shards(2)
+        .expect("all TP rank shards should load")
+        .decode_f32_tensor_parallel_shards()
+        .expect("F32 cache should decode");
+    let mut kv_cache = GlmMoeDsaF32KvPageStore::default();
+
+    let error = f32_runtime
+        .attention_output_with_kv_cache(
+            0,
+            &[vec![1.0, 0.0]],
+            &[1],
+            &[CachePageId::from(1)],
+            &[CachePageId::from(0), CachePageId::from(1)],
+            &mut kv_cache,
+        )
+        .expect_err("missing cached prefix page should be reported");
+
+    assert_eq!(
+        error,
+        GlmMoeDsaF32KernelError::MissingKvCachePage {
+            layer_id: 0,
+            cache_page: 0
+        }
+    );
 
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
