@@ -16,18 +16,18 @@ use sgl_router::config::{
     ActiveLoadConfig, Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig,
     PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
-use sgl_router::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec};
+use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults;
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
 use sgl_router::tokenizer::TokenizerRegistry;
-use sgl_router::workers::{manager, WorkerRegistry};
+use sgl_router::workers::WorkerRegistry;
 use sglang_srt::cli::ServerArgs;
 use sglang_srt::proto::sglang::runtime::v1::sglang_service_client::SglangServiceClient;
 use sglang_srt::proto::sglang::runtime::v1::HealthCheckRequest;
 use sglang_srt::server::launch_grpc_server_with_shutdown;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tower::ServiceExt;
 
 fn config() -> Config {
@@ -70,62 +70,6 @@ fn build_ctx_with_grpc_worker(addr: SocketAddr) -> Arc<AppContext> {
     let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
     Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
-}
-
-async fn build_ctx_with_grpc_pd_workers(
-    prefill_addr: SocketAddr,
-    decode_addr: SocketAddr,
-) -> Arc<AppContext> {
-    let cfg = config();
-    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
-    let registry = Arc::new(WorkerRegistry::default());
-    register_real_srt_grpc_workers_with_manager(prefill_addr, decode_addr, Arc::clone(&registry))
-        .await;
-
-    let model_id = ModelId("tiny".into());
-    assert_eq!(
-        registry
-            .workers_for_mode(&model_id, WorkerMode::Prefill)
-            .len(),
-        1,
-        "manager should classify the real SRT gRPC prefill worker from GetServerInfo"
-    );
-    assert_eq!(
-        registry
-            .workers_for_mode(&model_id, WorkerMode::Decode)
-            .len(),
-        1,
-        "manager should classify the real SRT gRPC decode worker from GetServerInfo"
-    );
-
-    let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
-    let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
-    Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
-}
-
-async fn register_real_srt_grpc_workers_with_manager(
-    prefill_addr: SocketAddr,
-    decode_addr: SocketAddr,
-    registry: Arc<WorkerRegistry>,
-) {
-    let (tx, rx) = mpsc::channel(8);
-    let manager = tokio::spawn(manager::run(rx, Arc::clone(&registry)));
-
-    for (id, addr) in [("grpc-prefill", prefill_addr), ("grpc-decode", decode_addr)] {
-        tx.send(DiscoveryEvent::Added(WorkerSpec {
-            id: WorkerId(id.into()),
-            url: format!("grpc://{addr}"),
-            mode: WorkerMode::Plain,
-            model_ids: Vec::new(),
-            bootstrap_port: None,
-        }))
-        .await
-        .expect("worker discovery event should send");
-    }
-    drop(tx);
-    manager
-        .await
-        .expect("worker manager task should join after discovery sender closes");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -640,8 +584,9 @@ async fn router_generate_accepts_tokenized_input_ids_for_real_rust_srt_grpc_work
         .expect("gRPC server should stop cleanly");
 }
 
+#[cfg(not(feature = "mooncake-link"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn router_pd_chat_reaches_real_rust_srt_grpc_mooncake_workers() {
+async fn real_rust_srt_grpc_mooncake_workers_reject_dummy_runtime_without_transferable_kv_memory() {
     let prefill_addr = unused_local_addr();
     let bootstrap_addr = unused_local_addr();
     let prefill_zmq_addr = unused_local_addr();
@@ -698,79 +643,38 @@ async fn router_pd_chat_reaches_real_rust_srt_grpc_mooncake_workers() {
     ])
     .expect("decode args should parse");
 
-    let (prefill_shutdown_tx, prefill_shutdown_rx) = oneshot::channel();
+    let (prefill_shutdown_tx, prefill_shutdown_rx) = oneshot::channel::<()>();
     let prefill_server = tokio::spawn(launch_grpc_server_with_shutdown(prefill_args, async move {
         let _ = prefill_shutdown_rx.await;
     }));
-    let (decode_shutdown_tx, decode_shutdown_rx) = oneshot::channel();
+    let (decode_shutdown_tx, decode_shutdown_rx) = oneshot::channel::<()>();
     let decode_server = tokio::spawn(launch_grpc_server_with_shutdown(decode_args, async move {
         let _ = decode_shutdown_rx.await;
     }));
 
-    wait_for_grpc_health(prefill_addr).await;
-    wait_for_grpc_health(decode_addr).await;
-
-    let app = build_router(build_ctx_with_grpc_pd_workers(prefill_addr, decode_addr).await);
-    let request = Request::builder()
-        .method("POST")
-        .uri("/v1/chat/completions")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({
-                "model": "tiny",
-                "messages": [{"role": "user", "content": "hi"}],
-                "max_tokens": 1,
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
-
-    let response = app.oneshot(request).await.expect("router should respond");
-    assert_eq!(
-        response.status(),
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "the default build should reach the unlinked Mooncake gRPC runtime, not fail in router dispatch"
-    );
-    let bootstrap_room = response
-        .headers()
-        .get("x-sgl-bootstrap-room")
-        .expect("PD gRPC response should expose the bootstrap room")
-        .to_str()
-        .expect("bootstrap room header should be ASCII")
-        .parse::<u64>()
-        .expect("bootstrap room header should be an unsigned integer");
-    assert!(
-        bootstrap_room <= i64::MAX as u64,
-        "bootstrap_room {bootstrap_room} exceeds signed 63-bit range"
-    );
-    let body = response
-        .into_body()
-        .collect()
-        .await
-        .expect("router response body should collect")
-        .to_bytes();
-    let body = std::str::from_utf8(&body).expect("router body should be UTF-8");
-    assert!(
-        body.contains(
-            "mooncake transfer engine requires building sglang-srt with the mooncake-link feature"
-        ),
-        "router must have reached the real Rust SRT gRPC decode transfer runtime; body={body}"
-    );
-
-    prefill_shutdown_tx
-        .send(())
-        .expect("prefill server should still be running");
-    decode_shutdown_tx
-        .send(())
-        .expect("decode server should still be running");
-    prefill_server
+    let prefill_error = prefill_server
         .await
         .expect("prefill server task should join")
-        .expect("prefill server should stop cleanly");
-    decode_server
+        .expect_err("dummy prefill worker should reject Mooncake PD startup");
+    let decode_error = decode_server
         .await
         .expect("decode server task should join")
-        .expect("decode server should stop cleanly");
+        .expect_err("dummy decode worker should reject Mooncake PD startup");
+
+    assert!(
+        prefill_error
+            .to_string()
+            .contains("does not expose transferable Mooncake KV memory"),
+        "{prefill_error}"
+    );
+    assert!(
+        decode_error
+            .to_string()
+            .contains("does not expose transferable Mooncake KV memory"),
+        "{decode_error}"
+    );
+    drop(prefill_shutdown_tx);
+    drop(decode_shutdown_tx);
 }
 
 async fn wait_for_grpc_health(addr: SocketAddr) {

@@ -10,6 +10,10 @@ publish = false  # binary-only; not published to crates.io
 name = "sgl_router"
 crate-type = ["rlib"]
 
+[features]
+default = []
+mooncake-link = ["sglang-srt/mooncake-link"]
+
 [[bin]]
 name = "sgl-router"
 path = "src/main.rs"

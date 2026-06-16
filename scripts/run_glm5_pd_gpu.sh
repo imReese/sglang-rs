@@ -9,6 +9,7 @@ set -euo pipefail
 # Useful overrides:
 #   TP_SIZE=8 DP_SIZE=1 ROUTER_PORT=8000 PREFILL_PORT=30001 DECODE_PORT=30002 \
 #   BOOTSTRAP_PORT=8200 ZMQ_PORTS=7000-7007 ./scripts/run_glm5_pd_gpu.sh
+#   MOONCAKE_LINK=1 MOONCAKE_RPC_PORT=41002 ./scripts/run_glm5_pd_gpu.sh
 #
 # Notes:
 # - Workers are launched in gRPC mode and routed through sgl-router's
@@ -47,6 +48,7 @@ ROUTER_POLICY="${ROUTER_POLICY:-cache_aware}"
 
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/target/pd-logs}"
 BUILD="${BUILD:-1}"
+MOONCAKE_LINK="${MOONCAKE_LINK:-0}"
 SMOKE="${SMOKE:-1}"
 SMOKE_CHAT="${SMOKE_CHAT:-0}"
 
@@ -56,7 +58,11 @@ SGL_ROUTER_BIN="${SGL_ROUTER_BIN:-$ROOT_DIR/target/release/sgl-router}"
 mkdir -p "$LOG_DIR"
 
 if [[ "$BUILD" == "1" ]]; then
-    cargo build --release --bin sglang-rs --bin sgl-router
+    if [[ "$MOONCAKE_LINK" == "1" ]]; then
+        cargo build --release --features sgl-router/mooncake-link --bin sglang-rs --bin sgl-router
+    else
+        cargo build --release --bin sglang-rs --bin sgl-router
+    fi
 fi
 
 pids=()
@@ -138,6 +144,7 @@ decode_args=(
     --disaggregation-mode decode
     --disaggregation-transfer-backend "$TRANSFER_BACKEND"
 )
+[[ -n "${MOONCAKE_RPC_PORT:-}" ]] && decode_args+=(--disaggregation-mooncake-rpc-port "$MOONCAKE_RPC_PORT")
 
 router_args=(
     launch

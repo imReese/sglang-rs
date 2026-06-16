@@ -14,8 +14,9 @@ use sglang_srt::transfer::{
     MooncakeSessionTargetResolver, MooncakeSubmittedBatch, MooncakeTransferRequest,
     MooncakeTransferStatus, MooncakeTransferStatusCode, MooncakeTransferStatusReader,
     MooncakeTransferSubmitter, MooncakeTransferTarget, MooncakeTransferTargetResolver,
-    build_mooncake_kv_transfer_requests, build_mooncake_remote_kv_transfer_requests,
-    execute_kv_cache_transfer_plan, is_decode_request_kv_ready, poll_mooncake_transfer_batches,
+    TransferableKvCacheMemory, TransferableKvCacheRegion, build_mooncake_kv_transfer_requests,
+    build_mooncake_remote_kv_transfer_requests, execute_kv_cache_transfer_plan,
+    is_decode_request_kv_ready, poll_mooncake_transfer_batches,
 };
 use sglang_srt::types::{
     BootstrapRoom, DisaggregatedParams, RequestId, SamplingParams, TokenGenerateRequest,
@@ -938,6 +939,54 @@ fn decode_kv_ready_check_reports_missing_bootstrap_session() {
         ))
     );
     assert_eq!(scheduler.decode_queue_depth(), 1);
+}
+
+#[test]
+fn transferable_kv_memory_builds_prefill_and_decode_mooncake_layouts() {
+    let memory = TransferableKvCacheMemory::new(
+        vec![TransferableKvCacheRegion {
+            base_addr: 0x1000,
+            byte_len: 4096,
+            page_size_bytes: 128,
+        }],
+        128,
+    )
+    .expect("memory should be valid");
+
+    assert_eq!(
+        memory.prefill_layout(0x200),
+        MooncakeKvCacheLayout {
+            source_base_addr: 0x1000,
+            page_size_bytes: 128,
+            target_base_offset: 0x200,
+        }
+    );
+    assert_eq!(
+        memory.decode_remote_layout(&[4, 5]),
+        MooncakeRemoteKvLayout {
+            dst_kv_ptrs: vec![0x1000],
+            dst_kv_indices: vec![4, 5],
+            dst_kv_item_len: 128,
+        }
+    );
+}
+
+#[test]
+fn transferable_kv_memory_rejects_zero_base_address() {
+    let error = TransferableKvCacheMemory::new(
+        vec![TransferableKvCacheRegion {
+            base_addr: 0,
+            byte_len: 128,
+            page_size_bytes: 128,
+        }],
+        128,
+    )
+    .expect_err("zero address should be rejected");
+
+    assert!(
+        error.to_string().contains("base address must be non-zero"),
+        "{error}"
+    );
 }
 
 #[test]

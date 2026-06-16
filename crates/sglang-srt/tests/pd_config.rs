@@ -135,6 +135,42 @@ fn mooncake_engine_config_uses_upstream_gpu_placement_args() {
 }
 
 #[test]
+fn mooncake_engine_config_builds_session_id_from_hostname_and_rpc_port() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "30002",
+        "--disaggregation-mode",
+        "decode",
+        "--disaggregation-transfer-backend",
+        "mooncake",
+        "--disaggregation-mooncake-rpc-port",
+        "41002",
+        "--kv-cache-dtype",
+        "bfloat16",
+        "--kv-cache-num-layers",
+        "1",
+        "--kv-cache-kv-heads",
+        "1",
+        "--kv-cache-head-dim",
+        "8",
+    ])
+    .expect("args should parse");
+    let pd_config = PdConfig::from_server_args(&args).expect("PD config should parse");
+
+    let engine_config =
+        MooncakeTransferEngineConfig::from_pd_config_for_rank("127.0.0.1", 0, &pd_config);
+
+    assert_eq!(pd_config.mooncake_rpc_port, Some(41002));
+    assert_eq!(engine_config.rpc_port, 41002);
+    assert_eq!(engine_config.session_id, "127.0.0.1:41002");
+}
+
+#[test]
 fn pd_config_carries_page_size_for_mooncake_kv_layout() {
     let args = ServerArgs::parse_from([
         "serve",
@@ -694,6 +730,78 @@ fn linked_mooncake_engine_constructor_is_available_under_feature() {
     ) -> Result<LinkedMooncakeTransferEngine, MooncakeError> = LinkedMooncakeTransferEngine::new;
 
     let _ = constructor;
+}
+
+#[cfg(feature = "mooncake-link")]
+#[test]
+#[ignore = "requires local Mooncake libraries and TCP-capable runtime"]
+fn linked_mooncake_engine_transfers_registered_host_buffers() {
+    use std::ffi::c_void;
+    use std::time::{Duration, Instant};
+
+    use sglang_srt::transfer::{
+        LinkedMooncakeTransferEngine, MooncakeBufferEntry, MooncakeTransferRequest,
+    };
+
+    let config = MooncakeTransferEngineConfig {
+        hostname: "127.0.0.1".to_string(),
+        gpu_id: 0,
+        rpc_port: 41011,
+        session_id: "127.0.0.1:41011".to_string(),
+        metadata_server: "P2PHANDSHAKE".to_string(),
+        protocol: "tcp".to_string(),
+        device_name: String::new(),
+    };
+    let engine = LinkedMooncakeTransferEngine::new(&config).expect("engine should initialize");
+    let mut source = vec![1_u8, 2, 3, 4, 5, 6, 7, 8];
+    let mut target = vec![0_u8; source.len()];
+    let mut buffers = vec![
+        MooncakeBufferEntry {
+            addr: source.as_mut_ptr().cast::<c_void>(),
+            length: source.len(),
+        },
+        MooncakeBufferEntry {
+            addr: target.as_mut_ptr().cast::<c_void>(),
+            length: target.len(),
+        },
+    ];
+    engine
+        .register_memory_batch(&mut buffers, "cpu:0")
+        .expect("host buffers should register");
+
+    let target_id = engine
+        .open_segment(config.session_id())
+        .expect("local segment should open");
+    let mut requests = vec![MooncakeTransferRequest {
+        opcode: MooncakeOpcode::Write as i32,
+        source: source.as_mut_ptr().cast::<c_void>(),
+        target_id,
+        target_offset: target.as_mut_ptr() as u64,
+        length: source.len() as u64,
+    }];
+    let batch_id = engine
+        .submit_transfer(&mut requests)
+        .expect("transfer should submit");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = engine
+            .transfer_status(batch_id, 0)
+            .expect("status should query");
+        if status.status == MooncakeTransferStatusCode::Completed as i32 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "Mooncake transfer timed out");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    engine.free_batch(batch_id).expect("batch should free");
+    let mut addrs = vec![
+        source.as_mut_ptr().cast::<c_void>(),
+        target.as_mut_ptr().cast::<c_void>(),
+    ];
+    engine
+        .unregister_memory_batch(&mut addrs)
+        .expect("buffers should unregister");
+    assert_eq!(target, source);
 }
 
 fn temp_model_dir(name: &str) -> PathBuf {

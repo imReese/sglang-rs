@@ -770,6 +770,9 @@ impl MooncakeDecodeBootstrapPublisher {
 
     fn kv_args_registration(&self) -> Option<MooncakeDecodeKvArgsRegistration> {
         let layout = self.kv_cache_layout?;
+        if layout.source_base_addr == 0 {
+            return None;
+        }
         Some(MooncakeDecodeKvArgsRegistration {
             endpoint: self.endpoint.clone(),
             dst_port: self.dst_port,
@@ -783,6 +786,11 @@ impl MooncakeDecodeBootstrapPublisher {
             dst_state_item_lens: Vec::new(),
             dst_state_dim_per_tensor: Vec::new(),
         })
+    }
+
+    #[doc(hidden)]
+    pub fn kv_args_registration_for_test(&self) -> Option<MooncakeDecodeKvArgsRegistration> {
+        self.kv_args_registration()
     }
 }
 

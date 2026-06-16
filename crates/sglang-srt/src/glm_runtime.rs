@@ -18,7 +18,8 @@ use crate::model_executor::{
 };
 use crate::transfer::{
     KvCacheModelLayout, KvCachePageSnapshotImporter, KvCachePageSnapshotProvider,
-    KvCacheTransferError, PdConfigError,
+    KvCacheTransferError, MooncakeKvCacheMemoryProvider, PdConfigError, TransferableKvCacheMemory,
+    TransferableKvCacheRegion,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1068,6 +1069,13 @@ impl GlmMoeDsaF32KvPageSnapshot {
 pub struct GlmMoeDsaF32CachedForwardModel {
     runtime: GlmMoeDsaF32TensorParallelRuntime,
     kv_cache: GlmMoeDsaF32KvPageStore,
+    transfer_pages: GlmMoeDsaF32TransferPageStore,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct GlmMoeDsaF32TransferPageStore {
+    page_size_bytes: usize,
+    pages: Vec<u8>,
 }
 
 impl GlmMoeDsaF32CachedForwardModel {
@@ -1075,6 +1083,10 @@ impl GlmMoeDsaF32CachedForwardModel {
         Self {
             runtime,
             kv_cache: GlmMoeDsaF32KvPageStore::default(),
+            transfer_pages: GlmMoeDsaF32TransferPageStore {
+                page_size_bytes: 1,
+                pages: Vec::new(),
+            },
         }
     }
 
@@ -1132,6 +1144,98 @@ impl GlmMoeDsaF32CachedForwardModel {
 
         Ok(())
     }
+
+    fn refresh_transfer_pages(&mut self) -> Result<(), KvCacheTransferError> {
+        let mut cache_pages = Vec::new();
+        for (_, cache_page) in self.kv_cache.entries.keys() {
+            cache_pages.push(cache_page.as_usize());
+        }
+        cache_pages.sort_unstable();
+        cache_pages.dedup();
+
+        let Some(max_cache_page) = cache_pages.iter().copied().max() else {
+            self.transfer_pages.pages.clear();
+            return Ok(());
+        };
+
+        let mut serialized_pages = Vec::with_capacity(cache_pages.len());
+        let mut page_size_bytes = None;
+        for cache_page_index in cache_pages {
+            let cache_page = CachePageId::from(cache_page_index);
+            let page = self.serialize_transfer_page(cache_page)?;
+            if page.is_empty() {
+                return Err(KvCacheTransferError::Runtime(
+                    "GLM transfer KV page serialization produced an empty page".to_string(),
+                ));
+            }
+            match page_size_bytes {
+                Some(expected) if expected != page.len() => {
+                    return Err(KvCacheTransferError::Runtime(format!(
+                        "GLM transfer KV page {} serialized to {} bytes but expected {expected}",
+                        cache_page_index,
+                        page.len()
+                    )));
+                }
+                None => page_size_bytes = Some(page.len()),
+                _ => {}
+            }
+            serialized_pages.push((cache_page, page));
+        }
+
+        let page_size_bytes = page_size_bytes.unwrap_or(1);
+        let byte_len = max_cache_page
+            .checked_add(1)
+            .and_then(|page_count| page_count.checked_mul(page_size_bytes))
+            .ok_or_else(|| {
+                KvCacheTransferError::Runtime(
+                    "GLM transfer KV page backing store length overflowed".to_string(),
+                )
+            })?;
+        self.transfer_pages.page_size_bytes = page_size_bytes;
+        self.transfer_pages.pages.clear();
+        self.transfer_pages.pages.resize(byte_len, 0);
+
+        for (cache_page, page) in serialized_pages {
+            let offset = cache_page
+                .as_usize()
+                .checked_mul(page_size_bytes)
+                .ok_or_else(|| {
+                    KvCacheTransferError::Runtime(
+                        "GLM transfer KV page offset overflowed".to_string(),
+                    )
+                })?;
+            self.transfer_pages.pages[offset..offset + page_size_bytes].copy_from_slice(&page);
+        }
+
+        Ok(())
+    }
+
+    fn serialize_transfer_page(
+        &self,
+        cache_page: CachePageId,
+    ) -> Result<Vec<u8>, KvCacheTransferError> {
+        let mut page = Vec::new();
+        for layer_id in 0..self.runtime.layer_count() {
+            let entry = self.kv_cache.get(layer_id, cache_page).ok_or_else(|| {
+                KvCacheTransferError::Runtime(format!(
+                    "missing GLM layer {layer_id} KV cache page {} for Mooncake transfer memory",
+                    cache_page.as_usize()
+                ))
+            })?;
+            append_f32_slice_bytes(&mut page, entry.projection.q_lora());
+            append_f32_slice_bytes(&mut page, entry.projection.q());
+            append_f32_slice_bytes(&mut page, entry.projection.kv_lora());
+            append_f32_slice_bytes(&mut page, entry.projection.k_rope());
+            append_f32_slice_bytes(&mut page, entry.projection.kv());
+        }
+        Ok(page)
+    }
+}
+
+fn append_f32_slice_bytes(output: &mut Vec<u8>, values: &[f32]) {
+    for value in values {
+        output.extend_from_slice(&value.to_le_bytes());
+    }
 }
 
 impl KvCachePageSnapshotProvider for GlmMoeDsaF32CachedForwardModel {
@@ -1158,16 +1262,31 @@ impl KvCachePageSnapshotImporter for GlmMoeDsaF32CachedForwardModel {
     }
 }
 
+impl MooncakeKvCacheMemoryProvider for GlmMoeDsaF32CachedForwardModel {
+    fn mooncake_kv_cache_memory(&self) -> Result<TransferableKvCacheMemory, KvCacheTransferError> {
+        TransferableKvCacheMemory::new(
+            vec![TransferableKvCacheRegion {
+                base_addr: self.transfer_pages.pages.as_ptr() as usize,
+                byte_len: self.transfer_pages.pages.len(),
+                page_size_bytes: self.transfer_pages.page_size_bytes,
+            }],
+            self.transfer_pages.page_size_bytes,
+        )
+    }
+}
+
 impl ForwardModel for GlmMoeDsaF32CachedForwardModel {
     fn forward(
         &mut self,
         batch: &ModelWorkerBatch,
     ) -> Result<ModelForwardOutput, ModelForwardError> {
-        ModelForwardOutput::new(
-            self.runtime
-                .transformer_lm_head_logits_with_kv_cache(batch, &mut self.kv_cache)
-                .map_err(|error| ModelForwardError::Runtime(error.to_string()))?,
-        )
+        let logits = self
+            .runtime
+            .transformer_lm_head_logits_with_kv_cache(batch, &mut self.kv_cache)
+            .map_err(|error| ModelForwardError::Runtime(error.to_string()))?;
+        self.refresh_transfer_pages()
+            .map_err(|error| ModelForwardError::Runtime(error.to_string()))?;
+        ModelForwardOutput::new(logits)
     }
 }
 

@@ -146,7 +146,7 @@ async fn manager_handles_mode_changed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn manager_resolves_pd_role_from_real_srt_grpc_server_info() {
+async fn manager_does_not_register_dummy_mooncake_srt_worker_without_transferable_kv_memory() {
     let grpc_addr = unused_local_addr();
     let bootstrap_addr = unused_local_addr();
     let zmq_addr = unused_local_addr();
@@ -182,7 +182,7 @@ async fn manager_resolves_pd_role_from_real_srt_grpc_server_info() {
     ])
     .expect("gRPC SRT args should parse");
 
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server = tokio::spawn(launch_grpc_server_with_shutdown(args, async move {
         let _ = shutdown_rx.await;
     }));
@@ -205,29 +205,21 @@ async fn manager_resolves_pd_role_from_real_srt_grpc_server_info() {
     let workers = registry.workers_for_mode(&ModelId("tiny".into()), WorkerMode::Prefill);
     assert_eq!(
         workers.len(),
-        1,
-        "manager should classify real Rust SRT gRPC prefill worker from GetServerInfo"
+        0,
+        "manager should not register a dummy Mooncake SRT worker that fails startup before GetServerInfo"
     );
-    assert_eq!(workers[0].bootstrap_port(), Some(bootstrap_addr.port()));
-    let kv_cache = workers[0]
-        .kv_cache_layout()
-        .expect("manager should carry SRT GetServerInfo kv_cache layout onto the worker");
-    assert_eq!(kv_cache.dtype, "bfloat16");
-    assert_eq!(kv_cache.page_size, 64);
-    assert_eq!(kv_cache.num_layers, 78);
-    assert_eq!(kv_cache.kv_heads, 64);
-    assert_eq!(kv_cache.head_dim, 64);
-    assert_eq!(kv_cache.kv_tensors_per_token, 2);
-    assert_eq!(kv_cache.bytes_per_token, 78 * 2 * 64 * 64 * 2);
-    assert_eq!(kv_cache.page_size_bytes, 64 * 78 * 2 * 64 * 64 * 2);
 
-    shutdown_tx
-        .send(())
-        .expect("gRPC worker should still be running");
-    server
+    let error = server
         .await
         .expect("gRPC server task should join")
-        .expect("gRPC server should stop cleanly");
+        .expect_err("dummy Mooncake SRT worker should fail before serving");
+    assert!(
+        error
+            .to_string()
+            .contains("does not expose transferable Mooncake KV memory"),
+        "{error}"
+    );
+    drop(shutdown_tx);
 }
 
 #[tokio::test]

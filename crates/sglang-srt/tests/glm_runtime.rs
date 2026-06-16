@@ -13,8 +13,9 @@ use sglang_srt::model_executor::{ForwardModel, ModelRunner, ModelWorkerBatch};
 use sglang_srt::scheduler::{ScheduledRequest, Scheduler};
 use sglang_srt::transfer::{
     DecodeBootstrapRegistry, FakeKvCacheTransferExecutor, KvCacheDtype, KvTransferModelWorker,
+    LocalSnapshotTransferPdModelWorkers, MooncakeKvCacheMemoryProvider,
 };
-use sglang_srt::types::{RequestId, SamplingParams};
+use sglang_srt::types::{BootstrapRoom, DisaggregatedParams, RequestId, SamplingParams};
 use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
 
 #[derive(Default)]
@@ -732,6 +733,101 @@ fn glm_moe_dsa_transfer_worker_forwards_kv_page_snapshots_to_inner_model_runner(
         &decode_output.logits()[0],
         &expected_dense_transformer_final_logits([4.0, 6.0]),
     );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn glm_cached_forward_model_exposes_nonzero_mooncake_kv_memory_after_prefill() {
+    let model_dir = temp_model_dir("glm-runtime-mooncake-kv-memory");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_glm_moe_dsa_attention_output_fixture(&model_dir);
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("GLM artifacts should load");
+    let runtime =
+        GlmMoeDsaRuntime::from_local_model_artifacts(&artifacts).expect("runtime should build");
+    let f32_runtime = runtime
+        .load_tensor_parallel_shards(2)
+        .expect("all TP rank shards should load")
+        .decode_f32_tensor_parallel_shards()
+        .expect("F32 cache should decode");
+    let mut runner = ModelRunner::new(GlmMoeDsaF32CachedForwardModel::new(f32_runtime));
+    let batch = single_request_prefill_worker_batch(vec![0], vec![CachePageId::from(0)]);
+
+    runner
+        .model_mut()
+        .forward(&batch)
+        .expect("prefill should populate KV");
+    let memory = runner
+        .model()
+        .mooncake_kv_cache_memory()
+        .expect("GLM model should expose KV memory");
+
+    assert!(!memory.regions().is_empty());
+    assert!(memory.regions()[0].base_addr > 0);
+    assert!(memory.regions()[0].byte_len >= memory.page_size_bytes());
+    assert!(memory.page_size_bytes() > 0);
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn glm_moe_dsa_local_snapshot_pd_workers_transfer_prefill_pages_before_decode() {
+    let model_dir = temp_model_dir("glm-runtime-f32-local-snapshot-pd-workers");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_glm_moe_dsa_attention_output_fixture(&model_dir);
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("GLM artifacts should load");
+    let runtime =
+        GlmMoeDsaRuntime::from_local_model_artifacts(&artifacts).expect("runtime should build");
+    let f32_runtime = runtime
+        .load_tensor_parallel_shards(2)
+        .expect("all TP rank shards should load")
+        .decode_f32_tensor_parallel_shards()
+        .expect("F32 cache should decode");
+    let workers = LocalSnapshotTransferPdModelWorkers::new(
+        ModelRunner::new(GlmMoeDsaF32CachedForwardModel::new(f32_runtime.clone())),
+        ModelRunner::new(GlmMoeDsaF32CachedForwardModel::new(f32_runtime)),
+    );
+    let mut scheduler =
+        Scheduler::with_cache_resources(workers, RadixCache::default(), CachePageAllocator::new(3));
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("glm-local-snapshot-pd"),
+            vec![0],
+            SamplingParams::new(2),
+        )
+        .with_disaggregated_params(Some(test_disaggregated_params(42))),
+    );
+
+    let prefill_outputs = scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should compute and transfer KV pages");
+
+    assert_eq!(prefill_outputs[0].token_ids, vec![1]);
+    assert_eq!(
+        scheduler
+            .worker()
+            .last_transfer_summary()
+            .expect("prefill should record a transfer summary")
+            .submitted_spans(),
+        1
+    );
+    assert!(
+        scheduler
+            .worker()
+            .decode()
+            .model()
+            .kv_cache_contains(0, CachePageId::from(0)),
+        "prefill page should be imported into the decode worker before decode dispatch"
+    );
+
+    let decode_outputs = scheduler
+        .dispatch_decode_batch(1)
+        .expect("decode should use transferred prefix page");
+
+    assert_eq!(decode_outputs[0].token_ids, vec![1]);
+    assert!(decode_outputs[0].finished);
 
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
@@ -1619,6 +1715,36 @@ fn assert_close(actual: &[f32], expected: &[f32]) {
             "index {index}: expected {expected}, got {actual}"
         );
     }
+}
+
+fn test_disaggregated_params(bootstrap_room: BootstrapRoom) -> DisaggregatedParams {
+    DisaggregatedParams {
+        bootstrap_host: "127.0.0.1".to_string(),
+        bootstrap_port: 8998,
+        bootstrap_room,
+    }
+}
+
+fn single_request_prefill_worker_batch(
+    input_ids: Vec<u32>,
+    out_cache_pages: Vec<CachePageId>,
+) -> ModelWorkerBatch {
+    let mut scheduler = Scheduler::with_cache_resources(
+        NoopWorker,
+        RadixCache::default(),
+        CachePageAllocator::new(out_cache_pages.len().max(input_ids.len())),
+    );
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("glm-mooncake-memory"),
+        input_ids,
+        SamplingParams::new(1),
+    ));
+    let batch = scheduler
+        .next_prefill_batch(1)
+        .expect("prefill batch should build");
+    let worker_batch = ModelWorkerBatch::from_schedule_batch(&batch);
+    assert_eq!(worker_batch.out_cache_pages(), out_cache_pages);
+    worker_batch
 }
 
 fn complete_glm_moe_dsa_tensor_shapes() -> Vec<(&'static str, Vec<usize>)> {

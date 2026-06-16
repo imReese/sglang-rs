@@ -4,31 +4,52 @@
 //! further: it starts actual `sglang-srt` prefill/decode HTTP workers
 //! and drives the router's PD fan-out through reqwest into those workers.
 
+#[cfg(feature = "mooncake-link")]
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+#[cfg(feature = "mooncake-link")]
+use std::net::TcpStream;
+use std::net::{SocketAddr, TcpListener};
+#[cfg(feature = "mooncake-link")]
 use std::sync::Arc;
+#[cfg(feature = "mooncake-link")]
 use std::time::Duration;
 
+#[cfg(feature = "mooncake-link")]
 use axum::body::Body;
+#[cfg(feature = "mooncake-link")]
 use axum::http::{Request, StatusCode};
+#[cfg(feature = "mooncake-link")]
 use http_body_util::BodyExt;
+#[cfg(feature = "mooncake-link")]
 use serde_json::json;
+#[cfg(feature = "mooncake-link")]
 use sgl_router::config::{
     ActiveLoadConfig, Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig,
     PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
+#[cfg(feature = "mooncake-link")]
 use sgl_router::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec};
+#[cfg(feature = "mooncake-link")]
 use sgl_router::policies::factory::build_registry_with_defaults;
+#[cfg(feature = "mooncake-link")]
 use sgl_router::proxy::Proxy;
+#[cfg(feature = "mooncake-link")]
 use sgl_router::server::app::build_router;
+#[cfg(feature = "mooncake-link")]
 use sgl_router::server::app_context::AppContext;
+#[cfg(feature = "mooncake-link")]
 use sgl_router::tokenizer::TokenizerRegistry;
+#[cfg(feature = "mooncake-link")]
 use sgl_router::workers::{manager, WorkerRegistry};
 use sglang_srt::cli::ServerArgs;
 use sglang_srt::server::launch_http_server_with_shutdown;
-use tokio::sync::{mpsc, oneshot};
+#[cfg(feature = "mooncake-link")]
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+#[cfg(feature = "mooncake-link")]
 use tower::ServiceExt;
 
+#[cfg(feature = "mooncake-link")]
 fn config() -> Config {
     Config {
         server: ServerConfig {
@@ -53,6 +74,7 @@ fn config() -> Config {
     }
 }
 
+#[cfg(feature = "mooncake-link")]
 async fn build_ctx(prefill_addr: SocketAddr, decode_addr: SocketAddr) -> Arc<AppContext> {
     let cfg = config();
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
@@ -80,6 +102,7 @@ async fn build_ctx(prefill_addr: SocketAddr, decode_addr: SocketAddr) -> Arc<App
     Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
 }
 
+#[cfg(feature = "mooncake-link")]
 async fn register_real_srt_workers_with_manager(
     prefill_addr: SocketAddr,
     decode_addr: SocketAddr,
@@ -107,8 +130,9 @@ async fn register_real_srt_workers_with_manager(
         .expect("worker manager task should join after discovery sender closes");
 }
 
+#[cfg(not(feature = "mooncake-link"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn router_pd_chat_reaches_real_rust_srt_mooncake_workers() {
+async fn real_rust_srt_mooncake_workers_reject_dummy_runtime_without_transferable_kv_memory() {
     let prefill_addr = unused_local_addr();
     let bootstrap_addr = unused_local_addr();
     let prefill_zmq_addr = unused_local_addr();
@@ -163,14 +187,14 @@ async fn router_pd_chat_reaches_real_rust_srt_mooncake_workers() {
     ])
     .expect("decode args should parse");
 
-    let (prefill_shutdown_tx, prefill_shutdown_rx) = oneshot::channel();
+    let (prefill_shutdown_tx, prefill_shutdown_rx) = oneshot::channel::<()>();
     let prefill_server = tokio::spawn(async move {
         launch_http_server_with_shutdown(prefill_args, async move {
             let _ = prefill_shutdown_rx.await;
         })
         .await
     });
-    let (decode_shutdown_tx, decode_shutdown_rx) = oneshot::channel();
+    let (decode_shutdown_tx, decode_shutdown_rx) = oneshot::channel::<()>();
     let decode_server = tokio::spawn(async move {
         launch_http_server_with_shutdown(decode_args, async move {
             let _ = decode_shutdown_rx.await;
@@ -178,60 +202,32 @@ async fn router_pd_chat_reaches_real_rust_srt_mooncake_workers() {
         .await
     });
 
-    wait_for_health(prefill_addr).await;
-    wait_for_health(decode_addr).await;
-
-    let app = build_router(build_ctx(prefill_addr, decode_addr).await);
-    let request = Request::builder()
-        .method("POST")
-        .uri("/v1/chat/completions")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({
-                "model": "tiny",
-                "messages": [{"role": "user", "content": "hi"}],
-                "max_tokens": 1,
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
-
-    let response = app.oneshot(request).await.expect("router should respond");
-    assert_eq!(
-        response.status(),
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "the default build should reach the unlinked Mooncake runtime, not fail in router dispatch"
-    );
-    let body = response
-        .into_body()
-        .collect()
-        .await
-        .expect("router response body should collect")
-        .to_bytes();
-    let body = std::str::from_utf8(&body).expect("router body should be UTF-8");
-    assert!(
-        body.contains(
-            "mooncake transfer engine requires building sglang-srt with the mooncake-link feature"
-        ),
-        "router must have reached the real Rust SRT decode transfer runtime; body={body}"
-    );
-
-    prefill_shutdown_tx
-        .send(())
-        .expect("prefill server should still be running");
-    decode_shutdown_tx
-        .send(())
-        .expect("decode server should still be running");
-    prefill_server
+    let prefill_error = prefill_server
         .await
         .expect("prefill server task should join")
-        .expect("prefill server should stop cleanly");
-    decode_server
+        .expect_err("dummy prefill worker should reject Mooncake PD startup");
+    let decode_error = decode_server
         .await
         .expect("decode server task should join")
-        .expect("decode server should stop cleanly");
+        .expect_err("dummy decode worker should reject Mooncake PD startup");
+
+    assert!(
+        prefill_error
+            .to_string()
+            .contains("does not expose transferable Mooncake KV memory"),
+        "{prefill_error}"
+    );
+    assert!(
+        decode_error
+            .to_string()
+            .contains("does not expose transferable Mooncake KV memory"),
+        "{decode_error}"
+    );
+    drop(prefill_shutdown_tx);
+    drop(decode_shutdown_tx);
 }
 
+#[cfg(feature = "mooncake-link")]
 async fn wait_for_health(addr: SocketAddr) {
     let mut last_error = None;
     for _ in 0..100 {
@@ -255,6 +251,7 @@ fn unused_local_addr() -> SocketAddr {
         .expect("ephemeral listener should have local addr")
 }
 
+#[cfg(feature = "mooncake-link")]
 async fn request_raw(
     addr: SocketAddr,
     method: &'static str,

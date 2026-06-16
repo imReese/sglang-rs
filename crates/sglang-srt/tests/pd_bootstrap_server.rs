@@ -220,6 +220,25 @@ fn prefill_bootstrap_ingests_mooncake_transfer_frames_and_marks_room_waiting() {
 }
 
 #[test]
+fn decode_bootstrap_publisher_uses_live_session_id_and_nonzero_kv_layout() {
+    let publisher = MooncakeDecodeBootstrapPublisher::new("127.0.0.1", 41009, "127.0.0.1:41011")
+        .with_kv_cache_layout(MooncakeKvCacheLayout {
+            source_base_addr: 0x7000,
+            page_size_bytes: 256,
+            target_base_offset: 0,
+        });
+    let registration = publisher
+        .kv_args_registration_for_test()
+        .expect("KVArgs registration should exist");
+
+    assert_eq!(registration.endpoint, "127.0.0.1");
+    assert_eq!(registration.dst_port, 41009);
+    assert_eq!(registration.mooncake_session_id, "127.0.0.1:41011");
+    assert_eq!(registration.dst_kv_ptrs, vec![0x7000]);
+    assert_eq!(registration.dst_kv_item_len, 256);
+}
+
+#[test]
 fn prefill_bootstrap_builds_remote_kv_layouts_from_decode_metadata() {
     let service = PrefillBootstrapService::default();
     let kv_args_frame = vec![

@@ -9,10 +9,7 @@ use sglang_srt::cache::{CachePageAllocator, RadixCache};
 use sglang_srt::cli::ServerArgs;
 use sglang_srt::engine::Engine;
 use sglang_srt::http::{HttpRouterService, serve_http_router_with_shutdown};
-use sglang_srt::pd_bootstrap::{
-    PrefillBootstrapService, serve_mooncake_bootstrap_zmq_with_shutdown,
-    serve_prefill_bootstrap_with_shutdown,
-};
+use sglang_srt::pd_bootstrap::{PrefillBootstrapService, serve_prefill_bootstrap_with_shutdown};
 use sglang_srt::router::{RouterGetModelInfoResponse, RouterRuntime};
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::server::{
@@ -1205,7 +1202,7 @@ async fn mooncake_prefill_http_uses_bootstrap_kv_layout_for_transfer() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn prefill_http_launch_starts_main_and_bootstrap_listeners() {
+async fn prefill_http_launch_rejects_dummy_mooncake_runtime_without_transferable_kv_memory() {
     let http_addr = unused_local_addr();
     let bootstrap_addr = unused_local_addr();
     let args = ServerArgs::parse_from([
@@ -1224,40 +1221,20 @@ async fn prefill_http_launch_starts_main_and_bootstrap_listeners() {
         &bootstrap_addr.port().to_string(),
     ])
     .expect("args should parse");
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-    let server = tokio::spawn(async move {
-        launch_http_server_with_shutdown(args, async move {
-            let _ = shutdown_rx.await;
-        })
-        .await
-    });
+    let error = launch_http_server_with_shutdown(args, async {}).await;
+    let error = error.expect_err("dummy prefill worker should reject Mooncake PD startup");
 
-    let health = get_json_with_retry(http_addr, "/health").await;
-    let bootstrap_health = request_raw_with_retry(bootstrap_addr, "GET", "/health", None).await;
-    let bootstrap_route = request_raw_with_retry(
-        bootstrap_addr,
-        "GET",
-        "/route?prefill_dp_rank=-1&prefill_cp_rank=-1&target_tp_rank=-1&target_pp_rank=-1",
-        None,
-    )
-    .await;
-
-    assert_eq!(health["healthy"], true);
-    assert!(bootstrap_health.ends_with("\r\n\r\nOK"));
-    assert!(bootstrap_route.starts_with("HTTP/1.1 503"));
-
-    shutdown_tx
-        .send(())
-        .expect("server should still be running");
-    server
-        .await
-        .expect("server task should join")
-        .expect("servers should stop cleanly");
+    assert!(
+        error
+            .to_string()
+            .contains("does not expose transferable Mooncake KV memory"),
+        "{error}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn prefill_http_launch_routes_disaggregated_chat_into_mooncake_runtime() {
+async fn prefill_http_launch_routes_reject_dummy_mooncake_runtime_without_transferable_kv_memory() {
     let http_addr = unused_local_addr();
     let bootstrap_addr = unused_local_addr();
     let args = ServerArgs::parse_from([
@@ -1280,38 +1257,16 @@ async fn prefill_http_launch_routes_disaggregated_chat_into_mooncake_runtime() {
         "8",
     ])
     .expect("args should parse");
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-    let server = tokio::spawn(async move {
-        launch_http_server_with_shutdown(args, async move {
-            let _ = shutdown_rx.await;
-        })
-        .await
-    });
+    let error = launch_http_server_with_shutdown(args, async {}).await;
+    let error = error.expect_err("dummy prefill worker should reject Mooncake PD startup");
 
-    let response = request_raw_with_retry(
-        http_addr,
-        "POST",
-        "/v1/chat/completions",
-        Some(
-            r#"{"model":"glm-prefill-launch-chat","messages":[{"role":"user","content":"hi"}],"max_tokens":1,"bootstrap_host":"10.0.0.8","bootstrap_port":8200,"bootstrap_room":77}"#,
-        ),
-    )
-    .await;
-
-    assert!(response.starts_with("HTTP/1.1 500"), "{response}");
     assert!(
-        response.contains("missing Mooncake transfer room: 77"),
-        "launch must route through the Mooncake bootstrap transfer runtime instead of rejecting as a plain HTTP worker: {response}"
+        error
+            .to_string()
+            .contains("does not expose transferable Mooncake KV memory"),
+        "{error}"
     );
-
-    shutdown_tx
-        .send(())
-        .expect("server should still be running");
-    server
-        .await
-        .expect("server task should join")
-        .expect("servers should stop cleanly");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1344,10 +1299,8 @@ async fn decode_http_launch_requires_kv_model_layout_for_mooncake() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn decode_http_launch_routes_disaggregated_chat_into_mooncake_runtime() {
+async fn decode_http_launch_rejects_dummy_mooncake_runtime_without_transferable_kv_memory() {
     let http_addr = unused_local_addr();
-    let bootstrap_addr = unused_local_addr();
-    let zmq_addr = unused_local_addr();
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
@@ -1374,122 +1327,16 @@ async fn decode_http_launch_routes_disaggregated_chat_into_mooncake_runtime() {
         "8",
     ])
     .expect("args should parse");
-    let bootstrap_service = PrefillBootstrapService::default();
-    let (bootstrap_shutdown_tx, bootstrap_shutdown_rx) = oneshot::channel();
-    let bootstrap_server = tokio::spawn({
-        let bootstrap_service = bootstrap_service.clone();
-        async move {
-            let (shutdown_tx, shutdown_rx_watch) = tokio::sync::watch::channel(false);
-            let mut http_task = tokio::spawn(serve_prefill_bootstrap_with_shutdown(
-                bootstrap_addr,
-                bootstrap_service.clone(),
-                watch_shutdown(shutdown_rx_watch.clone()),
-            ));
-            let mut zmq_task = tokio::spawn(serve_mooncake_bootstrap_zmq_with_shutdown(
-                format!("tcp://{}", zmq_addr),
-                bootstrap_service,
-                watch_shutdown(shutdown_rx_watch),
-            ));
 
-            tokio::select! {
-                _ = async move { let _ = bootstrap_shutdown_rx.await; } => {
-                    let _ = shutdown_tx.send(true);
-                    http_task.await.expect("HTTP bootstrap task should join")?;
-                    zmq_task.await.expect("ZMQ bootstrap task should join")?;
-                    Ok(())
-                }
-                result = &mut http_task => {
-                    let _ = shutdown_tx.send(true);
-                    zmq_task.await.expect("ZMQ bootstrap task should join")?;
-                    result.expect("HTTP bootstrap task should join")
-                }
-                result = &mut zmq_task => {
-                    let _ = shutdown_tx.send(true);
-                    http_task.await.expect("HTTP bootstrap task should join")?;
-                    result.expect("ZMQ bootstrap task should join")
-                }
-            }
-        }
-    });
-    let register_response = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        put_json_with_retry(
-            bootstrap_addr,
-            "/route",
-            Box::leak(format!(
-                r#"{{"attn_tp_size":1,"attn_tp_rank":0,"attn_cp_size":1,"attn_cp_rank":0,"attn_dp_size":1,"attn_dp_rank":0,"pp_size":1,"pp_rank":0,"system_dp_size":1,"system_dp_rank":0,"rank_ip":"127.0.0.1","rank_port":{},"page_size":64,"kv_cache_dtype":"auto","load_balance_method":"follow_bootstrap_room"}}"#,
-                zmq_addr.port()
-            ).into_boxed_str()),
-        ),
-    )
-    .await
-    .expect("bootstrap route registration should finish promptly");
-    assert!(register_response.starts_with("HTTP/1.1 200"));
+    let error = launch_http_server_with_shutdown(args, async {}).await;
+    let error = error.expect_err("dummy decode worker should reject Mooncake PD startup");
 
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server = tokio::spawn(async move {
-        launch_http_server_with_shutdown(args, async move {
-            let _ = shutdown_rx.await;
-        })
-        .await
-    });
-
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     assert!(
-        !server.is_finished(),
-        "decode HTTP launch should serve instead of returning unsupported PD runtime"
+        error
+            .to_string()
+            .contains("does not expose transferable Mooncake KV memory"),
+        "{error}"
     );
-
-    let response = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        request_raw_with_retry(
-            http_addr,
-            "POST",
-            "/v1/chat/completions",
-            Some(Box::leak(format!(
-                r#"{{"model":"glm-decode-launch-chat","messages":[{{"role":"user","content":"hi"}}],"max_tokens":1,"bootstrap_host":"{}","bootstrap_port":{},"bootstrap_room":78}}"#,
-                bootstrap_addr.ip(),
-                bootstrap_addr.port()
-            ).into_boxed_str())),
-        ),
-    )
-    .await
-    .expect("decode request should finish promptly");
-
-    assert!(response.starts_with("HTTP/1.1 500"), "{response}");
-    assert!(
-        response.contains(
-            "mooncake transfer engine requires building sglang-srt with the mooncake-link feature"
-        ),
-        "decode launch must route through the Mooncake transfer runtime instead of rejecting as unsupported: {response}"
-    );
-    let layouts = bootstrap_service
-        .state()
-        .lock()
-        .expect("bootstrap state lock should be held")
-        .remote_kv_layouts_for_room(78)
-        .expect("decode launch should publish KV args before transfer metadata");
-    assert_eq!(layouts.len(), 1);
-    assert_eq!(layouts[0].1.dst_kv_ptrs, vec![0]);
-    assert_eq!(layouts[0].1.dst_kv_indices, vec![0, 1]);
-    assert_eq!(layouts[0].1.dst_kv_item_len, 64);
-
-    shutdown_tx
-        .send(())
-        .expect("server should still be running");
-    tokio::time::timeout(std::time::Duration::from_secs(5), server)
-        .await
-        .expect("decode HTTP server should stop promptly")
-        .expect("server task should join")
-        .expect("server should stop cleanly");
-    bootstrap_shutdown_tx
-        .send(())
-        .expect("bootstrap server should still be running");
-    tokio::time::timeout(std::time::Duration::from_secs(5), bootstrap_server)
-        .await
-        .expect("bootstrap server should stop promptly")
-        .expect("bootstrap server task should join")
-        .expect("bootstrap servers should stop cleanly");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1698,18 +1545,6 @@ async fn get_json_with_retry(addr: SocketAddr, path: &str) -> Value {
 
 async fn post_json_with_retry(addr: SocketAddr, path: &str, body: &'static str) -> Value {
     request_json_with_retry(addr, "POST", path, Some(body)).await
-}
-
-async fn put_json_with_retry(addr: SocketAddr, path: &str, body: &'static str) -> String {
-    request_raw_with_retry(addr, "PUT", path, Some(body)).await
-}
-
-async fn watch_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
-    while !*shutdown.borrow() {
-        if shutdown.changed().await.is_err() {
-            break;
-        }
-    }
 }
 
 async fn request_json_with_retry(

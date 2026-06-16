@@ -3,7 +3,6 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::Duration;
 
 use tonic::Request;
 
@@ -18,8 +17,9 @@ use sglang_srt::proto::sglang::runtime::v1::{
 use sglang_srt::server::{
     ServerLaunchError, build_bootstrap_fake_pd_grpc_router_service,
     build_bootstrap_grpc_router_service, build_bootstrap_pd_grpc_router_service, grpc_listen_addr,
-    launch_grpc_server, launch_grpc_server_with_shutdown, prefill_mooncake_zmq_endpoints,
-    register_prefill_mooncake_routes_from_args, try_build_bootstrap_grpc_router_service,
+    launch_grpc_server, prefill_mooncake_zmq_endpoints, register_prefill_mooncake_routes_from_args,
+    try_build_bootstrap_grpc_router_service,
+    try_build_launch_mooncake_decode_http_router_service_for_test,
 };
 use sglang_srt::tokenizer::TokenizerError;
 use sglang_srt::transfer::{
@@ -1095,7 +1095,7 @@ async fn launch_grpc_server_rejects_unsupported_nixl_pd_backend() {
 }
 
 #[tokio::test]
-async fn launch_grpc_server_serves_mooncake_decode_pd_runtime() {
+async fn launch_grpc_server_rejects_mooncake_decode_dummy_runtime_without_kv_memory() {
     let addr = unused_local_addr();
     let args = ServerArgs::parse_from([
         "serve",
@@ -1121,24 +1121,20 @@ async fn launch_grpc_server_serves_mooncake_decode_pd_runtime() {
     ])
     .expect("args should parse");
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let mut server = tokio::spawn(launch_grpc_server_with_shutdown(args, async move {
-        let _ = shutdown_rx.await;
-    }));
-
-    tokio::time::timeout(Duration::from_millis(100), &mut server)
+    let error = launch_grpc_server(args)
         .await
-        .expect_err("Mooncake decode gRPC launch should keep serving until shutdown");
-    shutdown_tx
-        .send(())
-        .expect("server should still be running");
-    let result = server.await.expect("server task should join");
+        .expect_err("dummy Mooncake decode runtime should fail before serving");
 
-    result.expect("Mooncake decode gRPC launch should stop cleanly after shutdown");
+    assert!(
+        error
+            .to_string()
+            .contains("does not expose transferable Mooncake KV memory"),
+        "{error}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn launch_grpc_server_serves_mooncake_prefill_pd_runtime_with_bootstrap() {
+async fn launch_grpc_server_rejects_mooncake_prefill_dummy_runtime_without_kv_memory() {
     let addrs = unused_distinct_local_addrs(3);
     let grpc_addr = addrs[0];
     let bootstrap_addr = addrs[1];
@@ -1167,26 +1163,16 @@ async fn launch_grpc_server_serves_mooncake_prefill_pd_runtime_with_bootstrap() 
     ])
     .expect("args should parse");
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let mut server = tokio::spawn(launch_grpc_server_with_shutdown(args, async move {
-        let _ = shutdown_rx.await;
-    }));
-
-    let health = get_raw_with_retry(bootstrap_addr, "/health").await;
-    assert!(
-        health.starts_with("HTTP/1.1 200"),
-        "bootstrap health response should be HTTP 200, got {health:?}"
-    );
-
-    tokio::time::timeout(Duration::from_millis(100), &mut server)
+    let error = launch_grpc_server(args)
         .await
-        .expect_err("Mooncake prefill gRPC launch should keep serving until shutdown");
-    shutdown_tx
-        .send(())
-        .expect("server should still be running");
-    let result = server.await.expect("server task should join");
+        .expect_err("dummy Mooncake prefill runtime should fail before serving");
 
-    result.expect("Mooncake prefill gRPC launch should stop cleanly after shutdown");
+    assert!(
+        error
+            .to_string()
+            .contains("does not expose transferable Mooncake KV memory"),
+        "{error}"
+    );
 }
 
 #[tokio::test]
@@ -1217,6 +1203,46 @@ async fn launch_grpc_server_requires_kv_model_layout_for_mooncake_decode() {
     assert!(message.contains("--kv-cache-num-layers"));
     assert!(message.contains("--kv-cache-kv-heads"));
     assert!(message.contains("--kv-cache-head-dim"));
+}
+
+#[test]
+fn mooncake_decode_builder_rejects_runtime_without_transferable_kv_memory() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "30002",
+        "--disaggregation-mode",
+        "decode",
+        "--disaggregation-transfer-backend",
+        "mooncake",
+        "--kv-cache-dtype",
+        "bfloat16",
+        "--kv-cache-num-layers",
+        "1",
+        "--kv-cache-kv-heads",
+        "1",
+        "--kv-cache-head-dim",
+        "8",
+    ])
+    .expect("args should parse");
+    let pd_config = PdConfig::from_server_args(&args).expect("pd config should parse");
+
+    let error =
+        match try_build_launch_mooncake_decode_http_router_service_for_test(&args, &pd_config) {
+            Ok(_) => panic!("dummy Space model should not expose Mooncake KV memory"),
+            Err(error) => error,
+        };
+
+    assert!(
+        error
+            .to_string()
+            .contains("does not expose transferable Mooncake KV memory"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -1896,40 +1922,4 @@ fn unused_distinct_local_addrs(count: usize) -> Vec<SocketAddr> {
                 .expect("local port should have address")
         })
         .collect()
-}
-
-async fn get_raw_with_retry(addr: SocketAddr, path: &'static str) -> String {
-    for _ in 0..50 {
-        match raw_http_request(addr, "GET", path, None).await {
-            Ok(response) => return response,
-            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
-        }
-    }
-
-    raw_http_request(addr, "GET", path, None)
-        .await
-        .expect("HTTP bootstrap endpoint should respond")
-}
-
-async fn raw_http_request(
-    addr: SocketAddr,
-    method: &'static str,
-    path: &'static str,
-    body: Option<&'static str>,
-) -> std::io::Result<String> {
-    tokio::task::spawn_blocking(move || {
-        let mut stream = TcpStream::connect(addr)?;
-        let body = body.unwrap_or_default();
-        let request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        );
-        stream.write_all(request.as_bytes())?;
-
-        let mut response = String::new();
-        stream.read_to_string(&mut response)?;
-        Ok(response)
-    })
-    .await
-    .expect("blocking HTTP request should join")
 }

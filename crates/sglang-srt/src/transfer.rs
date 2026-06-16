@@ -402,6 +402,7 @@ pub struct PdConfig {
     pub transfer_backend: TransferBackend,
     pub force_tcp_transport: bool,
     pub bootstrap_port: u16,
+    pub mooncake_rpc_port: Option<u16>,
     pub ib_device: Option<String>,
     pub decode_enable_radix_cache: bool,
     pub decode_enable_offload_kvcache: bool,
@@ -511,6 +512,7 @@ impl PdConfig {
             transfer_backend: backend.backend,
             force_tcp_transport: backend.force_tcp_transport,
             bootstrap_port: args.disaggregation_bootstrap_port,
+            mooncake_rpc_port: args.disaggregation_mooncake_rpc_port,
             ib_device: if backend.force_tcp_transport {
                 None
             } else {
@@ -706,6 +708,8 @@ pub const MOONCAKE_P2P_HANDSHAKE_METADATA: &str = "P2PHANDSHAKE";
 pub struct MooncakeTransferEngineConfig {
     pub hostname: String,
     pub gpu_id: usize,
+    pub rpc_port: u16,
+    pub session_id: String,
     pub metadata_server: String,
     pub protocol: String,
     pub device_name: String,
@@ -713,9 +717,14 @@ pub struct MooncakeTransferEngineConfig {
 
 impl MooncakeTransferEngineConfig {
     pub fn from_pd_config(hostname: impl Into<String>, gpu_id: usize, config: &PdConfig) -> Self {
+        let hostname = hostname.into();
+        let rpc_port = config.mooncake_rpc_port.unwrap_or(0);
+        let session_id = format!("{hostname}:{rpc_port}");
         Self {
-            hostname: hostname.into(),
+            hostname,
             gpu_id,
+            rpc_port,
+            session_id,
             metadata_server: MOONCAKE_P2P_HANDSHAKE_METADATA.to_string(),
             protocol: if config.force_tcp_transport {
                 "tcp".to_string()
@@ -736,6 +745,10 @@ impl MooncakeTransferEngineConfig {
             config.base_gpu_id + local_rank * config.gpu_id_step,
             config,
         )
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 }
 
@@ -1092,6 +1105,120 @@ where
         snapshots: Vec<Self::Snapshot>,
     ) -> Result<(), KvCacheTransferError> {
         self.model_mut().import_kv_cache_pages(snapshots)
+    }
+}
+
+pub struct LocalSnapshotTransferPdModelWorkers<P, D> {
+    prefill: P,
+    decode: D,
+    last_transfer_summary: Option<KvCacheTransferSummary>,
+}
+
+impl<P, D> LocalSnapshotTransferPdModelWorkers<P, D> {
+    pub fn new(prefill: P, decode: D) -> Self {
+        Self {
+            prefill,
+            decode,
+            last_transfer_summary: None,
+        }
+    }
+
+    pub fn prefill(&self) -> &P {
+        &self.prefill
+    }
+
+    pub fn prefill_mut(&mut self) -> &mut P {
+        &mut self.prefill
+    }
+
+    pub fn decode(&self) -> &D {
+        &self.decode
+    }
+
+    pub fn decode_mut(&mut self) -> &mut D {
+        &mut self.decode
+    }
+
+    pub fn last_transfer_summary(&self) -> Option<&KvCacheTransferSummary> {
+        self.last_transfer_summary.as_ref()
+    }
+}
+
+impl<P, D> FallibleModelWorker for LocalSnapshotTransferPdModelWorkers<P, D>
+where
+    P: FallibleModelWorker + KvCachePageSnapshotProvider,
+    D: FallibleModelWorker + KvCachePageSnapshotImporter<Snapshot = P::Snapshot>,
+{
+    fn try_generate_batch(
+        &mut self,
+        batch: &ScheduleBatch,
+    ) -> Result<BatchGeneratedTokens, WorkerExecutionError> {
+        match batch.forward_mode() {
+            ForwardMode::Prefill => self.try_generate_prefill_batch(batch),
+            ForwardMode::Decode => self.decode.try_generate_batch(batch),
+        }
+    }
+
+    fn decode_request_state(
+        &self,
+        request: &ScheduledRequest,
+    ) -> Result<DecodeRequestState, WorkerExecutionError> {
+        self.decode.decode_request_state(request)
+    }
+
+    fn poll_transfers(&mut self) -> Result<MooncakeTransferPollSummary, KvCacheTransferError> {
+        Ok(MooncakeTransferPollSummary::default())
+    }
+
+    fn complete_request(&mut self, request: &ScheduledRequest) {
+        self.prefill.complete_request(request);
+        self.decode.complete_request(request);
+    }
+}
+
+impl<P, D> LocalSnapshotTransferPdModelWorkers<P, D>
+where
+    P: FallibleModelWorker + KvCachePageSnapshotProvider,
+    D: FallibleModelWorker + KvCachePageSnapshotImporter<Snapshot = P::Snapshot>,
+{
+    fn try_generate_prefill_batch(
+        &mut self,
+        batch: &ScheduleBatch,
+    ) -> Result<BatchGeneratedTokens, WorkerExecutionError> {
+        let worker_batch = ModelWorkerBatch::from_schedule_batch(batch);
+        let transfer_plan =
+            KvCacheTransferPlan::from_prefill_worker_batch(&worker_batch).map_err(|error| {
+                WorkerExecutionError::Runtime(format!("KV transfer planning failed: {error}"))
+            })?;
+
+        let output = self.prefill.try_generate_batch(batch)?;
+        let mut summary = KvCacheTransferSummary::default();
+        for span in transfer_plan.spans() {
+            if span.is_noop() {
+                summary.noop_spans += 1;
+                continue;
+            }
+
+            let snapshots = self
+                .prefill
+                .export_kv_cache_pages(span.cache_pages())
+                .map_err(|error| {
+                    WorkerExecutionError::Runtime(format!(
+                        "local KV snapshot export failed: {error}"
+                    ))
+                })?;
+            self.decode
+                .import_kv_cache_pages(snapshots)
+                .map_err(|error| {
+                    WorkerExecutionError::Runtime(format!(
+                        "local KV snapshot import failed: {error}"
+                    ))
+                })?;
+            summary.submitted_spans += 1;
+        }
+        self.last_transfer_summary = Some(summary);
+
+        Ok(output)
     }
 }
 
@@ -1561,6 +1688,105 @@ pub struct MooncakeRemoteKvLayout {
     pub dst_kv_ptrs: Vec<u64>,
     pub dst_kv_indices: Vec<i32>,
     pub dst_kv_item_len: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransferableKvCacheRegion {
+    pub base_addr: usize,
+    pub byte_len: usize,
+    pub page_size_bytes: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransferableKvCacheMemory {
+    regions: Vec<TransferableKvCacheRegion>,
+    page_size_bytes: usize,
+}
+
+impl TransferableKvCacheMemory {
+    pub fn new(
+        regions: Vec<TransferableKvCacheRegion>,
+        page_size_bytes: usize,
+    ) -> Result<Self, KvCacheTransferError> {
+        if page_size_bytes == 0 {
+            return Err(KvCacheTransferError::Runtime(
+                "transferable KV memory page size must be non-zero".to_string(),
+            ));
+        }
+        if regions.is_empty() {
+            return Err(KvCacheTransferError::Runtime(
+                "transferable KV memory must expose at least one region".to_string(),
+            ));
+        }
+        if page_size_bytes % regions.len() != 0 {
+            return Err(KvCacheTransferError::Runtime(format!(
+                "transferable KV memory page size {page_size_bytes} must be divisible by {} regions",
+                regions.len()
+            )));
+        }
+
+        for region in &regions {
+            if region.base_addr == 0 {
+                return Err(KvCacheTransferError::Runtime(
+                    "transferable KV memory base address must be non-zero".to_string(),
+                ));
+            }
+            if region.byte_len == 0 {
+                return Err(KvCacheTransferError::Runtime(
+                    "transferable KV memory region length must be non-zero".to_string(),
+                ));
+            }
+            if region.page_size_bytes != page_size_bytes {
+                return Err(KvCacheTransferError::Runtime(format!(
+                    "transferable KV region page size {} does not match {page_size_bytes}",
+                    region.page_size_bytes
+                )));
+            }
+            if region.byte_len % region.page_size_bytes != 0 {
+                return Err(KvCacheTransferError::Runtime(format!(
+                    "transferable KV memory region length {} must be a multiple of page size {}",
+                    region.byte_len, region.page_size_bytes
+                )));
+            }
+        }
+
+        Ok(Self {
+            regions,
+            page_size_bytes,
+        })
+    }
+
+    pub fn regions(&self) -> &[TransferableKvCacheRegion] {
+        &self.regions
+    }
+
+    pub fn page_size_bytes(&self) -> usize {
+        self.page_size_bytes
+    }
+
+    pub fn prefill_layout(&self, target_base_offset: u64) -> MooncakeKvCacheLayout {
+        MooncakeKvCacheLayout {
+            source_base_addr: self.regions[0].base_addr,
+            page_size_bytes: self.page_size_bytes,
+            target_base_offset,
+        }
+    }
+
+    pub fn decode_remote_layout(&self, dst_kv_indices: &[i32]) -> MooncakeRemoteKvLayout {
+        MooncakeRemoteKvLayout {
+            dst_kv_ptrs: self
+                .regions
+                .iter()
+                .map(|region| region.base_addr as u64)
+                .collect(),
+            dst_kv_indices: dst_kv_indices.to_vec(),
+            dst_kv_item_len: self.page_size_bytes / self.regions.len(),
+        }
+    }
+}
+
+pub trait MooncakeKvCacheMemoryProvider {
+    fn mooncake_kv_cache_memory(&self) -> Result<TransferableKvCacheMemory, KvCacheTransferError>;
 }
 
 pub trait MooncakeSegmentOpener {
@@ -2363,11 +2589,16 @@ pub struct LinkedMooncakeTransferEngine {
     handle: MooncakeTransferEngineHandle,
 }
 
+// MooncakeTransferEngineHandle is an opaque C++ engine owner. Rust never dereferences
+// the pointer directly, and shared use goes through SharedLinkedMooncakeTransferEngine's Mutex.
+#[cfg(feature = "mooncake-link")]
+unsafe impl Send for LinkedMooncakeTransferEngine {}
+
 #[cfg(feature = "mooncake-link")]
 impl LinkedMooncakeTransferEngine {
     pub fn new(config: &MooncakeTransferEngineConfig) -> Result<Self, MooncakeError> {
         let metadata = CString::new(config.metadata_server.as_str())?;
-        let local_server = CString::new(config.hostname.as_str())?;
+        let local_server = CString::new(config.session_id.as_str())?;
         let host = CString::new(config.hostname.as_str())?;
 
         let handle = unsafe {
@@ -2375,7 +2606,7 @@ impl LinkedMooncakeTransferEngine {
                 metadata.as_ptr(),
                 local_server.as_ptr(),
                 host.as_ptr(),
-                0,
+                u64::from(config.rpc_port),
                 1,
             )
         };
@@ -2533,6 +2764,24 @@ impl SharedLinkedMooncakeTransferEngine {
         Ok(Self {
             inner: Arc::new(Mutex::new(LinkedMooncakeTransferEngine::new(config)?)),
         })
+    }
+
+    pub fn register_memory_batch(
+        &self,
+        buffers: &mut [MooncakeBufferEntry],
+        location: &str,
+    ) -> Result<(), MooncakeError> {
+        self.inner
+            .lock()
+            .expect("linked Mooncake engine lock should be held")
+            .register_memory_batch(buffers, location)
+    }
+
+    pub fn unregister_memory_batch(&self, addrs: &mut [*mut c_void]) -> Result<(), MooncakeError> {
+        self.inner
+            .lock()
+            .expect("linked Mooncake engine lock should be held")
+            .unregister_memory_batch(addrs)
     }
 }
 
