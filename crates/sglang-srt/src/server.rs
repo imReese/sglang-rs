@@ -11,7 +11,7 @@ use crate::deepseek_runtime::{
 };
 use crate::engine::Engine;
 use crate::glm_runtime::{
-    GlmMoeDsaF32TensorParallelRuntime, GlmMoeDsaRuntime, GlmMoeDsaRuntimeError,
+    GlmMoeDsaF32CachedForwardModel, GlmMoeDsaRuntime, GlmMoeDsaRuntimeError,
     GlmMoeDsaTensorShardLoadError,
 };
 use crate::grpc::{GrpcRouterService, GrpcServeError, serve_grpc_router_with_shutdown};
@@ -55,7 +55,7 @@ pub enum BootstrapForwardModel {
     Space,
     CpuEmbeddingLm(CpuEmbeddingLmModel),
     DeepSeekV4(DeepSeekV4LoadedTensorParallelRuntime),
-    GlmMoeDsa(GlmMoeDsaF32TensorParallelRuntime),
+    GlmMoeDsa(GlmMoeDsaF32CachedForwardModel),
     UnsupportedLocalModelRuntime {
         model_path: PathBuf,
         model_type: Option<String>,
@@ -85,11 +85,11 @@ impl BootstrapForwardModel {
                 }
                 None if artifacts.config().model_type.as_deref() == Some("glm_moe_dsa") => {
                     let runtime = GlmMoeDsaRuntime::from_local_model_artifacts(&artifacts)?;
-                    Self::GlmMoeDsa(
+                    Self::GlmMoeDsa(GlmMoeDsaF32CachedForwardModel::new(
                         runtime
                             .load_tensor_parallel_shards(args.tp_size)?
                             .decode_f32_tensor_parallel_shards()?,
-                    )
+                    ))
                 }
                 None => Self::UnsupportedLocalModelRuntime {
                     model_path: artifacts.model_path().to_path_buf(),
@@ -129,11 +129,7 @@ impl ForwardModel for BootstrapForwardModel {
                     plan.input_ids().len()
                 )))
             }
-            Self::GlmMoeDsa(runtime) => ModelForwardOutput::new(
-                runtime
-                    .transformer_lm_head_logits(batch)
-                    .map_err(|error| ModelForwardError::Runtime(error.to_string()))?,
-            ),
+            Self::GlmMoeDsa(model) => model.forward(batch),
             Self::UnsupportedLocalModelRuntime {
                 model_path,
                 model_type,

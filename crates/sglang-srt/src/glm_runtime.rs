@@ -13,7 +13,9 @@ use crate::model_artifacts::{
     SafetensorsTensorData, SafetensorsTensorDecodeError, SafetensorsTensorMetadata,
     SafetensorsTensorSpan,
 };
-use crate::model_executor::ModelWorkerBatch;
+use crate::model_executor::{
+    ForwardModel, ModelForwardError, ModelForwardOutput, ModelWorkerBatch,
+};
 use crate::transfer::{KvCacheModelLayout, PdConfigError};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1033,6 +1035,42 @@ impl GlmMoeDsaF32KvPageStore {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlmMoeDsaF32CachedForwardModel {
+    runtime: GlmMoeDsaF32TensorParallelRuntime,
+    kv_cache: GlmMoeDsaF32KvPageStore,
+}
+
+impl GlmMoeDsaF32CachedForwardModel {
+    pub fn new(runtime: GlmMoeDsaF32TensorParallelRuntime) -> Self {
+        Self {
+            runtime,
+            kv_cache: GlmMoeDsaF32KvPageStore::default(),
+        }
+    }
+
+    pub fn runtime(&self) -> &GlmMoeDsaF32TensorParallelRuntime {
+        &self.runtime
+    }
+
+    pub fn kv_cache_contains(&self, layer_id: usize, cache_page: CachePageId) -> bool {
+        self.kv_cache.contains(layer_id, cache_page)
+    }
+}
+
+impl ForwardModel for GlmMoeDsaF32CachedForwardModel {
+    fn forward(
+        &mut self,
+        batch: &ModelWorkerBatch,
+    ) -> Result<ModelForwardOutput, ModelForwardError> {
+        ModelForwardOutput::new(
+            self.runtime
+                .transformer_lm_head_logits_with_kv_cache(batch, &mut self.kv_cache)
+                .map_err(|error| ModelForwardError::Runtime(error.to_string()))?,
+        )
+    }
+}
+
 impl GlmMoeDsaF32TensorParallelRuntime {
     fn from_loaded_runtime(
         runtime: &GlmMoeDsaLoadedTensorParallelRuntime,
@@ -1135,6 +1173,39 @@ impl GlmMoeDsaF32TensorParallelRuntime {
                     &positions,
                 )
             })
+            .collect()
+    }
+
+    pub fn transformer_lm_head_logits_with_kv_cache(
+        &self,
+        batch: &ModelWorkerBatch,
+        kv_cache: &mut GlmMoeDsaF32KvPageStore,
+    ) -> Result<Vec<Vec<f32>>, GlmMoeDsaF32KernelError> {
+        if batch.out_cache_pages().len() != batch.input_ids().len()
+            || batch.sequence_cache_pages().len() != batch.sequence_token_ids().len()
+        {
+            return self.transformer_lm_head_logits(batch);
+        }
+
+        batch
+            .sequence_offsets()
+            .iter()
+            .zip(batch.sequence_token_counts())
+            .zip(batch.request_offsets())
+            .zip(batch.input_token_counts())
+            .map(
+                |(((sequence_offset, sequence_token_count), request_offset), input_token_count)| {
+                    let sequence_end = *sequence_offset + *sequence_token_count;
+                    let input_end = *request_offset + *input_token_count;
+                    self.transformer_lm_head_logits_for_cached_request(
+                        &batch.input_ids()[*request_offset..input_end],
+                        &batch.positions()[*request_offset..input_end],
+                        &batch.out_cache_pages()[*request_offset..input_end],
+                        &batch.sequence_cache_pages()[*sequence_offset..sequence_end],
+                        kv_cache,
+                    )
+                },
+            )
             .collect()
     }
 
@@ -1315,6 +1386,53 @@ impl GlmMoeDsaF32TensorParallelRuntime {
 
         let attention_output =
             self.attention_output_with_positions(layer_id, &attention_input, positions)?;
+        attention_output
+            .iter()
+            .zip(&attention_residual)
+            .map(|(attention_output, residual)| {
+                self.feed_forward_layer_output(layer_id, attention_output, Some(residual))
+            })
+            .collect()
+    }
+
+    fn transformer_layer_output_with_kv_cache(
+        &self,
+        layer_id: usize,
+        hidden_states: &[Vec<f32>],
+        positions: &[usize],
+        out_cache_pages: &[CachePageId],
+        sequence_cache_pages: &[CachePageId],
+        kv_cache: &mut GlmMoeDsaF32KvPageStore,
+        residuals: Option<&[Vec<f32>]>,
+    ) -> Result<Vec<GlmMoeDsaF32LayerOutput>, GlmMoeDsaF32KernelError> {
+        if let Some(residuals) = residuals {
+            if residuals.len() != hidden_states.len() {
+                return Err(GlmMoeDsaF32KernelError::TokenCountMismatch {
+                    tensor_name: format!("model.layers.{layer_id}.input_layernorm.weight"),
+                    expected: hidden_states.len(),
+                    actual: residuals.len(),
+                });
+            }
+        }
+
+        let mut attention_input = Vec::with_capacity(hidden_states.len());
+        let mut attention_residual = Vec::with_capacity(hidden_states.len());
+        for (token_index, hidden) in hidden_states.iter().enumerate() {
+            let residual = residuals.and_then(|residuals| residuals.get(token_index));
+            let (normalized, residual) =
+                self.prepare_attention_input(layer_id, hidden, residual.map(Vec::as_slice))?;
+            attention_input.push(normalized);
+            attention_residual.push(residual);
+        }
+
+        let attention_output = self.attention_output_with_kv_cache(
+            layer_id,
+            &attention_input,
+            positions,
+            out_cache_pages,
+            sequence_cache_pages,
+            kv_cache,
+        )?;
         attention_output
             .iter()
             .zip(&attention_residual)
@@ -1529,6 +1647,91 @@ impl GlmMoeDsaF32TensorParallelRuntime {
                 layer_id,
                 &hidden_states,
                 positions,
+                residuals.as_deref(),
+            )?;
+            hidden_states = layer_output
+                .iter()
+                .map(|output| output.hidden_states().to_vec())
+                .collect();
+            residuals = Some(
+                layer_output
+                    .iter()
+                    .map(|output| output.residual().to_vec())
+                    .collect(),
+            );
+        }
+
+        let last_token_index = hidden_states.len() - 1;
+        let mut hidden = hidden_states[last_token_index].clone();
+        if let Some(residuals) = residuals {
+            let residual = &residuals[last_token_index];
+            if residual.len() != hidden.len() {
+                return Err(GlmMoeDsaF32KernelError::HiddenSizeMismatch {
+                    tensor_name: "model.norm.weight".to_string(),
+                    expected: hidden.len(),
+                    actual: residual.len(),
+                });
+            }
+            for (hidden, residual) in hidden.iter_mut().zip(residual) {
+                *hidden += residual;
+            }
+        }
+
+        let norm_weight = self.final_norm_weight()?;
+        apply_rms_norm(
+            "model.norm.weight",
+            &mut hidden,
+            norm_weight,
+            self.rms_norm_eps,
+        )?;
+        self.lm_head_logits_for_hidden(&hidden)
+    }
+
+    fn transformer_lm_head_logits_for_cached_request(
+        &self,
+        input_ids: &[u32],
+        positions: &[usize],
+        out_cache_pages: &[CachePageId],
+        sequence_cache_pages: &[CachePageId],
+        kv_cache: &mut GlmMoeDsaF32KvPageStore,
+    ) -> Result<Vec<f32>, GlmMoeDsaF32KernelError> {
+        if input_ids.is_empty() {
+            return Err(GlmMoeDsaF32KernelError::TokenCountMismatch {
+                tensor_name: "model.embed_tokens.weight".to_string(),
+                expected: 1,
+                actual: 0,
+            });
+        }
+        if positions.len() != input_ids.len() {
+            return Err(GlmMoeDsaF32KernelError::TokenCountMismatch {
+                tensor_name: "model.layers.0.self_attn.rotary_emb".to_string(),
+                expected: input_ids.len(),
+                actual: positions.len(),
+            });
+        }
+        if out_cache_pages.len() != input_ids.len() {
+            return Err(GlmMoeDsaF32KernelError::TokenCountMismatch {
+                tensor_name: "model.layers.0.self_attn.kv_cache".to_string(),
+                expected: input_ids.len(),
+                actual: out_cache_pages.len(),
+            });
+        }
+
+        let mut hidden_states = input_ids
+            .iter()
+            .copied()
+            .map(|token_id| self.token_embedding(token_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut residuals = None::<Vec<Vec<f32>>>;
+
+        for layer_id in 0..self.layer_count {
+            let layer_output = self.transformer_layer_output_with_kv_cache(
+                layer_id,
+                &hidden_states,
+                positions,
+                out_cache_pages,
+                sequence_cache_pages,
+                kv_cache,
                 residuals.as_deref(),
             )?;
             hidden_states = layer_output

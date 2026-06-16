@@ -1,14 +1,15 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use sglang_srt::cache::CachePageId;
+use sglang_srt::cache::{CachePageAllocator, CachePageId, RadixCache};
 use sglang_srt::glm_runtime::{
-    GlmMoeDsaF32KernelError, GlmMoeDsaF32KvPageStore, GlmMoeDsaFeedForwardTensorDescriptors,
-    GlmMoeDsaRuntime, GlmMoeDsaTensorPlacementKind, GlmMoeDsaTensorShardSelection,
+    GlmMoeDsaF32CachedForwardModel, GlmMoeDsaF32KernelError, GlmMoeDsaF32KvPageStore,
+    GlmMoeDsaFeedForwardTensorDescriptors, GlmMoeDsaRuntime, GlmMoeDsaTensorPlacementKind,
+    GlmMoeDsaTensorShardSelection,
 };
 use sglang_srt::model_artifacts::LocalModelArtifacts;
 use sglang_srt::model_artifacts::SafetensorsTensorDecodeError;
-use sglang_srt::model_executor::ModelWorkerBatch;
+use sglang_srt::model_executor::{ForwardModel, ModelRunner, ModelWorkerBatch};
 use sglang_srt::scheduler::{ScheduledRequest, Scheduler};
 use sglang_srt::transfer::KvCacheDtype;
 use sglang_srt::types::{RequestId, SamplingParams};
@@ -543,6 +544,71 @@ fn glm_moe_dsa_f32_runtime_uses_decode_sequence_history_for_transformer_logits()
     assert_eq!(logits.len(), 1);
     assert_close(
         &logits[0],
+        &expected_dense_transformer_final_logits([4.0, 6.0]),
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn glm_moe_dsa_cached_forward_model_populates_and_reuses_kv_pages_for_decode() {
+    let model_dir = temp_model_dir("glm-runtime-f32-cached-forward-decode");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_glm_moe_dsa_attention_output_fixture(&model_dir);
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("GLM artifacts should load");
+    let runtime =
+        GlmMoeDsaRuntime::from_local_model_artifacts(&artifacts).expect("runtime should build");
+    let f32_runtime = runtime
+        .load_tensor_parallel_shards(2)
+        .expect("all TP rank shards should load")
+        .decode_f32_tensor_parallel_shards()
+        .expect("F32 cache should decode");
+    let mut scheduler = Scheduler::with_cache_resources(
+        ModelRunner::new(GlmMoeDsaF32CachedForwardModel::new(f32_runtime)),
+        RadixCache::default(),
+        CachePageAllocator::new(3),
+    );
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("glm-cached-forward-decode"),
+        vec![0],
+        SamplingParams::new(2),
+    ));
+
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("cached prefill should dispatch first token");
+
+    assert!(
+        scheduler
+            .worker()
+            .model()
+            .kv_cache_contains(0, CachePageId::from(0)),
+        "prefill forward should populate the request's prefix cache page"
+    );
+
+    let decode_batch = scheduler
+        .next_decode_batch(1)
+        .expect("decode batch should be available");
+    let worker_batch = ModelWorkerBatch::from_schedule_batch(&decode_batch);
+    let decode_output = scheduler
+        .worker_mut()
+        .model_mut()
+        .forward(&worker_batch)
+        .expect("cached decode forward should reuse the prefix page");
+
+    assert_eq!(worker_batch.input_ids(), &[1]);
+    assert_eq!(worker_batch.sequence_cache_pages().len(), 2);
+    assert!(
+        scheduler
+            .worker()
+            .model()
+            .kv_cache_contains(0, CachePageId::from(1)),
+        "decode forward should populate the newly allocated cache page"
+    );
+    assert_eq!(decode_output.logits().len(), 1);
+    assert_close(
+        &decode_output.logits()[0],
         &expected_dense_transformer_final_logits([4.0, 6.0]),
     );
 
