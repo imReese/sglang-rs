@@ -728,8 +728,11 @@ fn linked_mooncake_engine_constructor_is_available_under_feature() {
     let constructor: fn(
         &MooncakeTransferEngineConfig,
     ) -> Result<LinkedMooncakeTransferEngine, MooncakeError> = LinkedMooncakeTransferEngine::new;
+    let endpoint_query: fn(&LinkedMooncakeTransferEngine) -> Result<String, MooncakeError> =
+        LinkedMooncakeTransferEngine::local_endpoint;
 
     let _ = constructor;
+    let _ = endpoint_query;
 }
 
 #[cfg(feature = "mooncake-link")]
@@ -746,8 +749,8 @@ fn linked_mooncake_engine_transfers_registered_host_buffers() {
     let config = MooncakeTransferEngineConfig {
         hostname: "127.0.0.1".to_string(),
         gpu_id: 0,
-        rpc_port: 41011,
-        session_id: "127.0.0.1:41011".to_string(),
+        rpc_port: 0,
+        session_id: "127.0.0.1:0".to_string(),
         metadata_server: "P2PHANDSHAKE".to_string(),
         protocol: "tcp".to_string(),
         device_name: String::new(),
@@ -769,8 +772,11 @@ fn linked_mooncake_engine_transfers_registered_host_buffers() {
         .register_memory_batch(&mut buffers, "cpu:0")
         .expect("host buffers should register");
 
+    let local_endpoint = engine
+        .local_endpoint()
+        .expect("actual Mooncake endpoint should be available");
     let target_id = engine
-        .open_segment(config.session_id())
+        .open_segment(&local_endpoint)
         .expect("local segment should open");
     let mut requests = vec![MooncakeTransferRequest {
         opcode: MooncakeOpcode::Write as i32,

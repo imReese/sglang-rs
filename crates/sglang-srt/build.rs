@@ -1,6 +1,9 @@
 use std::env;
 use std::path::PathBuf;
 
+#[path = "build_support/mooncake_link.rs"]
+mod mooncake_link;
+
 fn main() {
     compile_proto();
     configure_mooncake_link();
@@ -33,43 +36,23 @@ fn configure_mooncake_link() {
         return;
     }
 
-    let build_dir = mooncake_build_dir();
-    let transfer_engine_dir = build_dir.join("mooncake-transfer-engine").join("src");
-    let base_dir = transfer_engine_dir.join("common").join("base");
-    let common_src_dir = build_dir.join("mooncake-common").join("src");
-    let common_dir = build_dir.join("mooncake-common");
+    let plan = mooncake_link::resolve_link_plan_from_env().unwrap_or_else(|error| {
+        panic!("mooncake-link feature requires built Mooncake native libraries:\n{error}")
+    });
 
-    println!(
-        "cargo:rustc-link-search=native={}",
-        transfer_engine_dir.display()
-    );
-    println!(
-        "cargo:rustc-link-search=native={}",
-        common_src_dir.display()
-    );
-    println!("cargo:rustc-link-search=native={}", base_dir.display());
-    println!("cargo:rustc-link-search=native={}", common_dir.display());
-    println!("cargo:rustc-link-lib=static=transfer_engine");
-    println!("cargo:rustc-link-lib=static=mooncake_common");
-    println!("cargo:rustc-link-lib=static=base");
-    println!("cargo:rustc-link-lib=dylib=asio");
-    println!("cargo:rustc-link-lib=dylib=stdc++");
-    println!("cargo:rustc-link-lib=dylib=jsoncpp");
-    println!("cargo:rustc-link-lib=dylib=curl");
-    println!("cargo:rustc-link-lib=dylib=glog");
-    println!("cargo:rustc-link-lib=dylib=gflags");
-    println!("cargo:rustc-link-lib=dylib=ibverbs");
-    println!("cargo:rustc-link-lib=dylib=numa");
-    println!("cargo:rustc-link-lib=dylib=pthread");
-}
-
-fn mooncake_build_dir() -> PathBuf {
-    if let Some(path) = env::var_os("MOONCAKE_BUILD_DIR") {
-        return PathBuf::from(path);
+    for artifact in &plan.required_artifacts {
+        println!("cargo:rerun-if-changed={}", artifact.display());
     }
-
-    let mooncake_home = env::var_os("MOONCAKE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/home/reese/workspace/code/kvcache-ai/Mooncake"));
-    mooncake_home.join("build")
+    for dir in &plan.link_search_dirs {
+        println!("cargo:rustc-link-search=native={}", dir.display());
+    }
+    for lib in &plan.static_libs {
+        println!("cargo:rustc-link-lib=static={lib}");
+    }
+    for lib in &plan.dynamic_libs {
+        println!("cargo:rustc-link-lib=dylib={lib}");
+    }
+    for lib in &plan.system_dynamic_libs {
+        println!("cargo:rustc-link-lib=dylib={lib}");
+    }
 }

@@ -1000,6 +1000,7 @@ fn try_build_launch_mooncake_decode_http_router_service(
         pd_config,
     );
     let engine = SharedLinkedMooncakeTransferEngine::new(&engine_config)?;
+    let mooncake_session_id = engine.local_endpoint()?;
     let target_resolver = MooncakeSessionTargetResolver::new(engine.clone(), Vec::new());
     let kv_cache_layout = launch_mooncake_decode_kv_layout(&model)?;
     let transfer_executor = MooncakeKvCacheTransferExecutor::with_target_resolver(
@@ -1011,11 +1012,7 @@ fn try_build_launch_mooncake_decode_http_router_service(
         args,
         DecodeBootstrapRegistry::default(),
         transfer_executor,
-        launch_mooncake_decode_bootstrap_publisher(
-            args,
-            kv_cache_layout,
-            engine_config.session_id().to_string(),
-        ),
+        launch_mooncake_decode_bootstrap_publisher(args, kv_cache_layout, mooncake_session_id),
     )
 }
 
@@ -1076,6 +1073,7 @@ fn try_build_launch_mooncake_decode_grpc_router_service(
         pd_config,
     );
     let engine = SharedLinkedMooncakeTransferEngine::new(&engine_config)?;
+    let mooncake_session_id = engine.local_endpoint()?;
     let target_resolver = MooncakeSessionTargetResolver::new(engine.clone(), Vec::new());
     let kv_cache_layout = launch_mooncake_decode_kv_layout(&model)?;
     let transfer_executor = MooncakeKvCacheTransferExecutor::with_target_resolver(
@@ -1087,11 +1085,7 @@ fn try_build_launch_mooncake_decode_grpc_router_service(
         args,
         DecodeBootstrapRegistry::default(),
         transfer_executor,
-        launch_mooncake_decode_bootstrap_publisher(
-            args,
-            kv_cache_layout,
-            engine_config.session_id().to_string(),
-        ),
+        launch_mooncake_decode_bootstrap_publisher(args, kv_cache_layout, mooncake_session_id),
     )
 }
 

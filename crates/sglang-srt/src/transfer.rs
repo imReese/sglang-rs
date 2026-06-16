@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 #[cfg(feature = "mooncake-link")]
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::ffi::{NulError, c_char, c_int, c_void};
 use std::fmt;
 use std::fs;
@@ -652,6 +652,8 @@ pub enum MooncakeError {
     InteriorNul,
     UnavailableWithoutLink,
     EngineCreateFailed,
+    LocalEndpointQueryFailed(i32),
+    LocalEndpointUtf8,
     TransportInstallFailed(String),
     RegisterMemoryFailed(i32),
     UnregisterMemoryFailed(i32),
@@ -676,6 +678,12 @@ impl fmt::Display for MooncakeError {
             ),
             Self::EngineCreateFailed => {
                 formatter.write_str("mooncake transfer engine create failed")
+            }
+            Self::LocalEndpointQueryFailed(code) => {
+                write!(formatter, "mooncake local endpoint query failed: {code}")
+            }
+            Self::LocalEndpointUtf8 => {
+                formatter.write_str("mooncake local endpoint is not valid UTF-8")
             }
             Self::TransportInstallFailed(protocol) => {
                 write!(formatter, "mooncake transport install failed: {protocol}")
@@ -2623,6 +2631,25 @@ impl LinkedMooncakeTransferEngine {
         self.handle
     }
 
+    pub fn local_endpoint(&self) -> Result<String, MooncakeError> {
+        let mut buffer = vec![0_u8; 256];
+        let code = unsafe {
+            getLocalIpAndPort(
+                self.handle,
+                buffer.as_mut_ptr().cast::<c_char>(),
+                buffer.len(),
+            )
+        };
+        if code != 0 {
+            return Err(MooncakeError::LocalEndpointQueryFailed(code));
+        }
+        let endpoint = CStr::from_bytes_until_nul(&buffer)
+            .map_err(|_| MooncakeError::LocalEndpointUtf8)?
+            .to_str()
+            .map_err(|_| MooncakeError::LocalEndpointUtf8)?;
+        Ok(endpoint.to_string())
+    }
+
     pub fn install_transport(&self, protocol: &str) -> Result<(), MooncakeError> {
         let protocol_c = CString::new(protocol)?;
         let transport =
@@ -2766,6 +2793,13 @@ impl SharedLinkedMooncakeTransferEngine {
         })
     }
 
+    pub fn local_endpoint(&self) -> Result<String, MooncakeError> {
+        self.inner
+            .lock()
+            .expect("linked Mooncake engine lock should be held")
+            .local_endpoint()
+    }
+
     pub fn register_memory_batch(
         &self,
         buffers: &mut [MooncakeBufferEntry],
@@ -2842,6 +2876,12 @@ unsafe extern "C" {
     ) -> MooncakeTransferEngineHandle;
 
     pub fn destroyTransferEngine(engine: MooncakeTransferEngineHandle);
+
+    pub fn getLocalIpAndPort(
+        engine: MooncakeTransferEngineHandle,
+        buf_out: *mut c_char,
+        buf_len: usize,
+    ) -> c_int;
 
     pub fn installTransport(
         engine: MooncakeTransferEngineHandle,
