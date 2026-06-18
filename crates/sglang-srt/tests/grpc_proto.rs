@@ -495,6 +495,55 @@ async fn grpc_complete_streams_openai_completion_chunks() {
 }
 
 #[tokio::test]
+async fn grpc_rerank_returns_raw_worker_results() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "tiny",
+        "--grpc-mode",
+    ])
+    .expect("args should parse");
+    let runtime = RouterRuntime::new(Engine::new(
+        ByteTokenizer,
+        Scheduler::new(GrpcTwoStepWorker),
+    ));
+    let service = GrpcRouterService::with_server_args(runtime, &args);
+    let payload = serde_json::json!({
+        "model": "tiny",
+        "query": "rust pd router",
+        "documents": [
+            "python gateway only",
+            "rust pd router transfers kv cache",
+            "router"
+        ],
+    });
+
+    let response = service
+        .rerank(Request::new(OpenAiJsonRequest {
+            json: serde_json::to_vec(&payload).expect("payload should serialize"),
+            options: None,
+        }))
+        .await
+        .expect("rerank should execute")
+        .into_inner();
+
+    let body: serde_json::Value =
+        serde_json::from_slice(&response.json).expect("response should be JSON");
+    let results = body.as_array().expect("worker should return raw list");
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["index"], 1);
+    assert_eq!(results[0]["document"], "rust pd router transfers kv cache");
+    assert_eq!(results[1]["index"], 2);
+    assert_eq!(results[2]["index"], 0);
+    assert!(
+        results[0]["score"].as_f64().unwrap() > results[1]["score"].as_f64().unwrap(),
+        "more overlapping tokens should score higher: {results:?}"
+    );
+}
+
+#[tokio::test]
 async fn grpc_generate_can_poll_pd_transfer_before_decode() {
     let worker = KvTransferModelWorker::new(
         GrpcTwoStepWorker,

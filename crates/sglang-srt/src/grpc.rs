@@ -10,6 +10,9 @@ use tonic::{Code, Request, Response, Status};
 
 use crate::cli::ServerArgs;
 use crate::engine::Engine;
+use crate::openai_rerank::{
+    parse_rerank_request, rerank_results_to_json, score_rerank_documents, truncate_rerank_results,
+};
 use crate::proto::sglang::runtime::v1::generate_response::Body as ProtoGenerateResponseBody;
 use crate::proto::sglang::runtime::v1::sglang_service_server::{
     SglangService, SglangServiceServer,
@@ -932,9 +935,25 @@ where
 
     async fn rerank(
         &self,
-        _request: Request<OpenAiJsonRequest>,
+        request: Request<OpenAiJsonRequest>,
     ) -> Result<Response<OpenAiJsonResponse>, Status> {
-        Err(unimplemented_rpc("Rerank"))
+        let model_info = self.model_info()?;
+        let payload: Value = serde_json::from_slice(&request.into_inner().json)
+            .map_err(|e| Status::invalid_argument(format!("invalid rerank JSON: {e}")))?;
+        let request = parse_rerank_request(&payload, &model_info.served_model_name)
+            .map_err(Status::invalid_argument)?;
+        let mut results = {
+            let runtime = self
+                .runtime
+                .lock()
+                .map_err(|_| Status::internal("router runtime mutex poisoned"))?;
+            score_rerank_documents(&runtime, &request)
+        };
+        truncate_rerank_results(&request, &mut results);
+        let json = rerank_results_to_json(&request, results);
+        let json = serde_json::to_vec(&json)
+            .map_err(|e| Status::internal(format!("serialize rerank JSON: {e}")))?;
+        Ok(Response::new(OpenAiJsonResponse { json }))
     }
 
     async fn start_profile(
