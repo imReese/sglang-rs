@@ -1255,6 +1255,83 @@ async fn http_prefill_server_accepts_batched_disaggregated_openai_completions() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_prefill_server_accepts_batched_disaggregated_chat_completions() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "glm-prefill-chat-batch",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--disaggregation-mode",
+        "prefill",
+        "--disaggregation-transfer-backend",
+        "fake",
+        "--num-reserved-decode-tokens",
+        "8",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let service = build_bootstrap_prefill_http_router_service(&args);
+    let inspected_service = service.clone();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let completion = post_json_with_retry(
+        addr,
+        "/v1/chat/completions",
+        r#"{"request_id":["http-pd-chat-batch-a","http-pd-chat-batch-b"],"model":"glm-prefill-chat-batch","messages":[{"role":"user","content":"hi"}],"n":2,"max_tokens":1,"bootstrap_host":["10.0.0.8","10.0.0.8"],"bootstrap_port":[8200,8200],"bootstrap_room":[107,108]}"#,
+    )
+    .await;
+
+    assert_eq!(completion["object"], "chat.completion");
+    assert_eq!(completion["model"], "glm-prefill-chat-batch");
+    let choices = completion["choices"]
+        .as_array()
+        .expect("batched chat completions should return one choice per n");
+    assert_eq!(choices.len(), 2);
+    assert_eq!(choices[0]["index"], 0);
+    assert_eq!(choices[0]["message"]["role"], "assistant");
+    assert_eq!(choices[0]["message"]["content"], " ");
+    assert_eq!(choices[0]["finish_reason"], "stop");
+    assert_eq!(choices[1]["index"], 1);
+    assert_eq!(choices[1]["message"]["role"], "assistant");
+    assert_eq!(choices[1]["message"]["content"], " ");
+    assert_eq!(choices[1]["finish_reason"], "stop");
+    assert_eq!(completion["usage"]["prompt_tokens"], 4);
+    assert_eq!(completion["usage"]["completion_tokens"], 2);
+
+    let runtime = inspected_service
+        .runtime()
+        .lock()
+        .expect("runtime lock should be held");
+    let worker = runtime.engine().scheduler().worker();
+    let summary = worker
+        .last_transfer_summary()
+        .expect("PD prefill chat batch should record transfer summary");
+    assert_eq!(summary.submitted_spans(), 2);
+    assert_eq!(worker.transfer_executor().transferred_rooms(), &[107, 108]);
+
+    drop(runtime);
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_pd_server_polls_async_transfer_before_decode() {
     let args = ServerArgs::parse_from([
         "serve",

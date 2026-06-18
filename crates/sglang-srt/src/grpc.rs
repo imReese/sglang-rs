@@ -46,6 +46,11 @@ type OpenAiJsonResponseStream = Pin<
     Box<dyn tonic::codegen::tokio_stream::Stream<Item = Result<OpenAiJsonResponse, Status>> + Send>,
 >;
 
+enum GrpcChatResponse {
+    Single(Vec<RouterGenerateResponse>),
+    Batch(Vec<Vec<RouterGenerateResponse>>),
+}
+
 enum GrpcCompletionResponse {
     Single(Vec<RouterGenerateResponse>),
     Batch(Vec<Vec<RouterGenerateResponse>>),
@@ -256,6 +261,70 @@ fn openai_chat_response_from_router_responses(
         }
     };
 
+    let json = serde_json::to_vec(&json)
+        .map_err(|e| Status::internal(format!("serialize OpenAI chat JSON: {e}")))?;
+    Ok(OpenAiJsonResponse { json })
+}
+
+#[derive(Default)]
+struct OpenAiChatUsage {
+    prompt_tokens: i32,
+    completion_tokens: i32,
+    cached_tokens: i32,
+}
+
+fn openai_chat_batch_response_from_router_responses(
+    batch_responses: Vec<Vec<RouterGenerateResponse>>,
+    model: &str,
+) -> Result<OpenAiJsonResponse, Status> {
+    let mut choices = Vec::with_capacity(batch_responses.len());
+    let mut usage = OpenAiChatUsage::default();
+    let mut response_id = None;
+
+    for (batch_index, mut responses) in batch_responses.into_iter().enumerate() {
+        let Some(response) = responses.pop() else {
+            return Err(Status::internal("generation produced no response"));
+        };
+        if response_id.is_none() {
+            response_id = Some(response.request_id.clone());
+        }
+
+        match response.body {
+            RouterGenerateResponseBody::Complete(complete) => {
+                usage.prompt_tokens += complete.prompt_tokens;
+                usage.completion_tokens += complete.completion_tokens;
+                usage.cached_tokens += complete.cached_tokens;
+                choices.push(json!({
+                    "index": batch_index,
+                    "message": {
+                        "role": "assistant",
+                        "content": complete.text,
+                    },
+                    "finish_reason": complete.finish_reason,
+                }));
+            }
+            RouterGenerateResponseBody::Chunk(_) => {
+                return Err(Status::internal(
+                    "non-stream gRPC chat completion returned a stream chunk",
+                ));
+            }
+            RouterGenerateResponseBody::Error(error) => {
+                return Err(Status::internal(error.message));
+            }
+        }
+    }
+
+    let json = json!({
+        "id": format!("chatcmpl-{}", response_id.unwrap_or_default()),
+        "object": "chat.completion",
+        "model": model,
+        "choices": choices,
+        "usage": {
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "cached_tokens": usage.cached_tokens,
+        }
+    });
     let json = serde_json::to_vec(&json)
         .map_err(|e| Status::internal(format!("serialize OpenAI chat JSON: {e}")))?;
     Ok(OpenAiJsonResponse { json })
@@ -699,30 +768,68 @@ where
         let model = self.model_info()?.served_model_name;
         let mut request = crate::http::http_chat_payload_to_router_request(payload, &model)
             .map_err(Status::invalid_argument)?;
-        apply_openai_json_options_to_router_request(&mut request, options);
-        let stream = request.stream;
+        match &mut request {
+            crate::http::HttpChatRequest::Single(request) => {
+                apply_openai_json_options_to_router_request(request, options);
+            }
+            crate::http::HttpChatRequest::Batch(requests) => {
+                for request in requests {
+                    apply_openai_json_options_to_router_request(request, options.clone());
+                }
+            }
+        }
+        let stream = request.stream();
 
-        let responses = self
+        let mut runtime = self
             .runtime
             .lock()
-            .map_err(|_| Status::internal("router runtime mutex poisoned"))?
-            .generate_text_stream_with_transfer_polling(request, self.max_transfer_polls)
-            .map_err(router_runtime_error_to_status)?;
-
-        if stream {
-            let stream = responses
-                .into_iter()
-                .map(|response| openai_chat_stream_response_from_router_response(response, &model))
-                .collect::<Vec<_>>();
-            return Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
-                stream,
-            ))));
+            .map_err(|_| Status::internal("router runtime mutex poisoned"))?;
+        let response = match request {
+            crate::http::HttpChatRequest::Single(request) => runtime
+                .generate_text_stream_with_transfer_polling(request, self.max_transfer_polls)
+                .map(GrpcChatResponse::Single),
+            crate::http::HttpChatRequest::Batch(requests) => {
+                if stream {
+                    return Err(Status::invalid_argument(
+                        "streaming batched chat completions are not supported yet",
+                    ));
+                }
+                runtime
+                    .generate_text_batch_stream_with_transfer_polling(
+                        requests,
+                        self.max_transfer_polls,
+                    )
+                    .map(GrpcChatResponse::Batch)
+            }
         }
+        .map_err(router_runtime_error_to_status)?;
 
-        let response = openai_chat_response_from_router_responses(responses, &model)?;
-        Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
-            [Ok(response)],
-        ))))
+        match response {
+            GrpcChatResponse::Single(responses) if stream => {
+                let stream = responses
+                    .into_iter()
+                    .map(|response| {
+                        openai_chat_stream_response_from_router_response(response, &model)
+                    })
+                    .collect::<Vec<_>>();
+                Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
+                    stream,
+                ))))
+            }
+            GrpcChatResponse::Single(responses) => {
+                let response = openai_chat_response_from_router_responses(responses, &model)?;
+                Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
+                    [Ok(response)],
+                ))))
+            }
+            GrpcChatResponse::Batch(batch_responses) => {
+                let response =
+                    openai_chat_batch_response_from_router_responses(batch_responses, &model)?;
+                Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
+                    [Ok(response)],
+                ))))
+            }
+        }
     }
 
     async fn complete(

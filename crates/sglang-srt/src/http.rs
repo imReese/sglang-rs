@@ -866,8 +866,8 @@ where
                 .into_response();
         }
     };
-    let stream = request.stream;
-    if request.disaggregated_params.is_some() && !service.allow_disaggregated_requests {
+    let stream = request.stream();
+    if request.disaggregated_params().is_some() && !service.allow_disaggregated_requests {
         return (
             StatusCode::NOT_IMPLEMENTED,
             Json(json!({
@@ -884,15 +884,52 @@ where
             .runtime
             .lock()
             .expect("HTTP router runtime lock should be held");
-        if service.max_transfer_polls == 0 {
-            runtime.generate_text_stream(request)
-        } else {
-            runtime.generate_text_stream_with_transfer_polling(request, service.max_transfer_polls)
+        match request {
+            HttpChatRequest::Single(request) => {
+                if service.max_transfer_polls == 0 {
+                    runtime
+                        .generate_text_stream(request)
+                        .map(HttpChatResponse::Single)
+                } else {
+                    runtime
+                        .generate_text_stream_with_transfer_polling(
+                            request,
+                            service.max_transfer_polls,
+                        )
+                        .map(HttpChatResponse::Single)
+                }
+            }
+            HttpChatRequest::Batch(requests) => {
+                if stream {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": {
+                                "message": "streaming batched /v1/chat/completions is not supported yet"
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
+
+                if service.max_transfer_polls == 0 {
+                    runtime
+                        .generate_text_batch_stream(requests)
+                        .map(HttpChatResponse::Batch)
+                } else {
+                    runtime
+                        .generate_text_batch_stream_with_transfer_polling(
+                            requests,
+                            service.max_transfer_polls,
+                        )
+                        .map(HttpChatResponse::Batch)
+                }
+            }
         }
     };
 
     match response {
-        Ok(mut responses) => {
+        Ok(HttpChatResponse::Single(mut responses)) => {
             if stream {
                 return http_chat_stream_response_from_router_responses(responses, &model);
             }
@@ -942,12 +979,124 @@ where
                     .into_response(),
             }
         }
+        Ok(HttpChatResponse::Batch(batch_responses)) => {
+            http_chat_batch_response_from_router_responses(batch_responses, &model)
+        }
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": { "message": error.to_string() } })),
         )
             .into_response(),
     }
+}
+
+pub(crate) enum HttpChatRequest {
+    Single(RouterTextGenerateRequest),
+    Batch(Vec<RouterTextGenerateRequest>),
+}
+
+impl HttpChatRequest {
+    pub(crate) fn stream(&self) -> bool {
+        match self {
+            Self::Single(request) => request.stream,
+            Self::Batch(requests) => requests
+                .first()
+                .map(|request| request.stream)
+                .unwrap_or(false),
+        }
+    }
+
+    pub(crate) fn disaggregated_params(&self) -> Option<&RouterDisaggregatedParams> {
+        match self {
+            Self::Single(request) => request.disaggregated_params.as_ref(),
+            Self::Batch(requests) => requests
+                .iter()
+                .find_map(|request| request.disaggregated_params.as_ref()),
+        }
+    }
+}
+
+enum HttpChatResponse {
+    Single(Vec<RouterGenerateResponse>),
+    Batch(Vec<Vec<RouterGenerateResponse>>),
+}
+
+#[derive(Default)]
+struct ChatUsage {
+    prompt_tokens: i32,
+    completion_tokens: i32,
+    cached_tokens: i32,
+}
+
+fn http_chat_batch_response_from_router_responses(
+    batch_responses: Vec<Vec<RouterGenerateResponse>>,
+    model: &str,
+) -> Response {
+    let mut choices = Vec::with_capacity(batch_responses.len());
+    let mut usage = ChatUsage::default();
+    let mut response_id = None;
+
+    for (batch_index, mut responses) in batch_responses.into_iter().enumerate() {
+        let Some(response) = responses.pop() else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": { "message": "generation produced no response" } })),
+            )
+                .into_response();
+        };
+        if response_id.is_none() {
+            response_id = Some(response.request_id.clone());
+        }
+        match response.body {
+            RouterGenerateResponseBody::Complete(complete) => {
+                usage.prompt_tokens += complete.prompt_tokens;
+                usage.completion_tokens += complete.completion_tokens;
+                usage.cached_tokens += complete.cached_tokens;
+                choices.push(json!({
+                    "index": batch_index,
+                    "message": {
+                        "role": "assistant",
+                        "content": complete.text,
+                    },
+                    "finish_reason": complete.finish_reason,
+                }));
+            }
+            RouterGenerateResponseBody::Chunk(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": {
+                            "message": "non-stream HTTP chat completion returned a stream chunk"
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+            RouterGenerateResponseBody::Error(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": { "message": error.message } })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "id": format!("chatcmpl-{}", response_id.unwrap_or_default()),
+            "object": "chat.completion",
+            "model": model,
+            "choices": choices,
+            "usage": {
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "cached_tokens": usage.cached_tokens,
+            }
+        })),
+    )
+        .into_response()
 }
 
 fn http_chat_stream_response_from_router_responses(
@@ -1700,7 +1849,7 @@ pub(crate) fn http_completion_payload_to_router_request(
 pub(crate) fn http_chat_payload_to_router_request(
     payload: Value,
     served_model_name: &str,
-) -> Result<RouterTextGenerateRequest, String> {
+) -> Result<HttpChatRequest, String> {
     let model = payload
         .get("model")
         .and_then(Value::as_str)
@@ -1719,20 +1868,48 @@ pub(crate) fn http_chat_payload_to_router_request(
     if let Some(max_tokens) = optional_i32(&payload, "max_tokens")? {
         sampling_params.max_new_tokens = Some(max_tokens);
     }
+    let stream = optional_bool(&payload, "stream")?.unwrap_or(false);
+    let n = optional_i32(&payload, "n")?.unwrap_or(1);
+    if n < 1 {
+        return Err("n must be at least 1".to_string());
+    }
+    let text = chat_messages_to_prompt_text(&payload)?;
 
-    Ok(RouterTextGenerateRequest {
-        request_id: payload
-            .get("request_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        text: chat_messages_to_prompt_text(&payload)?,
-        sampling_params: Some(sampling_params),
-        disaggregated_params: json_to_disaggregated_params(&payload)?,
-        stream: optional_bool(&payload, "stream")?.unwrap_or(false),
-        data_parallel_rank: optional_i32(&payload, "data_parallel_rank")?.unwrap_or_default(),
-        ..Default::default()
-    })
+    if n == 1 {
+        return Ok(HttpChatRequest::Single(RouterTextGenerateRequest {
+            request_id: payload
+                .get("request_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            text,
+            sampling_params: Some(sampling_params),
+            disaggregated_params: json_to_disaggregated_params(&payload)?,
+            stream,
+            data_parallel_rank: optional_i32(&payload, "data_parallel_rank")?.unwrap_or_default(),
+            ..Default::default()
+        }));
+    }
+
+    let batch_size = usize::try_from(n).map_err(|_| "n is out of range".to_string())?;
+    let request_ids = optional_string_values(&payload, "request_id", batch_size)?;
+    let data_parallel_ranks = optional_i32_values(&payload, "data_parallel_rank", batch_size)?;
+    let disaggregated_params = json_to_disaggregated_params_values(&payload, batch_size)?;
+    let mut requests = Vec::with_capacity(batch_size);
+
+    for index in 0..batch_size {
+        requests.push(RouterTextGenerateRequest {
+            request_id: request_ids[index].clone(),
+            text: text.clone(),
+            sampling_params: Some(sampling_params.clone()),
+            disaggregated_params: disaggregated_params[index].clone(),
+            stream,
+            data_parallel_rank: data_parallel_ranks[index],
+            ..Default::default()
+        });
+    }
+
+    Ok(HttpChatRequest::Batch(requests))
 }
 
 enum CompletionPrompts {
