@@ -261,6 +261,77 @@ async fn http_server_accepts_embedding_requests() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_accepts_classify_requests() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "tiny-classifier",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let service = build_bootstrap_http_router_service(&args);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let classified = post_json_with_retry(
+        addr,
+        "/v1/classify",
+        r#"{
+            "model": "tiny-classifier",
+            "input": ["rust pd router", "python gateway"]
+        }"#,
+    )
+    .await;
+
+    assert_eq!(classified["object"], "list");
+    assert_eq!(classified["model"], "tiny-classifier");
+    assert!(classified["id"].as_str().unwrap().starts_with("classify-"));
+    assert!(classified["created"].as_u64().unwrap() > 0);
+    let data = classified["data"]
+        .as_array()
+        .expect("data should be an array");
+    assert_eq!(data.len(), 2);
+    assert_eq!(data[0]["index"], 0);
+    assert_eq!(data[1]["index"], 1);
+    assert!(data[0]["label"].as_str().unwrap().starts_with("LABEL_"));
+    assert_eq!(data[0]["num_classes"], 3);
+    assert_eq!(data[0]["probs"].as_array().unwrap().len(), 3);
+    assert_ne!(data[0]["probs"], data[1]["probs"]);
+    let prob_sum = data[0]["probs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_f64().unwrap())
+        .sum::<f64>();
+    assert!((prob_sum - 1.0).abs() < 1.0e-6);
+    assert!(classified["usage"]["prompt_tokens"].as_i64().unwrap() > 0);
+    assert_eq!(
+        classified["usage"]["total_tokens"],
+        classified["usage"]["prompt_tokens"]
+    );
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_server_accepts_tokenize_and_detokenize_requests_for_sglang_clients() {
     let args = ServerArgs::parse_from([
         "serve",

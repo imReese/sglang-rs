@@ -197,6 +197,67 @@ async fn router_embeddings_reaches_real_rust_srt_http_worker() {
         .expect("HTTP server should stop cleanly");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn router_classify_reaches_real_rust_srt_http_worker() {
+    let addr = unused_local_addr();
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "tiny-reranker",
+        "--host",
+        &addr.ip().to_string(),
+        "--port",
+        &addr.port().to_string(),
+    ])
+    .expect("HTTP SRT args should parse");
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(launch_http_server_with_shutdown(args, async move {
+        let _ = shutdown_rx.await;
+    }));
+    wait_for_http_health(addr).await;
+
+    let app = build_router(build_ctx_with_http_worker(addr));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/classify")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "tiny-reranker",
+                "input": ["rust pd router", "python gateway"],
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+
+    let response = app.oneshot(request).await.expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("router response body should collect")
+        .to_bytes();
+    let body: serde_json::Value =
+        serde_json::from_slice(&body).expect("response should be classify JSON");
+    assert_eq!(body["object"], "list");
+    assert_eq!(body["model"], "tiny-reranker");
+    assert_eq!(body["data"].as_array().unwrap().len(), 2);
+    assert_eq!(body["data"][0]["num_classes"], 3);
+    assert!(body["usage"]["prompt_tokens"].as_i64().unwrap() > 0);
+
+    shutdown_tx
+        .send(())
+        .expect("HTTP worker should still be running");
+    server
+        .await
+        .expect("HTTP server task should join")
+        .expect("HTTP server should stop cleanly");
+}
+
 async fn wait_for_http_health(addr: SocketAddr) {
     let client = reqwest::Client::new();
     let url = format!("http://{addr}/health");

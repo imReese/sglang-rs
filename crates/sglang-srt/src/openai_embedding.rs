@@ -200,7 +200,7 @@ fn validate_non_empty_text(text: &str, field: &'static str) -> Result<(), String
     Ok(())
 }
 
-fn token_ids_to_embedding(token_ids: &[u32], dimensions: usize) -> Vec<f32> {
+pub(crate) fn token_ids_to_embedding(token_ids: &[u32], dimensions: usize) -> Vec<f32> {
     let mut embedding = vec![0.0_f32; dimensions];
     for (position, token_id) in token_ids.iter().enumerate() {
         let hash = splitmix64(u64::from(*token_id) ^ ((position as u64) << 32));

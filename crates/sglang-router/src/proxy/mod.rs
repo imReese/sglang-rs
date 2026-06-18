@@ -587,6 +587,7 @@ impl Proxy {
             && path != "/v1/completions"
             && path != "/v1/rerank"
             && path != "/v1/embeddings"
+            && path != "/v1/classify"
         {
             breaker.record_failure();
             return Err(ApiError::WorkerMisconfigured {
@@ -649,6 +650,14 @@ impl Proxy {
                 "/v1/embeddings" => {
                     let response = client
                         .open_ai_embed(GrpcRequest::new(request))
+                        .await
+                        .map_err(GrpcForwardError::Status)?
+                        .into_inner();
+                    return Ok::<_, GrpcForwardError>(response.json);
+                }
+                "/v1/classify" => {
+                    let response = client
+                        .open_ai_classify(GrpcRequest::new(request))
                         .await
                         .map_err(GrpcForwardError::Status)?
                         .into_inner();

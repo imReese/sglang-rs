@@ -10,6 +10,7 @@ use tonic::{Code, Request, Response, Status};
 
 use crate::cli::ServerArgs;
 use crate::engine::Engine;
+use crate::openai_classify::{classify_response_json, parse_classify_request};
 use crate::openai_embedding::{embeddings_response_json, parse_embedding_request};
 use crate::openai_rerank::{
     parse_rerank_request, rerank_results_to_json, score_rerank_documents, truncate_rerank_results,
@@ -936,9 +937,23 @@ where
 
     async fn open_ai_classify(
         &self,
-        _request: Request<OpenAiJsonRequest>,
+        request: Request<OpenAiJsonRequest>,
     ) -> Result<Response<OpenAiJsonResponse>, Status> {
-        Err(unimplemented_rpc("OpenAIClassify"))
+        let model_info = self.model_info()?;
+        let payload: Value = serde_json::from_slice(&request.into_inner().json)
+            .map_err(|e| Status::invalid_argument(format!("invalid classify JSON: {e}")))?;
+        let request = parse_classify_request(&payload, &model_info.served_model_name)
+            .map_err(Status::invalid_argument)?;
+        let json = {
+            let runtime = self
+                .runtime
+                .lock()
+                .map_err(|_| Status::internal("router runtime mutex poisoned"))?;
+            classify_response_json(&runtime, &request)
+        };
+        let json = serde_json::to_vec(&json)
+            .map_err(|e| Status::internal(format!("serialize classify JSON: {e}")))?;
+        Ok(Response::new(OpenAiJsonResponse { json }))
     }
 
     async fn score(

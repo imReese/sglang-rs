@@ -586,6 +586,55 @@ async fn grpc_open_ai_embed_returns_embedding_json() {
 }
 
 #[tokio::test]
+async fn grpc_open_ai_classify_returns_classify_json() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "tiny",
+        "--grpc-mode",
+    ])
+    .expect("args should parse");
+    let runtime = RouterRuntime::new(Engine::new(
+        ByteTokenizer,
+        Scheduler::new(GrpcTwoStepWorker),
+    ));
+    let service = GrpcRouterService::with_server_args(runtime, &args);
+    let payload = serde_json::json!({
+        "model": "tiny",
+        "input": ["rust pd router", "python gateway"],
+    });
+
+    let response = service
+        .open_ai_classify(Request::new(OpenAiJsonRequest {
+            json: serde_json::to_vec(&payload).expect("payload should serialize"),
+            options: None,
+        }))
+        .await
+        .expect("OpenAI classify should execute")
+        .into_inner();
+
+    let body: serde_json::Value =
+        serde_json::from_slice(&response.json).expect("response should be JSON");
+    assert_eq!(body["object"], "list");
+    assert_eq!(body["model"], "tiny");
+    assert!(body["id"].as_str().unwrap().starts_with("classify-"));
+    assert_eq!(body["data"].as_array().unwrap().len(), 2);
+    assert_eq!(body["data"][0]["index"], 0);
+    assert!(
+        body["data"][0]["label"]
+            .as_str()
+            .unwrap()
+            .starts_with("LABEL_")
+    );
+    assert_eq!(body["data"][0]["num_classes"], 3);
+    assert_eq!(body["data"][0]["probs"].as_array().unwrap().len(), 3);
+    assert_ne!(body["data"][0]["probs"], body["data"][1]["probs"]);
+    assert!(body["usage"]["prompt_tokens"].as_i64().unwrap() > 0);
+}
+
+#[tokio::test]
 async fn grpc_generate_can_poll_pd_transfer_before_decode() {
     let worker = KvTransferModelWorker::new(
         GrpcTwoStepWorker,
