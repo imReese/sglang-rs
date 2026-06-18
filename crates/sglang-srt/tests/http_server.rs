@@ -136,6 +136,68 @@ async fn http_server_accepts_tokenized_generate_requests() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_accepts_rerank_requests() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "tiny-reranker",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let service = build_bootstrap_http_router_service(&args);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let reranked = post_json_with_retry(
+        addr,
+        "/v1/rerank",
+        r#"{
+            "model": "tiny-reranker",
+            "query": "rust pd router",
+            "documents": [
+                "python gateway only",
+                "rust pd router transfers kv cache",
+                "router"
+            ]
+        }"#,
+    )
+    .await;
+
+    let results = reranked.as_array().expect("worker should return raw list");
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["index"], 1);
+    assert_eq!(results[0]["document"], "rust pd router transfers kv cache");
+    assert_eq!(results[1]["index"], 2);
+    assert_eq!(results[1]["document"], "router");
+    assert_eq!(results[2]["index"], 0);
+    assert_eq!(results[2]["document"], "python gateway only");
+    assert!(
+        results[0]["score"].as_f64().unwrap() > results[1]["score"].as_f64().unwrap(),
+        "more overlapping tokens should score higher: {results:?}"
+    );
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_server_accepts_tokenize_and_detokenize_requests_for_sglang_clients() {
     let args = ServerArgs::parse_from([
         "serve",
