@@ -46,6 +46,11 @@ type OpenAiJsonResponseStream = Pin<
     Box<dyn tonic::codegen::tokio_stream::Stream<Item = Result<OpenAiJsonResponse, Status>> + Send>,
 >;
 
+enum GrpcCompletionResponse {
+    Single(Vec<RouterGenerateResponse>),
+    Batch(Vec<Vec<RouterGenerateResponse>>),
+}
+
 pub const SGLANG_RUNTIME_FILE_DESCRIPTOR_SET: &[u8] =
     tonic::include_file_descriptor_set!("sglang_runtime_descriptor");
 
@@ -334,6 +339,69 @@ fn openai_completion_response_from_router_responses(
         }
     };
 
+    let json = serde_json::to_vec(&json)
+        .map_err(|e| Status::internal(format!("serialize OpenAI completion JSON: {e}")))?;
+    Ok(OpenAiJsonResponse { json })
+}
+
+#[derive(Default)]
+struct OpenAiCompletionUsage {
+    prompt_tokens: i32,
+    completion_tokens: i32,
+    cached_tokens: i32,
+}
+
+fn openai_completion_batch_response_from_router_responses(
+    batch_responses: Vec<Vec<RouterGenerateResponse>>,
+    model: &str,
+) -> Result<OpenAiJsonResponse, Status> {
+    let mut choices = Vec::with_capacity(batch_responses.len());
+    let mut usage = OpenAiCompletionUsage::default();
+    let mut response_id = None;
+
+    for (batch_index, mut responses) in batch_responses.into_iter().enumerate() {
+        let Some(response) = responses.pop() else {
+            return Err(Status::internal("generation produced no response"));
+        };
+        if response_id.is_none() {
+            response_id = Some(response.request_id.clone());
+        }
+
+        match response.body {
+            RouterGenerateResponseBody::Complete(complete) => {
+                usage.prompt_tokens += complete.prompt_tokens;
+                usage.completion_tokens += complete.completion_tokens;
+                usage.cached_tokens += complete.cached_tokens;
+                choices.push(json!({
+                    "index": batch_index,
+                    "text": complete.text,
+                    "logprobs": Value::Null,
+                    "finish_reason": complete.finish_reason,
+                }));
+            }
+            RouterGenerateResponseBody::Chunk(_) => {
+                return Err(Status::internal(
+                    "non-stream gRPC completion returned a stream chunk",
+                ));
+            }
+            RouterGenerateResponseBody::Error(error) => {
+                return Err(Status::internal(error.message));
+            }
+        }
+    }
+
+    let json = json!({
+        "id": format!("cmpl-{}", response_id.unwrap_or_default()),
+        "object": "text_completion",
+        "model": model,
+        "choices": choices,
+        "usage": {
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.prompt_tokens + usage.completion_tokens,
+            "cached_tokens": usage.cached_tokens,
+        }
+    });
     let json = serde_json::to_vec(&json)
         .map_err(|e| Status::internal(format!("serialize OpenAI completion JSON: {e}")))?;
     Ok(OpenAiJsonResponse { json })
@@ -668,32 +736,70 @@ where
         let model = self.model_info()?.served_model_name;
         let mut request = crate::http::http_completion_payload_to_router_request(payload, &model)
             .map_err(Status::invalid_argument)?;
-        apply_openai_json_options_to_router_request(&mut request, options);
-        let stream = request.stream;
+        match &mut request {
+            crate::http::HttpCompletionRequest::Single(request) => {
+                apply_openai_json_options_to_router_request(request, options);
+            }
+            crate::http::HttpCompletionRequest::Batch(requests) => {
+                for request in requests {
+                    apply_openai_json_options_to_router_request(request, options.clone());
+                }
+            }
+        }
+        let stream = request.stream();
 
-        let responses = self
+        let mut runtime = self
             .runtime
             .lock()
-            .map_err(|_| Status::internal("router runtime mutex poisoned"))?
-            .generate_text_stream_with_transfer_polling(request, self.max_transfer_polls)
-            .map_err(router_runtime_error_to_status)?;
-
-        if stream {
-            let stream = responses
-                .into_iter()
-                .map(|response| {
-                    openai_completion_stream_response_from_router_response(response, &model)
-                })
-                .collect::<Vec<_>>();
-            return Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
-                stream,
-            ))));
+            .map_err(|_| Status::internal("router runtime mutex poisoned"))?;
+        let response = match request {
+            crate::http::HttpCompletionRequest::Single(request) => runtime
+                .generate_text_stream_with_transfer_polling(request, self.max_transfer_polls)
+                .map(GrpcCompletionResponse::Single),
+            crate::http::HttpCompletionRequest::Batch(requests) => {
+                if stream {
+                    return Err(Status::invalid_argument(
+                        "streaming batched completions are not supported yet",
+                    ));
+                }
+                runtime
+                    .generate_text_batch_stream_with_transfer_polling(
+                        requests,
+                        self.max_transfer_polls,
+                    )
+                    .map(GrpcCompletionResponse::Batch)
+            }
         }
+        .map_err(router_runtime_error_to_status)?;
 
-        let response = openai_completion_response_from_router_responses(responses, &model)?;
-        Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
-            [Ok(response)],
-        ))))
+        match response {
+            GrpcCompletionResponse::Single(responses) if stream => {
+                let stream = responses
+                    .into_iter()
+                    .map(|response| {
+                        openai_completion_stream_response_from_router_response(response, &model)
+                    })
+                    .collect::<Vec<_>>();
+                Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
+                    stream,
+                ))))
+            }
+            GrpcCompletionResponse::Single(responses) => {
+                let response = openai_completion_response_from_router_responses(responses, &model)?;
+                Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
+                    [Ok(response)],
+                ))))
+            }
+            GrpcCompletionResponse::Batch(batch_responses) => {
+                let response = openai_completion_batch_response_from_router_responses(
+                    batch_responses,
+                    &model,
+                )?;
+                Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
+                    [Ok(response)],
+                ))))
+            }
+        }
     }
 
     async fn open_ai_embed(

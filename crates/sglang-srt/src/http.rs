@@ -13,9 +13,9 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 
 use crate::router::{
-    RouterDisaggregatedParams, RouterGenerateRequest, RouterGenerateResponse,
-    RouterGenerateResponseBody, RouterGetModelInfoResponse, RouterRuntime, RouterSamplingParams,
-    RouterTextGenerateRequest, RouterTokenizedInput,
+    RouterDisaggregatedParams, RouterGenerateComplete, RouterGenerateRequest,
+    RouterGenerateResponse, RouterGenerateResponseBody, RouterGetModelInfoResponse, RouterRuntime,
+    RouterSamplingParams, RouterTextGenerateRequest, RouterTokenizedInput,
 };
 use crate::tokenizer::Tokenizer;
 use crate::types::BootstrapRoom;
@@ -1032,8 +1032,8 @@ where
                 .into_response();
         }
     };
-    let stream = request.stream;
-    if request.disaggregated_params.is_some() && !service.allow_disaggregated_requests {
+    let stream = request.stream();
+    if request.disaggregated_params().is_some() && !service.allow_disaggregated_requests {
         return (
             StatusCode::NOT_IMPLEMENTED,
             Json(json!({
@@ -1050,24 +1050,97 @@ where
             .runtime
             .lock()
             .expect("HTTP router runtime lock should be held");
-        if service.max_transfer_polls == 0 {
-            runtime.generate_text_stream(request)
-        } else {
-            runtime.generate_text_stream_with_transfer_polling(request, service.max_transfer_polls)
+        match request {
+            HttpCompletionRequest::Single(request) => {
+                if service.max_transfer_polls == 0 {
+                    runtime
+                        .generate_text_stream(request)
+                        .map(HttpCompletionResponse::Single)
+                } else {
+                    runtime
+                        .generate_text_stream_with_transfer_polling(
+                            request,
+                            service.max_transfer_polls,
+                        )
+                        .map(HttpCompletionResponse::Single)
+                }
+            }
+            HttpCompletionRequest::Batch(requests) => {
+                if stream {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": {
+                                "message": "streaming batched /v1/completions is not supported yet"
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
+
+                if service.max_transfer_polls == 0 {
+                    runtime
+                        .generate_text_batch_stream(requests)
+                        .map(HttpCompletionResponse::Batch)
+                } else {
+                    runtime
+                        .generate_text_batch_stream_with_transfer_polling(
+                            requests,
+                            service.max_transfer_polls,
+                        )
+                        .map(HttpCompletionResponse::Batch)
+                }
+            }
         }
     };
 
     match response {
-        Ok(responses) if stream => {
+        Ok(HttpCompletionResponse::Single(responses)) if stream => {
             http_completion_stream_response_from_router_responses(responses, &model)
         }
-        Ok(responses) => http_completion_response_from_router_responses(responses, &model),
+        Ok(HttpCompletionResponse::Single(responses)) => {
+            http_completion_response_from_router_responses(responses, &model)
+        }
+        Ok(HttpCompletionResponse::Batch(batch_responses)) => {
+            http_completion_batch_response_from_router_responses(batch_responses, &model)
+        }
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": { "message": error.to_string() } })),
         )
             .into_response(),
     }
+}
+
+pub(crate) enum HttpCompletionRequest {
+    Single(RouterTextGenerateRequest),
+    Batch(Vec<RouterTextGenerateRequest>),
+}
+
+impl HttpCompletionRequest {
+    pub(crate) fn stream(&self) -> bool {
+        match self {
+            Self::Single(request) => request.stream,
+            Self::Batch(requests) => requests
+                .first()
+                .map(|request| request.stream)
+                .unwrap_or(false),
+        }
+    }
+
+    pub(crate) fn disaggregated_params(&self) -> Option<&RouterDisaggregatedParams> {
+        match self {
+            Self::Single(request) => request.disaggregated_params.as_ref(),
+            Self::Batch(requests) => requests
+                .iter()
+                .find_map(|request| request.disaggregated_params.as_ref()),
+        }
+    }
+}
+
+enum HttpCompletionResponse {
+    Single(Vec<RouterGenerateResponse>),
+    Batch(Vec<Vec<RouterGenerateResponse>>),
 }
 
 fn http_completion_response_from_router_responses(
@@ -1119,6 +1192,89 @@ fn http_completion_response_from_router_responses(
         )
             .into_response(),
     }
+}
+
+#[derive(Default)]
+struct CompletionUsage {
+    prompt_tokens: i32,
+    completion_tokens: i32,
+    cached_tokens: i32,
+}
+
+impl CompletionUsage {
+    fn add_complete(&mut self, complete: &RouterGenerateComplete) {
+        self.prompt_tokens += complete.prompt_tokens;
+        self.completion_tokens += complete.completion_tokens;
+        self.cached_tokens += complete.cached_tokens;
+    }
+}
+
+fn http_completion_batch_response_from_router_responses(
+    batch_responses: Vec<Vec<RouterGenerateResponse>>,
+    model: &str,
+) -> Response {
+    let mut choices = Vec::with_capacity(batch_responses.len());
+    let mut usage = CompletionUsage::default();
+    let mut response_id = None;
+
+    for (batch_index, mut responses) in batch_responses.into_iter().enumerate() {
+        let Some(response) = responses.pop() else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": { "message": "generation produced no response" } })),
+            )
+                .into_response();
+        };
+        if response_id.is_none() {
+            response_id = Some(response.request_id.clone());
+        }
+        match response.body {
+            RouterGenerateResponseBody::Complete(complete) => {
+                usage.add_complete(&complete);
+                choices.push(json!({
+                    "index": batch_index,
+                    "text": complete.text,
+                    "logprobs": Value::Null,
+                    "finish_reason": complete.finish_reason,
+                }));
+            }
+            RouterGenerateResponseBody::Chunk(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "error": {
+                            "message": "non-stream HTTP completion returned a stream chunk"
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+            RouterGenerateResponseBody::Error(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": { "message": error.message } })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "id": format!("cmpl-{}", response_id.unwrap_or_default()),
+            "object": "text_completion",
+            "model": model,
+            "choices": choices,
+            "usage": {
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "total_tokens": usage.prompt_tokens + usage.completion_tokens,
+                "cached_tokens": usage.cached_tokens,
+            }
+        })),
+    )
+        .into_response()
 }
 
 fn http_completion_stream_response_from_router_responses(
@@ -1475,7 +1631,7 @@ fn optional_i32_values(
 pub(crate) fn http_completion_payload_to_router_request(
     payload: Value,
     served_model_name: &str,
-) -> Result<RouterTextGenerateRequest, String> {
+) -> Result<HttpCompletionRequest, String> {
     let model = payload
         .get("model")
         .and_then(Value::as_str)
@@ -1494,20 +1650,51 @@ pub(crate) fn http_completion_payload_to_router_request(
     if let Some(max_tokens) = optional_i32(&payload, "max_tokens")? {
         sampling_params.max_new_tokens = Some(max_tokens);
     }
+    let stream = optional_bool(&payload, "stream")?.unwrap_or(false);
 
-    Ok(RouterTextGenerateRequest {
-        request_id: payload
-            .get("request_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-        text: completion_prompt_to_text(&payload)?,
-        sampling_params: Some(sampling_params),
-        disaggregated_params: json_to_disaggregated_params(&payload)?,
-        stream: optional_bool(&payload, "stream")?.unwrap_or(false),
-        data_parallel_rank: optional_i32(&payload, "data_parallel_rank")?.unwrap_or_default(),
-        ..Default::default()
-    })
+    match completion_prompt_to_texts(&payload)? {
+        CompletionPrompts::Single(text) => {
+            Ok(HttpCompletionRequest::Single(RouterTextGenerateRequest {
+                request_id: payload
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                text,
+                sampling_params: Some(sampling_params),
+                disaggregated_params: json_to_disaggregated_params(&payload)?,
+                stream,
+                data_parallel_rank: optional_i32(&payload, "data_parallel_rank")?
+                    .unwrap_or_default(),
+                ..Default::default()
+            }))
+        }
+        CompletionPrompts::Batch(texts) => {
+            let batch_size = texts.len();
+            if batch_size == 0 {
+                return Err("prompt array must not be empty".to_string());
+            }
+            let request_ids = optional_string_values(&payload, "request_id", batch_size)?;
+            let data_parallel_ranks =
+                optional_i32_values(&payload, "data_parallel_rank", batch_size)?;
+            let disaggregated_params = json_to_disaggregated_params_values(&payload, batch_size)?;
+            let mut requests = Vec::with_capacity(batch_size);
+
+            for index in 0..batch_size {
+                requests.push(RouterTextGenerateRequest {
+                    request_id: request_ids[index].clone(),
+                    text: texts[index].clone(),
+                    sampling_params: Some(sampling_params.clone()),
+                    disaggregated_params: disaggregated_params[index].clone(),
+                    stream,
+                    data_parallel_rank: data_parallel_ranks[index],
+                    ..Default::default()
+                });
+            }
+
+            Ok(HttpCompletionRequest::Batch(requests))
+        }
+    }
 }
 
 pub(crate) fn http_chat_payload_to_router_request(
@@ -1548,12 +1735,17 @@ pub(crate) fn http_chat_payload_to_router_request(
     })
 }
 
-fn completion_prompt_to_text(payload: &Value) -> Result<String, String> {
+enum CompletionPrompts {
+    Single(String),
+    Batch(Vec<String>),
+}
+
+fn completion_prompt_to_texts(payload: &Value) -> Result<CompletionPrompts, String> {
     let prompt = payload
         .get("prompt")
         .ok_or_else(|| "missing prompt".to_string())?;
     if let Some(text) = prompt.as_str() {
-        return Ok(text.to_string());
+        return Ok(CompletionPrompts::Single(text.to_string()));
     }
     if let Some(prompts) = prompt.as_array() {
         return prompts
@@ -1565,7 +1757,7 @@ fn completion_prompt_to_text(payload: &Value) -> Result<String, String> {
                     .ok_or_else(|| "prompt array entries must be strings".to_string())
             })
             .collect::<Result<Vec<_>, _>>()
-            .map(|items| items.join("\n"));
+            .map(CompletionPrompts::Batch);
     }
     Err("prompt must be a string or array of strings".to_string())
 }

@@ -1180,6 +1180,81 @@ async fn http_prefill_server_accepts_batched_disaggregated_text_generate_request
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_prefill_server_accepts_batched_disaggregated_openai_completions() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "glm-prefill-completion-batch",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--disaggregation-mode",
+        "prefill",
+        "--disaggregation-transfer-backend",
+        "fake",
+        "--num-reserved-decode-tokens",
+        "8",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let service = build_bootstrap_prefill_http_router_service(&args);
+    let inspected_service = service.clone();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let completion = post_json_with_retry(
+        addr,
+        "/v1/completions",
+        r#"{"request_id":["http-pd-completion-batch-a","http-pd-completion-batch-b"],"model":"glm-prefill-completion-batch","prompt":["hi","hey"],"max_tokens":1,"bootstrap_host":["10.0.0.8","10.0.0.8"],"bootstrap_port":[8200,8200],"bootstrap_room":[97,98]}"#,
+    )
+    .await;
+
+    assert_eq!(completion["object"], "text_completion");
+    assert_eq!(completion["model"], "glm-prefill-completion-batch");
+    let choices = completion["choices"]
+        .as_array()
+        .expect("batched completions should return one choice per prompt");
+    assert_eq!(choices.len(), 2);
+    assert_eq!(choices[0]["index"], 0);
+    assert_eq!(choices[0]["text"], " ");
+    assert_eq!(choices[0]["finish_reason"], "stop");
+    assert_eq!(choices[1]["index"], 1);
+    assert_eq!(choices[1]["text"], " ");
+    assert_eq!(choices[1]["finish_reason"], "stop");
+    assert_eq!(completion["usage"]["prompt_tokens"], 5);
+    assert_eq!(completion["usage"]["completion_tokens"], 2);
+
+    let runtime = inspected_service
+        .runtime()
+        .lock()
+        .expect("runtime lock should be held");
+    let worker = runtime.engine().scheduler().worker();
+    let summary = worker
+        .last_transfer_summary()
+        .expect("PD prefill completion batch should record transfer summary");
+    assert_eq!(summary.submitted_spans(), 2);
+    assert_eq!(worker.transfer_executor().transferred_rooms(), &[97, 98]);
+
+    drop(runtime);
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_pd_server_polls_async_transfer_before_decode() {
     let args = ServerArgs::parse_from([
         "serve",
