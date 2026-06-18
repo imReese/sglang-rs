@@ -998,7 +998,7 @@ fn test_addrs() -> (SocketAddr, SocketAddr, SocketAddr, SocketAddr) {
 Run:
 
 ```bash
-cargo test -p sgl-router --test proxy real_srt_pd -- --nocapture
+cargo test -p sglang-router --test proxy real_srt_pd -- --nocapture
 ```
 
 Expected: PASS with the unlinked runtime error assertion.
@@ -1008,7 +1008,7 @@ Expected: PASS with the unlinked runtime error assertion.
 Run:
 
 ```bash
-cargo test -p sgl-router --features sglang-srt/mooncake-link --test proxy router_pd_chat_completes_with_real_rust_srt_mooncake_workers -- --ignored --nocapture
+cargo test -p sglang-router --features sglang-srt/mooncake-link --test proxy router_pd_chat_completes_with_real_rust_srt_mooncake_workers -- --ignored --nocapture
 ```
 
 Expected with Mooncake available: PASS. Expected without Mooncake available: linker or runtime environment failure recorded in final notes, while default e2e remains PASS.

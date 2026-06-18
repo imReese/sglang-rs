@@ -1111,6 +1111,75 @@ async fn http_prefill_server_accepts_batched_disaggregated_token_generate_reques
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_prefill_server_accepts_batched_disaggregated_text_generate_requests() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "glm-prefill-http-text-batch",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--disaggregation-mode",
+        "prefill",
+        "--disaggregation-transfer-backend",
+        "fake",
+        "--num-reserved-decode-tokens",
+        "8",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let service = build_bootstrap_prefill_http_router_service(&args);
+    let inspected_service = service.clone();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let generated = post_json_with_retry(
+        addr,
+        "/generate",
+        r#"{"request_id":["http-pd-text-batch-a","http-pd-text-batch-b"],"text":["hello","hi"],"sampling_params":{"max_new_tokens":1},"bootstrap_host":["10.0.0.8","10.0.0.8"],"bootstrap_port":[8200,8200],"bootstrap_room":[87,88]}"#,
+    )
+    .await;
+
+    let generated = generated
+        .as_array()
+        .expect("batched text /generate should return an array of results");
+    assert_eq!(generated.len(), 2);
+    assert_eq!(generated[0]["request_id"], "http-pd-text-batch-a");
+    assert_eq!(generated[1]["request_id"], "http-pd-text-batch-b");
+    assert_eq!(generated[0]["text"], " ");
+    assert_eq!(generated[1]["text"], " ");
+
+    let runtime = inspected_service
+        .runtime()
+        .lock()
+        .expect("runtime lock should be held");
+    let worker = runtime.engine().scheduler().worker();
+    let summary = worker
+        .last_transfer_summary()
+        .expect("PD prefill text batch should record transfer summary");
+    assert_eq!(summary.submitted_spans(), 2);
+    assert_eq!(worker.transfer_executor().transferred_rooms(), &[87, 88]);
+
+    drop(runtime);
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_pd_server_polls_async_transfer_before_decode() {
     let args = ServerArgs::parse_from([
         "serve",

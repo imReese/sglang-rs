@@ -624,6 +624,32 @@ where
                         .map(HttpGenerateResponse::Single)
                 }
             }
+            HttpGenerateRequest::BatchText(requests) => {
+                if stream {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": {
+                                "message": "streaming batched /generate is not supported yet"
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
+
+                if service.max_transfer_polls == 0 {
+                    runtime
+                        .generate_text_batch_stream(requests)
+                        .map(HttpGenerateResponse::Batch)
+                } else {
+                    runtime
+                        .generate_text_batch_stream_with_transfer_polling(
+                            requests,
+                            service.max_transfer_polls,
+                        )
+                        .map(HttpGenerateResponse::Batch)
+                }
+            }
             HttpGenerateRequest::Tokenized(request) => {
                 if service.max_transfer_polls == 0 {
                     runtime
@@ -1159,6 +1185,7 @@ fn http_completion_stream_response_from_router_responses(
 
 enum HttpGenerateRequest {
     Text(RouterTextGenerateRequest),
+    BatchText(Vec<RouterTextGenerateRequest>),
     Tokenized(RouterGenerateRequest),
     BatchTokenized(Vec<RouterGenerateRequest>),
 }
@@ -1167,6 +1194,10 @@ impl HttpGenerateRequest {
     fn stream(&self) -> bool {
         match self {
             Self::Text(request) => request.stream,
+            Self::BatchText(requests) => requests
+                .first()
+                .map(|request| request.stream)
+                .unwrap_or(false),
             Self::Tokenized(request) => request.stream,
             Self::BatchTokenized(requests) => requests
                 .first()
@@ -1178,6 +1209,9 @@ impl HttpGenerateRequest {
     fn disaggregated_params(&self) -> Option<&RouterDisaggregatedParams> {
         match self {
             Self::Text(request) => request.disaggregated_params.as_ref(),
+            Self::BatchText(requests) => requests
+                .iter()
+                .find_map(|request| request.disaggregated_params.as_ref()),
             Self::Tokenized(request) => request.disaggregated_params.as_ref(),
             Self::BatchTokenized(requests) => requests
                 .iter()
@@ -1197,38 +1231,83 @@ fn http_generate_payload_to_router_request(payload: Value) -> Result<HttpGenerat
             }
         };
     }
-    http_generate_payload_to_router_text_request(payload).map(HttpGenerateRequest::Text)
+    match http_generate_payload_to_router_text_requests(payload)? {
+        HttpTextGenerateRequests::Single(request) => Ok(HttpGenerateRequest::Text(request)),
+        HttpTextGenerateRequests::Batch(requests) => Ok(HttpGenerateRequest::BatchText(requests)),
+    }
 }
 
-fn http_generate_payload_to_router_text_request(
+enum HttpTextGenerateRequests {
+    Single(RouterTextGenerateRequest),
+    Batch(Vec<RouterTextGenerateRequest>),
+}
+
+fn http_generate_payload_to_router_text_requests(
     payload: Value,
-) -> Result<RouterTextGenerateRequest, String> {
-    let text = payload
+) -> Result<HttpTextGenerateRequests, String> {
+    let text_value = payload
         .get("text")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "missing text".to_string())?
+        .ok_or_else(|| "missing text".to_string())?;
+    let sampling_params = payload
+        .get("sampling_params")
+        .map(json_to_sampling_params)
+        .transpose()?;
+    let stream = optional_bool(&payload, "stream")?.unwrap_or(false);
+
+    if let Some(text_values) = text_value.as_array() {
+        let batch_size = text_values.len();
+        let texts = text_values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(ToString::to_string)
+                    .ok_or_else(|| "text entries must be strings".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let request_ids = optional_string_values(&payload, "request_id", batch_size)?;
+        let data_parallel_ranks = optional_i32_values(&payload, "data_parallel_rank", batch_size)?;
+        let disaggregated_params = json_to_disaggregated_params_values(&payload, batch_size)?;
+        let mut requests = Vec::with_capacity(batch_size);
+
+        for index in 0..batch_size {
+            requests.push(RouterTextGenerateRequest {
+                request_id: request_ids[index].clone(),
+                text: texts[index].clone(),
+                sampling_params: sampling_params.clone(),
+                disaggregated_params: disaggregated_params[index].clone(),
+                stream,
+                data_parallel_rank: data_parallel_ranks[index],
+                ..Default::default()
+            });
+        }
+
+        return Ok(HttpTextGenerateRequests::Batch(requests));
+    }
+
+    let text = text_value
+        .as_str()
+        .ok_or_else(|| "text must be a string or array of strings".to_string())?
         .to_string();
     let request_id = payload
         .get("request_id")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let sampling_params = payload
-        .get("sampling_params")
-        .map(json_to_sampling_params)
-        .transpose()?;
     let disaggregated_params = json_to_disaggregated_params(&payload)?;
     let data_parallel_rank = optional_i32(&payload, "data_parallel_rank")?.unwrap_or_default();
 
-    Ok(RouterTextGenerateRequest {
-        request_id,
-        text,
-        sampling_params,
-        disaggregated_params,
-        stream: optional_bool(&payload, "stream")?.unwrap_or(false),
-        data_parallel_rank,
-        ..Default::default()
-    })
+    Ok(HttpTextGenerateRequests::Single(
+        RouterTextGenerateRequest {
+            request_id,
+            text,
+            sampling_params,
+            disaggregated_params,
+            stream,
+            data_parallel_rank,
+            ..Default::default()
+        },
+    ))
 }
 
 enum HttpTokenGenerateRequests {

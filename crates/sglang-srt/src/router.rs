@@ -877,6 +877,41 @@ where
         Ok(responses)
     }
 
+    pub fn generate_text_batch_stream(
+        &mut self,
+        requests: Vec<RouterTextGenerateRequest>,
+    ) -> Result<Vec<Vec<RouterGenerateResponse>>, RouterRuntimeError> {
+        let mut tokenized_requests = Vec::with_capacity(requests.len());
+        for request in requests {
+            if request.text.is_empty() {
+                return Err(RouterProtocolError::EmptyTextInput.into());
+            }
+
+            let input_ids = self.engine.tokenize(&request.text);
+            tokenized_requests.push(RouterGenerateRequest {
+                request_id: request.request_id,
+                tokenized: Some(RouterTokenizedInput {
+                    original_text: request.text,
+                    input_ids,
+                }),
+                sampling_params: request.sampling_params,
+                disaggregated_params: request.disaggregated_params,
+                stream: request.stream,
+                data_parallel_rank: request.data_parallel_rank,
+                trace_headers: request.trace_headers,
+            });
+        }
+
+        let mut batch_responses = self.generate_batch_stream(tokenized_requests)?;
+        for responses in &mut batch_responses {
+            for response in responses {
+                self.fill_generate_response_text(response)?;
+            }
+        }
+
+        Ok(batch_responses)
+    }
+
     fn fill_generate_response_text(
         &self,
         response: &mut RouterGenerateResponse,
@@ -1004,6 +1039,43 @@ where
         }
 
         Ok(responses)
+    }
+
+    pub fn generate_text_batch_stream_with_transfer_polling(
+        &mut self,
+        requests: Vec<RouterTextGenerateRequest>,
+        max_transfer_polls: usize,
+    ) -> Result<Vec<Vec<RouterGenerateResponse>>, RouterRuntimeError> {
+        let mut tokenized_requests = Vec::with_capacity(requests.len());
+        for request in requests {
+            if request.text.is_empty() {
+                return Err(RouterProtocolError::EmptyTextInput.into());
+            }
+
+            let input_ids = self.engine.tokenize(&request.text);
+            tokenized_requests.push(RouterGenerateRequest {
+                request_id: request.request_id,
+                tokenized: Some(RouterTokenizedInput {
+                    original_text: request.text,
+                    input_ids,
+                }),
+                sampling_params: request.sampling_params,
+                disaggregated_params: request.disaggregated_params,
+                stream: request.stream,
+                data_parallel_rank: request.data_parallel_rank,
+                trace_headers: request.trace_headers,
+            });
+        }
+
+        let mut batch_responses = self
+            .generate_batch_stream_with_transfer_polling(tokenized_requests, max_transfer_polls)?;
+        for responses in &mut batch_responses {
+            for response in responses {
+                self.fill_generate_response_text(response)?;
+            }
+        }
+
+        Ok(batch_responses)
     }
 }
 

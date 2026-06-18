@@ -59,7 +59,7 @@ mkdir -p "$LOG_DIR"
 
 if [[ "$BUILD" == "1" ]]; then
     if [[ "$MOONCAKE_LINK" == "1" ]]; then
-        cargo build --release --features sgl-router/mooncake-link --bin sglang-rs --bin sgl-router
+        cargo build --release --features sglang-router/mooncake-link --bin sglang-rs --bin sgl-router
     else
         cargo build --release --bin sglang-rs --bin sgl-router
     fi

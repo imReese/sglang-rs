@@ -4157,7 +4157,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sgl-router"
+name = "sglang-router"
 version = "0.1.0"
 dependencies = [
  "anyhow",
