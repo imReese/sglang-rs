@@ -12,6 +12,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
 
+use crate::openai_embedding::{embeddings_response_json, parse_embedding_request};
 use crate::openai_rerank::{
     parse_rerank_request, rerank_results_to_json, score_rerank_documents, truncate_rerank_results,
 };
@@ -144,6 +145,7 @@ where
             .route("/v1/completions", post(completions::<T, W>))
             .route("/v1/rerank", post(rerank::<T, W>))
             .route("/rerank", post(rerank::<T, W>))
+            .route("/v1/embeddings", post(embeddings::<T, W>))
             .route("/generate", post(generate::<T, W>))
             .with_state(self)
     }
@@ -534,6 +536,34 @@ where
     truncate_rerank_results(&request, &mut results);
 
     Json(rerank_results_to_json(&request, results)).into_response()
+}
+
+async fn embeddings<T, W>(
+    State(service): State<HttpRouterService<T, W>>,
+    Json(payload): Json<Value>,
+) -> Response
+where
+    T: Tokenizer + Send + 'static,
+    W: WorkerExecutor + Send + 'static,
+{
+    let request = match parse_embedding_request(&payload, &service.model_info.served_model_name) {
+        Ok(request) => request,
+        Err(message) => return bad_request_json(message),
+    };
+    let runtime = match service.runtime.lock() {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": {"message": "router runtime mutex poisoned"}
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    Json(embeddings_response_json(&runtime, &request)).into_response()
 }
 
 fn parse_tokenize_prompt(payload: &Value) -> Result<TokenizePrompt, String> {

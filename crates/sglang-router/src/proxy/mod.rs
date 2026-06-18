@@ -583,7 +583,11 @@ impl Proxy {
                 .forward_grpc_generate_json_to(worker_url, breaker, headers, body)
                 .await;
         }
-        if path != "/v1/chat/completions" && path != "/v1/completions" && path != "/v1/rerank" {
+        if path != "/v1/chat/completions"
+            && path != "/v1/completions"
+            && path != "/v1/rerank"
+            && path != "/v1/embeddings"
+        {
             breaker.record_failure();
             return Err(ApiError::WorkerMisconfigured {
                 worker: worker_url.to_string(),
@@ -637,6 +641,14 @@ impl Proxy {
                 "/v1/rerank" => {
                     let response = client
                         .rerank(GrpcRequest::new(request))
+                        .await
+                        .map_err(GrpcForwardError::Status)?
+                        .into_inner();
+                    return Ok::<_, GrpcForwardError>(response.json);
+                }
+                "/v1/embeddings" => {
+                    let response = client
+                        .open_ai_embed(GrpcRequest::new(request))
                         .await
                         .map_err(GrpcForwardError::Status)?
                         .into_inner();

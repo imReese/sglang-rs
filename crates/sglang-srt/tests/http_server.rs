@@ -198,6 +198,69 @@ async fn http_server_accepts_rerank_requests() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_accepts_embedding_requests() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "tiny-embedding",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let service = build_bootstrap_http_router_service(&args);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let embeddings = post_json_with_retry(
+        addr,
+        "/v1/embeddings",
+        r#"{
+            "model": "tiny-embedding",
+            "input": ["rust pd router", "python gateway"],
+            "dimensions": 4
+        }"#,
+    )
+    .await;
+
+    assert_eq!(embeddings["object"], "list");
+    assert_eq!(embeddings["model"], "tiny-embedding");
+    let data = embeddings["data"]
+        .as_array()
+        .expect("data should be an array");
+    assert_eq!(data.len(), 2);
+    assert_eq!(data[0]["object"], "embedding");
+    assert_eq!(data[0]["index"], 0);
+    assert_eq!(data[1]["index"], 1);
+    assert_eq!(data[0]["embedding"].as_array().unwrap().len(), 4);
+    assert_eq!(data[1]["embedding"].as_array().unwrap().len(), 4);
+    assert_ne!(data[0]["embedding"], data[1]["embedding"]);
+    assert!(embeddings["usage"]["prompt_tokens"].as_i64().unwrap() > 0);
+    assert_eq!(
+        embeddings["usage"]["total_tokens"],
+        embeddings["usage"]["prompt_tokens"]
+    );
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_server_accepts_tokenize_and_detokenize_requests_for_sglang_clients() {
     let args = ServerArgs::parse_from([
         "serve",
