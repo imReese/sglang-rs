@@ -7,7 +7,7 @@ description = "Slim KV-aware OpenAI-compatible router for SGLang workers"
 publish = false  # binary-only; not published to crates.io
 
 [lib]
-name = "sgl_router"
+name = "sglang_router"
 crate-type = ["rlib"]
 
 [features]

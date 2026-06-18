@@ -3,7 +3,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{ArgAction, Parser, Subcommand};
-use sgl_router::config::{
+use sglang_router::config::{
     ActiveLoadConfig, Config, DiscoveryBackend, DiscoveryConfig, LogFormat, ModelConfig,
     ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
@@ -307,18 +307,18 @@ async fn main() -> Result<()> {
     );
 
     let tokenizers = Arc::new(
-        sgl_router::tokenizer::TokenizerRegistry::load_from_config(&cfg)
+        sglang_router::tokenizer::TokenizerRegistry::load_from_config(&cfg)
             .context("load tokenizers")?,
     );
 
-    let registry = Arc::new(sgl_router::workers::WorkerRegistry::default());
+    let registry = Arc::new(sglang_router::workers::WorkerRegistry::default());
 
     // Build the KV-event index up front so the cache-aware-zmq policy can
     // share its `HashTree` handle + `BlockSizeOracle`. When no model uses
     // `cache_aware_zmq`, the index is still constructed (cheap) but no
     // subscribers are ever added.
-    let block_size_oracle = sgl_router::policies::kv_events::BlockSizeOracle::new();
-    let kv_index = sgl_router::policies::kv_events::KvEventIndex::new_with_http_and_oracle(
+    let block_size_oracle = sglang_router::policies::kv_events::BlockSizeOracle::new();
+    let kv_index = sglang_router::policies::kv_events::KvEventIndex::new_with_http_and_oracle(
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(2))
             .build()
@@ -326,7 +326,7 @@ async fn main() -> Result<()> {
         Arc::clone(&block_size_oracle),
     );
     let policies = Arc::new(
-        sgl_router::policies::factory::build_registry(
+        sglang_router::policies::factory::build_registry(
             &cfg,
             kv_index.tree(),
             Arc::clone(&tokenizers),
@@ -342,8 +342,8 @@ async fn main() -> Result<()> {
     // is spawned so the manager can call `forget_worker` on
     // `DiscoveryEvent::Removed`.
     let stale_timeout = std::time::Duration::from_secs(cfg.active_load.stale_request_timeout_secs);
-    let active_load = sgl_router::policies::active_load::ActiveLoadRegistry::new(
-        Arc::new(sgl_router::policies::active_load::SystemTimeClock),
+    let active_load = sglang_router::policies::active_load::ActiveLoadRegistry::new(
+        Arc::new(sglang_router::policies::active_load::SystemTimeClock),
         stale_timeout,
     );
     // Sweep cadence is 1/10 of the configured timeout, clamped to
@@ -353,16 +353,18 @@ async fn main() -> Result<()> {
     let sweep_interval = std::time::Duration::from_secs(
         (cfg.active_load.stale_request_timeout_secs / 10).clamp(1, 60),
     );
-    let janitor_handle =
-        sgl_router::policies::active_load::spawn_janitor(Arc::clone(&active_load), sweep_interval);
+    let janitor_handle = sglang_router::policies::active_load::spawn_janitor(
+        Arc::clone(&active_load),
+        sweep_interval,
+    );
 
     // Spawn discovery + manager tasks.
-    let (event_rx, discovery_handle) = sgl_router::discovery::spawn_discovery(&cfg)
+    let (event_rx, discovery_handle) = sglang_router::discovery::spawn_discovery(&cfg)
         .await
         .context("spawn discovery")?;
-    let kv_index_opt: Option<Arc<sgl_router::policies::kv_events::KvEventIndex>> =
+    let kv_index_opt: Option<Arc<sglang_router::policies::kv_events::KvEventIndex>> =
         Some(Arc::clone(&kv_index));
-    let manager_handle = tokio::spawn(sgl_router::workers::manager::run_with_config(
+    let manager_handle = tokio::spawn(sglang_router::workers::manager::run_with_config(
         event_rx,
         registry.clone(),
         Some(Arc::new(cfg.clone())),
@@ -371,14 +373,14 @@ async fn main() -> Result<()> {
     ));
 
     let proxy = Arc::new(
-        sgl_router::proxy::Proxy::new(std::time::Duration::from_secs(
+        sglang_router::proxy::Proxy::new(std::time::Duration::from_secs(
             cfg.proxy.request_timeout_secs,
         ))
         .context("build proxy client")?,
     );
 
     let ctx = Arc::new(
-        sgl_router::server::app_context::AppContext::with_active_load(
+        sglang_router::server::app_context::AppContext::with_active_load(
             cfg.clone(),
             tokenizers,
             proxy,
@@ -389,7 +391,7 @@ async fn main() -> Result<()> {
     );
     ctx.mark_ready();
 
-    let app = sgl_router::server::app::build_router(ctx.clone());
+    let app = sglang_router::server::app::build_router(ctx.clone());
 
     let bind = format!("{}:{}", cfg.server.host, cfg.server.port);
     let listener = tokio::net::TcpListener::bind(&bind)

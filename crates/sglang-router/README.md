@@ -1,4 +1,4 @@
-# sgl-router
+# sglang-router
 
 Slim, KV-aware, OpenAI-compatible router for SGLang workers.
 
@@ -11,8 +11,7 @@ service discovery, and observability still pending.
 ## Building
 
 ```bash
-cd experimental/sgl-router
-cargo build --release
+cargo build -p sglang-router --release
 ```
 
 ## License

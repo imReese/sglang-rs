@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bootstrap a kind cluster for sgl-router K8s integration E2E tests.
+# Bootstrap a kind cluster for sglang-router K8s integration E2E tests.
 #
 # Prerequisites: Docker, kind, kubectl
 #
@@ -10,8 +10,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../../.." && pwd)"  # repo root (above experimental/)
-SGL_ROUTER_DIR="${REPO_ROOT}/experimental/sgl-router"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../../.." && pwd)"
+SGL_ROUTER_DIR="${REPO_ROOT}/crates/sglang-router"
 CLUSTER_NAME="${CLUSTER:-sgl-router-kind}"
 NAMESPACE="${NAMESPACE:-sgl-router-test}"
 CONTEXT="kind-${CLUSTER_NAME}"

@@ -1,9 +1,9 @@
-"""Minimal sgl-router Gateway class — adapted from SMG's e2e_test/infra/gateway.py.
+"""Minimal sglang-router Gateway class — adapted from SMG's e2e_test/infra/gateway.py.
 
 Differences from SMG:
   - SMG drives a Python launcher (`python3 -m sglang_router.launch_router`)
     with worker URLs on the CLI.
-  - sgl-router uses a Rust binary (`experimental/sgl-router/target/release/sgl-router`)
+  - sglang-router uses a Rust binary (`target/release/sgl-router`)
     with a TOML config file. Worker discovery is config-file-based; this
     Gateway writes a TOML to a tempfile and execs the binary with
     `--config <tempfile>`.
@@ -42,15 +42,10 @@ logger = logging.getLogger(__name__)
 
 # Repo-relative path to the release binary. Set ``SGL_ROUTER_BINARY`` to
 # override (e.g. a debug build, or a non-default ``CARGO_TARGET_DIR``).
-# This file is at `experimental/sgl-router/tests/e2e/infra/gateway.py`,
-# so four `.parent` hops to reach the sgl-router workspace root
-# (infra → e2e → tests → sgl-router). Cargo lands the binary at
-# `experimental/sgl-router/target/release/sgl-router`. A previous
-# version used three hops and pointed at `tests/target/`, which
-# would have broken any test that actually launches the router via
-# this helper.
+# This file is at `crates/sglang-router/tests/e2e/infra/gateway.py`; Cargo
+# lands the binary under the repository workspace target directory.
 DEFAULT_BINARY = (
-    Path(__file__).resolve().parent.parent.parent.parent
+    Path(__file__).resolve().parents[5]
     / "target"
     / "release"
     / "sgl-router"
@@ -78,7 +73,7 @@ def _get_open_port() -> int:
 def _resolve_tokenizer_path(tokenizer_path: str) -> str:
     """Resolve a HuggingFace repo ID to a local ``tokenizer.json`` path.
 
-    sgl-router's tokenizer loader treats the input as a filesystem path and
+    sglang-router's tokenizer loader treats the input as a filesystem path and
     inspects its extension; a bare HF id like ``Qwen/Qwen3-0.6B`` looks
     like a file with extension ``.6B`` and is rejected. When the HF Hub
     cache already has the tokenizer, point the loader at the on-disk
@@ -350,7 +345,7 @@ urls = [{urls_toml}]
         if not self.binary.exists():
             raise RuntimeError(
                 f"sgl-router binary not found at {self.binary}. "
-                "Build it first: `cd experimental/sgl-router && cargo build --release` "
+                "Build it first: `cargo build -p sglang-router --release` "
                 "or set SGL_ROUTER_BINARY to the binary path."
             )
         # Write the main config.

@@ -91,8 +91,8 @@ fn parity_matrix() {
                 skipped.push((f.model_id.clone(), f.shape.clone()));
                 continue;
             };
-            let tok = sgl_router::tokenizer::adapter::load(tp.to_str().unwrap()).unwrap();
-            let ids = sgl_router::tokenizer::adapter::encode(&tok, &f.prompt_text).unwrap();
+            let tok = sglang_router::tokenizer::adapter::load(tp.to_str().unwrap()).unwrap();
+            let ids = sglang_router::tokenizer::adapter::encode(&tok, &f.prompt_text).unwrap();
             assert_eq!(
                 ids, f.expected_token_ids,
                 "DRIFT on {}/{}",

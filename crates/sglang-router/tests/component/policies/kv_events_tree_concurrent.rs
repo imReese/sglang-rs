@@ -25,7 +25,7 @@
 use std::sync::Arc;
 use std::thread;
 
-use sgl_router::policies::kv_events::{HashTree, KvWorkerId};
+use sglang_router::policies::kv_events::{HashTree, KvWorkerId};
 
 fn worker(i: usize) -> KvWorkerId {
     KvWorkerId {

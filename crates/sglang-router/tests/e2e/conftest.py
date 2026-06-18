@@ -1,4 +1,4 @@
-"""Pytest fixtures for ``experimental/sgl-router/tests/e2e/``.
+"""Pytest fixtures for ``crates/sglang-router/tests/e2e/``.
 
 Two flavors of fixtures coexist here:
 
@@ -48,19 +48,11 @@ SGLANG_PORT = 30000
 ROUTER_PORT = 8090
 
 # Path to the release binary. This file lives at
-# `experimental/sgl-router/tests/e2e/conftest.py`, so:
-#   parent             = tests/e2e/
-#   parent.parent      = tests/
-#   parent.parent.parent = experimental/sgl-router/   ← cargo workspace root
-# A previous version used `parent.parent / "target"`, which pointed at
-# `experimental/sgl-router/tests/target/` and silently broke every
-# fixture that tries to launch the router binary (CI's
-# `cargo build --release` lands the artifact at
-# `experimental/sgl-router/target/release/sgl-router`, not under
-# `tests/`).
-_SGL_ROUTER_ROOT = Path(__file__).parent.parent.parent
+# `crates/sglang-router/tests/e2e/conftest.py`; Cargo writes release artifacts
+# to the workspace target directory at the repository root.
+_WORKSPACE_ROOT = Path(__file__).resolve().parents[4]
 _BINARY = (
-    Path(os.environ.get("CARGO_TARGET_DIR", str(_SGL_ROUTER_ROOT / "target")))
+    Path(os.environ.get("CARGO_TARGET_DIR", str(_WORKSPACE_ROOT / "target")))
     / "release"
     / "sgl-router"
 )
@@ -309,7 +301,7 @@ def router_binary() -> Path:
     pytest.skip(
         "sgl-router release binary not found at any of: "
         + ", ".join(str(c) for c in candidates)
-        + ". Build with `cargo build --release` in experimental/sgl-router/."
+        + ". Build with `cargo build -p sglang-router --release` from the workspace root."
     )
 
 

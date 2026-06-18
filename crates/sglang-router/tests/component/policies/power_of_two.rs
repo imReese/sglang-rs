@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::power_of_two::PowerOfTwoChoicesPolicy;
-use sgl_router::policies::{Policy, SelectionContext};
-use sgl_router::workers::Worker;
+use sglang_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+use sglang_router::policies::power_of_two::PowerOfTwoChoicesPolicy;
+use sglang_router::policies::{Policy, SelectionContext};
+use sglang_router::workers::Worker;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 

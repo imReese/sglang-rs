@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::round_robin::RoundRobinPolicy;
-use sgl_router::policies::{Policy, SelectionContext};
-use sgl_router::workers::Worker;
+use sglang_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+use sglang_router::policies::round_robin::RoundRobinPolicy;
+use sglang_router::policies::{Policy, SelectionContext};
+use sglang_router::workers::Worker;
 use std::sync::Arc;
 
 fn worker(id: &str) -> Arc<Worker> {

@@ -28,6 +28,7 @@ sglang-rs/
       sglang.proto
 
   crates/
+    sglang-router/    # Rust router package aligned with sgl-model-gateway PD shape
     sglang-srt/        # Current runtime crate: router, scheduler, engine, gRPC
     sglang-core/       # Future shared config/types/errors crate if boundaries grow
     sglang-cuda/       # Future Rust FFI wrapper around CUDA/C++ kernels
@@ -58,7 +59,8 @@ cross-language contract.
 
 ## Current Scope
 
-This repository currently contains the first `sglang-srt` runtime crate:
+This repository currently contains the first `sglang-srt` runtime crate and the
+`sglang-router` package used to exercise the gateway/router boundary:
 
 - `proto`: the initial `sglang.runtime.v1.SglangService` contract for the
   native Rust gRPC path in the community roadmap, including typed

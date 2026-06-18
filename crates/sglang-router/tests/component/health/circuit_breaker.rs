@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use sgl_router::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+use sglang_router::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use std::time::Duration;
 
 fn cb() -> CircuitBreaker {

@@ -3,12 +3,12 @@ Generator + validator for KV-event block-hash parity fixtures.
 
 Two modes:
 
-  python3 experimental/sgl-router/tests/scripts/generate_kv_events_hash_parity.py
+  python3 crates/sglang-router/tests/scripts/generate_kv_events_hash_parity.py
       Regenerate the committed JSON fixture from the locally-replicated
       algorithm. Run this when changing block-hash logic or adding new
       shape coverage. CI's drift-check step runs this in --check mode.
 
-  python3 experimental/sgl-router/tests/scripts/generate_kv_events_hash_parity.py --validate-against-sglang
+  python3 crates/sglang-router/tests/scripts/generate_kv_events_hash_parity.py --validate-against-sglang
       Import the real `sglang.srt.mem_cache.radix_cache.RadixKey.hash_page`
       and assert it agrees with the locally-replicated algorithm on every
       fixture case. This is the only place the replica and the real

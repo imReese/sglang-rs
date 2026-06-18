@@ -12,9 +12,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-use sgl_router::workers::{Worker, WorkerRegistry};
+use sglang_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+use sglang_router::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+use sglang_router::workers::{Worker, WorkerRegistry};
 
 /// HalfOpen state must admit at most one probe at a time even under high
 /// concurrency.  N threads race `allow()` when the breaker is HalfOpen; the

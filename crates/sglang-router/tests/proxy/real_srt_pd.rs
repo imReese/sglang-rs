@@ -27,24 +27,24 @@ use http_body_util::BodyExt;
 #[cfg(feature = "mooncake-link")]
 use serde_json::json;
 #[cfg(feature = "mooncake-link")]
-use sgl_router::config::{
+use sglang_router::config::{
     ActiveLoadConfig, Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig,
     PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 #[cfg(feature = "mooncake-link")]
-use sgl_router::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec};
+use sglang_router::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec};
 #[cfg(feature = "mooncake-link")]
-use sgl_router::policies::factory::build_registry_with_defaults;
+use sglang_router::policies::factory::build_registry_with_defaults;
 #[cfg(feature = "mooncake-link")]
-use sgl_router::proxy::Proxy;
+use sglang_router::proxy::Proxy;
 #[cfg(feature = "mooncake-link")]
-use sgl_router::server::app::build_router;
+use sglang_router::server::app::build_router;
 #[cfg(feature = "mooncake-link")]
-use sgl_router::server::app_context::AppContext;
+use sglang_router::server::app_context::AppContext;
 #[cfg(feature = "mooncake-link")]
-use sgl_router::tokenizer::TokenizerRegistry;
+use sglang_router::tokenizer::TokenizerRegistry;
 #[cfg(feature = "mooncake-link")]
-use sgl_router::workers::{manager, WorkerRegistry};
+use sglang_router::workers::{manager, WorkerRegistry};
 use sglang_srt::cli::ServerArgs;
 use sglang_srt::server::launch_http_server_with_shutdown;
 #[cfg(feature = "mooncake-link")]

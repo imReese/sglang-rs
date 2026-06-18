@@ -3,17 +3,17 @@
 
 use axum::body::Body;
 use axum::http::Request;
-use sgl_router::config::{
+use sglang_router::config::{
     ActiveLoadConfig, Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig,
     PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
-use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::factory::build_registry_with_defaults as build_policy_registry;
-use sgl_router::proxy::Proxy;
-use sgl_router::server::app::build_router;
-use sgl_router::server::app_context::AppContext;
-use sgl_router::tokenizer::TokenizerRegistry;
-use sgl_router::workers::WorkerRegistry;
+use sglang_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+use sglang_router::policies::factory::build_registry_with_defaults as build_policy_registry;
+use sglang_router::proxy::Proxy;
+use sglang_router::server::app::build_router;
+use sglang_router::server::app_context::AppContext;
+use sglang_router::tokenizer::TokenizerRegistry;
+use sglang_router::workers::WorkerRegistry;
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;

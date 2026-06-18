@@ -12,8 +12,8 @@ set -euo pipefail
 #   MOONCAKE_LINK=1 MOONCAKE_RPC_PORT=41002 ./scripts/run_glm5_pd_gpu.sh
 #
 # Notes:
-# - Workers are launched in gRPC mode and routed through sgl-router's
-#   sgl-model-gateway-compatible PD launch surface.
+# - Workers are launched in gRPC mode and routed through the sglang-router
+#   package's sgl-model-gateway-compatible PD launch surface.
 # - The current Rust GLM path can boot and expose PD/router metadata, but full
 #   GLM transformer kernels are still being filled in. Keep SMOKE_CHAT=0 until
 #   the forward path is complete enough for generation on your checkpoint.

@@ -21,15 +21,17 @@ use std::time::Duration;
 
 use zeromq::SocketSend;
 
-use sgl_router::config::CacheAwareConfig;
-use sgl_router::config::{ActiveLoadConfig, ProxyConfig};
+use sglang_router::config::CacheAwareConfig;
+use sglang_router::config::{ActiveLoadConfig, ProxyConfig};
 
-use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::cache_aware_zmq::CacheAwareZmqPolicy;
-use sgl_router::policies::kv_events::{compute_block_hashes, discovery::EventConfig, KvEventIndex};
-use sgl_router::policies::{Policy, SelectionContext};
-use sgl_router::tokenizer::TokenizerRegistry;
-use sgl_router::workers::Worker;
+use sglang_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+use sglang_router::policies::cache_aware_zmq::CacheAwareZmqPolicy;
+use sglang_router::policies::kv_events::{
+    compute_block_hashes, discovery::EventConfig, KvEventIndex,
+};
+use sglang_router::policies::{Policy, SelectionContext};
+use sglang_router::tokenizer::TokenizerRegistry;
+use sglang_router::workers::Worker;
 
 use super::zmq_helpers::{
     build_multipart, encode_block_stored_event, encode_event_batch, make_pub_bound,
@@ -59,22 +61,22 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
     let model_id = ModelId("tiny".into());
 
     // 1. Tokenizer registry — use the in-tree tiny fixture.
-    let cfg = sgl_router::config::Config {
-        server: sgl_router::config::ServerConfig {
+    let cfg = sglang_router::config::Config {
+        server: sglang_router::config::ServerConfig {
             host: "0".into(),
             port: 0,
         },
         observability: Default::default(),
-        models: vec![sgl_router::config::ModelConfig {
+        models: vec![sglang_router::config::ModelConfig {
             id: "tiny".into(),
             tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
-            policy: sgl_router::config::PolicyKind::CacheAwareZmq,
+            policy: sglang_router::config::PolicyKind::CacheAwareZmq,
             circuit_breaker: None,
             cache_aware: None,
         }],
-        discovery: sgl_router::config::DiscoveryConfig {
-            backend: sgl_router::config::DiscoveryBackend::StaticUrls(
-                sgl_router::config::StaticUrlsDiscoveryConfig {
+        discovery: sglang_router::config::DiscoveryConfig {
+            backend: sglang_router::config::DiscoveryBackend::StaticUrls(
+                sglang_router::config::StaticUrlsDiscoveryConfig {
                     urls: vec!["http://placeholder:0".into()],
                 },
             ),
@@ -90,7 +92,7 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
     // 3. Compute the hash chain for the routing prompt.
     let text = "hello world hello world hello world";
     let tok = tokenizers.get("tiny").unwrap();
-    let token_ids = sgl_router::tokenizer::adapter::encode(&tok, text).unwrap();
+    let token_ids = sglang_router::tokenizer::adapter::encode(&tok, text).unwrap();
     let block_size = 4u32;
     let hashes = compute_block_hashes(&token_ids, block_size as usize);
     assert!(!hashes.is_empty(), "tiny tokenizer must yield ≥1 block");

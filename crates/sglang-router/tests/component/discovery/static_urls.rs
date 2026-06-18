@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use sgl_router::config::StaticUrlsDiscoveryConfig;
-use sgl_router::discovery::{DiscoveryEvent, WorkerMode};
+use sglang_router::config::StaticUrlsDiscoveryConfig;
+use sglang_router::discovery::{DiscoveryEvent, WorkerMode};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -13,7 +13,7 @@ async fn emits_one_added_per_url_with_plain_seed() {
         urls: vec!["http://x:30000".into(), "http://y:30000".into()],
     };
     let (tx, mut rx) = mpsc::channel(16);
-    let _h = sgl_router::discovery::static_urls::spawn(cfg, tx)
+    let _h = sglang_router::discovery::static_urls::spawn(cfg, tx)
         .await
         .unwrap();
 
@@ -58,7 +58,7 @@ async fn emits_one_event_and_parks_until_receiver_dropped() {
         urls: vec!["http://x:30000".into()],
     };
     let (tx, mut rx) = mpsc::channel(16);
-    let h = sgl_router::discovery::static_urls::spawn(cfg, tx)
+    let h = sglang_router::discovery::static_urls::spawn(cfg, tx)
         .await
         .unwrap();
     let event = rx.recv().await.unwrap();
@@ -89,12 +89,12 @@ async fn emits_one_event_and_parks_until_receiver_dropped() {
 async fn static_urls_pd_role_resolved_end_to_end() {
     use axum::{routing::get, Json, Router};
     use serde_json::json;
-    use sgl_router::config::{
+    use sglang_router::config::{
         ActiveLoadConfig, Config, DiscoveryBackend, DiscoveryConfig, ObservabilityConfig,
         ProxyConfig, ServerConfig,
     };
-    use sgl_router::discovery::{spawn_discovery, WorkerId};
-    use sgl_router::workers::{manager, WorkerRegistry};
+    use sglang_router::discovery::{spawn_discovery, WorkerId};
+    use sglang_router::workers::{manager, WorkerRegistry};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
 

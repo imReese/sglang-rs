@@ -3,8 +3,8 @@
 
 use axum::{routing::get, Json, Router};
 use serde_json::{json, Value};
-use sgl_router::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::workers::{manager, WorkerRegistry};
+use sglang_router::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec};
+use sglang_router::workers::{manager, WorkerRegistry};
 use sglang_srt::cli::ServerArgs;
 use sglang_srt::server::launch_grpc_server_with_shutdown;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
@@ -536,7 +536,7 @@ async fn removed_awaits_pending_added() {
 /// independently — 2N round-trips for N workers.
 #[tokio::test]
 async fn manager_emits_single_server_info_fetch_per_worker() {
-    use sgl_router::policies::kv_events::KvEventIndex;
+    use sglang_router::policies::kv_events::KvEventIndex;
 
     let body = json!({
         "served_model_name": "m",

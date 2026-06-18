@@ -36,7 +36,7 @@ Implement a Mooncake-linked Rust PD runtime path that can:
 4. Transfer prefill KV pages over Mooncake into decode KV pages.
 5. Let decode generation wait for KV transfer success, then continue the real
    model forward path.
-6. Route the pair through `sgl-router` and remain compatible with the community
+6. Route the pair through `sglang-router` and remain compatible with the community
    `sgl-model-gateway` PD flags:
    `--pd-disaggregation --prefill <url> <bootstrap_port> --decode <url>`.
 
@@ -58,7 +58,7 @@ following remain follow-up work:
 The linked runtime keeps the current separation between routing, scheduling,
 bootstrap metadata, transfer execution, and model execution.
 
-`sgl-router` or `sgl-model-gateway` selects a PD worker pair. It sends a
+`sglang-router` or `sgl-model-gateway` selects a PD worker pair. It sends a
 prefill request containing `bootstrap_host`, `bootstrap_port`, and
 `bootstrap_room`, then sends the matching decode request to the decode worker.
 
@@ -215,7 +215,7 @@ The implementation should use TDD and keep tests split by environment:
     buffer through Mooncake using the Rust FFI wrapper.
   - Decode publisher sends KVArgs and transfer metadata that the prefill
     bootstrap service ingests into remote layouts.
-  - A real Rust SRT prefill/decode pair behind `sgl-router` returns a successful
+  - A real Rust SRT prefill/decode pair behind `sglang-router` returns a successful
     `/generate` or `/v1/chat/completions` response in linked mode.
 
 - Manual GPU smoke:
@@ -248,7 +248,7 @@ The implementation should use TDD and keep tests split by environment:
   derived from live runtime memory.
 - Decode generation remains pending until Mooncake reports success, then runs
   model forward against transferred KV.
-- `sgl-router` can route to Rust prefill/decode workers using the same PD
+- `sglang-router` can route to Rust prefill/decode workers using the same PD
   worker arguments as `sgl-model-gateway`.
 - Any unsupported model/runtime path fails explicitly and does not fall back to
   mock, zero-address, or no-op transfer behavior.

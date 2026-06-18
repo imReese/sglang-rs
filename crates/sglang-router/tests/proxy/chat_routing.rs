@@ -1,17 +1,17 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use sgl_router::config::{
+use sglang_router::config::{
     ActiveLoadConfig, Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig,
     PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
-use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
-use sgl_router::policies::factory::build_registry_with_defaults as build_policy_registry;
-use sgl_router::proxy::Proxy;
-use sgl_router::server::app::build_router;
-use sgl_router::server::app_context::AppContext;
-use sgl_router::tokenizer::{adapter, TokenizerRegistry};
-use sgl_router::workers::{Worker, WorkerRegistry};
+use sglang_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
+use sglang_router::policies::factory::build_registry_with_defaults as build_policy_registry;
+use sglang_router::proxy::Proxy;
+use sglang_router::server::app::build_router;
+use sglang_router::server::app_context::AppContext;
+use sglang_router::tokenizer::{adapter, TokenizerRegistry};
+use sglang_router::workers::{Worker, WorkerRegistry};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -815,8 +815,8 @@ async fn forward_json_to_records_failure_on_body_drop() {
     // that does this repeatedly stays eligible. The fix moves the
     // breaker record to after the body completes, treating a body-drop
     // as failure.
-    use sgl_router::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-    use sgl_router::server::error::ApiError;
+    use sglang_router::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+    use sglang_router::server::error::ApiError;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -867,8 +867,8 @@ async fn forward_json_to_records_success_only_after_body_completes() {
     // failure. If `record_success` fired on the clean call, the failure
     // count is back to 1 and the breaker stays closed. If it didn't,
     // the count is now 2 and the breaker opens.
-    use sgl_router::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-    use sgl_router::server::error::ApiError;
+    use sglang_router::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+    use sglang_router::server::error::ApiError;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -921,8 +921,8 @@ async fn forward_streaming_to_records_failure_on_mid_stream_drop() {
     // stream on a spawned pump, so the recording has to flow through
     // that pump's completion path.
     use http_body_util::BodyExt;
-    use sgl_router::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-    use sgl_router::server::error::ApiError;
+    use sglang_router::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+    use sglang_router::server::error::ApiError;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -969,8 +969,8 @@ async fn forward_streaming_to_records_failure_on_mid_stream_drop() {
 
 #[tokio::test]
 async fn forward_json_to_records_failure_on_5xx() {
-    use sgl_router::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-    use sgl_router::server::error::ApiError;
+    use sglang_router::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+    use sglang_router::server::error::ApiError;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1006,8 +1006,8 @@ async fn forward_json_to_records_failure_on_5xx() {
 
 #[tokio::test]
 async fn forward_json_to_rejects_when_breaker_open() {
-    use sgl_router::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-    use sgl_router::server::error::ApiError;
+    use sglang_router::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+    use sglang_router::server::error::ApiError;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1045,8 +1045,8 @@ async fn forward_json_to_rejects_when_breaker_open() {
 /// it.
 #[tokio::test]
 async fn forward_json_to_malformed_url_returns_worker_misconfigured_and_trips_breaker() {
-    use sgl_router::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-    use sgl_router::server::error::ApiError;
+    use sglang_router::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+    use sglang_router::server::error::ApiError;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1429,7 +1429,7 @@ async fn streaming_active_load_drops_on_client_disconnect() {
 /// returns; cancellation fires; handler returns 504.
 #[tokio::test]
 async fn janitor_expiry_returns_504_stale_request_expired() {
-    use sgl_router::policies::active_load::{spawn_janitor, ActiveLoadRegistry};
+    use sglang_router::policies::active_load::{spawn_janitor, ActiveLoadRegistry};
     // Upstream that takes 2s to respond — longer than our 50ms
     // stale_request_timeout.
     let worker =
@@ -1451,7 +1451,7 @@ async fn janitor_expiry_returns_504_stale_request_expired() {
     // tick (every 20ms) and fire the cancellation token before the
     // upstream returns.
     let active_load = ActiveLoadRegistry::new(
-        Arc::new(sgl_router::policies::active_load::SystemTimeClock),
+        Arc::new(sglang_router::policies::active_load::SystemTimeClock),
         Duration::from_millis(50),
     );
     let _janitor = spawn_janitor(Arc::clone(&active_load), Duration::from_millis(20));
