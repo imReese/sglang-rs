@@ -1,11 +1,11 @@
 # sglang-rs
 
-Rust runtime work for rewriting SGLang while keeping CUDA kernels as the
-execution backend boundary.
+Rust runtime work for rewriting SGLang while keeping kernel execution behind a
+cross-platform backend boundary.
 
 The goal is to move Python-heavy runtime work into Rust: request lifecycle
 management, scheduling, prefix-cache matching, tokenization/detokenization
-boundaries, and eventually the bridge into the existing CUDA kernels.
+boundaries, and eventually the bridge into the existing SGLang kernel library.
 
 ## Project Layout
 
@@ -31,12 +31,15 @@ sglang-rs/
     sglang-router/    # Rust router package aligned with sgl-model-gateway PD shape
     sglang-srt/        # Current runtime crate: router, scheduler, engine, gRPC
     sglang-core/       # Future shared config/types/errors crate if boundaries grow
-    sglang-cuda/       # Future Rust FFI wrapper around CUDA/C++ kernels
+    sglang-kernel/     # Rust kernel backend boundary with CPU references first
     sglang-python/     # Future PyO3 extension crate for Python integration
 
-  cuda/                # Future CUDA/C++ kernels and headers
-    include/
-    src/
+  kernels/             # Future native kernel sources and imported upstream pieces
+    cuda/
+    cpu/
+    metal/
+    rocm/
+    musa/
 
   python/              # Future pure Python package, CLI glue, and Python tests
     sglang_rs/
@@ -50,12 +53,38 @@ subdirectory is a Rust crate with its own `Cargo.toml`; crates are split only
 when the boundary is useful. For now, `crates/sglang-srt` remains the main crate
 so runtime work can move quickly without premature crate churn.
 
-CUDA and Python code should not be folded into the current crate by default.
-CUDA kernels belong under `cuda/`, with a Rust wrapper crate such as
-`crates/sglang-cuda` handling build/link/FFI. Python code belongs under
-`python/`, while a PyO3 extension crate belongs under `crates/sglang-python`.
-The shared `proto/` directory stays at the workspace root because it is a
-cross-language contract.
+Native kernels and Python code should not be folded into the current crate by
+default. Kernel backend sources belong under `kernels/`, with
+`crates/sglang-kernel` handling the Rust-side backend abstraction, build/link
+steps, and FFI. Python code belongs under `python/`, while a PyO3 extension
+crate belongs under `crates/sglang-python`. The shared `proto/` directory stays
+at the workspace root because it is a cross-language contract.
+
+## Kernel Reuse Direction
+
+The upstream SGLang repository already has a kernel package under
+`sgl-kernel/`, published as `sglang-kernel` while keeping the Python import path
+as `sgl_kernel`. This repository should align with that name and treat
+`sglang-kernel` as the Rust crate boundary for native execution backends rather
+than naming the crate after one backend such as CUDA.
+
+The first integration target is not to rewrite every kernel in Rust. Instead,
+`crates/sglang-kernel` exposes a small Rust API over kernels needed by the
+runtime and PD path, starting with CPU reference implementations and then
+binding selected upstream implementations through thin FFI layers. The backend
+layout should stay cross-platform:
+
+- CUDA/CUTLASS/FlashInfer kernels for NVIDIA deployments.
+- CPU kernels for local correctness tests and non-GPU fallback paths.
+- Metal kernels for Apple Silicon development and eventual MLX-backed paths.
+- ROCm/HIP and MUSA-oriented sources where upstream support already exists.
+
+For the PD-disaggregation milestone, the highest-value reuse candidates are KV
+cache transfer/layout helpers, attention/MLA kernels, GEMM and quantization
+kernels, MoE top-k/alignment kernels, elementwise operations such as RMSNorm and
+RoPE, and sampling/grammar helpers. The Rust runtime should depend on traits and
+typed buffers owned by `sglang-kernel`; backend-specific CUDA, CPU, Metal, ROCm,
+or MUSA details should stay behind feature-gated implementations.
 
 ## Current Scope
 

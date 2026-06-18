@@ -4157,6 +4157,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "sglang-kernel"
+version = "0.1.0"
+
+[[package]]
 name = "sglang-router"
 version = "0.1.0"
 dependencies = [
