@@ -19,7 +19,6 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use bytes::Bytes;
-use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use sgl_router::config::{
     ActiveLoadConfig, Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig,
@@ -274,7 +273,7 @@ async fn pd_mode_prefill_without_bootstrap_port_is_rejected_before_dispatch() {
 }
 
 #[tokio::test]
-async fn pd_mode_generate_batch_is_rejected_before_dispatch() {
+async fn pd_mode_generate_batch_injects_array_bootstrap_fields_into_both_bodies() {
     let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx(vec![
@@ -296,21 +295,38 @@ async fn pd_mode_generate_batch_is_rejected_before_dispatch() {
     let app = build_router(ctx);
 
     let res = app.oneshot(generate_batch_request()).await.unwrap();
-    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(res.status(), StatusCode::OK, "decode side should 200");
 
-    let body = res.into_body().collect().await.unwrap().to_bytes();
-    let body_str = String::from_utf8_lossy(&body);
-    assert!(
-        body_str.contains("PD mode does not support batched /generate requests"),
-        "body: {body_str}"
-    );
-    assert!(
-        prefill.captured.lock().unwrap().last_body.is_none(),
-        "unsupported PD batch request must not reach prefill",
-    );
-    assert!(
-        decode.captured.lock().unwrap().last_body.is_none(),
-        "unsupported PD batch request must not reach decode",
+    let prefill_body = await_captured_body(&prefill, Duration::from_secs(2), "prefill").await;
+    let decode_body = await_captured_body(&decode, Duration::from_secs(2), "decode").await;
+    let pj = parse_body(&prefill_body);
+    let dj = parse_body(&decode_body);
+
+    for body in [&pj, &dj] {
+        assert_eq!(
+            body["bootstrap_host"],
+            json!(["127.0.0.1", "127.0.0.1"]),
+            "batch bootstrap_host should match the chosen prefill host"
+        );
+        assert_eq!(
+            body["bootstrap_port"],
+            json!([8997, 8997]),
+            "batch bootstrap_port should match the chosen prefill bootstrap port"
+        );
+        let rooms = body["bootstrap_room"]
+            .as_array()
+            .expect("batch bootstrap_room should be an array");
+        assert_eq!(rooms.len(), 2);
+        for room in rooms {
+            let room = room
+                .as_u64()
+                .expect("batch bootstrap_room entries should be unsigned integers");
+            assert!(room <= i64::MAX as u64);
+        }
+    }
+    assert_eq!(
+        pj["bootstrap_room"], dj["bootstrap_room"],
+        "prefill and decode must share the exact per-item bootstrap rooms"
     );
 }
 

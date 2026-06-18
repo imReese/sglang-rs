@@ -814,46 +814,38 @@ where
         let outputs = self
             .engine
             .generate_token_stream(self.apply_default_stop_token_ids(validated_request.request))?;
-        let mut output_ids = Vec::new();
-        let mut responses = Vec::with_capacity(outputs.len());
+        Ok(token_outputs_to_generate_responses(
+            outputs,
+            prompt_tokens,
+            stream,
+        ))
+    }
 
-        for output in outputs {
-            let request_id = output.request_id.as_str().to_string();
-            output_ids.extend_from_slice(&output.output_ids);
-            let completion_tokens = output_ids.len() as i32;
-            let cached_tokens = output.cached_tokens as i32;
-
-            let body = if output.finished {
-                RouterGenerateResponseBody::Complete(RouterGenerateComplete {
-                    output_ids: output_ids.clone(),
-                    text: String::new(),
-                    finish_reason: "stop".to_string(),
-                    prompt_tokens,
-                    completion_tokens,
-                    cached_tokens,
-                    index: 0,
-                })
-            } else {
-                RouterGenerateResponseBody::Chunk(RouterGenerateStreamChunk {
-                    token_ids: output.output_ids,
-                    text: String::new(),
-                    prompt_tokens,
-                    completion_tokens,
-                    cached_tokens,
-                    index: 0,
-                })
-            };
-
-            responses.push(RouterGenerateResponse { request_id, body });
+    pub fn generate_batch_stream(
+        &mut self,
+        requests: Vec<RouterGenerateRequest>,
+    ) -> Result<Vec<Vec<RouterGenerateResponse>>, RouterRuntimeError> {
+        let mut prompt_tokens = Vec::with_capacity(requests.len());
+        let mut streams = Vec::with_capacity(requests.len());
+        let mut token_requests = Vec::with_capacity(requests.len());
+        for request in requests {
+            let validated_request =
+                request.try_into_validated_token_request(self.validation_config)?;
+            prompt_tokens.push(validated_request.prompt_tokens as i32);
+            streams.push(validated_request.stream);
+            token_requests.push(self.apply_default_stop_token_ids(validated_request.request));
         }
 
-        if !stream {
-            responses.retain(|response| {
-                matches!(response.body, RouterGenerateResponseBody::Complete(_))
-            });
-        }
-
-        Ok(responses)
+        self.ensure_generation_ready()?;
+        let batch_outputs = self.engine.generate_token_batch_stream(token_requests)?;
+        Ok(batch_outputs
+            .into_iter()
+            .zip(prompt_tokens)
+            .zip(streams)
+            .map(|((outputs, prompt_tokens), stream)| {
+                token_outputs_to_generate_responses(outputs, prompt_tokens, stream)
+            })
+            .collect())
     }
 
     pub fn generate_text_stream(
@@ -941,46 +933,44 @@ where
             self.apply_default_stop_token_ids(validated_request.request),
             max_transfer_polls,
         )?;
-        let mut output_ids = Vec::new();
-        let mut responses = Vec::with_capacity(outputs.len());
+        Ok(token_outputs_to_generate_responses(
+            outputs,
+            prompt_tokens,
+            stream,
+        ))
+    }
 
-        for output in outputs {
-            let request_id = output.request_id.as_str().to_string();
-            output_ids.extend_from_slice(&output.output_ids);
-            let completion_tokens = output_ids.len() as i32;
-            let cached_tokens = output.cached_tokens as i32;
-
-            let body = if output.finished {
-                RouterGenerateResponseBody::Complete(RouterGenerateComplete {
-                    output_ids: output_ids.clone(),
-                    text: String::new(),
-                    finish_reason: "stop".to_string(),
-                    prompt_tokens,
-                    completion_tokens,
-                    cached_tokens,
-                    index: 0,
-                })
-            } else {
-                RouterGenerateResponseBody::Chunk(RouterGenerateStreamChunk {
-                    token_ids: output.output_ids,
-                    text: String::new(),
-                    prompt_tokens,
-                    completion_tokens,
-                    cached_tokens,
-                    index: 0,
-                })
-            };
-
-            responses.push(RouterGenerateResponse { request_id, body });
+    pub fn generate_batch_stream_with_transfer_polling(
+        &mut self,
+        requests: Vec<RouterGenerateRequest>,
+        max_transfer_polls: usize,
+    ) -> Result<Vec<Vec<RouterGenerateResponse>>, RouterRuntimeError> {
+        let mut prompt_tokens = Vec::with_capacity(requests.len());
+        let mut streams = Vec::with_capacity(requests.len());
+        let mut token_requests = Vec::with_capacity(requests.len());
+        for request in requests {
+            let validated_request =
+                request.try_into_validated_token_request(self.validation_config)?;
+            prompt_tokens.push(validated_request.prompt_tokens as i32);
+            streams.push(validated_request.stream);
+            token_requests.push(self.apply_default_stop_token_ids(validated_request.request));
         }
 
-        if !stream {
-            responses.retain(|response| {
-                matches!(response.body, RouterGenerateResponseBody::Complete(_))
-            });
-        }
-
-        Ok(responses)
+        self.ensure_generation_ready()?;
+        let batch_outputs = self
+            .engine
+            .generate_token_batch_stream_with_transfer_polling(
+                token_requests,
+                max_transfer_polls,
+            )?;
+        Ok(batch_outputs
+            .into_iter()
+            .zip(prompt_tokens)
+            .zip(streams)
+            .map(|((outputs, prompt_tokens), stream)| {
+                token_outputs_to_generate_responses(outputs, prompt_tokens, stream)
+            })
+            .collect())
     }
 
     pub fn generate_text_stream_with_transfer_polling(
@@ -1015,6 +1005,52 @@ where
 
         Ok(responses)
     }
+}
+
+fn token_outputs_to_generate_responses(
+    outputs: Vec<TokenGenerateOutput>,
+    prompt_tokens: i32,
+    stream: bool,
+) -> Vec<RouterGenerateResponse> {
+    let mut output_ids = Vec::new();
+    let mut responses = Vec::with_capacity(outputs.len());
+
+    for output in outputs {
+        let request_id = output.request_id.as_str().to_string();
+        output_ids.extend_from_slice(&output.output_ids);
+        let completion_tokens = output_ids.len() as i32;
+        let cached_tokens = output.cached_tokens as i32;
+
+        let body = if output.finished {
+            RouterGenerateResponseBody::Complete(RouterGenerateComplete {
+                output_ids: output_ids.clone(),
+                text: String::new(),
+                finish_reason: "stop".to_string(),
+                prompt_tokens,
+                completion_tokens,
+                cached_tokens,
+                index: 0,
+            })
+        } else {
+            RouterGenerateResponseBody::Chunk(RouterGenerateStreamChunk {
+                token_ids: output.output_ids,
+                text: String::new(),
+                prompt_tokens,
+                completion_tokens,
+                cached_tokens,
+                index: 0,
+            })
+        };
+
+        responses.push(RouterGenerateResponse { request_id, body });
+    }
+
+    if !stream {
+        responses
+            .retain(|response| matches!(response.body, RouterGenerateResponseBody::Complete(_)));
+    }
+
+    responses
 }
 
 #[derive(Clone, Debug, PartialEq)]

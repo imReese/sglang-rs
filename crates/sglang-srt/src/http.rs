@@ -612,27 +612,60 @@ where
         match request {
             HttpGenerateRequest::Text(request) => {
                 if service.max_transfer_polls == 0 {
-                    runtime.generate_text_stream(request)
+                    runtime
+                        .generate_text_stream(request)
+                        .map(HttpGenerateResponse::Single)
                 } else {
-                    runtime.generate_text_stream_with_transfer_polling(
-                        request,
-                        service.max_transfer_polls,
-                    )
+                    runtime
+                        .generate_text_stream_with_transfer_polling(
+                            request,
+                            service.max_transfer_polls,
+                        )
+                        .map(HttpGenerateResponse::Single)
                 }
             }
             HttpGenerateRequest::Tokenized(request) => {
                 if service.max_transfer_polls == 0 {
-                    runtime.generate_stream(request)
+                    runtime
+                        .generate_stream(request)
+                        .map(HttpGenerateResponse::Single)
                 } else {
                     runtime
                         .generate_stream_with_transfer_polling(request, service.max_transfer_polls)
+                        .map(HttpGenerateResponse::Single)
+                }
+            }
+            HttpGenerateRequest::BatchTokenized(requests) => {
+                if stream {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": {
+                                "message": "streaming batched /generate is not supported yet"
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
+
+                if service.max_transfer_polls == 0 {
+                    runtime
+                        .generate_batch_stream(requests)
+                        .map(HttpGenerateResponse::Batch)
+                } else {
+                    runtime
+                        .generate_batch_stream_with_transfer_polling(
+                            requests,
+                            service.max_transfer_polls,
+                        )
+                        .map(HttpGenerateResponse::Batch)
                 }
             }
         }
     };
 
     match response {
-        Ok(mut responses) => {
+        Ok(HttpGenerateResponse::Single(mut responses)) => {
             if stream {
                 return http_generate_stream_response_from_router_responses(responses);
             }
@@ -643,41 +676,94 @@ where
                 )
                     .into_response();
             };
-            match response.body {
-                RouterGenerateResponseBody::Complete(complete) => (
-                    StatusCode::OK,
-                    Json(json!({
-                        "request_id": response.request_id,
-                        "text": complete.text,
-                        "output_ids": complete.output_ids,
-                        "finish_reason": complete.finish_reason,
-                        "usage": {
-                            "prompt_tokens": complete.prompt_tokens,
-                            "completion_tokens": complete.completion_tokens,
-                            "cached_tokens": complete.cached_tokens,
-                        }
-                    })),
-                )
-                    .into_response(),
-                RouterGenerateResponseBody::Chunk(_) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(
-                        json!({ "error": { "message": "non-stream HTTP generate returned a stream chunk" } }),
-                    ),
-                )
-                    .into_response(),
-                RouterGenerateResponseBody::Error(error) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": { "message": error.message } })),
-                )
-                    .into_response(),
+            match generate_complete_response_json(response) {
+                Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+                Err(response) => match response.body {
+                    RouterGenerateResponseBody::Chunk(_) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(
+                            json!({ "error": { "message": "non-stream HTTP generate returned a stream chunk" } }),
+                        ),
+                    )
+                        .into_response(),
+                    RouterGenerateResponseBody::Error(error) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": { "message": error.message } })),
+                    )
+                        .into_response(),
+                    RouterGenerateResponseBody::Complete(_) => unreachable!(),
+                },
             }
+        }
+        Ok(HttpGenerateResponse::Batch(batch_responses)) => {
+            let mut body = Vec::with_capacity(batch_responses.len());
+            for mut responses in batch_responses {
+                let Some(response) = responses.pop() else {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": { "message": "generation produced no response" } })),
+                    )
+                        .into_response();
+                };
+                match generate_complete_response_json(response) {
+                    Ok(item) => body.push(item),
+                    Err(response) => match response.body {
+                        RouterGenerateResponseBody::Chunk(_) => {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(json!({
+                                    "error": {
+                                        "message": "non-stream HTTP generate returned a stream chunk"
+                                    }
+                                })),
+                            )
+                                .into_response();
+                        }
+                        RouterGenerateResponseBody::Error(error) => {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(json!({ "error": { "message": error.message } })),
+                            )
+                                .into_response();
+                        }
+                        RouterGenerateResponseBody::Complete(_) => unreachable!(),
+                    },
+                }
+            }
+            (StatusCode::OK, Json(Value::Array(body))).into_response()
         }
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": { "message": error.to_string() } })),
         )
             .into_response(),
+    }
+}
+
+enum HttpGenerateResponse {
+    Single(Vec<RouterGenerateResponse>),
+    Batch(Vec<Vec<RouterGenerateResponse>>),
+}
+
+fn generate_complete_response_json(
+    response: RouterGenerateResponse,
+) -> Result<Value, RouterGenerateResponse> {
+    match response.body {
+        RouterGenerateResponseBody::Complete(complete) => Ok(json!({
+            "request_id": response.request_id,
+            "text": complete.text,
+            "output_ids": complete.output_ids,
+            "finish_reason": complete.finish_reason,
+            "usage": {
+                "prompt_tokens": complete.prompt_tokens,
+                "completion_tokens": complete.completion_tokens,
+                "cached_tokens": complete.cached_tokens,
+            }
+        })),
+        body => Err(RouterGenerateResponse {
+            request_id: response.request_id,
+            body,
+        }),
     }
 }
 
@@ -1074,6 +1160,7 @@ fn http_completion_stream_response_from_router_responses(
 enum HttpGenerateRequest {
     Text(RouterTextGenerateRequest),
     Tokenized(RouterGenerateRequest),
+    BatchTokenized(Vec<RouterGenerateRequest>),
 }
 
 impl HttpGenerateRequest {
@@ -1081,6 +1168,10 @@ impl HttpGenerateRequest {
         match self {
             Self::Text(request) => request.stream,
             Self::Tokenized(request) => request.stream,
+            Self::BatchTokenized(requests) => requests
+                .first()
+                .map(|request| request.stream)
+                .unwrap_or(false),
         }
     }
 
@@ -1088,14 +1179,23 @@ impl HttpGenerateRequest {
         match self {
             Self::Text(request) => request.disaggregated_params.as_ref(),
             Self::Tokenized(request) => request.disaggregated_params.as_ref(),
+            Self::BatchTokenized(requests) => requests
+                .iter()
+                .find_map(|request| request.disaggregated_params.as_ref()),
         }
     }
 }
 
 fn http_generate_payload_to_router_request(payload: Value) -> Result<HttpGenerateRequest, String> {
     if payload.get("input_ids").is_some() {
-        return http_generate_payload_to_router_token_request(payload)
-            .map(HttpGenerateRequest::Tokenized);
+        return match http_generate_payload_to_router_token_requests(payload)? {
+            HttpTokenGenerateRequests::Single(request) => {
+                Ok(HttpGenerateRequest::Tokenized(request))
+            }
+            HttpTokenGenerateRequests::Batch(requests) => {
+                Ok(HttpGenerateRequest::BatchTokenized(requests))
+            }
+        };
     }
     http_generate_payload_to_router_text_request(payload).map(HttpGenerateRequest::Text)
 }
@@ -1131,12 +1231,88 @@ fn http_generate_payload_to_router_text_request(
     })
 }
 
-fn http_generate_payload_to_router_token_request(
+enum HttpTokenGenerateRequests {
+    Single(RouterGenerateRequest),
+    Batch(Vec<RouterGenerateRequest>),
+}
+
+fn http_generate_payload_to_router_token_requests(
     payload: Value,
-) -> Result<RouterGenerateRequest, String> {
-    let input_ids = payload
+) -> Result<HttpTokenGenerateRequests, String> {
+    let input_ids_value = payload
         .get("input_ids")
         .and_then(Value::as_array)
+        .ok_or_else(|| "input_ids must be an array".to_string())?;
+    let sampling_params = payload
+        .get("sampling_params")
+        .map(json_to_sampling_params)
+        .transpose()?;
+    let stream = optional_bool(&payload, "stream")?.unwrap_or(false);
+
+    if input_ids_value
+        .first()
+        .is_some_and(serde_json::Value::is_array)
+    {
+        let input_batches = input_ids_value
+            .iter()
+            .map(token_id_array)
+            .collect::<Result<Vec<_>, _>>()?;
+        let batch_size = input_batches.len();
+        let request_ids = optional_string_values(&payload, "request_id", batch_size)?;
+        let original_texts = optional_string_values(&payload, "original_text", batch_size)?;
+        let data_parallel_ranks = optional_i32_values(&payload, "data_parallel_rank", batch_size)?;
+        let disaggregated_params = json_to_disaggregated_params_values(&payload, batch_size)?;
+        let mut requests = Vec::with_capacity(batch_size);
+
+        for index in 0..batch_size {
+            requests.push(RouterGenerateRequest {
+                request_id: request_ids[index].clone(),
+                tokenized: Some(RouterTokenizedInput {
+                    original_text: original_texts[index].clone(),
+                    input_ids: input_batches[index].clone(),
+                }),
+                sampling_params: sampling_params.clone(),
+                disaggregated_params: disaggregated_params[index].clone(),
+                stream,
+                data_parallel_rank: data_parallel_ranks[index],
+                ..Default::default()
+            });
+        }
+
+        return Ok(HttpTokenGenerateRequests::Batch(requests));
+    }
+
+    let input_ids = token_id_array(&Value::Array(input_ids_value.clone()))?;
+    let request_id = payload
+        .get("request_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let original_text = payload
+        .get("original_text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let disaggregated_params = json_to_disaggregated_params(&payload)?;
+    let data_parallel_rank = optional_i32(&payload, "data_parallel_rank")?.unwrap_or_default();
+
+    Ok(HttpTokenGenerateRequests::Single(RouterGenerateRequest {
+        request_id,
+        tokenized: Some(RouterTokenizedInput {
+            original_text,
+            input_ids,
+        }),
+        sampling_params,
+        disaggregated_params,
+        stream,
+        data_parallel_rank,
+        ..Default::default()
+    }))
+}
+
+fn token_id_array(value: &Value) -> Result<Vec<u32>, String> {
+    value
+        .as_array()
         .ok_or_else(|| "input_ids must be an array".to_string())?
         .iter()
         .map(|value| {
@@ -1145,36 +1321,76 @@ fn http_generate_payload_to_router_token_request(
             };
             u32::try_from(raw).map_err(|_| "input_ids entry is out of u32 range".to_string())
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    let original_text = payload
-        .get("original_text")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let request_id = payload
-        .get("request_id")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let sampling_params = payload
-        .get("sampling_params")
-        .map(json_to_sampling_params)
-        .transpose()?;
-    let disaggregated_params = json_to_disaggregated_params(&payload)?;
-    let data_parallel_rank = optional_i32(&payload, "data_parallel_rank")?.unwrap_or_default();
+        .collect()
+}
 
-    Ok(RouterGenerateRequest {
-        request_id,
-        tokenized: Some(RouterTokenizedInput {
-            original_text,
-            input_ids,
-        }),
-        sampling_params,
-        disaggregated_params,
-        stream: optional_bool(&payload, "stream")?.unwrap_or(false),
-        data_parallel_rank,
-        ..Default::default()
-    })
+fn optional_string_values(
+    payload: &Value,
+    field: &'static str,
+    batch_size: usize,
+) -> Result<Vec<String>, String> {
+    let Some(value) = payload.get(field) else {
+        return Ok(vec![String::new(); batch_size]);
+    };
+
+    if let Some(text) = value.as_str() {
+        return Ok(vec![text.to_string(); batch_size]);
+    }
+
+    let values = value
+        .as_array()
+        .ok_or_else(|| format!("{field} must be a string or array of strings"))?;
+    if values.len() != batch_size {
+        return Err(format!(
+            "{field} length {} does not match batch size {batch_size}",
+            values.len()
+        ));
+    }
+
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(ToString::to_string)
+                .ok_or_else(|| format!("{field} entries must be strings"))
+        })
+        .collect()
+}
+
+fn optional_i32_values(
+    payload: &Value,
+    field: &'static str,
+    batch_size: usize,
+) -> Result<Vec<i32>, String> {
+    let Some(value) = payload.get(field) else {
+        return Ok(vec![0; batch_size]);
+    };
+
+    if let Some(raw) = value.as_i64() {
+        let value = i32::try_from(raw).map_err(|_| format!("{field} is out of i32 range"))?;
+        return Ok(vec![value; batch_size]);
+    }
+
+    let values = value
+        .as_array()
+        .ok_or_else(|| format!("{field} must be an integer or array of integers"))?;
+    if values.len() != batch_size {
+        return Err(format!(
+            "{field} length {} does not match batch size {batch_size}",
+            values.len()
+        ));
+    }
+
+    values
+        .iter()
+        .map(|value| {
+            let raw = value
+                .as_i64()
+                .ok_or_else(|| format!("{field} entries must be integers"))?;
+            i32::try_from(raw).map_err(|_| format!("{field} entry is out of i32 range"))
+        })
+        .collect()
 }
 
 pub(crate) fn http_completion_payload_to_router_request(
@@ -1343,6 +1559,35 @@ fn json_to_disaggregated_params(
     }))
 }
 
+fn json_to_disaggregated_params_values(
+    payload: &Value,
+    batch_size: usize,
+) -> Result<Vec<Option<RouterDisaggregatedParams>>, String> {
+    if payload.get("bootstrap_host").is_some()
+        || payload.get("bootstrap_port").is_some()
+        || payload.get("bootstrap_room").is_some()
+    {
+        let hosts = required_string_values(payload, "bootstrap_host", batch_size)?;
+        let ports = required_u16_values(payload, "bootstrap_port", batch_size)?;
+        let rooms = required_bootstrap_room_values(payload, "bootstrap_room", batch_size)?;
+        return Ok((0..batch_size)
+            .map(|index| {
+                Some(RouterDisaggregatedParams {
+                    bootstrap_host: hosts[index].clone(),
+                    bootstrap_port: ports[index],
+                    bootstrap_room: rooms[index],
+                })
+            })
+            .collect());
+    }
+
+    if payload.get("disaggregated_params").is_some() {
+        return Ok(vec![json_to_disaggregated_params(payload)?; batch_size]);
+    }
+
+    Ok(vec![None; batch_size])
+}
+
 fn json_to_sampling_params(value: &Value) -> Result<RouterSamplingParams, String> {
     if !value.is_object() {
         return Err("sampling_params must be an object".to_string());
@@ -1372,10 +1617,50 @@ fn required_string<'a>(value: &'a Value, field: &'static str) -> Result<&'a str,
         .ok_or_else(|| format!("{field} must be a string"))
 }
 
+fn required_string_values(
+    value: &Value,
+    field: &'static str,
+    batch_size: usize,
+) -> Result<Vec<String>, String> {
+    let Some(value) = value.get(field) else {
+        return Err(format!("{field} is required"));
+    };
+    if let Some(text) = value.as_str() {
+        return Ok(vec![text.to_string(); batch_size]);
+    }
+    let values = value
+        .as_array()
+        .ok_or_else(|| format!("{field} must be a string or array of strings"))?;
+    if values.len() != batch_size {
+        return Err(format!(
+            "{field} length {} does not match batch size {batch_size}",
+            values.len()
+        ));
+    }
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(ToString::to_string)
+                .ok_or_else(|| format!("{field} entries must be strings"))
+        })
+        .collect()
+}
+
 fn required_bootstrap_room(value: &Value, field: &'static str) -> Result<BootstrapRoom, String> {
-    let raw = value
+    let value = value
         .get(field)
-        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("{field} must be an unsigned integer"))?;
+    required_bootstrap_room_value(value, field)
+}
+
+fn required_bootstrap_room_value(
+    value: &Value,
+    field: &'static str,
+) -> Result<BootstrapRoom, String> {
+    let raw = value
+        .as_u64()
         .ok_or_else(|| format!("{field} must be an unsigned integer"))?;
     if raw > i64::MAX as u64 {
         return Err(format!("{field} must fit in signed 63-bit range"));
@@ -1384,12 +1669,75 @@ fn required_bootstrap_room(value: &Value, field: &'static str) -> Result<Bootstr
     Ok(raw)
 }
 
+fn required_bootstrap_room_values(
+    value: &Value,
+    field: &'static str,
+    batch_size: usize,
+) -> Result<Vec<BootstrapRoom>, String> {
+    let Some(value) = value.get(field) else {
+        return Err(format!("{field} is required"));
+    };
+    if value.as_u64().is_some() {
+        return Ok(vec![
+            required_bootstrap_room_value(value, field)?;
+            batch_size
+        ]);
+    }
+
+    let values = value
+        .as_array()
+        .ok_or_else(|| format!("{field} must be an unsigned integer or array"))?;
+    if values.len() != batch_size {
+        return Err(format!(
+            "{field} length {} does not match batch size {batch_size}",
+            values.len()
+        ));
+    }
+    values
+        .iter()
+        .map(|value| required_bootstrap_room_value(value, field))
+        .collect()
+}
+
 fn required_u16(value: &Value, field: &'static str) -> Result<u16, String> {
-    let raw = value
+    let value = value
         .get(field)
-        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("{field} must be an unsigned integer"))?;
+    required_u16_value(value, field)
+}
+
+fn required_u16_value(value: &Value, field: &'static str) -> Result<u16, String> {
+    let raw = value
+        .as_u64()
         .ok_or_else(|| format!("{field} must be an unsigned integer"))?;
     u16::try_from(raw).map_err(|_| format!("{field} is too large for u16"))
+}
+
+fn required_u16_values(
+    value: &Value,
+    field: &'static str,
+    batch_size: usize,
+) -> Result<Vec<u16>, String> {
+    let Some(value) = value.get(field) else {
+        return Err(format!("{field} is required"));
+    };
+    if value.as_u64().is_some() {
+        return Ok(vec![required_u16_value(value, field)?; batch_size]);
+    }
+
+    let values = value
+        .as_array()
+        .ok_or_else(|| format!("{field} must be an unsigned integer or array"))?;
+    if values.len() != batch_size {
+        return Err(format!(
+            "{field} length {} does not match batch size {batch_size}",
+            values.len()
+        ));
+    }
+    values
+        .iter()
+        .map(|value| required_u16_value(value, field))
+        .collect()
 }
 
 fn optional_i32(value: &Value, field: &'static str) -> Result<Option<i32>, String> {

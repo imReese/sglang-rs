@@ -395,7 +395,7 @@ async fn routed_generation(
         WorkerMode::Plain => WorkerModeLabel::Plain,
     };
     let metrics_model = model_str.clone();
-    let dispatch_plan = RouteDispatchPlan::prepare(selection, upstream_path, headers, body)?;
+    let dispatch_plan = RouteDispatchPlan::prepare(selection, headers, body)?;
 
     let result = match dispatch_plan {
         RouteDispatchPlan::Pd {

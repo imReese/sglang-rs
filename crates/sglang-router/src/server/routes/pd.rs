@@ -49,7 +49,11 @@ impl PdWorkerPair {
         &self.prefill
     }
 
-    pub(crate) fn prepare_plan(&self, body: &Bytes) -> Result<PdDispatchPlan, ApiError> {
+    pub(crate) fn prepare_plan(
+        &self,
+        body: &Bytes,
+        batch_size: Option<usize>,
+    ) -> Result<PdDispatchPlan, ApiError> {
         let bootstrap_port =
             self.prefill
                 .bootstrap_port()
@@ -64,6 +68,7 @@ impl PdWorkerPair {
             self.prefill.bootstrap_host(),
             bootstrap_port,
             body,
+            batch_size,
         )
     }
 }
@@ -135,7 +140,7 @@ pub(crate) struct PdExecutionRequest {
 
 impl PdExecutionRequest {
     pub(crate) fn prepare(pair: PdWorkerPair, body: &Bytes) -> Result<Self, ApiError> {
-        let plan = pair.prepare_plan(body)?;
+        let plan = pair.prepare_plan(body, request_batch_size_from_bytes(body)?)?;
         Ok(Self { pair, plan })
     }
 
@@ -166,8 +171,9 @@ impl PdExecutionRequest {
 
 /// Prepared route dispatch request. This is the HTTP route's
 /// request-building stage: plain requests preserve the selected worker,
-/// headers, and body; PD requests reject unsupported batches, inject
-/// bootstrap metadata, and attach decode-affinity metadata before
+/// headers, and body; PD requests inject bootstrap metadata, including
+/// array-valued bootstrap fields for batch generate/completion bodies,
+/// and attach decode-affinity metadata before
 /// execution.
 #[derive(Debug, Clone)]
 pub(crate) enum RouteDispatchPlan {
@@ -185,7 +191,6 @@ pub(crate) enum RouteDispatchPlan {
 impl RouteDispatchPlan {
     pub(crate) fn prepare(
         selection: RouteWorkerSelection,
-        upstream_path: &str,
         mut headers: HeaderMap,
         body: Bytes,
     ) -> Result<Self, ApiError> {
@@ -196,7 +201,6 @@ impl RouteDispatchPlan {
                 body,
             }),
             RouteWorkerSelection::Dual { pair } => {
-                reject_batched_request(upstream_path, &body)?;
                 let request = PdExecutionRequest::prepare(pair, &body)?;
                 request.insert_request_headers(&mut headers);
                 Ok(Self::Pd { request, headers })
@@ -283,11 +287,13 @@ impl PdDispatchPlan {
         bootstrap_host: impl Into<String>,
         bootstrap_port: u16,
         body: &Bytes,
+        batch_size: Option<usize>,
     ) -> Result<Self, ApiError> {
         Self::from_bootstrap(
             decode_url,
             BootstrapMetadata::new(bootstrap_host, bootstrap_port),
             body,
+            batch_size,
         )
     }
 
@@ -295,8 +301,9 @@ impl PdDispatchPlan {
         decode_url: impl Into<String>,
         bootstrap: BootstrapMetadata,
         body: &Bytes,
+        batch_size: Option<usize>,
     ) -> Result<Self, ApiError> {
-        let injected_body = bootstrap.inject_into_body(body)?;
+        let injected_body = bootstrap.inject_into_body(body, batch_size)?;
         let bootstrap_room = bootstrap.room();
         let mut metadata = PdDispatchMetadata::new(decode_url);
         metadata.set_bootstrap(bootstrap);
@@ -313,7 +320,7 @@ impl PdDispatchPlan {
         bootstrap: BootstrapMetadata,
         body: &Bytes,
     ) -> Result<Self, ApiError> {
-        Self::from_bootstrap(decode_url, bootstrap, body)
+        Self::from_bootstrap(decode_url, bootstrap, body, None)
     }
 
     pub(crate) fn body(&self) -> &Bytes {
@@ -372,24 +379,54 @@ impl BootstrapMetadata {
     /// * `bootstrap_port` — the prefill worker's bootstrap server port.
     /// * `bootstrap_room` — a 63-bit random `u64` identifying this
     ///   request on both prefill and decode sides.
-    pub(crate) fn inject_into_body(&self, body: &Bytes) -> Result<Bytes, ApiError> {
+    pub(crate) fn inject_into_body(
+        &self,
+        body: &Bytes,
+        batch_size: Option<usize>,
+    ) -> Result<Bytes, ApiError> {
         let mut obj: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(body)
             .map_err(|e| {
                 tracing::debug!(error = %e, "re-parse for bootstrap injection failed");
                 ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
             })?;
-        obj.insert(
-            "bootstrap_host".to_string(),
-            serde_json::Value::String(self.host.clone()),
-        );
-        obj.insert(
-            "bootstrap_port".to_string(),
-            serde_json::Value::Number(self.port.into()),
-        );
-        obj.insert(
-            "bootstrap_room".to_string(),
-            serde_json::Value::Number(self.room.into()),
-        );
+        match batch_size {
+            Some(batch_size) => {
+                let mut hosts = Vec::with_capacity(batch_size);
+                let mut ports = Vec::with_capacity(batch_size);
+                let mut rooms = Vec::with_capacity(batch_size);
+                for _ in 0..batch_size {
+                    hosts.push(serde_json::Value::String(self.host.clone()));
+                    ports.push(serde_json::Value::Number(self.port.into()));
+                    rooms.push(serde_json::Value::Number(generate_room_id().into()));
+                }
+                obj.insert(
+                    "bootstrap_host".to_string(),
+                    serde_json::Value::Array(hosts),
+                );
+                obj.insert(
+                    "bootstrap_port".to_string(),
+                    serde_json::Value::Array(ports),
+                );
+                obj.insert(
+                    "bootstrap_room".to_string(),
+                    serde_json::Value::Array(rooms),
+                );
+            }
+            None => {
+                obj.insert(
+                    "bootstrap_host".to_string(),
+                    serde_json::Value::String(self.host.clone()),
+                );
+                obj.insert(
+                    "bootstrap_port".to_string(),
+                    serde_json::Value::Number(self.port.into()),
+                );
+                obj.insert(
+                    "bootstrap_room".to_string(),
+                    serde_json::Value::Number(self.room.into()),
+                );
+            }
+        }
         let bytes = serde_json::to_vec(&obj).map_err(|e| {
             ApiError::Internal(
                 anyhow::Error::new(e).context("re-serialize bootstrap-injected body"),
@@ -418,20 +455,13 @@ pub(crate) fn generate_room_id() -> u64 {
     rand::random::<u64>() & (i64::MAX as u64)
 }
 
-pub(crate) fn reject_batched_request(upstream_path: &str, body: &Bytes) -> Result<(), ApiError> {
+fn request_batch_size_from_bytes(body: &Bytes) -> Result<Option<usize>, ApiError> {
     let obj: serde_json::Map<String, serde_json::Value> =
         serde_json::from_slice(body).map_err(|e| {
             tracing::debug!(error = %e, "re-parse for PD batch detection failed");
             ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
         })?;
-
-    if request_batch_size(&obj).is_some() {
-        return Err(ApiError::BadRequest(format!(
-            "PD mode does not support batched {upstream_path} requests"
-        )));
-    }
-
-    Ok(())
+    Ok(request_batch_size(&obj))
 }
 
 fn request_batch_size(obj: &serde_json::Map<String, serde_json::Value>) -> Option<usize> {
@@ -492,7 +522,7 @@ mod tests {
         let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
         let metadata = BootstrapMetadata::with_room("prefill.local", 8200, 42);
 
-        let injected = metadata.inject_into_body(&body).unwrap();
+        let injected = metadata.inject_into_body(&body, None).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&injected).unwrap();
         assert_eq!(parsed["bootstrap_host"], "prefill.local");
         assert_eq!(parsed["bootstrap_port"], 8200);
@@ -506,6 +536,26 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("42")
         );
+    }
+
+    #[test]
+    fn bootstrap_metadata_injects_array_fields_for_batch_requests() {
+        let body = Bytes::from_static(br#"{"input_ids":[[1,2],[3,4]]}"#);
+        let metadata = BootstrapMetadata::with_room("prefill.local", 8200, 42);
+
+        let injected = metadata.inject_into_body(&body, Some(2)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&injected).unwrap();
+
+        assert_eq!(
+            parsed["bootstrap_host"],
+            serde_json::json!(["prefill.local", "prefill.local"])
+        );
+        assert_eq!(parsed["bootstrap_port"], serde_json::json!([8200, 8200]));
+        let rooms = parsed["bootstrap_room"].as_array().unwrap();
+        assert_eq!(rooms.len(), 2);
+        assert!(rooms
+            .iter()
+            .all(|room| room.as_u64().unwrap() <= i64::MAX as u64));
     }
 
     #[test]
@@ -588,7 +638,7 @@ mod tests {
         let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
 
         let plan = PdWorkerPair::new(prefill, decode)
-            .prepare_plan(&body)
+            .prepare_plan(&body, None)
             .unwrap();
 
         let parsed: serde_json::Value = serde_json::from_slice(plan.body()).unwrap();
@@ -652,9 +702,7 @@ mod tests {
             worker: Arc::clone(&worker),
         };
 
-        let plan =
-            RouteDispatchPlan::prepare(selection, "/v1/chat/completions", headers, body.clone())
-                .unwrap();
+        let plan = RouteDispatchPlan::prepare(selection, headers, body.clone()).unwrap();
 
         match plan {
             RouteDispatchPlan::Plain {
@@ -693,9 +741,7 @@ mod tests {
             pair: PdWorkerPair::new(prefill, decode),
         };
 
-        let plan =
-            RouteDispatchPlan::prepare(selection, "/v1/chat/completions", HeaderMap::new(), body)
-                .unwrap();
+        let plan = RouteDispatchPlan::prepare(selection, HeaderMap::new(), body).unwrap();
 
         match plan {
             RouteDispatchPlan::Pd { request, headers } => {
@@ -898,7 +944,7 @@ mod tests {
     fn inject_bootstrap_fields_includes_required_port() {
         let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
         let metadata = BootstrapMetadata::with_room("host", 8997, 42);
-        let injected = metadata.inject_into_body(&body).unwrap();
+        let injected = metadata.inject_into_body(&body, None).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&injected).unwrap();
         assert_eq!(
             parsed.get("bootstrap_port"),

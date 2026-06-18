@@ -161,6 +161,22 @@ where
             .collect())
     }
 
+    pub fn generate_token_batch_stream(
+        &mut self,
+        requests: Vec<TokenGenerateRequest>,
+    ) -> Result<Vec<Vec<TokenGenerateOutput>>, RuntimeError> {
+        let scheduled_requests = requests
+            .into_iter()
+            .map(|request| {
+                ScheduledRequest::new(request.request_id, request.input_ids, request.sampling)
+                    .with_disaggregated_params(request.disaggregated_params)
+                    .with_data_parallel_rank(request.data_parallel_rank)
+            })
+            .collect::<Vec<_>>();
+        let outputs = self.generate_scheduled_batch_stream(scheduled_requests)?;
+        Ok(group_token_outputs_by_request(outputs))
+    }
+
     fn generate_scheduled(
         &mut self,
         request: ScheduledRequest,
@@ -205,6 +221,44 @@ where
         }
 
         Ok(outputs)
+    }
+
+    fn generate_scheduled_batch_stream(
+        &mut self,
+        requests: Vec<ScheduledRequest>,
+    ) -> Result<Vec<Vec<ScheduledOutput>>, RuntimeError> {
+        let batch_size = requests.len();
+        if batch_size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let request_ids = requests
+            .iter()
+            .map(|request| request.request_id().clone())
+            .collect::<Vec<_>>();
+        for request in requests {
+            self.scheduler.enqueue(request);
+        }
+
+        let prefill_outputs = match self.scheduler.dispatch_prefill_batch(batch_size) {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                for request_id in &request_ids {
+                    self.scheduler.abort_request(request_id);
+                }
+                return Err(error.into());
+            }
+        };
+        let mut grouped = vec![Vec::new(); batch_size];
+        let mut active =
+            record_batch_outputs(&mut grouped, (0..batch_size).collect(), prefill_outputs);
+
+        while !active.is_empty() {
+            let decode_outputs = self.scheduler.dispatch_decode_batch(active.len())?;
+            active = record_batch_outputs(&mut grouped, active, decode_outputs);
+        }
+
+        Ok(grouped)
     }
 
     fn next_decode_output(&mut self) -> Result<ScheduledOutput, RuntimeError> {
@@ -272,6 +326,26 @@ where
             .collect())
     }
 
+    pub fn generate_token_batch_stream_with_transfer_polling(
+        &mut self,
+        requests: Vec<TokenGenerateRequest>,
+        max_transfer_polls: usize,
+    ) -> Result<Vec<Vec<TokenGenerateOutput>>, RuntimeError> {
+        let scheduled_requests = requests
+            .into_iter()
+            .map(|request| {
+                ScheduledRequest::new(request.request_id, request.input_ids, request.sampling)
+                    .with_disaggregated_params(request.disaggregated_params)
+                    .with_data_parallel_rank(request.data_parallel_rank)
+            })
+            .collect::<Vec<_>>();
+        let outputs = self.generate_scheduled_batch_stream_with_transfer_polling(
+            scheduled_requests,
+            max_transfer_polls,
+        )?;
+        Ok(group_token_outputs_by_request(outputs))
+    }
+
     fn generate_scheduled_stream_with_transfer_polling(
         &mut self,
         request: ScheduledRequest,
@@ -291,6 +365,55 @@ where
         Ok(outputs)
     }
 
+    fn generate_scheduled_batch_stream_with_transfer_polling(
+        &mut self,
+        requests: Vec<ScheduledRequest>,
+        max_transfer_polls: usize,
+    ) -> Result<Vec<Vec<ScheduledOutput>>, RuntimeError> {
+        let batch_size = requests.len();
+        if batch_size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let request_ids = requests
+            .iter()
+            .map(|request| request.request_id().clone())
+            .collect::<Vec<_>>();
+        for request in requests {
+            self.scheduler.enqueue(request);
+        }
+
+        let prefill_outputs = match self.scheduler.dispatch_prefill_batch(batch_size) {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                for request_id in &request_ids {
+                    self.scheduler.abort_request(request_id);
+                }
+                return Err(error.into());
+            }
+        };
+        let mut grouped = vec![Vec::new(); batch_size];
+        let mut active =
+            record_batch_outputs(&mut grouped, (0..batch_size).collect(), prefill_outputs);
+        let mut remaining_transfer_polls = max_transfer_polls;
+
+        while !active.is_empty() {
+            let decode_outputs = loop {
+                match self.scheduler.dispatch_decode_batch(active.len()) {
+                    Ok(outputs) => break outputs,
+                    Err(SchedulerError::DecodeNotReady { .. }) if remaining_transfer_polls > 0 => {
+                        remaining_transfer_polls -= 1;
+                        self.poll_transfers()?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            active = record_batch_outputs(&mut grouped, active, decode_outputs);
+        }
+
+        Ok(grouped)
+    }
+
     fn next_decode_output_with_transfer_polling(
         &mut self,
         remaining_transfer_polls: &mut usize,
@@ -308,4 +431,47 @@ where
             }
         }
     }
+}
+
+fn record_batch_outputs(
+    grouped: &mut [Vec<ScheduledOutput>],
+    active_indices: Vec<usize>,
+    outputs: Vec<ScheduledOutput>,
+) -> Vec<usize> {
+    let dispatched = outputs.len();
+    let mut next_active = active_indices
+        .iter()
+        .skip(dispatched)
+        .copied()
+        .collect::<Vec<_>>();
+    let mut requeued = Vec::new();
+
+    for (index, output) in active_indices.into_iter().zip(outputs.into_iter()) {
+        if !output.finished {
+            requeued.push(index);
+        }
+        grouped[index].push(output);
+    }
+
+    next_active.extend(requeued);
+    next_active
+}
+
+fn group_token_outputs_by_request(
+    outputs: Vec<Vec<ScheduledOutput>>,
+) -> Vec<Vec<TokenGenerateOutput>> {
+    outputs
+        .into_iter()
+        .map(|outputs| {
+            outputs
+                .into_iter()
+                .map(|output| TokenGenerateOutput {
+                    request_id: output.request_id,
+                    output_ids: output.token_ids,
+                    cached_tokens: output.cached_tokens,
+                    finished: output.finished,
+                })
+                .collect()
+        })
+        .collect()
 }
