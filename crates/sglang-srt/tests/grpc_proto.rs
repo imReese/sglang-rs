@@ -11,10 +11,11 @@ use sglang_srt::grpc::{
 use sglang_srt::proto::sglang::runtime::v1::generate_response::Body;
 use sglang_srt::proto::sglang::runtime::v1::sglang_service_server::SglangService;
 use sglang_srt::proto::sglang::runtime::v1::{
-    AbortRequest, ContinueGenerationRequest, DetokenizeRequest, DisaggregatedParams,
-    FlushCacheRequest, GenerateRequest, GetLoadRequest, GetModelInfoRequest, GetServerInfoRequest,
-    ListModelsRequest, OpenAiJsonRequest, PauseGenerationRequest, RequestOptions, SamplingParams,
-    TextGenerateRequest, TokenizeRequest,
+    AbortRequest, ClassifyRequest, ContinueGenerationRequest, DetokenizeRequest,
+    DisaggregatedParams, EmbedRequest, FlushCacheRequest, GenerateRequest, GetLoadRequest,
+    GetModelInfoRequest, GetServerInfoRequest, ListModelsRequest, OpenAiJsonRequest,
+    PauseGenerationRequest, RequestOptions, SamplingParams, TextEmbedRequest, TextGenerateRequest,
+    TokenizeRequest, TokenizedInput,
 };
 use sglang_srt::router::{RouterProtocolError, RouterRuntime};
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
@@ -291,6 +292,111 @@ async fn grpc_generate_non_stream_returns_only_complete_response() {
         ))
     );
     assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn grpc_text_embed_returns_proto_embeddings() {
+    let service = GrpcRouterService::from_engine(Engine::new(
+        ByteTokenizer,
+        Scheduler::new(GrpcTwoStepWorker),
+    ));
+
+    let response = service
+        .text_embed(Request::new(TextEmbedRequest {
+            texts: vec!["rust pd router".to_string(), "python gateway".to_string()],
+            options: None,
+        }))
+        .await
+        .expect("text embed should execute")
+        .into_inner();
+
+    assert_eq!(response.embeddings.len(), 2);
+    assert_eq!(response.embeddings[0].index, 0);
+    assert_eq!(response.embeddings[1].index, 1);
+    assert_eq!(response.embeddings[0].values.len(), 8);
+    assert_eq!(response.embeddings[1].values.len(), 8);
+    assert_ne!(response.embeddings[0].values, response.embeddings[1].values);
+    let usage = response.usage.expect("usage");
+    assert!(usage.prompt_tokens > 0);
+    assert_eq!(usage.completion_tokens, 0);
+    assert_eq!(usage.total_tokens, usage.prompt_tokens);
+}
+
+#[tokio::test]
+async fn grpc_embed_returns_proto_embeddings_for_tokenized_inputs() {
+    let service = GrpcRouterService::from_engine(Engine::new(
+        ByteTokenizer,
+        Scheduler::new(GrpcTwoStepWorker),
+    ));
+
+    let response = service
+        .embed(Request::new(EmbedRequest {
+            inputs: vec![
+                TokenizedInput {
+                    original_text: "rust".to_string(),
+                    input_ids: vec![1, 2, 3],
+                },
+                TokenizedInput {
+                    original_text: "gateway".to_string(),
+                    input_ids: vec![4, 5],
+                },
+            ],
+            options: None,
+        }))
+        .await
+        .expect("embed should execute")
+        .into_inner();
+
+    assert_eq!(response.embeddings.len(), 2);
+    assert_eq!(response.embeddings[0].index, 0);
+    assert_eq!(response.embeddings[1].index, 1);
+    assert_eq!(response.embeddings[0].values.len(), 8);
+    assert_eq!(response.embeddings[1].values.len(), 8);
+    let usage = response.usage.expect("usage");
+    assert_eq!(usage.prompt_tokens, 5);
+    assert_eq!(usage.completion_tokens, 0);
+    assert_eq!(usage.total_tokens, 5);
+}
+
+#[tokio::test]
+async fn grpc_classify_returns_proto_classifications() {
+    let service = GrpcRouterService::from_engine(Engine::new(
+        ByteTokenizer,
+        Scheduler::new(GrpcTwoStepWorker),
+    ));
+    let labels = vec!["cpu".to_string(), "gpu".to_string(), "router".to_string()];
+
+    let response = service
+        .classify(Request::new(ClassifyRequest {
+            inputs: vec![
+                TokenizedInput {
+                    original_text: "rust".to_string(),
+                    input_ids: vec![1, 2, 3],
+                },
+                TokenizedInput {
+                    original_text: "python".to_string(),
+                    input_ids: vec![4, 5, 6, 7],
+                },
+            ],
+            labels: labels.clone(),
+            options: None,
+        }))
+        .await
+        .expect("classify should execute")
+        .into_inner();
+
+    assert_eq!(response.classifications.len(), 2);
+    assert_eq!(response.classifications[0].index, 0);
+    assert_eq!(response.classifications[1].index, 1);
+    for classification in &response.classifications {
+        assert!(labels.contains(&classification.label));
+        assert!(classification.score.is_finite());
+        assert!((0.0..=1.0).contains(&classification.score));
+    }
+    let usage = response.usage.expect("usage");
+    assert_eq!(usage.prompt_tokens, 7);
+    assert_eq!(usage.completion_tokens, 0);
+    assert_eq!(usage.total_tokens, 7);
 }
 
 #[tokio::test]

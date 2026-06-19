@@ -11,7 +11,9 @@ use tonic::{Code, Request, Response, Status};
 use crate::cli::ServerArgs;
 use crate::engine::Engine;
 use crate::openai_classify::{classify_response_json, parse_classify_request};
-use crate::openai_embedding::{embeddings_response_json, parse_embedding_request};
+use crate::openai_embedding::{
+    embeddings_response_json, parse_embedding_request, token_ids_to_embedding,
+};
 use crate::openai_rerank::{
     parse_rerank_request, rerank_results_to_json, score_rerank_documents, truncate_rerank_results,
 };
@@ -20,16 +22,17 @@ use crate::proto::sglang::runtime::v1::sglang_service_server::{
     SglangService, SglangServiceServer,
 };
 use crate::proto::sglang::runtime::v1::{
-    AbortRequest, ClassifyRequest, ClassifyResponse, ContinueGenerationRequest, ControlResponse,
-    DetokenizeRequest, DetokenizeResponse, EmbedRequest, EmbedResponse, FlushCacheRequest,
-    GenerateComplete as ProtoGenerateComplete, GenerateError as ProtoGenerateError,
-    GenerateRequest as ProtoGenerateRequest, GenerateResponse as ProtoGenerateResponse,
-    GenerateStreamChunk as ProtoGenerateStreamChunk, GetLoadRequest, GetModelInfoRequest,
-    GetServerInfoRequest, HealthCheckRequest, HealthCheckResponse, ListModelsRequest,
-    ListModelsResponse, LoadResponse, ModelInfoResponse, OpenAiJsonRequest, OpenAiJsonResponse,
-    PauseGenerationRequest, SamplingParams as ProtoSamplingParams, ServerInfoResponse,
-    StartProfileRequest, StopProfileRequest, TextEmbedRequest, TextGenerateRequest,
-    TokenizeRequest, TokenizeResponse, UpdateWeightsFromDiskRequest,
+    AbortRequest, Classification, ClassifyRequest, ClassifyResponse, ContinueGenerationRequest,
+    ControlResponse, DetokenizeRequest, DetokenizeResponse, EmbedRequest, EmbedResponse, Embedding,
+    FlushCacheRequest, GenerateComplete as ProtoGenerateComplete,
+    GenerateError as ProtoGenerateError, GenerateRequest as ProtoGenerateRequest,
+    GenerateResponse as ProtoGenerateResponse, GenerateStreamChunk as ProtoGenerateStreamChunk,
+    GetLoadRequest, GetModelInfoRequest, GetServerInfoRequest, HealthCheckRequest,
+    HealthCheckResponse, ListModelsRequest, ListModelsResponse, LoadResponse, ModelInfoResponse,
+    OpenAiJsonRequest, OpenAiJsonResponse, PauseGenerationRequest,
+    SamplingParams as ProtoSamplingParams, ServerInfoResponse, StartProfileRequest,
+    StopProfileRequest, TextEmbedRequest, TextGenerateRequest, TokenizeRequest, TokenizeResponse,
+    TokenizedInput, UpdateWeightsFromDiskRequest, Usage,
 };
 use crate::router::{
     RouterDisaggregatedParams, RouterGenerateComplete, RouterGenerateError, RouterGenerateRequest,
@@ -50,6 +53,9 @@ type GenerateResponseStream = Pin<
 type OpenAiJsonResponseStream = Pin<
     Box<dyn tonic::codegen::tokio_stream::Stream<Item = Result<OpenAiJsonResponse, Status>> + Send>,
 >;
+
+const DEFAULT_PROTO_EMBEDDING_DIMENSIONS: usize = 8;
+const DEFAULT_PROTO_CLASS_COUNT: usize = 3;
 
 enum GrpcChatResponse {
     Single(Vec<RouterGenerateResponse>),
@@ -524,6 +530,144 @@ fn openai_completion_stream_response_from_router_response(
     Ok(OpenAiJsonResponse { json })
 }
 
+fn proto_embed_response_from_batches(
+    token_batches: Vec<Vec<u32>>,
+) -> Result<EmbedResponse, Status> {
+    if token_batches.is_empty() {
+        return Err(Status::invalid_argument("input cannot be empty"));
+    }
+
+    let prompt_tokens = token_batches
+        .iter()
+        .map(|token_ids| token_ids.len())
+        .sum::<usize>();
+    let embeddings = token_batches
+        .into_iter()
+        .enumerate()
+        .map(|(index, token_ids)| {
+            if token_ids.is_empty() {
+                return Err(Status::invalid_argument("token ID input cannot be empty"));
+            }
+            Ok(Embedding {
+                values: token_ids_to_embedding(&token_ids, DEFAULT_PROTO_EMBEDDING_DIMENSIONS),
+                index: usize_to_u32(index)?,
+            })
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+
+    Ok(EmbedResponse {
+        embeddings,
+        usage: Some(proto_usage(prompt_tokens)?),
+    })
+}
+
+fn proto_tokenized_inputs_to_batches(inputs: Vec<TokenizedInput>) -> Result<Vec<Vec<u32>>, Status> {
+    if inputs.is_empty() {
+        return Err(Status::invalid_argument("input cannot be empty"));
+    }
+
+    inputs
+        .into_iter()
+        .enumerate()
+        .map(|(index, input)| {
+            if input.input_ids.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "token ID input at index {index} cannot be empty"
+                )));
+            }
+            Ok(input.input_ids)
+        })
+        .collect()
+}
+
+fn proto_classify_response_from_batches(
+    token_batches: Vec<Vec<u32>>,
+    labels: Vec<String>,
+) -> Result<ClassifyResponse, Status> {
+    if token_batches.is_empty() {
+        return Err(Status::invalid_argument("input cannot be empty"));
+    }
+    let labels = normalize_classification_labels(labels)?;
+    let prompt_tokens = token_batches
+        .iter()
+        .map(|token_ids| token_ids.len())
+        .sum::<usize>();
+    let classifications = token_batches
+        .into_iter()
+        .enumerate()
+        .map(|(index, token_ids)| {
+            if token_ids.is_empty() {
+                return Err(Status::invalid_argument("token ID input cannot be empty"));
+            }
+            let logits = token_ids_to_embedding(&token_ids, labels.len());
+            let probs = softmax(&logits);
+            let (label_index, score) = probs
+                .iter()
+                .copied()
+                .enumerate()
+                .max_by(|(left_index, left), (right_index, right)| {
+                    left.total_cmp(right)
+                        .then_with(|| right_index.cmp(left_index))
+                })
+                .unwrap_or((0, 0.0));
+
+            Ok(Classification {
+                label: labels[label_index].clone(),
+                score,
+                index: usize_to_u32(index)?,
+            })
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+
+    Ok(ClassifyResponse {
+        classifications,
+        usage: Some(proto_usage(prompt_tokens)?),
+    })
+}
+
+fn normalize_classification_labels(labels: Vec<String>) -> Result<Vec<String>, Status> {
+    if labels.is_empty() {
+        return Ok((0..DEFAULT_PROTO_CLASS_COUNT)
+            .map(|index| format!("LABEL_{index}"))
+            .collect());
+    }
+
+    labels
+        .into_iter()
+        .enumerate()
+        .map(|(index, label)| {
+            if label.trim().is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "classification label at index {index} cannot be empty"
+                )));
+            }
+            Ok(label)
+        })
+        .collect()
+}
+
+fn softmax(logits: &[f32]) -> Vec<f32> {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let exp = logits
+        .iter()
+        .map(|logit| (*logit - max).exp())
+        .collect::<Vec<_>>();
+    let sum = exp.iter().sum::<f32>();
+    if sum == 0.0 {
+        return vec![1.0 / logits.len() as f32; logits.len()];
+    }
+    exp.into_iter().map(|value| value / sum).collect()
+}
+
+fn proto_usage(prompt_tokens: usize) -> Result<Usage, Status> {
+    let prompt_tokens = usize_to_i32(prompt_tokens)?;
+    Ok(Usage {
+        prompt_tokens,
+        completion_tokens: 0,
+        total_tokens: prompt_tokens,
+    })
+}
+
 fn unimplemented_rpc(name: &'static str) -> Status {
     Status::unimplemented(format!(
         "{name} is not implemented in the Rust gRPC runtime yet"
@@ -585,23 +729,61 @@ where
 
     async fn text_embed(
         &self,
-        _request: Request<TextEmbedRequest>,
+        request: Request<TextEmbedRequest>,
     ) -> Result<Response<EmbedResponse>, Status> {
-        Err(unimplemented_rpc("TextEmbed"))
+        let request = request.into_inner();
+        if request.texts.is_empty() {
+            return Err(Status::invalid_argument("input cannot be empty"));
+        }
+        if let Some((index, _)) = request
+            .texts
+            .iter()
+            .enumerate()
+            .find(|(_, text)| text.trim().is_empty())
+        {
+            return Err(Status::invalid_argument(format!(
+                "input text at index {index} cannot be empty or whitespace only"
+            )));
+        }
+
+        let token_batches = {
+            let runtime = self
+                .runtime
+                .lock()
+                .map_err(|_| Status::internal("router runtime mutex poisoned"))?;
+            request
+                .texts
+                .iter()
+                .map(|text| runtime.tokenize(text).token_ids)
+                .collect::<Vec<_>>()
+        };
+
+        Ok(Response::new(proto_embed_response_from_batches(
+            token_batches,
+        )?))
     }
 
     async fn embed(
         &self,
-        _request: Request<EmbedRequest>,
+        request: Request<EmbedRequest>,
     ) -> Result<Response<EmbedResponse>, Status> {
-        Err(unimplemented_rpc("Embed"))
+        let request = request.into_inner();
+        let token_batches = proto_tokenized_inputs_to_batches(request.inputs)?;
+        Ok(Response::new(proto_embed_response_from_batches(
+            token_batches,
+        )?))
     }
 
     async fn classify(
         &self,
-        _request: Request<ClassifyRequest>,
+        request: Request<ClassifyRequest>,
     ) -> Result<Response<ClassifyResponse>, Status> {
-        Err(unimplemented_rpc("Classify"))
+        let request = request.into_inner();
+        let token_batches = proto_tokenized_inputs_to_batches(request.inputs)?;
+        Ok(Response::new(proto_classify_response_from_batches(
+            token_batches,
+            request.labels,
+        )?))
     }
 
     async fn tokenize(
@@ -1284,4 +1466,8 @@ fn router_model_info_to_proto_response(
 
 fn usize_to_u32(value: usize) -> Result<u32, Status> {
     u32::try_from(value).map_err(|_| Status::internal("load metric overflowed uint32"))
+}
+
+fn usize_to_i32(value: usize) -> Result<i32, Status> {
+    i32::try_from(value).map_err(|_| Status::internal("usage metric overflowed int32"))
 }
