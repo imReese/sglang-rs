@@ -53,7 +53,7 @@ use crate::transfer::{
     MooncakeBufferEntry, MooncakeSessionTargetResolver, MooncakeTransferEngineConfig,
     SharedLinkedMooncakeTransferEngine,
 };
-use crate::worker::WorkerExecutor;
+use crate::worker::{WorkerExecutor, WorkerWeightUpdateRequest};
 
 #[derive(Clone, Debug, Default)]
 pub enum BootstrapForwardModel {
@@ -82,18 +82,25 @@ impl BootstrapForwardModel {
             Err(error) => return Err(error.into()),
         };
 
+        Self::from_local_model_artifacts(&artifacts, args.tp_size)
+    }
+
+    fn from_local_model_artifacts(
+        artifacts: &LocalModelArtifacts,
+        tp_size: usize,
+    ) -> Result<Self, ServerLaunchError> {
         Ok(
-            match CpuEmbeddingLmModel::from_local_model_artifacts(&artifacts)? {
+            match CpuEmbeddingLmModel::from_local_model_artifacts(artifacts)? {
                 Some(model) => Self::CpuEmbeddingLm(model),
                 None if artifacts.config().model_type.as_deref() == Some("deepseek_v4") => {
-                    let runtime = DeepSeekV4Runtime::from_local_model_artifacts(&artifacts)?;
-                    Self::DeepSeekV4(runtime.load_tensor_parallel_shards(args.tp_size)?)
+                    let runtime = DeepSeekV4Runtime::from_local_model_artifacts(artifacts)?;
+                    Self::DeepSeekV4(runtime.load_tensor_parallel_shards(tp_size)?)
                 }
                 None if artifacts.config().model_type.as_deref() == Some("glm_moe_dsa") => {
-                    let runtime = GlmMoeDsaRuntime::from_local_model_artifacts(&artifacts)?;
+                    let runtime = GlmMoeDsaRuntime::from_local_model_artifacts(artifacts)?;
                     Self::GlmMoeDsa(GlmMoeDsaF32CachedForwardModel::new(
                         runtime
-                            .load_tensor_parallel_shards(args.tp_size)?
+                            .load_tensor_parallel_shards(tp_size)?
                             .decode_f32_tensor_parallel_shards()?,
                     ))
                 }
@@ -103,6 +110,14 @@ impl BootstrapForwardModel {
                 },
             },
         )
+    }
+
+    fn reload_tp_size(&self) -> usize {
+        match self {
+            Self::DeepSeekV4(runtime) => runtime.rank_count(),
+            Self::GlmMoeDsa(model) => model.rank_count(),
+            Self::Space | Self::CpuEmbeddingLm(_) | Self::UnsupportedLocalModelRuntime { .. } => 1,
+        }
     }
 
     #[cfg(feature = "mooncake-link")]
@@ -176,6 +191,18 @@ impl ForwardModel for BootstrapForwardModel {
                 model_path.display()
             ))),
         }
+    }
+
+    fn update_weights_from_disk(
+        &mut self,
+        request: &WorkerWeightUpdateRequest,
+    ) -> Result<(), ModelForwardError> {
+        let artifacts = LocalModelArtifacts::from_model_path(&request.model_path)
+            .map_err(|error| ModelForwardError::Runtime(error.to_string()))?;
+        let next = Self::from_local_model_artifacts(&artifacts, self.reload_tp_size())
+            .map_err(|error| ModelForwardError::Runtime(error.to_string()))?;
+        *self = next;
+        Ok(())
     }
 }
 

@@ -28,7 +28,10 @@ use sglang_srt::transfer::{
     MooncakeTransferSubmitter, MooncakeTransferTarget,
 };
 use sglang_srt::types::{BootstrapRoom, RequestId, SamplingParams as RuntimeSamplingParams};
-use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
+use sglang_srt::worker::{
+    BatchGeneratedTokens, FallibleModelWorker, GeneratedToken, ModelWorker, WorkerExecutionError,
+    WorkerWeightUpdateRequest,
+};
 
 #[derive(Default)]
 struct HttpTwoStepWorker;
@@ -42,6 +45,34 @@ impl ModelWorker for HttpTwoStepWorker {
 
         BatchGeneratedTokens::from_batch(batch, vec![token])
             .expect("output shape should match batch")
+    }
+}
+
+#[derive(Default)]
+struct HttpReloadingWorker {
+    updates: Vec<WorkerWeightUpdateRequest>,
+}
+
+impl FallibleModelWorker for HttpReloadingWorker {
+    fn try_generate_batch(
+        &mut self,
+        batch: &ScheduleBatch,
+    ) -> Result<BatchGeneratedTokens, WorkerExecutionError> {
+        let token = match batch.forward_mode() {
+            sglang_srt::scheduler::ForwardMode::Prefill => GeneratedToken::unfinished(vec![42]),
+            sglang_srt::scheduler::ForwardMode::Decode => GeneratedToken::finished(vec![43]),
+        };
+
+        Ok(BatchGeneratedTokens::from_batch(batch, vec![token])
+            .expect("output shape should match batch"))
+    }
+
+    fn update_weights_from_disk(
+        &mut self,
+        request: &WorkerWeightUpdateRequest,
+    ) -> Result<(), WorkerExecutionError> {
+        self.updates.push(request.clone());
+        Ok(())
     }
 }
 
@@ -991,7 +1022,12 @@ async fn http_server_update_weights_from_disk_validates_artifacts_and_updates_mo
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_http_router_service(&args);
+    let runtime = RouterRuntime::new(Engine::new(
+        ByteTokenizer,
+        Scheduler::new(HttpReloadingWorker::default()),
+    ));
+    let service =
+        HttpRouterService::new(runtime, RouterGetModelInfoResponse::from_server_args(&args));
     let model_dir = temp_model_dir("http-update-weights");
     write_minimal_generic_model_artifacts(&model_dir);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -1014,7 +1050,7 @@ async fn http_server_update_weights_from_disk_validates_artifacts_and_updates_mo
         .to_string(),
     )
     .await;
-    assert_eq!(update["success"], true);
+    assert_eq!(update["success"], true, "update response: {update}");
     assert!(update["message"].as_str().unwrap().contains("registered"));
     assert_eq!(update["num_paused_requests"], 0);
 

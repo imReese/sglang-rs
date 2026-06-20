@@ -16,6 +16,7 @@ use crate::scheduler::{ForwardMode, ScheduleBatch, ScheduledRequest};
 use crate::types::{BootstrapRoom, DisaggregatedParams, RequestId};
 use crate::worker::{
     BatchGeneratedTokens, DecodeRequestState, FallibleModelWorker, WorkerExecutionError,
+    WorkerWeightUpdateRequest,
 };
 
 #[cfg(feature = "mooncake-link")]
@@ -1182,6 +1183,14 @@ where
         self.prefill.complete_request(request);
         self.decode.complete_request(request);
     }
+
+    fn update_weights_from_disk(
+        &mut self,
+        request: &WorkerWeightUpdateRequest,
+    ) -> Result<(), WorkerExecutionError> {
+        self.prefill.update_weights_from_disk(request)?;
+        self.decode.update_weights_from_disk(request)
+    }
 }
 
 impl<P, D> LocalSnapshotTransferPdModelWorkers<P, D>
@@ -1538,6 +1547,13 @@ where
         }
 
         self.worker.complete_request(request)
+    }
+
+    fn update_weights_from_disk(
+        &mut self,
+        request: &WorkerWeightUpdateRequest,
+    ) -> Result<(), WorkerExecutionError> {
+        self.worker.update_weights_from_disk(request)
     }
 }
 

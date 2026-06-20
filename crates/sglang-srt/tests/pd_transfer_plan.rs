@@ -9,19 +9,22 @@ use sglang_srt::transfer::{
     DecodeBootstrapMetadataPublishSummary, DecodeBootstrapPublisher, DecodeBootstrapRegistry,
     DecodeBootstrapSession, FakeKvCacheTransferExecutor, KvCacheTransferError,
     KvCacheTransferExecutor, KvCacheTransferPlan, KvCacheTransferPlanError, KvCacheTransferSpan,
-    KvPoll, KvTransferModelWorker, MooncakeBatchId, MooncakeBatchReleaser, MooncakeError,
-    MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeOpcode, MooncakeRemoteKvLayout,
-    MooncakeSessionTargetResolver, MooncakeSubmittedBatch, MooncakeTransferRequest,
-    MooncakeTransferStatus, MooncakeTransferStatusCode, MooncakeTransferStatusReader,
-    MooncakeTransferSubmitter, MooncakeTransferTarget, MooncakeTransferTargetResolver,
-    TransferableKvCacheMemory, TransferableKvCacheRegion, build_mooncake_kv_transfer_requests,
-    build_mooncake_remote_kv_transfer_requests, execute_kv_cache_transfer_plan,
-    is_decode_request_kv_ready, poll_mooncake_transfer_batches,
+    KvPoll, KvTransferModelWorker, LocalSnapshotTransferPdModelWorkers, MooncakeBatchId,
+    MooncakeBatchReleaser, MooncakeError, MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor,
+    MooncakeOpcode, MooncakeRemoteKvLayout, MooncakeSessionTargetResolver, MooncakeSubmittedBatch,
+    MooncakeTransferRequest, MooncakeTransferStatus, MooncakeTransferStatusCode,
+    MooncakeTransferStatusReader, MooncakeTransferSubmitter, MooncakeTransferTarget,
+    MooncakeTransferTargetResolver, TransferableKvCacheMemory, TransferableKvCacheRegion,
+    build_mooncake_kv_transfer_requests, build_mooncake_remote_kv_transfer_requests,
+    execute_kv_cache_transfer_plan, is_decode_request_kv_ready, poll_mooncake_transfer_batches,
 };
 use sglang_srt::types::{
     BootstrapRoom, DisaggregatedParams, RequestId, SamplingParams, TokenGenerateRequest,
 };
-use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker, WorkerExecutionError};
+use sglang_srt::worker::{
+    BatchGeneratedTokens, FallibleModelWorker, GeneratedToken, ModelWorker, WorkerExecutionError,
+    WorkerWeightUpdateRequest,
+};
 use std::time::Duration;
 
 #[derive(Default)]
@@ -55,6 +58,58 @@ impl ModelWorker for UnfinishedWorker {
                 .collect(),
         )
         .expect("output shape should match batch")
+    }
+}
+
+#[derive(Default)]
+struct ReloadRecordingWorker {
+    updates: Vec<WorkerWeightUpdateRequest>,
+}
+
+impl FallibleModelWorker for ReloadRecordingWorker {
+    fn try_generate_batch(
+        &mut self,
+        batch: &ScheduleBatch,
+    ) -> Result<BatchGeneratedTokens, WorkerExecutionError> {
+        BatchGeneratedTokens::from_batch(
+            batch,
+            batch
+                .requests()
+                .iter()
+                .map(|_| GeneratedToken::finished(vec![1]))
+                .collect(),
+        )
+        .map_err(WorkerExecutionError::from)
+    }
+
+    fn update_weights_from_disk(
+        &mut self,
+        request: &WorkerWeightUpdateRequest,
+    ) -> Result<(), WorkerExecutionError> {
+        self.updates.push(request.clone());
+        Ok(())
+    }
+}
+
+impl sglang_srt::transfer::KvCachePageSnapshotProvider for ReloadRecordingWorker {
+    type Snapshot = CachePageId;
+
+    fn export_kv_cache_pages(
+        &self,
+        cache_pages: &[CachePageId],
+    ) -> Result<Vec<Self::Snapshot>, KvCacheTransferError> {
+        Ok(cache_pages.to_vec())
+    }
+}
+
+impl sglang_srt::transfer::KvCachePageSnapshotImporter for ReloadRecordingWorker {
+    type Snapshot = CachePageId;
+
+    fn import_kv_cache_pages(
+        &mut self,
+        _snapshots: Vec<Self::Snapshot>,
+    ) -> Result<(), KvCacheTransferError> {
+        Ok(())
     }
 }
 
@@ -323,6 +378,46 @@ fn transfer_model_worker_submits_pd_prefill_transfer_during_scheduler_dispatch()
     );
     assert_eq!(worker.transfer_executor().seen_rooms, vec![15]);
     assert!(worker.registry().get(15).is_none());
+}
+
+#[test]
+fn transfer_model_worker_forwards_weight_updates_to_inner_worker() {
+    let mut worker = KvTransferModelWorker::new(
+        ReloadRecordingWorker::default(),
+        DecodeBootstrapRegistry::default(),
+        RecordingTransferExecutor::default(),
+    );
+    let request = WorkerWeightUpdateRequest {
+        model_path: "/models/reloaded".to_string(),
+        load_format: Some("safetensors".to_string()),
+        weight_version: "weights-v2".to_string(),
+    };
+
+    worker
+        .update_weights_from_disk(&request)
+        .expect("transfer wrapper should forward reload requests");
+
+    assert_eq!(worker.worker().updates, vec![request]);
+}
+
+#[test]
+fn local_snapshot_transfer_pd_workers_forward_weight_updates_to_both_workers() {
+    let mut workers = LocalSnapshotTransferPdModelWorkers::new(
+        ReloadRecordingWorker::default(),
+        ReloadRecordingWorker::default(),
+    );
+    let request = WorkerWeightUpdateRequest {
+        model_path: "/models/local-snapshot-reloaded".to_string(),
+        load_format: Some("safetensors".to_string()),
+        weight_version: "snapshot-v2".to_string(),
+    };
+
+    workers
+        .update_weights_from_disk(&request)
+        .expect("local snapshot wrapper should forward reload requests");
+
+    assert_eq!(workers.prefill().updates, vec![request.clone()]);
+    assert_eq!(workers.decode().updates, vec![request]);
 }
 
 #[test]

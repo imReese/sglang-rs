@@ -119,6 +119,13 @@ impl From<WorkerOutputError> for WorkerExecutionError {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkerWeightUpdateRequest {
+    pub model_path: String,
+    pub load_format: Option<String>,
+    pub weight_version: String,
+}
+
 pub trait ModelWorker {
     fn generate_batch(&mut self, batch: &ScheduleBatch) -> BatchGeneratedTokens;
 }
@@ -141,6 +148,15 @@ pub trait FallibleModelWorker {
     }
 
     fn complete_request(&mut self, _request: &ScheduledRequest) {}
+
+    fn update_weights_from_disk(
+        &mut self,
+        _request: &WorkerWeightUpdateRequest,
+    ) -> Result<(), WorkerExecutionError> {
+        Err(WorkerExecutionError::Runtime(
+            "worker does not support update_weights_from_disk".to_string(),
+        ))
+    }
 }
 
 pub trait WorkerExecutor {
@@ -157,6 +173,11 @@ pub trait WorkerExecutor {
     fn poll_transfers(&mut self) -> Result<MooncakeTransferPollSummary, KvCacheTransferError>;
 
     fn complete_request(&mut self, request: &ScheduledRequest);
+
+    fn update_weights_from_disk(
+        &mut self,
+        request: &WorkerWeightUpdateRequest,
+    ) -> Result<(), WorkerExecutionError>;
 }
 
 impl<W> FallibleModelWorker for W
@@ -195,6 +216,13 @@ where
 
     fn complete_request(&mut self, request: &ScheduledRequest) {
         FallibleModelWorker::complete_request(self, request)
+    }
+
+    fn update_weights_from_disk(
+        &mut self,
+        request: &WorkerWeightUpdateRequest,
+    ) -> Result<(), WorkerExecutionError> {
+        FallibleModelWorker::update_weights_from_disk(self, request)
     }
 }
 
@@ -246,5 +274,13 @@ where
             ForwardMode::Prefill => self.prefill.try_generate_batch(batch),
             ForwardMode::Decode => self.decode.try_generate_batch(batch),
         }
+    }
+
+    fn update_weights_from_disk(
+        &mut self,
+        request: &WorkerWeightUpdateRequest,
+    ) -> Result<(), WorkerExecutionError> {
+        self.prefill.update_weights_from_disk(request)?;
+        self.decode.update_weights_from_disk(request)
     }
 }

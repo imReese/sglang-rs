@@ -2,10 +2,12 @@ use sha2::{Digest, Sha256};
 
 use crate::model_artifacts::LocalModelArtifacts;
 use crate::router::RouterGetModelInfoResponse;
+use crate::worker::WorkerWeightUpdateRequest;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WeightMetadataUpdate {
     pub model_info: RouterGetModelInfoResponse,
+    pub worker_request: WorkerWeightUpdateRequest,
     pub message: String,
 }
 
@@ -28,6 +30,11 @@ pub(crate) fn update_model_info_from_disk(
 
     let weight_version = safetensors_weight_version(&artifacts, load_format)?;
     let model_info = updated_model_info_from_artifacts(current, &artifacts, weight_version.clone());
+    let worker_request = WorkerWeightUpdateRequest {
+        model_path: artifacts.model_path().to_string_lossy().to_string(),
+        load_format: Some(load_format.to_string()),
+        weight_version: weight_version.clone(),
+    };
     let message = format!(
         "registered {load_format} weights from {} with version {weight_version}",
         artifacts.model_path().display()
@@ -35,6 +42,7 @@ pub(crate) fn update_model_info_from_disk(
 
     Ok(WeightMetadataUpdate {
         model_info,
+        worker_request,
         message,
     })
 }

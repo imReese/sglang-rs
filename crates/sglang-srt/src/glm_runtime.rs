@@ -1092,6 +1092,10 @@ impl GlmMoeDsaF32CachedForwardModel {
         &self.runtime
     }
 
+    pub fn rank_count(&self) -> usize {
+        self.runtime.rank_count()
+    }
+
     pub fn kv_cache_contains(&self, layer_id: usize, cache_page: CachePageId) -> bool {
         self.kv_cache.contains(layer_id, cache_page)
     }

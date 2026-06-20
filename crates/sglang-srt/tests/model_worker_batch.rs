@@ -7,7 +7,9 @@ use sglang_srt::scheduler::{
     ForwardMode, ScheduleBatch, ScheduledRequest, Scheduler, SchedulerError,
 };
 use sglang_srt::types::{DisaggregatedParams, FAKE_BOOTSTRAP_HOST, RequestId, SamplingParams};
-use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
+use sglang_srt::worker::{
+    BatchGeneratedTokens, GeneratedToken, ModelWorker, WorkerExecutor, WorkerWeightUpdateRequest,
+};
 
 #[derive(Default)]
 struct NoopWorker;
@@ -279,6 +281,37 @@ impl ForwardModel for RecordingForwardModel {
 
         ModelForwardOutput::new(vec![vec![0.1, 9.0, 0.2], vec![0.0, 0.5, 8.0]])
     }
+
+    fn update_weights_from_disk(
+        &mut self,
+        request: &WorkerWeightUpdateRequest,
+    ) -> Result<(), ModelForwardError> {
+        self.seen_input_ids = request
+            .weight_version
+            .as_bytes()
+            .iter()
+            .map(|byte| u32::from(*byte))
+            .collect();
+        Ok(())
+    }
+}
+
+#[test]
+fn model_runner_forwards_weight_updates_to_reloadable_model() {
+    let mut runner = ModelRunner::new(RecordingForwardModel::default());
+
+    runner
+        .update_weights_from_disk(&WorkerWeightUpdateRequest {
+            model_path: "/tmp/reload-model".into(),
+            load_format: Some("safetensors".into()),
+            weight_version: "v1".into(),
+        })
+        .expect("reloadable model should accept weight updates");
+
+    assert_eq!(
+        runner.model().seen_input_ids,
+        vec![u32::from(b'v'), u32::from(b'1')]
+    );
 }
 
 #[test]

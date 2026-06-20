@@ -462,20 +462,12 @@ where
         Err(message) => return update_weights_bad_request(message),
     };
 
-    let flush = match service.runtime.lock() {
-        Ok(mut runtime) => runtime.flush_cache(),
+    let reload = match service.runtime.lock() {
+        Ok(mut runtime) => runtime.update_weights_from_disk(update.worker_request.clone()),
         Err(_) => return internal_error_json("router runtime mutex poisoned"),
     };
-    if !flush.success {
-        let message = if flush.message.is_empty() {
-            "cannot update weights while requests are running or waiting".to_string()
-        } else {
-            format!(
-                "cannot update weights while requests are running or waiting: {}",
-                flush.message
-            )
-        };
-        return update_weights_bad_request(message);
+    if let Err(error) = reload {
+        return update_weights_bad_request(error.to_string());
     }
 
     if let Err(message) = service.replace_model_info(update.model_info) {

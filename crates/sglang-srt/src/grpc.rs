@@ -1305,6 +1305,15 @@ where
             request.load_format.as_deref(),
         )
         .map_err(Status::invalid_argument)?;
+        {
+            let mut runtime = self
+                .runtime
+                .lock()
+                .map_err(|_| Status::internal("router runtime mutex poisoned"))?;
+            runtime
+                .update_weights_from_disk(update.worker_request.clone())
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        }
 
         *self
             .model_info

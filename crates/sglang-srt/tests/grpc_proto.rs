@@ -35,7 +35,10 @@ use sglang_srt::types::{
     BootstrapRoom, DisaggregatedParams as RuntimeDisaggregatedParams, RequestId,
     SamplingParams as RuntimeSamplingParams,
 };
-use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
+use sglang_srt::worker::{
+    BatchGeneratedTokens, FallibleModelWorker, GeneratedToken, ModelWorker, WorkerExecutionError,
+    WorkerWeightUpdateRequest,
+};
 
 #[derive(Default)]
 struct GrpcTwoStepWorker;
@@ -49,6 +52,33 @@ impl ModelWorker for GrpcTwoStepWorker {
 
         BatchGeneratedTokens::from_batch(batch, vec![token])
             .expect("output shape should match batch")
+    }
+}
+
+#[derive(Default)]
+struct GrpcReloadingWorker {
+    updates: Vec<WorkerWeightUpdateRequest>,
+}
+
+impl FallibleModelWorker for GrpcReloadingWorker {
+    fn try_generate_batch(
+        &mut self,
+        batch: &ScheduleBatch,
+    ) -> Result<BatchGeneratedTokens, WorkerExecutionError> {
+        let token = match batch.forward_mode() {
+            sglang_srt::scheduler::ForwardMode::Prefill => GeneratedToken::unfinished(vec![42]),
+            sglang_srt::scheduler::ForwardMode::Decode => GeneratedToken::finished(vec![43]),
+        };
+        Ok(BatchGeneratedTokens::from_batch(batch, vec![token])
+            .expect("output shape should match batch"))
+    }
+
+    fn update_weights_from_disk(
+        &mut self,
+        request: &WorkerWeightUpdateRequest,
+    ) -> Result<(), WorkerExecutionError> {
+        self.updates.push(request.clone());
+        Ok(())
     }
 }
 
@@ -1434,7 +1464,7 @@ async fn grpc_update_weights_from_disk_validates_artifacts_and_updates_model_inf
     let service = GrpcRouterService::with_server_args(
         RouterRuntime::new(Engine::new(
             ByteTokenizer,
-            Scheduler::new(GrpcTwoStepWorker),
+            Scheduler::new(GrpcReloadingWorker::default()),
         )),
         &args,
     );

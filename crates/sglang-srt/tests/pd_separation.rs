@@ -9,7 +9,10 @@ use sglang_srt::scheduler::{
 };
 use sglang_srt::tokenizer::ByteTokenizer;
 use sglang_srt::types::{RequestId, SamplingParams};
-use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker, PdModelWorkers};
+use sglang_srt::worker::{
+    BatchGeneratedTokens, FallibleModelWorker, GeneratedToken, ModelWorker, PdModelWorkers,
+    WorkerExecutionError, WorkerWeightUpdateRequest,
+};
 
 #[derive(Default)]
 struct PrefillOnlyWorker {
@@ -58,6 +61,36 @@ impl ModelWorker for DecodeOnlyWorker {
     }
 }
 
+#[derive(Default)]
+struct WeightUpdateRecordingWorker {
+    updates: Vec<WorkerWeightUpdateRequest>,
+}
+
+impl FallibleModelWorker for WeightUpdateRecordingWorker {
+    fn try_generate_batch(
+        &mut self,
+        batch: &ScheduleBatch,
+    ) -> Result<BatchGeneratedTokens, WorkerExecutionError> {
+        BatchGeneratedTokens::from_batch(
+            batch,
+            batch
+                .requests()
+                .iter()
+                .map(|_| GeneratedToken::finished(vec![1]))
+                .collect(),
+        )
+        .map_err(WorkerExecutionError::from)
+    }
+
+    fn update_weights_from_disk(
+        &mut self,
+        request: &WorkerWeightUpdateRequest,
+    ) -> Result<(), WorkerExecutionError> {
+        self.updates.push(request.clone());
+        Ok(())
+    }
+}
+
 #[test]
 fn pd_workers_route_prefill_and_decode_batches_to_separate_executors() {
     let workers = PdModelWorkers::new(PrefillOnlyWorker::default(), DecodeOnlyWorker::default());
@@ -87,6 +120,26 @@ fn pd_workers_route_prefill_and_decode_batches_to_separate_executors() {
         scheduler.worker().decode().seen_modes,
         vec![ForwardMode::Decode]
     );
+}
+
+#[test]
+fn pd_workers_forward_weight_updates_to_prefill_and_decode_workers() {
+    let mut workers = PdModelWorkers::new(
+        WeightUpdateRecordingWorker::default(),
+        WeightUpdateRecordingWorker::default(),
+    );
+    let request = WorkerWeightUpdateRequest {
+        model_path: "/models/next".to_string(),
+        load_format: Some("safetensors".to_string()),
+        weight_version: "v2".to_string(),
+    };
+
+    workers
+        .update_weights_from_disk(&request)
+        .expect("PD workers should forward reload requests");
+
+    assert_eq!(workers.prefill().updates, vec![request.clone()]);
+    assert_eq!(workers.decode().updates, vec![request]);
 }
 
 #[test]

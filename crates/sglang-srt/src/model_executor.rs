@@ -11,6 +11,7 @@ use crate::model_artifacts::{
 };
 use crate::worker::{
     BatchGeneratedTokens, FallibleModelWorker, GeneratedToken, WorkerExecutionError,
+    WorkerWeightUpdateRequest,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -196,6 +197,15 @@ pub trait ForwardModel {
         &mut self,
         batch: &ModelWorkerBatch,
     ) -> Result<ModelForwardOutput, ModelForwardError>;
+
+    fn update_weights_from_disk(
+        &mut self,
+        _request: &WorkerWeightUpdateRequest,
+    ) -> Result<(), ModelForwardError> {
+        Err(ModelForwardError::Runtime(
+            "forward model does not support update_weights_from_disk".to_string(),
+        ))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -860,6 +870,15 @@ where
                 })
                 .collect(),
         )?)
+    }
+
+    fn update_weights_from_disk(
+        &mut self,
+        request: &WorkerWeightUpdateRequest,
+    ) -> Result<(), WorkerExecutionError> {
+        self.model
+            .update_weights_from_disk(request)
+            .map_err(|error| WorkerExecutionError::Runtime(error.to_string()))
     }
 }
 

@@ -14,7 +14,10 @@ use sglang_srt::router::{
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::tokenizer::ByteTokenizer;
 use sglang_srt::types::{RequestId, SamplingParams, TokenGenerateOutput};
-use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
+use sglang_srt::worker::{
+    BatchGeneratedTokens, DecodeRequestState, FallibleModelWorker, GeneratedToken, ModelWorker,
+    WorkerExecutionError, WorkerWeightUpdateRequest,
+};
 
 #[derive(Default)]
 struct RouterEchoWorker {
@@ -55,6 +58,38 @@ impl ModelWorker for TwoStepRouterWorker {
 
         BatchGeneratedTokens::from_batch(batch, vec![token])
             .expect("output shape should match batch")
+    }
+}
+
+#[derive(Default)]
+struct RecordingWeightUpdateWorker {
+    updates: Vec<WorkerWeightUpdateRequest>,
+}
+
+impl FallibleModelWorker for RecordingWeightUpdateWorker {
+    fn try_generate_batch(
+        &mut self,
+        batch: &ScheduleBatch,
+    ) -> Result<BatchGeneratedTokens, WorkerExecutionError> {
+        Ok(
+            BatchGeneratedTokens::from_batch(batch, vec![GeneratedToken::finished(vec![42])])
+                .expect("output shape should match batch"),
+        )
+    }
+
+    fn decode_request_state(
+        &self,
+        _request: &ScheduledRequest,
+    ) -> Result<DecodeRequestState, WorkerExecutionError> {
+        Ok(DecodeRequestState::Ready)
+    }
+
+    fn update_weights_from_disk(
+        &mut self,
+        request: &WorkerWeightUpdateRequest,
+    ) -> Result<(), WorkerExecutionError> {
+        self.updates.push(request.clone());
+        Ok(())
     }
 }
 
@@ -1301,6 +1336,59 @@ fn router_runtime_flush_cache_reports_failure_when_decode_requests_are_active() 
         runtime.engine().scheduler().available_cache_pages(),
         Some(2)
     );
+}
+
+#[test]
+fn router_runtime_update_weights_from_disk_calls_worker_reload_hook() {
+    let tokenizer = ByteTokenizer::default();
+    let scheduler = Scheduler::new(RecordingWeightUpdateWorker::default());
+    let engine = Engine::new(tokenizer, scheduler);
+    let mut runtime = RouterRuntime::new(engine);
+
+    runtime
+        .update_weights_from_disk(WorkerWeightUpdateRequest {
+            model_path: "/tmp/new-model".into(),
+            load_format: Some("safetensors".into()),
+            weight_version: "safetensors-sha256:abc".into(),
+        })
+        .expect("idle runtime should update worker weights");
+
+    assert_eq!(
+        runtime.engine().scheduler().worker().updates,
+        vec![WorkerWeightUpdateRequest {
+            model_path: "/tmp/new-model".into(),
+            load_format: Some("safetensors".into()),
+            weight_version: "safetensors-sha256:abc".into(),
+        }]
+    );
+}
+
+#[test]
+fn router_runtime_update_weights_from_disk_rejects_when_requests_are_queued() {
+    let tokenizer = ByteTokenizer::default();
+    let mut scheduler = Scheduler::new(RecordingWeightUpdateWorker::default());
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("queued"),
+        vec![1, 2],
+        SamplingParams::new(2),
+    ));
+    let engine = Engine::new(tokenizer, scheduler);
+    let mut runtime = RouterRuntime::new(engine);
+
+    let error = runtime
+        .update_weights_from_disk(WorkerWeightUpdateRequest {
+            model_path: "/tmp/new-model".into(),
+            load_format: Some("safetensors".into()),
+            weight_version: "safetensors-sha256:abc".into(),
+        })
+        .expect_err("queued requests should prevent weight updates");
+
+    assert!(
+        error
+            .to_string()
+            .contains("cannot update weights while requests are running or waiting")
+    );
+    assert!(runtime.engine().scheduler().worker().updates.is_empty());
 }
 
 fn kv_worker(endpoint: &str, dp_rank: u32) -> KvCacheWorkerId {

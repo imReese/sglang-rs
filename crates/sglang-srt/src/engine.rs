@@ -6,13 +6,15 @@ use crate::transfer::{KvCacheTransferError, MooncakeTransferPollSummary};
 use crate::types::{
     GenerateOutput, GenerateRequest, RequestId, TokenGenerateOutput, TokenGenerateRequest,
 };
-use crate::worker::WorkerExecutor;
+use crate::worker::{WorkerExecutionError, WorkerExecutor, WorkerWeightUpdateRequest};
 
 #[derive(Debug)]
 pub enum RuntimeError {
     Scheduler(SchedulerError),
     Tokenizer(TokenizerError),
     Transfer(KvCacheTransferError),
+    Worker(WorkerExecutionError),
+    InvalidState(String),
 }
 
 impl fmt::Display for RuntimeError {
@@ -21,6 +23,8 @@ impl fmt::Display for RuntimeError {
             Self::Scheduler(error) => write!(formatter, "scheduler error: {error}"),
             Self::Tokenizer(error) => write!(formatter, "tokenizer error: {error}"),
             Self::Transfer(error) => write!(formatter, "transfer error: {error}"),
+            Self::Worker(error) => write!(formatter, "worker error: {error}"),
+            Self::InvalidState(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -42,6 +46,12 @@ impl From<TokenizerError> for RuntimeError {
 impl From<KvCacheTransferError> for RuntimeError {
     fn from(value: KvCacheTransferError) -> Self {
         Self::Transfer(value)
+    }
+}
+
+impl From<WorkerExecutionError> for RuntimeError {
+    fn from(value: WorkerExecutionError) -> Self {
+        Self::Worker(value)
     }
 }
 
@@ -84,6 +94,23 @@ where
 {
     pub fn poll_transfers(&mut self) -> Result<MooncakeTransferPollSummary, RuntimeError> {
         Ok(self.scheduler.worker_mut().poll_transfers()?)
+    }
+
+    pub fn update_weights_from_disk(
+        &mut self,
+        request: &WorkerWeightUpdateRequest,
+    ) -> Result<(), RuntimeError> {
+        if self.scheduler.waiting_queue_depth() > 0 || self.scheduler.decode_queue_depth() > 0 {
+            return Err(RuntimeError::InvalidState(
+                "cannot update weights while requests are running or waiting".to_string(),
+            ));
+        }
+
+        self.scheduler
+            .worker_mut()
+            .update_weights_from_disk(request)?;
+        self.flush_cache();
+        Ok(())
     }
 }
 

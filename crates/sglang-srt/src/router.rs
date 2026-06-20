@@ -14,6 +14,7 @@ use crate::types::{
     TokenGenerateRequest,
 };
 use crate::worker::WorkerExecutor;
+use crate::worker::WorkerWeightUpdateRequest;
 
 pub const DEFAULT_MAX_NEW_TOKENS: usize = 128;
 static ROUTER_REQUEST_ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -794,6 +795,14 @@ where
             completed_batches: summary.completed_batches(),
             pending_batches: summary.pending_batches(),
         })
+    }
+
+    pub fn update_weights_from_disk(
+        &mut self,
+        request: WorkerWeightUpdateRequest,
+    ) -> Result<(), RouterRuntimeError> {
+        self.engine.update_weights_from_disk(&request)?;
+        Ok(())
     }
 }
 
