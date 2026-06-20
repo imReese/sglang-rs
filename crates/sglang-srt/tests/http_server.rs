@@ -1,6 +1,9 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use serde_json::Value;
 use tokio::sync::oneshot;
@@ -971,6 +974,130 @@ async fn http_server_model_info_reports_local_model_architectures_for_gateway_di
         .expect("server task should join")
         .expect("server should stop cleanly");
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_update_weights_from_disk_validates_artifacts_and_updates_model_info() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "old-model",
+        "--served-model-name",
+        "tiny-http",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let service = build_bootstrap_http_router_service(&args);
+    let model_dir = temp_model_dir("http-update-weights");
+    write_minimal_generic_model_artifacts(&model_dir);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let update = request_json_dynamic_with_retry(
+        addr,
+        "POST",
+        "/update_weights_from_disk",
+        serde_json::json!({
+            "model_path": model_dir.to_string_lossy(),
+            "load_format": "safetensors"
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(update["success"], true);
+    assert!(update["message"].as_str().unwrap().contains("registered"));
+    assert_eq!(update["num_paused_requests"], 0);
+
+    let model_info = get_json_with_retry(addr, "/model_info").await;
+    let model_path = model_dir.to_string_lossy().to_string();
+    assert_eq!(model_info["model_path"], model_path);
+    assert_eq!(model_info["tokenizer_path"], model_path);
+    assert_eq!(model_info["model_type"], "tiny");
+    assert_eq!(
+        model_info["architectures"],
+        serde_json::json!(["TinyForCausalLM"])
+    );
+    assert_eq!(model_info["vocab_size"], 128);
+    assert_eq!(model_info["max_context_length"], 4096);
+    assert!(
+        model_info["weight_version"]
+            .as_str()
+            .unwrap()
+            .starts_with("safetensors-sha256:")
+    );
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_update_weights_from_disk_rejects_invalid_requests() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "old-model",
+        "--served-model-name",
+        "tiny-http",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let service = build_bootstrap_http_router_service(&args);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let empty_path = request_raw_with_retry(
+        addr,
+        "POST",
+        "/update_weights_from_disk",
+        Some(r#"{"model_path":"  "}"#),
+    )
+    .await;
+    assert!(empty_path.starts_with("HTTP/1.1 400"));
+    assert!(empty_path.contains("model_path"));
+
+    let unsupported_format = request_raw_with_retry(
+        addr,
+        "POST",
+        "/update_weights_from_disk",
+        Some(r#"{"model_path":"some-model","load_format":"gguf"}"#),
+    )
+    .await;
+    assert!(unsupported_format.starts_with("HTTP/1.1 400"));
+    assert!(unsupported_format.contains("load_format"));
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2022,6 +2149,32 @@ fn temp_model_dir(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("sglang-rs-{name}-{}", std::process::id()))
 }
 
+fn write_minimal_generic_model_artifacts(model_dir: &Path) {
+    fs::create_dir_all(model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "architectures": ["TinyForCausalLM"],
+  "model_type": "tiny",
+  "vocab_size": 128,
+  "max_position_embeddings": 4096,
+  "eos_token_id": [2, 3]
+}"#,
+    )
+    .expect("config should be written");
+    write_minimal_safetensors_file(&model_dir.join("model.safetensors"));
+}
+
+fn write_minimal_safetensors_file(path: &Path) {
+    let header =
+        br#"{"model.embed_tokens.weight":{"dtype":"F32","shape":[1,1],"data_offsets":[0,4]}}"#;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(header);
+    bytes.extend_from_slice(&0.0f32.to_le_bytes());
+    fs::write(path, bytes).expect("safetensors shard should be written");
+}
+
 fn unused_contiguous_local_ports_excluding(count: u16, excluded_ports: &[u16]) -> Vec<u16> {
     for _ in 0..100 {
         let first = unused_local_addr().port();
@@ -2144,6 +2297,43 @@ async fn request_raw_with_retry(
     );
 }
 
+async fn request_json_dynamic_with_retry(
+    addr: SocketAddr,
+    method: &'static str,
+    path: &str,
+    body: String,
+) -> Value {
+    let raw = request_raw_dynamic_with_retry(addr, method, path, body).await;
+    let (_, body) = raw
+        .split_once("\r\n\r\n")
+        .expect("HTTP response should include headers");
+    serde_json::from_str(body).expect("HTTP response should contain JSON")
+}
+
+async fn request_raw_dynamic_with_retry(
+    addr: SocketAddr,
+    method: &'static str,
+    path: &str,
+    body: String,
+) -> String {
+    let mut last_error = None;
+
+    for _ in 0..100 {
+        match request_raw_dynamic(addr, method, path, body.clone()).await {
+            Ok(value) => return value,
+            Err(error) => {
+                last_error = Some(error);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+    }
+
+    panic!(
+        "HTTP client should connect to test server: {}",
+        last_error.expect("at least one connection attempt should run")
+    );
+}
+
 async fn request_json(
     addr: SocketAddr,
     method: &'static str,
@@ -2156,6 +2346,28 @@ async fn request_json(
         .split_once("\r\n\r\n")
         .expect("HTTP response should include headers");
     serde_json::from_str(body).map_err(std::io::Error::other)
+}
+
+async fn request_raw_dynamic(
+    addr: SocketAddr,
+    method: &'static str,
+    path: &str,
+    body: String,
+) -> Result<String, std::io::Error> {
+    let path = path.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut stream = TcpStream::connect(addr)?;
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes())?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        Ok(response)
+    })
+    .await
+    .expect("blocking HTTP request should join")
 }
 
 async fn request_raw(

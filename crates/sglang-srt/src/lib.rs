@@ -19,4 +19,5 @@ pub mod server;
 pub mod tokenizer;
 pub mod transfer;
 pub mod types;
+mod weight_update;
 pub mod worker;

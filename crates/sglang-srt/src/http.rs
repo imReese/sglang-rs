@@ -25,11 +25,12 @@ use crate::router::{
 };
 use crate::tokenizer::Tokenizer;
 use crate::types::BootstrapRoom;
+use crate::weight_update::update_model_info_from_disk;
 use crate::worker::WorkerExecutor;
 
 pub struct HttpRouterService<T, W> {
     runtime: Arc<Mutex<RouterRuntime<T, W>>>,
-    model_info: RouterGetModelInfoResponse,
+    model_info: Arc<Mutex<RouterGetModelInfoResponse>>,
     server_info: HttpServerInfo,
     allow_disaggregated_requests: bool,
     max_transfer_polls: usize,
@@ -39,7 +40,7 @@ impl<T, W> Clone for HttpRouterService<T, W> {
     fn clone(&self) -> Self {
         Self {
             runtime: Arc::clone(&self.runtime),
-            model_info: self.model_info.clone(),
+            model_info: Arc::clone(&self.model_info),
             server_info: self.server_info.clone(),
             allow_disaggregated_requests: self.allow_disaggregated_requests,
             max_transfer_polls: self.max_transfer_polls,
@@ -92,7 +93,7 @@ impl<T, W> HttpRouterService<T, W> {
     pub fn new(runtime: RouterRuntime<T, W>, model_info: RouterGetModelInfoResponse) -> Self {
         Self {
             runtime: Arc::new(Mutex::new(runtime)),
-            model_info,
+            model_info: Arc::new(Mutex::new(model_info)),
             server_info: HttpServerInfo::default(),
             allow_disaggregated_requests: false,
             max_transfer_polls: 0,
@@ -101,6 +102,24 @@ impl<T, W> HttpRouterService<T, W> {
 
     pub fn runtime(&self) -> &Arc<Mutex<RouterRuntime<T, W>>> {
         &self.runtime
+    }
+
+    fn model_info_snapshot(&self) -> Result<RouterGetModelInfoResponse, &'static str> {
+        self.model_info
+            .lock()
+            .map_err(|_| "model info mutex poisoned")
+            .map(|model_info| model_info.clone())
+    }
+
+    fn replace_model_info(
+        &self,
+        model_info: RouterGetModelInfoResponse,
+    ) -> Result<(), &'static str> {
+        *self
+            .model_info
+            .lock()
+            .map_err(|_| "model info mutex poisoned")? = model_info;
+        Ok(())
     }
 
     pub fn with_disaggregated_requests(mut self) -> Self {
@@ -138,6 +157,10 @@ where
             .route(
                 "/flush_cache",
                 get(flush_cache::<T, W>).post(flush_cache::<T, W>),
+            )
+            .route(
+                "/update_weights_from_disk",
+                post(update_weights_from_disk::<T, W>),
             )
             .route("/v1/tokenize", post(tokenize::<T, W>))
             .route("/tokenize", post(tokenize::<T, W>))
@@ -211,29 +234,38 @@ async fn health() -> Json<Value> {
     }))
 }
 
-async fn list_models<T, W>(State(service): State<HttpRouterService<T, W>>) -> Json<Value>
+async fn list_models<T, W>(State(service): State<HttpRouterService<T, W>>) -> Response
 where
     T: Send + 'static,
     W: Send + 'static,
 {
+    let info = match service.model_info_snapshot() {
+        Ok(info) => info,
+        Err(message) => return internal_error_json(message),
+    };
     Json(json!({
         "object": "list",
         "data": [{
-            "id": service.model_info.served_model_name,
+            "id": info.served_model_name,
             "object": "model",
             "owned_by": "sglang-rs",
-            "root": service.model_info.model_path,
+            "root": info.model_path,
         }]
     }))
+    .into_response()
 }
 
-async fn server_info<T, W>(State(service): State<HttpRouterService<T, W>>) -> Json<Value>
+async fn server_info<T, W>(State(service): State<HttpRouterService<T, W>>) -> Response
 where
     T: Send + 'static,
     W: Send + 'static,
 {
+    let info = match service.model_info_snapshot() {
+        Ok(info) => info,
+        Err(message) => return internal_error_json(message),
+    };
     let mut body = json!({
-        "served_model_name": service.model_info.served_model_name,
+        "served_model_name": info.served_model_name,
         "disaggregation_mode": service.server_info.disaggregation_mode,
     });
 
@@ -263,16 +295,23 @@ where
         });
     }
 
-    Json(body)
+    Json(body).into_response()
 }
 
-async fn model_info<T, W>(State(service): State<HttpRouterService<T, W>>) -> Json<Value>
+async fn model_info<T, W>(State(service): State<HttpRouterService<T, W>>) -> Response
 where
     T: Send + 'static,
     W: Send + 'static,
 {
-    let info = service.model_info;
-    Json(json!({
+    let info = match service.model_info_snapshot() {
+        Ok(info) => info,
+        Err(message) => return internal_error_json(message),
+    };
+    Json(model_info_json(info)).into_response()
+}
+
+fn model_info_json(info: RouterGetModelInfoResponse) -> Value {
+    json!({
         "model_path": info.model_path,
         "tokenizer_path": info.tokenizer_path,
         "is_generation": info.is_generation,
@@ -288,7 +327,7 @@ where
         "pad_token_id": info.pad_token_id,
         "bos_token_id": info.bos_token_id,
         "max_req_input_len": info.max_req_input_len,
-    }))
+    })
 }
 
 async fn loads<T, W>(State(service): State<HttpRouterService<T, W>>) -> Response
@@ -389,6 +428,83 @@ where
     }
 }
 
+async fn update_weights_from_disk<T, W>(
+    State(service): State<HttpRouterService<T, W>>,
+    Json(payload): Json<Value>,
+) -> Response
+where
+    T: Tokenizer + Send + 'static,
+    W: WorkerExecutor + Send + 'static,
+{
+    let model_path = match payload.get("model_path").and_then(Value::as_str) {
+        Some(model_path) => model_path,
+        None => {
+            return update_weights_bad_request(
+                "model_path is required and must be a string".to_string(),
+            );
+        }
+    };
+    let load_format = match payload.get("load_format") {
+        Some(Value::String(load_format)) => Some(load_format.as_str()),
+        Some(Value::Null) | None => None,
+        Some(_) => {
+            return update_weights_bad_request(
+                "load_format must be a string when provided".to_string(),
+            );
+        }
+    };
+    let current = match service.model_info_snapshot() {
+        Ok(info) => info,
+        Err(message) => return internal_error_json(message),
+    };
+    let update = match update_model_info_from_disk(current, model_path, load_format) {
+        Ok(update) => update,
+        Err(message) => return update_weights_bad_request(message),
+    };
+
+    let flush = match service.runtime.lock() {
+        Ok(mut runtime) => runtime.flush_cache(),
+        Err(_) => return internal_error_json("router runtime mutex poisoned"),
+    };
+    if !flush.success {
+        let message = if flush.message.is_empty() {
+            "cannot update weights while requests are running or waiting".to_string()
+        } else {
+            format!(
+                "cannot update weights while requests are running or waiting: {}",
+                flush.message
+            )
+        };
+        return update_weights_bad_request(message);
+    }
+
+    if let Err(message) = service.replace_model_info(update.model_info) {
+        return internal_error_json(message);
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "success": true,
+            "message": update.message,
+            "num_paused_requests": 0,
+        })),
+    )
+        .into_response()
+}
+
+fn update_weights_bad_request(message: String) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "success": false,
+            "message": message,
+            "num_paused_requests": 0,
+        })),
+    )
+        .into_response()
+}
+
 enum TokenizePrompt {
     Single(String),
     Batch(Vec<String>),
@@ -412,8 +528,12 @@ where
         Err(message) => return bad_request_json(message),
     };
 
-    let max_model_len = if service.model_info.max_context_length > 0 {
-        service.model_info.max_context_length
+    let info = match service.model_info_snapshot() {
+        Ok(info) => info,
+        Err(message) => return internal_error_json(message),
+    };
+    let max_model_len = if info.max_context_length > 0 {
+        info.max_context_length
     } else {
         -1
     };
@@ -516,7 +636,11 @@ where
     T: Tokenizer + Send + 'static,
     W: WorkerExecutor + Send + 'static,
 {
-    let request = match parse_rerank_request(&payload, &service.model_info.served_model_name) {
+    let info = match service.model_info_snapshot() {
+        Ok(info) => info,
+        Err(message) => return internal_error_json(message),
+    };
+    let request = match parse_rerank_request(&payload, &info.served_model_name) {
         Ok(request) => request,
         Err(message) => return bad_request_json(message),
     };
@@ -550,7 +674,11 @@ where
     T: Tokenizer + Send + 'static,
     W: WorkerExecutor + Send + 'static,
 {
-    let request = match parse_score_request(&payload, &service.model_info.served_model_name) {
+    let info = match service.model_info_snapshot() {
+        Ok(info) => info,
+        Err(message) => return internal_error_json(message),
+    };
+    let request = match parse_score_request(&payload, &info.served_model_name) {
         Ok(request) => request,
         Err(message) => return bad_request_json(message),
     };
@@ -582,7 +710,11 @@ where
     T: Tokenizer + Send + 'static,
     W: WorkerExecutor + Send + 'static,
 {
-    let request = match parse_embedding_request(&payload, &service.model_info.served_model_name) {
+    let info = match service.model_info_snapshot() {
+        Ok(info) => info,
+        Err(message) => return internal_error_json(message),
+    };
+    let request = match parse_embedding_request(&payload, &info.served_model_name) {
         Ok(request) => request,
         Err(message) => return bad_request_json(message),
     };
@@ -610,7 +742,11 @@ where
     T: Tokenizer + Send + 'static,
     W: WorkerExecutor + Send + 'static,
 {
-    let request = match parse_classify_request(&payload, &service.model_info.served_model_name) {
+    let info = match service.model_info_snapshot() {
+        Ok(info) => info,
+        Err(message) => return internal_error_json(message),
+    };
+    let request = match parse_classify_request(&payload, &info.served_model_name) {
         Ok(request) => request,
         Err(message) => return bad_request_json(message),
     };
@@ -701,6 +837,14 @@ fn parse_token_id_list(items: &[Value]) -> Result<Vec<u32>, String> {
 fn bad_request_json(message: impl Into<String>) -> Response {
     (
         StatusCode::BAD_REQUEST,
+        Json(json!({ "error": { "message": message.into() } })),
+    )
+        .into_response()
+}
+
+fn internal_error_json(message: impl Into<String>) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
         Json(json!({ "error": { "message": message.into() } })),
     )
         .into_response()
@@ -988,7 +1132,10 @@ where
     T: Tokenizer + Send + 'static,
     W: WorkerExecutor + Send + 'static,
 {
-    let model = service.model_info.served_model_name.clone();
+    let model = match service.model_info_snapshot() {
+        Ok(info) => info.served_model_name,
+        Err(message) => return internal_error_json(message),
+    };
     let request = match http_chat_payload_to_router_request(payload, &model) {
         Ok(request) => request,
         Err(error) => {
@@ -1303,7 +1450,10 @@ where
     T: Tokenizer + Send + 'static,
     W: WorkerExecutor + Send + 'static,
 {
-    let model = service.model_info.served_model_name.clone();
+    let model = match service.model_info_snapshot() {
+        Ok(info) => info.served_model_name,
+        Err(message) => return internal_error_json(message),
+    };
     let request = match http_completion_payload_to_router_request(payload, &model) {
         Ok(request) => request,
         Err(error) => {
