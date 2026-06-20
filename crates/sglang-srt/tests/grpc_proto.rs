@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use prost::Message;
@@ -19,6 +20,7 @@ use sglang_srt::proto::sglang::runtime::v1::{
     GetModelInfoRequest, GetServerInfoRequest, ListModelsRequest, OpenAiJsonRequest,
     PauseGenerationRequest, RequestOptions, SamplingParams, StartProfileRequest,
     StopProfileRequest, TextEmbedRequest, TextGenerateRequest, TokenizeRequest, TokenizedInput,
+    UpdateWeightsFromDiskRequest,
 };
 use sglang_srt::router::{RouterProtocolError, RouterRuntime};
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
@@ -59,6 +61,43 @@ fn unique_profile_dir() -> std::path::PathBuf {
         "sglang-rs-grpc-profile-{}-{suffix}",
         std::process::id()
     ))
+}
+
+fn unique_weight_update_model_dir() -> std::path::PathBuf {
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "sglang-rs-grpc-weight-update-{}-{suffix}",
+        std::process::id()
+    ))
+}
+
+fn write_minimal_generic_model_artifacts(model_dir: &Path) {
+    fs::create_dir_all(model_dir).expect("model directory should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "architectures": ["TinyForCausalLM"],
+  "model_type": "tiny",
+  "vocab_size": 128,
+  "max_position_embeddings": 4096,
+  "eos_token_id": [2, 3]
+}"#,
+    )
+    .expect("config should be written");
+    write_minimal_safetensors_file(&model_dir.join("model.safetensors"));
+}
+
+fn write_minimal_safetensors_file(path: &Path) {
+    let header =
+        br#"{"model.embed_tokens.weight":{"dtype":"F32","shape":[1,1],"data_offsets":[0,4]}}"#;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(header);
+    bytes.extend_from_slice(&0.0f32.to_le_bytes());
+    fs::write(path, bytes).expect("safetensors shard should be written");
 }
 
 #[test]
@@ -1380,6 +1419,93 @@ async fn grpc_profile_start_stop_writes_trace_file() {
     );
 
     fs::remove_dir_all(output_dir).expect("profile temp directory should clean up");
+}
+
+#[tokio::test]
+async fn grpc_update_weights_from_disk_validates_artifacts_and_updates_model_info() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "old-model",
+        "--served-model-name",
+        "tiny",
+    ])
+    .expect("server args should parse");
+    let service = GrpcRouterService::with_server_args(
+        RouterRuntime::new(Engine::new(
+            ByteTokenizer,
+            Scheduler::new(GrpcTwoStepWorker),
+        )),
+        &args,
+    );
+    let model_dir = unique_weight_update_model_dir();
+    write_minimal_generic_model_artifacts(&model_dir);
+
+    let response = service
+        .update_weights_from_disk(Request::new(UpdateWeightsFromDiskRequest {
+            model_path: model_dir.to_string_lossy().to_string(),
+            load_format: Some("safetensors".to_string()),
+        }))
+        .await
+        .expect("local safetensors artifacts should update model metadata")
+        .into_inner();
+    assert!(response.success);
+    assert!(response.message.contains("registered"));
+
+    let model_info = service
+        .get_model_info(Request::new(GetModelInfoRequest {}))
+        .await
+        .expect("updated model info should be readable")
+        .into_inner();
+    assert_eq!(model_info.model_path, model_dir.to_string_lossy());
+    assert_eq!(model_info.tokenizer_path, model_dir.to_string_lossy());
+    assert_eq!(model_info.served_model_name, "tiny");
+    assert_eq!(model_info.model_type, "tiny");
+    assert_eq!(model_info.eos_token_ids, vec![2, 3]);
+    assert_eq!(model_info.vocab_size, 128);
+    assert_eq!(model_info.max_context_length, 4096);
+    assert!(model_info.weight_version.starts_with("safetensors-sha256:"));
+
+    fs::remove_dir_all(model_dir).expect("model temp directory should clean up");
+}
+
+#[tokio::test]
+async fn grpc_update_weights_from_disk_rejects_invalid_requests() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "old-model",
+        "--served-model-name",
+        "tiny",
+    ])
+    .expect("server args should parse");
+    let service = GrpcRouterService::with_server_args(
+        RouterRuntime::new(Engine::new(
+            ByteTokenizer,
+            Scheduler::new(GrpcTwoStepWorker),
+        )),
+        &args,
+    );
+
+    let empty_path = service
+        .update_weights_from_disk(Request::new(UpdateWeightsFromDiskRequest {
+            model_path: "  ".to_string(),
+            load_format: None,
+        }))
+        .await
+        .expect_err("empty model paths should be rejected");
+    assert_eq!(empty_path.code(), Code::InvalidArgument);
+    assert!(empty_path.message().contains("model_path"));
+
+    let unsupported_format = service
+        .update_weights_from_disk(Request::new(UpdateWeightsFromDiskRequest {
+            model_path: "some-model".to_string(),
+            load_format: Some("gguf".to_string()),
+        }))
+        .await
+        .expect_err("unsupported load formats should be rejected");
+    assert_eq!(unsupported_format.code(), Code::InvalidArgument);
+    assert!(unsupported_format.message().contains("load_format"));
 }
 
 #[tokio::test]

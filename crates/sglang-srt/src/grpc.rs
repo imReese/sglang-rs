@@ -9,10 +9,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tonic::{Code, Request, Response, Status};
 
 use crate::cli::ServerArgs;
 use crate::engine::Engine;
+use crate::model_artifacts::LocalModelArtifacts;
 use crate::openai_classify::{classify_response_json, parse_classify_request};
 use crate::openai_embedding::{
     embeddings_response_json, parse_embedding_request, token_ids_to_embedding,
@@ -77,7 +79,7 @@ pub const SGLANG_RUNTIME_FILE_DESCRIPTOR_SET: &[u8] =
 #[derive(Clone)]
 pub struct GrpcRouterService<T, W> {
     runtime: Arc<Mutex<RouterRuntime<T, W>>>,
-    model_info: Option<RouterGetModelInfoResponse>,
+    model_info: Arc<Mutex<Option<RouterGetModelInfoResponse>>>,
     max_transfer_polls: usize,
     server_info_attributes: HashMap<String, String>,
     profile: Arc<Mutex<Option<GrpcProfileSession>>>,
@@ -122,7 +124,7 @@ impl<T, W> GrpcRouterService<T, W> {
     pub fn new(runtime: RouterRuntime<T, W>) -> Self {
         Self {
             runtime: Arc::new(Mutex::new(runtime)),
-            model_info: None,
+            model_info: Arc::new(Mutex::new(None)),
             max_transfer_polls: 0,
             server_info_attributes: default_server_info_attributes(),
             profile: Arc::new(Mutex::new(None)),
@@ -135,7 +137,7 @@ impl<T, W> GrpcRouterService<T, W> {
     ) -> Self {
         Self {
             runtime: Arc::new(Mutex::new(runtime)),
-            model_info: Some(model_info),
+            model_info: Arc::new(Mutex::new(Some(model_info))),
             max_transfer_polls: 0,
             server_info_attributes: default_server_info_attributes(),
             profile: Arc::new(Mutex::new(None)),
@@ -174,6 +176,8 @@ impl<T, W> GrpcRouterService<T, W> {
 
     fn model_info(&self) -> Result<RouterGetModelInfoResponse, Status> {
         self.model_info
+            .lock()
+            .map_err(|_| Status::internal("model info mutex poisoned"))?
             .clone()
             .ok_or_else(|| Status::failed_precondition("model info is not configured"))
     }
@@ -696,6 +700,88 @@ fn profile_output_dir(request: StartProfileRequest) -> Result<PathBuf, Status> {
     Ok(PathBuf::from(output_dir))
 }
 
+fn validate_update_weights_load_format(load_format: Option<&str>) -> Result<&'static str, Status> {
+    let Some(load_format) = load_format else {
+        return Ok("safetensors");
+    };
+    let load_format = load_format.trim();
+    match load_format {
+        "" => Err(Status::invalid_argument(
+            "load_format cannot be empty or whitespace only",
+        )),
+        "auto" | "safetensors" => Ok("safetensors"),
+        other => Err(Status::invalid_argument(format!(
+            "unsupported load_format {other:?}; supported values are auto and safetensors"
+        ))),
+    }
+}
+
+fn safetensors_weight_version(
+    artifacts: &LocalModelArtifacts,
+    load_format: &str,
+) -> Result<String, Status> {
+    let mut entries = artifacts
+        .safetensors()
+        .checkpoint_fingerprint_entries()
+        .map_err(|error| {
+            Status::invalid_argument(format!("invalid safetensors weights: {error}"))
+        })?;
+    entries.sort_by(|left, right| {
+        left.tensor_name
+            .cmp(&right.tensor_name)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+
+    let mut hasher = Sha256::new();
+    hasher.update(load_format.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(artifacts.model_path().to_string_lossy().as_bytes());
+    hasher.update(b"\0");
+    for entry in entries {
+        hasher.update(entry.tensor_name.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(entry.path.to_string_lossy().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(entry.dtype.as_bytes());
+        hasher.update(b"\0");
+        for dimension in entry.shape {
+            hasher.update(dimension.to_le_bytes());
+        }
+        hasher.update(entry.absolute_byte_offset.to_le_bytes());
+        hasher.update(entry.byte_len.to_le_bytes());
+        hasher.update(entry.fnv1a64.to_le_bytes());
+    }
+
+    let digest = hasher.finalize();
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!("safetensors-sha256:{hex}"))
+}
+
+fn updated_model_info_from_artifacts(
+    current: RouterGetModelInfoResponse,
+    artifacts: &LocalModelArtifacts,
+    weight_version: String,
+) -> RouterGetModelInfoResponse {
+    let model_path = artifacts.model_path().to_string_lossy().to_string();
+    let tokenizer_path = if current.tokenizer_path.trim().is_empty()
+        || current.tokenizer_path == current.model_path
+    {
+        model_path
+    } else {
+        current.tokenizer_path
+    };
+
+    RouterGetModelInfoResponse::from_local_model_artifacts(
+        artifacts,
+        current.served_model_name,
+        tokenizer_path,
+        weight_version,
+    )
+}
+
 fn unix_millis(time: SystemTime) -> u128 {
     time.duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -735,12 +821,6 @@ fn write_profile_file(
         .map_err(|error| Status::internal(format!("write profile JSON: {error}")))?;
 
     Ok(profile_path)
-}
-
-fn unimplemented_rpc(name: &'static str) -> Status {
-    Status::unimplemented(format!(
-        "{name} is not implemented in the Rust gRPC runtime yet"
-    ))
 }
 
 #[tonic::async_trait]
@@ -1298,9 +1378,42 @@ where
 
     async fn update_weights_from_disk(
         &self,
-        _request: Request<UpdateWeightsFromDiskRequest>,
+        request: Request<UpdateWeightsFromDiskRequest>,
     ) -> Result<Response<ControlResponse>, Status> {
-        Err(unimplemented_rpc("UpdateWeightsFromDisk"))
+        let request = request.into_inner();
+        let model_path = request.model_path.trim();
+        if model_path.is_empty() {
+            return Err(Status::invalid_argument(
+                "model_path cannot be empty or whitespace only",
+            ));
+        }
+        let load_format = validate_update_weights_load_format(request.load_format.as_deref())?;
+        let current = self.model_info()?;
+
+        let artifacts = LocalModelArtifacts::from_model_path(model_path).map_err(|error| {
+            Status::invalid_argument(format!("invalid local model artifacts: {error}"))
+        })?;
+        artifacts
+            .validate_checkpoint_for_supported_model()
+            .map_err(|error| {
+                Status::invalid_argument(format!("unsupported local model checkpoint: {error}"))
+            })?;
+        let weight_version = safetensors_weight_version(&artifacts, load_format)?;
+        let updated_model_info =
+            updated_model_info_from_artifacts(current, &artifacts, weight_version.clone());
+
+        *self
+            .model_info
+            .lock()
+            .map_err(|_| Status::internal("model info mutex poisoned"))? = Some(updated_model_info);
+
+        Ok(Response::new(ControlResponse {
+            success: true,
+            message: format!(
+                "registered {load_format} weights from {} with version {weight_version}",
+                artifacts.model_path().display()
+            ),
+        }))
     }
 }
 

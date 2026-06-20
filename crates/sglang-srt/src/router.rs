@@ -601,6 +601,42 @@ impl RouterGetModelInfoResponse {
         response
     }
 
+    pub fn from_local_model_artifacts(
+        artifacts: &LocalModelArtifacts,
+        served_model_name: String,
+        tokenizer_path: String,
+        weight_version: String,
+    ) -> Self {
+        let mut response = Self {
+            model_path: artifacts.model_path().to_string_lossy().to_string(),
+            tokenizer_path,
+            is_generation: true,
+            preferred_sampling_params: "{}".to_string(),
+            weight_version,
+            served_model_name,
+            max_context_length: 0,
+            vocab_size: 0,
+            supports_vision: false,
+            model_type: String::new(),
+            architectures: Vec::new(),
+            eos_token_ids: Vec::new(),
+            pad_token_id: 0,
+            bos_token_id: 0,
+            max_req_input_len: 0,
+            routed_expert_expected_group_count: 0,
+            routed_expert_actual_group_count: 0,
+            routed_expert_expected_weight_count: 0,
+            routed_expert_actual_weight_count: 0,
+        };
+
+        response.apply_model_config(artifacts.config().clone());
+        if let Ok(coverage) = artifacts.validate_routed_expert_checkpoint_coverage() {
+            response.apply_routed_expert_checkpoint_coverage(coverage);
+        }
+
+        response
+    }
+
     fn apply_model_config(&mut self, config: HfModelConfig) {
         if let Some(model_type) = config.model_type {
             self.model_type = model_type;
