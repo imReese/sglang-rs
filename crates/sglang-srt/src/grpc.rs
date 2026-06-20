@@ -17,6 +17,7 @@ use crate::openai_embedding::{
 use crate::openai_rerank::{
     parse_rerank_request, rerank_results_to_json, score_rerank_documents, truncate_rerank_results,
 };
+use crate::openai_score::{parse_score_request, score_response_json};
 use crate::proto::sglang::runtime::v1::generate_response::Body as ProtoGenerateResponseBody;
 use crate::proto::sglang::runtime::v1::sglang_service_server::{
     SglangService, SglangServiceServer,
@@ -1140,9 +1141,23 @@ where
 
     async fn score(
         &self,
-        _request: Request<OpenAiJsonRequest>,
+        request: Request<OpenAiJsonRequest>,
     ) -> Result<Response<OpenAiJsonResponse>, Status> {
-        Err(unimplemented_rpc("Score"))
+        let model_info = self.model_info()?;
+        let payload: Value = serde_json::from_slice(&request.into_inner().json)
+            .map_err(|e| Status::invalid_argument(format!("invalid score JSON: {e}")))?;
+        let request = parse_score_request(&payload, &model_info.served_model_name)
+            .map_err(Status::invalid_argument)?;
+        let json = {
+            let runtime = self
+                .runtime
+                .lock()
+                .map_err(|_| Status::internal("router runtime mutex poisoned"))?;
+            score_response_json(&runtime, &request)
+        };
+        let json = serde_json::to_vec(&json)
+            .map_err(|e| Status::internal(format!("serialize score JSON: {e}")))?;
+        Ok(Response::new(OpenAiJsonResponse { json }))
     }
 
     async fn rerank(

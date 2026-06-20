@@ -145,6 +145,23 @@ fn classify_request() -> Request<Body> {
         .unwrap()
 }
 
+fn score_request() -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/score")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "query": "rust router",
+                "items": ["prefill", "decode"],
+                "label_token_ids": [1, 2],
+            }))
+            .unwrap(),
+        ))
+        .unwrap()
+}
+
 /// Gap closer #1: PD mode with only decode workers → 503 with
 /// `no_prefill_workers_available`. The chat route is a prefill
 /// dispatch, so a decode-only pool means partial failure.
@@ -242,6 +259,42 @@ async fn pd_mode_classify_returns_bad_request() {
     let body_str = String::from_utf8_lossy(&body);
     assert!(
         body_str.contains("PD mode does not support /v1/classify"),
+        "body: {body_str}"
+    );
+}
+
+#[tokio::test]
+async fn pd_mode_score_returns_bad_request() {
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx(vec![
+        WorkerSpec {
+            id: WorkerId("p1".into()),
+            url: prefill.url.clone(),
+            mode: WorkerMode::Prefill,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: Some(8997),
+        },
+        WorkerSpec {
+            id: WorkerId("d1".into()),
+            url: decode.url.clone(),
+            mode: WorkerMode::Decode,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+        },
+    ]);
+    let app = build_router(ctx);
+
+    let res = app.oneshot(score_request()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        res.headers().get("x-router-error-code").unwrap(),
+        "bad_request"
+    );
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(
+        body_str.contains("PD mode does not support /v1/score"),
         "body: {body_str}"
     );
 }

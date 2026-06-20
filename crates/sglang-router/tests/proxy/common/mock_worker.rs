@@ -60,6 +60,7 @@ impl MockWorker {
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(chat))
             .route("/v1/rerank", post(chat))
+            .route("/v1/score", post(chat))
             .route("/v1/embeddings", post(chat))
             .route("/v1/classify", post(chat))
             .route("/generate", post(chat))

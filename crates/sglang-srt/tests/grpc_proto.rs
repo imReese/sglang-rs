@@ -650,6 +650,66 @@ async fn grpc_rerank_returns_raw_worker_results() {
 }
 
 #[tokio::test]
+async fn grpc_score_returns_openai_scoring_json() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "tiny",
+        "--grpc-mode",
+    ])
+    .expect("args should parse");
+    let runtime = RouterRuntime::new(Engine::new(
+        ByteTokenizer,
+        Scheduler::new(GrpcTwoStepWorker),
+    ));
+    let service = GrpcRouterService::with_server_args(runtime, &args);
+    let payload = serde_json::json!({
+        "model": "tiny",
+        "query": "rust pd router",
+        "items": [
+            "rust pd router transfers kv cache",
+            "unrelated python gateway"
+        ],
+        "label_token_ids": [1, 2, 3],
+        "apply_softmax": true
+    });
+
+    let response = service
+        .score(Request::new(OpenAiJsonRequest {
+            json: serde_json::to_vec(&payload).expect("payload should serialize"),
+            options: None,
+        }))
+        .await
+        .expect("score should execute")
+        .into_inner();
+
+    let body: serde_json::Value =
+        serde_json::from_slice(&response.json).expect("response should be JSON");
+    assert_eq!(body["object"], "scoring");
+    assert_eq!(body["model"], "tiny");
+    assert!(body["pooled_hidden_states"].is_null());
+    let scores = body["scores"].as_array().expect("scores");
+    assert_eq!(scores.len(), 2);
+    for row in scores {
+        let row = row.as_array().expect("score row");
+        assert_eq!(row.len(), 3);
+        let sum = row.iter().map(|value| value.as_f64().unwrap()).sum::<f64>();
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "softmax score row should sum to 1: {row:?}"
+        );
+    }
+    assert!(body["usage"]["prompt_tokens"].as_i64().unwrap() > 0);
+    assert_eq!(body["usage"]["completion_tokens"], 0);
+    assert_eq!(
+        body["usage"]["total_tokens"],
+        body["usage"]["prompt_tokens"]
+    );
+}
+
+#[tokio::test]
 async fn grpc_open_ai_embed_returns_embedding_json() {
     let args = ServerArgs::parse_from([
         "serve",

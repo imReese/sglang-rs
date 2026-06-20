@@ -142,6 +142,23 @@ pub async fn rerank(
     .await
 }
 
+/// POST /v1/score — plain-mode gateway-compatible proxy for SGLang's
+/// OpenAI-compatible scoring API.
+pub async fn score(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    routed_plain_json(
+        ctx,
+        headers,
+        body,
+        "/v1/score",
+        "PD mode does not support /v1/score",
+    )
+    .await
+}
+
 /// POST /v1/embeddings — plain-mode gateway-compatible proxy. SGLang's
 /// HTTP PD router rejects embeddings in PD mode, so this route only
 /// dispatches to plain workers.

@@ -66,6 +66,12 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
+            "/v1/score",
+            post(crate::server::routes::chat::score)
+                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
             "/v1/embeddings",
             post(crate::server::routes::chat::embeddings)
                 .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))

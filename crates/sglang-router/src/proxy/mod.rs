@@ -586,6 +586,7 @@ impl Proxy {
         if path != "/v1/chat/completions"
             && path != "/v1/completions"
             && path != "/v1/rerank"
+            && path != "/v1/score"
             && path != "/v1/embeddings"
             && path != "/v1/classify"
         {
@@ -642,6 +643,14 @@ impl Proxy {
                 "/v1/rerank" => {
                     let response = client
                         .rerank(GrpcRequest::new(request))
+                        .await
+                        .map_err(GrpcForwardError::Status)?
+                        .into_inner();
+                    return Ok::<_, GrpcForwardError>(response.json);
+                }
+                "/v1/score" => {
+                    let response = client
+                        .score(GrpcRequest::new(request))
                         .await
                         .map_err(GrpcForwardError::Status)?
                         .into_inner();

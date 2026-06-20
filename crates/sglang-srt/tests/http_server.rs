@@ -198,6 +198,69 @@ async fn http_server_accepts_rerank_requests() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_accepts_score_requests() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "tiny-scorer",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let service = build_bootstrap_http_router_service(&args);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let scored = post_json_with_retry(
+        addr,
+        "/v1/score",
+        r#"{
+            "model": "tiny-scorer",
+            "query": "rust pd router",
+            "items": ["rust pd router transfers kv cache", "python gateway"],
+            "label_token_ids": [1, 2, 3],
+            "apply_softmax": true
+        }"#,
+    )
+    .await;
+
+    assert_eq!(scored["object"], "scoring");
+    assert_eq!(scored["model"], "tiny-scorer");
+    let scores = scored["scores"].as_array().expect("scores");
+    assert_eq!(scores.len(), 2);
+    for row in scores {
+        let row = row.as_array().expect("score row");
+        assert_eq!(row.len(), 3);
+        let sum = row.iter().map(|value| value.as_f64().unwrap()).sum::<f64>();
+        assert!((sum - 1.0).abs() < 1e-6);
+    }
+    assert!(scored["usage"]["prompt_tokens"].as_i64().unwrap() > 0);
+    assert_eq!(
+        scored["usage"]["total_tokens"],
+        scored["usage"]["prompt_tokens"]
+    );
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_server_accepts_embedding_requests() {
     let args = ServerArgs::parse_from([
         "serve",
