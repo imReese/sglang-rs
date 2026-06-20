@@ -1,3 +1,6 @@
+use std::fs;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use prost::Message;
 use tonic::codegen::tokio_stream::StreamExt;
 use tonic::{Code, Request};
@@ -14,8 +17,8 @@ use sglang_srt::proto::sglang::runtime::v1::{
     AbortRequest, ClassifyRequest, ContinueGenerationRequest, DetokenizeRequest,
     DisaggregatedParams, EmbedRequest, FlushCacheRequest, GenerateRequest, GetLoadRequest,
     GetModelInfoRequest, GetServerInfoRequest, ListModelsRequest, OpenAiJsonRequest,
-    PauseGenerationRequest, RequestOptions, SamplingParams, TextEmbedRequest, TextGenerateRequest,
-    TokenizeRequest, TokenizedInput,
+    PauseGenerationRequest, RequestOptions, SamplingParams, StartProfileRequest,
+    StopProfileRequest, TextEmbedRequest, TextGenerateRequest, TokenizeRequest, TokenizedInput,
 };
 use sglang_srt::router::{RouterProtocolError, RouterRuntime};
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
@@ -45,6 +48,17 @@ impl ModelWorker for GrpcTwoStepWorker {
         BatchGeneratedTokens::from_batch(batch, vec![token])
             .expect("output shape should match batch")
     }
+}
+
+fn unique_profile_dir() -> std::path::PathBuf {
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "sglang-rs-grpc-profile-{}-{suffix}",
+        std::process::id()
+    ))
 }
 
 #[test]
@@ -1315,6 +1329,57 @@ async fn grpc_flush_cache_calls_router_runtime() {
 
     assert!(response.success);
     assert_eq!(response.message, "cache flushed");
+}
+
+#[tokio::test]
+async fn grpc_profile_start_stop_writes_trace_file() {
+    let service = GrpcRouterService::from_engine(Engine::new(
+        ByteTokenizer,
+        Scheduler::new(GrpcTwoStepWorker),
+    ));
+    let output_dir = unique_profile_dir();
+
+    let start = service
+        .start_profile(Request::new(StartProfileRequest {
+            output_dir: Some(output_dir.to_string_lossy().to_string()),
+        }))
+        .await
+        .expect("start profile should execute")
+        .into_inner();
+    assert!(start.success);
+    assert!(start.message.contains("profile started"));
+
+    let duplicate = service
+        .start_profile(Request::new(StartProfileRequest { output_dir: None }))
+        .await
+        .expect_err("duplicate profile start should be rejected");
+    assert_eq!(duplicate.code(), Code::AlreadyExists);
+
+    let stop = service
+        .stop_profile(Request::new(StopProfileRequest {}))
+        .await
+        .expect("stop profile should execute")
+        .into_inner();
+    assert!(stop.success);
+    assert!(stop.message.contains("profile stopped"));
+
+    let entries = fs::read_dir(&output_dir)
+        .expect("profile output directory should exist")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("profile directory should be readable");
+    assert_eq!(entries.len(), 1);
+    let profile: serde_json::Value = serde_json::from_slice(
+        &fs::read(entries[0].path()).expect("profile file should be readable"),
+    )
+    .expect("profile file should contain JSON");
+    assert_eq!(profile["profile"]["transport"], "tonic-grpc");
+    assert!(profile["profile"]["duration_ms"].as_u64().is_some());
+    assert!(
+        profile["profile"]["started_unix_ms"].as_u64().unwrap()
+            <= profile["profile"]["stopped_unix_ms"].as_u64().unwrap()
+    );
+
+    fs::remove_dir_all(output_dir).expect("profile temp directory should clean up");
 }
 
 #[tokio::test]

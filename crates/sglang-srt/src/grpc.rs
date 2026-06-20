@@ -1,9 +1,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::fs;
 use std::future::{Future, pending};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use tonic::{Code, Request, Response, Status};
@@ -77,6 +80,13 @@ pub struct GrpcRouterService<T, W> {
     model_info: Option<RouterGetModelInfoResponse>,
     max_transfer_polls: usize,
     server_info_attributes: HashMap<String, String>,
+    profile: Arc<Mutex<Option<GrpcProfileSession>>>,
+}
+
+#[derive(Clone, Debug)]
+struct GrpcProfileSession {
+    output_dir: PathBuf,
+    started_at: SystemTime,
 }
 
 #[derive(Debug)]
@@ -115,6 +125,7 @@ impl<T, W> GrpcRouterService<T, W> {
             model_info: None,
             max_transfer_polls: 0,
             server_info_attributes: default_server_info_attributes(),
+            profile: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -127,6 +138,7 @@ impl<T, W> GrpcRouterService<T, W> {
             model_info: Some(model_info),
             max_transfer_polls: 0,
             server_info_attributes: default_server_info_attributes(),
+            profile: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -669,6 +681,62 @@ fn proto_usage(prompt_tokens: usize) -> Result<Usage, Status> {
     })
 }
 
+fn profile_output_dir(request: StartProfileRequest) -> Result<PathBuf, Status> {
+    let output_dir = request.output_dir.unwrap_or_else(|| {
+        std::env::temp_dir()
+            .join("sglang-rs-profile")
+            .to_string_lossy()
+            .to_string()
+    });
+    if output_dir.trim().is_empty() {
+        return Err(Status::invalid_argument(
+            "profile output_dir cannot be empty or whitespace only",
+        ));
+    }
+    Ok(PathBuf::from(output_dir))
+}
+
+fn unix_millis(time: SystemTime) -> u128 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn write_profile_file(
+    session: GrpcProfileSession,
+    stopped_at: SystemTime,
+    attributes: &HashMap<String, String>,
+) -> Result<PathBuf, Status> {
+    fs::create_dir_all(&session.output_dir)
+        .map_err(|error| Status::internal(format!("create profile output directory: {error}")))?;
+
+    let started_unix_ms = unix_millis(session.started_at);
+    let stopped_unix_ms = unix_millis(stopped_at);
+    let duration_ms = stopped_at
+        .duration_since(session.started_at)
+        .unwrap_or_default()
+        .as_millis();
+    let profile_path = session.output_dir.join(format!(
+        "sglang-profile-{started_unix_ms}-{stopped_unix_ms}.json"
+    ));
+    let profile = json!({
+        "profile": {
+            "transport": attributes.get("transport").map(String::as_str).unwrap_or("tonic-grpc"),
+            "output_dir": session.output_dir,
+            "started_unix_ms": started_unix_ms,
+            "stopped_unix_ms": stopped_unix_ms,
+            "duration_ms": duration_ms,
+            "attributes": attributes,
+        }
+    });
+    let bytes = serde_json::to_vec_pretty(&profile)
+        .map_err(|error| Status::internal(format!("serialize profile JSON: {error}")))?;
+    fs::write(&profile_path, bytes)
+        .map_err(|error| Status::internal(format!("write profile JSON: {error}")))?;
+
+    Ok(profile_path)
+}
+
 fn unimplemented_rpc(name: &'static str) -> Status {
     Status::unimplemented(format!(
         "{name} is not implemented in the Rust gRPC runtime yet"
@@ -1185,16 +1253,47 @@ where
 
     async fn start_profile(
         &self,
-        _request: Request<StartProfileRequest>,
+        request: Request<StartProfileRequest>,
     ) -> Result<Response<ControlResponse>, Status> {
-        Err(unimplemented_rpc("StartProfile"))
+        let output_dir = profile_output_dir(request.into_inner())?;
+        fs::create_dir_all(&output_dir).map_err(|error| {
+            Status::internal(format!("create profile output directory: {error}"))
+        })?;
+        let mut profile = self
+            .profile
+            .lock()
+            .map_err(|_| Status::internal("profile mutex poisoned"))?;
+        if profile.is_some() {
+            return Err(Status::already_exists("profile is already running"));
+        }
+        *profile = Some(GrpcProfileSession {
+            output_dir: output_dir.clone(),
+            started_at: SystemTime::now(),
+        });
+
+        Ok(Response::new(ControlResponse {
+            success: true,
+            message: format!("profile started: {}", output_dir.display()),
+        }))
     }
 
     async fn stop_profile(
         &self,
         _request: Request<StopProfileRequest>,
     ) -> Result<Response<ControlResponse>, Status> {
-        Err(unimplemented_rpc("StopProfile"))
+        let session = self
+            .profile
+            .lock()
+            .map_err(|_| Status::internal("profile mutex poisoned"))?
+            .take()
+            .ok_or_else(|| Status::failed_precondition("profile is not running"))?;
+        let profile_path =
+            write_profile_file(session, SystemTime::now(), &self.server_info_attributes)?;
+
+        Ok(Response::new(ControlResponse {
+            success: true,
+            message: format!("profile stopped: {}", profile_path.display()),
+        }))
     }
 
     async fn update_weights_from_disk(
