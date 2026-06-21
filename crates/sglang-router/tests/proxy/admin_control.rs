@@ -77,6 +77,133 @@ fn flush_cache_request(body: serde_json::Value) -> Request<Body> {
         .unwrap()
 }
 
+fn admin_request(path: &str, body: serde_json::Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn pause_and_continue_generation_proxy_to_single_plain_worker() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let cfg = config(&["tiny"]);
+    let ctx = build_ctx(
+        cfg,
+        vec![WorkerSpec {
+            id: WorkerId("plain-1".into()),
+            url: worker.url.clone(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+        }],
+    );
+    let app = build_router(ctx);
+
+    let pause = app
+        .clone()
+        .oneshot(admin_request(
+            "/pause_generation",
+            serde_json::json!({"mode": "in_place"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(pause.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&pause.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["success"], true);
+    assert_eq!(body["affected_workers"], 1);
+
+    let captured_pause = worker
+        .captured
+        .lock()
+        .unwrap()
+        .last_body
+        .clone()
+        .expect("plain worker should receive pause request");
+    let forwarded_pause: serde_json::Value = serde_json::from_slice(&captured_pause).unwrap();
+    assert_eq!(forwarded_pause["mode"], "in_place");
+
+    let cont = app
+        .oneshot(admin_request(
+            "/continue_generation",
+            serde_json::json!({"torch_empty_cache": false}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cont.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&cont.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["success"], true);
+    assert_eq!(body["affected_workers"], 1);
+
+    let captured_continue = worker
+        .captured
+        .lock()
+        .unwrap()
+        .last_body
+        .clone()
+        .expect("plain worker should receive continue request");
+    let forwarded_continue: serde_json::Value = serde_json::from_slice(&captured_continue).unwrap();
+    assert_eq!(forwarded_continue["torch_empty_cache"], false);
+}
+
+#[tokio::test]
+async fn pause_generation_proxies_to_prefill_and_decode_pd_workers() {
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let cfg = config(&["tiny"]);
+    let ctx = build_ctx(
+        cfg,
+        vec![
+            WorkerSpec {
+                id: WorkerId("prefill-1".into()),
+                url: prefill.url.clone(),
+                mode: WorkerMode::Prefill,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: Some(8997),
+            },
+            WorkerSpec {
+                id: WorkerId("decode-1".into()),
+                url: decode.url.clone(),
+                mode: WorkerMode::Decode,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: None,
+            },
+        ],
+    );
+    let app = build_router(ctx);
+
+    let pause = app
+        .oneshot(admin_request(
+            "/pause_generation",
+            serde_json::json!({"model": "tiny", "mode": "retract"}),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(pause.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&pause.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["success"], true);
+    assert_eq!(body["affected_workers"], 2);
+
+    for worker in [&prefill, &decode] {
+        let captured = worker
+            .captured
+            .lock()
+            .unwrap()
+            .last_body
+            .clone()
+            .expect("PD worker should receive pause request");
+        let forwarded: serde_json::Value = serde_json::from_slice(&captured).unwrap();
+        assert_eq!(forwarded["model"], "tiny");
+        assert_eq!(forwarded["mode"], "retract");
+    }
+}
+
 #[tokio::test]
 async fn flush_cache_proxies_to_single_plain_worker() {
     let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;

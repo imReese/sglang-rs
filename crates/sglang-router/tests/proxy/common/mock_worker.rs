@@ -66,6 +66,8 @@ impl MockWorker {
             .route("/generate", post(chat))
             .route("/update_weights_from_disk", post(chat))
             .route("/flush_cache", post(chat))
+            .route("/pause_generation", post(chat))
+            .route("/continue_generation", post(chat))
             .route("/server_info", get(serve_tiny_server_info))
             .with_state(state);
 
@@ -450,6 +452,20 @@ async fn chat(
         return Json(serde_json::json!({
             "success": true,
             "message": "cache flushed",
+        }))
+        .into_response();
+    }
+    if uri.path() == "/pause_generation" {
+        return Json(serde_json::json!({
+            "success": true,
+            "message": "generation paused",
+        }))
+        .into_response();
+    }
+    if uri.path() == "/continue_generation" {
+        return Json(serde_json::json!({
+            "success": true,
+            "message": "generation continued",
         }))
         .into_response();
     }

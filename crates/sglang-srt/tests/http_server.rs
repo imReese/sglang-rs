@@ -1269,6 +1269,60 @@ async fn http_server_flush_cache_uses_router_runtime_state() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_pause_and_continue_generation_use_router_runtime_state() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let service = build_bootstrap_http_router_service(&args);
+    let addr = unused_local_addr();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let pause_response = post_json_with_retry(addr, "/pause_generation", "{}").await;
+    assert_eq!(pause_response["success"], true);
+    assert_eq!(pause_response["message"], "generation paused");
+
+    let paused_generate =
+        request_raw_with_retry(addr, "POST", "/generate", Some(r#"{"text":"hello"}"#)).await;
+    assert!(
+        paused_generate.starts_with("HTTP/1.1 412"),
+        "paused generate should be rejected, got {paused_generate}"
+    );
+
+    let continue_response = post_json_with_retry(addr, "/continue_generation", "{}").await;
+    assert_eq!(continue_response["success"], true);
+    assert_eq!(continue_response["message"], "generation continued");
+
+    let generated = post_json_with_retry(
+        addr,
+        "/generate",
+        r#"{"text":"hello","sampling_params":{"max_new_tokens":1}}"#,
+    )
+    .await;
+    assert_eq!(generated["usage"]["completion_tokens"], 1);
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_server_rejects_disaggregated_generate_without_transfer_runtime() {
     let args = ServerArgs::parse_from([
         "serve",

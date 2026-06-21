@@ -67,6 +67,38 @@ pub async fn flush_cache(
     .into_response())
 }
 
+pub async fn pause_generation(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    forward_generation_control(
+        ctx,
+        headers,
+        body,
+        "/pause_generation",
+        "generation paused",
+        "paused generation",
+    )
+    .await
+}
+
+pub async fn continue_generation(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    forward_generation_control(
+        ctx,
+        headers,
+        body,
+        "/continue_generation",
+        "generation continued",
+        "continued generation",
+    )
+    .await
+}
+
 pub async fn update_weights_from_disk(
     State(ctx): State<Arc<AppContext>>,
     headers: HeaderMap,
@@ -112,6 +144,47 @@ pub async fn update_weights_from_disk(
         "updated_workers": updated_workers,
         "model": model,
         "load_format": probe.load_format,
+    }))
+    .into_response())
+}
+
+async fn forward_generation_control(
+    ctx: Arc<AppContext>,
+    headers: HeaderMap,
+    body: Bytes,
+    upstream_path: &'static str,
+    message: &'static str,
+    action: &'static str,
+) -> Result<Response<Body>, ApiError> {
+    let probe = parse_admin_model_probe(&body)?;
+    let model = select_admin_model(&ctx, probe.model)?;
+    let model_id = ModelId(model.clone());
+    let workers = admin_control_workers(&ctx, &model_id, &model)?;
+    let mut affected_workers = 0usize;
+
+    for worker in workers {
+        let response = ctx
+            .proxy
+            .forward_json_to(
+                &worker.url,
+                &worker.breaker,
+                upstream_path,
+                &headers,
+                body.clone(),
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Ok(response);
+        }
+        affected_workers += 1;
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": message,
+        "affected_workers": affected_workers,
+        "model": model,
+        "action": action,
     }))
     .into_response())
 }

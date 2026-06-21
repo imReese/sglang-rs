@@ -19,10 +19,12 @@ use serde_json::Value;
 use sglang_srt::proto::sglang::runtime::v1::generate_response::Body as ProtoGenerateResponseBody;
 use sglang_srt::proto::sglang::runtime::v1::sglang_service_client::SglangServiceClient;
 use sglang_srt::proto::sglang::runtime::v1::{
+    ContinueGenerationRequest as ProtoContinueGenerationRequest,
     DisaggregatedParams as ProtoDisaggregatedParams, FlushCacheRequest as ProtoFlushCacheRequest,
     GenerateRequest as ProtoGenerateRequest, GenerateResponse as ProtoGenerateResponse,
-    OpenAiJsonRequest, OpenAiJsonResponse, RequestOptions as ProtoRequestOptions,
-    SamplingParams as ProtoSamplingParams, TextGenerateRequest as ProtoTextGenerateRequest,
+    OpenAiJsonRequest, OpenAiJsonResponse, PauseGenerationRequest as ProtoPauseGenerationRequest,
+    RequestOptions as ProtoRequestOptions, SamplingParams as ProtoSamplingParams,
+    TextGenerateRequest as ProtoTextGenerateRequest,
     UpdateWeightsFromDiskRequest as ProtoUpdateWeightsFromDiskRequest,
 };
 use std::collections::HashMap;
@@ -373,6 +375,13 @@ enum NativeGenerateRequest {
     Tokenized(ProtoGenerateRequest),
 }
 
+#[derive(Clone, Copy)]
+enum GrpcControlRpc {
+    FlushCache,
+    PauseGeneration,
+    ContinueGeneration,
+}
+
 fn proto_native_generate_request_from_json(
     body: &[u8],
     headers: &HeaderMap,
@@ -622,6 +631,16 @@ impl Proxy {
         if path == "/flush_cache" {
             return self.forward_grpc_flush_cache(worker_url, breaker).await;
         }
+        if path == "/pause_generation" {
+            return self
+                .forward_grpc_control_rpc(worker_url, breaker, GrpcControlRpc::PauseGeneration)
+                .await;
+        }
+        if path == "/continue_generation" {
+            return self
+                .forward_grpc_control_rpc(worker_url, breaker, GrpcControlRpc::ContinueGeneration)
+                .await;
+        }
         if path != "/v1/chat/completions"
             && path != "/v1/completions"
             && path != "/v1/rerank"
@@ -763,6 +782,16 @@ impl Proxy {
         worker_url: &str,
         breaker: &CircuitBreaker,
     ) -> Result<Response<Body>, ApiError> {
+        self.forward_grpc_control_rpc(worker_url, breaker, GrpcControlRpc::FlushCache)
+            .await
+    }
+
+    async fn forward_grpc_control_rpc(
+        &self,
+        worker_url: &str,
+        breaker: &CircuitBreaker,
+        rpc: GrpcControlRpc,
+    ) -> Result<Response<Body>, ApiError> {
         let parsed = parse_worker_url(worker_url, breaker)?;
         let endpoint = grpc_endpoint_from_worker_url(&parsed).ok_or_else(|| {
             breaker.record_failure();
@@ -789,11 +818,25 @@ impl Proxy {
                     ))
                 })?;
             let mut client = SglangServiceClient::new(channel);
-            client
-                .flush_cache(GrpcRequest::new(ProtoFlushCacheRequest {}))
-                .await
-                .map(|response| response.into_inner())
-                .map_err(GrpcForwardError::Status)
+            match rpc {
+                GrpcControlRpc::FlushCache => {
+                    client
+                        .flush_cache(GrpcRequest::new(ProtoFlushCacheRequest {}))
+                        .await
+                }
+                GrpcControlRpc::PauseGeneration => {
+                    client
+                        .pause_generation(GrpcRequest::new(ProtoPauseGenerationRequest {}))
+                        .await
+                }
+                GrpcControlRpc::ContinueGeneration => {
+                    client
+                        .continue_generation(GrpcRequest::new(ProtoContinueGenerationRequest {}))
+                        .await
+                }
+            }
+            .map(|response| response.into_inner())
+            .map_err(GrpcForwardError::Status)
         };
 
         let response = match tokio::time::timeout(self.request_timeout, fut).await {

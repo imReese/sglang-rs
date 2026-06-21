@@ -52,6 +52,18 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
+            "/pause_generation",
+            post(crate::server::routes::admin::pause_generation)
+                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
+            "/continue_generation",
+            post(crate::server::routes::admin::continue_generation)
+                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
             "/v1/tokenize",
             post(crate::server::routes::tokenize::tokenize),
         )

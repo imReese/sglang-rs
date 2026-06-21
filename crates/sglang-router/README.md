@@ -2,11 +2,12 @@
 
 Slim, KV-aware, OpenAI-compatible router for SGLang workers.
 
-**Status:** functional single-worker HTTP proxy. Exposes `/v1/tokenize`,
-`/v1/detokenize`, `/v1/models`, `/v1/chat/completions` (buffered and SSE),
-plus `/healthz` / `/readyz`. Forwards to one configured worker via reqwest;
-parity-tested against `transformers.AutoTokenizer`. Multi-worker routing,
-service discovery, and observability still pending.
+**Status:** functional HTTP/gRPC proxy aligned with the SGLang model gateway
+shape. Exposes `/v1/tokenize`, `/v1/detokenize`, `/v1/models`,
+`/v1/chat/completions` (buffered and SSE), `/generate`, plus `/healthz` /
+`/readyz`. Control-plane forwarding covers `/update_weights_from_disk`,
+`/flush_cache`, `/pause_generation`, and `/continue_generation` across plain
+workers and PD prefill/decode pools.
 
 ## Building
 

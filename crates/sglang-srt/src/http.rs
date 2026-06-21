@@ -21,7 +21,8 @@ use crate::openai_score::{parse_score_request, score_response_json};
 use crate::router::{
     RouterDisaggregatedParams, RouterGenerateComplete, RouterGenerateRequest,
     RouterGenerateResponse, RouterGenerateResponseBody, RouterGetModelInfoResponse, RouterRuntime,
-    RouterSamplingParams, RouterTextGenerateRequest, RouterTokenizedInput,
+    RouterRuntimeError, RouterSamplingParams, RouterStatusCode, RouterTextGenerateRequest,
+    RouterTokenizedInput,
 };
 use crate::tokenizer::Tokenizer;
 use crate::types::BootstrapRoom;
@@ -158,6 +159,8 @@ where
                 "/flush_cache",
                 get(flush_cache::<T, W>).post(flush_cache::<T, W>),
             )
+            .route("/pause_generation", post(pause_generation::<T, W>))
+            .route("/continue_generation", post(continue_generation::<T, W>))
             .route(
                 "/update_weights_from_disk",
                 post(update_weights_from_disk::<T, W>),
@@ -426,6 +429,40 @@ where
         };
         (StatusCode::BAD_REQUEST, message).into_response()
     }
+}
+
+async fn pause_generation<T, W>(State(service): State<HttpRouterService<T, W>>) -> Response
+where
+    T: Tokenizer + Send + 'static,
+    W: WorkerExecutor + Send + 'static,
+{
+    let response = match service.runtime.lock() {
+        Ok(mut runtime) => runtime.pause_generation(),
+        Err(_) => return internal_error_json("router runtime mutex poisoned"),
+    };
+
+    Json(json!({
+        "success": response.success,
+        "message": response.message,
+    }))
+    .into_response()
+}
+
+async fn continue_generation<T, W>(State(service): State<HttpRouterService<T, W>>) -> Response
+where
+    T: Tokenizer + Send + 'static,
+    W: WorkerExecutor + Send + 'static,
+{
+    let response = match service.runtime.lock() {
+        Ok(mut runtime) => runtime.continue_generation(),
+        Err(_) => return internal_error_json("router runtime mutex poisoned"),
+    };
+
+    Json(json!({
+        "success": response.success,
+        "message": response.message,
+    }))
+    .into_response()
 }
 
 async fn update_weights_from_disk<T, W>(
@@ -1027,11 +1064,7 @@ where
             }
             (StatusCode::OK, Json(Value::Array(body))).into_response()
         }
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": { "message": error.to_string() } })),
-        )
-            .into_response(),
+        Err(error) => router_runtime_error_json(error),
     }
 }
 
@@ -1114,6 +1147,29 @@ fn http_generate_stream_response_from_router_responses(
         HeaderValue::from_static("text/event-stream"),
     );
     response
+}
+
+fn router_runtime_error_json(error: RouterRuntimeError) -> Response {
+    let status = match &error {
+        RouterRuntimeError::Protocol(protocol) => {
+            router_status_code_to_http_status(protocol.status_code())
+        }
+        RouterRuntimeError::Runtime(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+
+    (
+        status,
+        Json(json!({ "error": { "message": error.to_string() } })),
+    )
+        .into_response()
+}
+
+fn router_status_code_to_http_status(status_code: RouterStatusCode) -> StatusCode {
+    match status_code {
+        RouterStatusCode::InvalidArgument => StatusCode::BAD_REQUEST,
+        RouterStatusCode::ResourceExhausted => StatusCode::TOO_MANY_REQUESTS,
+        RouterStatusCode::FailedPrecondition => StatusCode::PRECONDITION_FAILED,
+    }
 }
 
 async fn chat_completions<T, W>(

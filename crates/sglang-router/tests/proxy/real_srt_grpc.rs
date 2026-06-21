@@ -342,6 +342,109 @@ async fn router_flush_cache_reaches_real_rust_srt_grpc_worker() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn router_pause_and_continue_generation_reach_real_rust_srt_grpc_worker() {
+    let addr = unused_local_addr();
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "tiny",
+        "--host",
+        &addr.ip().to_string(),
+        "--port",
+        &addr.port().to_string(),
+        "--grpc-mode",
+        "--num-reserved-decode-tokens",
+        "8",
+    ])
+    .expect("gRPC SRT args should parse");
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(launch_grpc_server_with_shutdown(args, async move {
+        let _ = shutdown_rx.await;
+    }));
+    wait_for_grpc_health(addr).await;
+
+    let app = build_router(build_ctx_with_grpc_worker(addr));
+    let pause = Request::builder()
+        .method("POST")
+        .uri("/pause_generation")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({"model": "tiny"})).unwrap(),
+        ))
+        .unwrap();
+    let pause_response = app
+        .clone()
+        .oneshot(pause)
+        .await
+        .expect("router should respond");
+    assert_eq!(pause_response.status(), StatusCode::OK);
+    let body = pause_response
+        .into_body()
+        .collect()
+        .await
+        .expect("router response body should collect")
+        .to_bytes();
+    let body: serde_json::Value =
+        serde_json::from_slice(&body).expect("response should be pause JSON");
+    assert_eq!(body["success"], true);
+    assert_eq!(body["message"], "generation paused");
+    assert_eq!(body["affected_workers"], 1);
+
+    let paused_generate = Request::builder()
+        .method("POST")
+        .uri("/generate")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "tiny",
+                "text": "hi",
+                "sampling_params": {"max_new_tokens": 1},
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let paused_response = app
+        .clone()
+        .oneshot(paused_generate)
+        .await
+        .expect("router should respond");
+    assert_eq!(paused_response.status(), StatusCode::BAD_REQUEST);
+
+    let cont = Request::builder()
+        .method("POST")
+        .uri("/continue_generation")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({"model": "tiny"})).unwrap(),
+        ))
+        .unwrap();
+    let continue_response = app.oneshot(cont).await.expect("router should respond");
+    assert_eq!(continue_response.status(), StatusCode::OK);
+    let body = continue_response
+        .into_body()
+        .collect()
+        .await
+        .expect("router response body should collect")
+        .to_bytes();
+    let body: serde_json::Value =
+        serde_json::from_slice(&body).expect("response should be continue JSON");
+    assert_eq!(body["success"], true);
+    assert_eq!(body["message"], "generation continued");
+    assert_eq!(body["affected_workers"], 1);
+
+    shutdown_tx
+        .send(())
+        .expect("gRPC worker should still be running");
+    server
+        .await
+        .expect("gRPC server task should join")
+        .expect("gRPC server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn router_completions_reaches_real_rust_srt_grpc_worker() {
     let addr = unused_local_addr();
     let args = ServerArgs::parse_from([
