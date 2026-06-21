@@ -20,9 +20,9 @@ use crate::openai_rerank::{
 use crate::openai_score::{parse_score_request, score_response_json};
 use crate::router::{
     RouterDisaggregatedParams, RouterGenerateComplete, RouterGenerateRequest,
-    RouterGenerateResponse, RouterGenerateResponseBody, RouterGetModelInfoResponse, RouterRuntime,
-    RouterRuntimeError, RouterSamplingParams, RouterStatusCode, RouterTextGenerateRequest,
-    RouterTokenizedInput,
+    RouterGenerateResponse, RouterGenerateResponseBody, RouterGetModelInfoResponse,
+    RouterProtocolError, RouterRuntime, RouterRuntimeError, RouterSamplingParams, RouterStatusCode,
+    RouterTextGenerateRequest, RouterTokenizedInput,
 };
 use crate::tokenizer::Tokenizer;
 use crate::types::BootstrapRoom;
@@ -161,6 +161,7 @@ where
             )
             .route("/pause_generation", post(pause_generation::<T, W>))
             .route("/continue_generation", post(continue_generation::<T, W>))
+            .route("/abort_request", post(abort_request::<T, W>))
             .route(
                 "/update_weights_from_disk",
                 post(update_weights_from_disk::<T, W>),
@@ -455,6 +456,42 @@ where
 {
     let response = match service.runtime.lock() {
         Ok(mut runtime) => runtime.continue_generation(),
+        Err(_) => return internal_error_json("router runtime mutex poisoned"),
+    };
+
+    Json(json!({
+        "success": response.success,
+        "message": response.message,
+    }))
+    .into_response()
+}
+
+async fn abort_request<T, W>(
+    State(service): State<HttpRouterService<T, W>>,
+    Json(payload): Json<Value>,
+) -> Response
+where
+    T: Tokenizer + Send + 'static,
+    W: WorkerExecutor + Send + 'static,
+{
+    if payload
+        .get("abort_all")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return bad_request_json("abort_all is not supported by the Rust HTTP runtime yet");
+    }
+    let request_id = payload
+        .get("rid")
+        .or_else(|| payload.get("request_id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    let response = match service.runtime.lock() {
+        Ok(mut runtime) => match runtime.abort_request(request_id) {
+            Ok(response) => response,
+            Err(error) => return router_protocol_error_json(error),
+        },
         Err(_) => return internal_error_json("router runtime mutex poisoned"),
     };
 
@@ -1159,6 +1196,14 @@ fn router_runtime_error_json(error: RouterRuntimeError) -> Response {
 
     (
         status,
+        Json(json!({ "error": { "message": error.to_string() } })),
+    )
+        .into_response()
+}
+
+fn router_protocol_error_json(error: RouterProtocolError) -> Response {
+    (
+        router_status_code_to_http_status(error.status_code()),
         Json(json!({ "error": { "message": error.to_string() } })),
     )
         .into_response()

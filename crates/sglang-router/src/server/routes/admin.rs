@@ -6,7 +6,7 @@ use crate::policies::registry::{PdPoolResolver, PdPools, PdResolveError};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::workers::Worker;
-use axum::body::Body;
+use axum::body::{to_bytes, Body};
 use axum::extract::State;
 use axum::http::{HeaderMap, Response};
 use axum::response::IntoResponse;
@@ -28,6 +28,25 @@ struct UpdateWeightsProbe {
 struct AdminModelProbe {
     #[serde(default)]
     model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AbortProbe {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    rid: Option<String>,
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    abort_all: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ControlResponseBody {
+    success: bool,
+    #[serde(default)]
+    message: String,
 }
 
 pub async fn flush_cache(
@@ -97,6 +116,89 @@ pub async fn continue_generation(
         "continued generation",
     )
     .await
+}
+
+pub async fn abort_request(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    let probe: AbortProbe = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::BadRequest("request body must be a JSON object".to_string()))?;
+    if probe.abort_all {
+        return Err(ApiError::BadRequest(
+            "abort_all is not supported by the Rust router yet".to_string(),
+        ));
+    }
+    let request_id = probe
+        .rid
+        .as_deref()
+        .or(probe.request_id.as_deref())
+        .unwrap_or_default();
+    if request_id.is_empty() {
+        return Err(ApiError::BadRequest("rid must be non-empty".to_string()));
+    }
+
+    let model = select_admin_model(&ctx, probe.model)?;
+    let model_id = ModelId(model.clone());
+    let workers = admin_control_workers(&ctx, &model_id, &model)?;
+    let mut affected_workers = 0usize;
+    let mut aborted_workers = 0usize;
+    let mut messages = Vec::new();
+
+    for worker in workers {
+        let response = ctx
+            .proxy
+            .forward_json_to(
+                &worker.url,
+                &worker.breaker,
+                "/abort_request",
+                &headers,
+                body.clone(),
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Ok(response);
+        }
+
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map_err(|error| {
+                ApiError::Internal(anyhow::anyhow!("read abort response body: {error}"))
+            })?;
+        let control: ControlResponseBody = serde_json::from_slice(&bytes).map_err(|error| {
+            ApiError::Internal(anyhow::anyhow!("decode abort response body: {error}"))
+        })?;
+        affected_workers += 1;
+        if control.success {
+            aborted_workers += 1;
+        }
+        if !control.message.is_empty()
+            && !messages.iter().any(|message| message == &control.message)
+        {
+            messages.push(control.message);
+        }
+    }
+
+    let success = aborted_workers > 0;
+    let message = if success {
+        "request aborted".to_string()
+    } else {
+        messages
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "request not found".to_string())
+    };
+
+    Ok(Json(serde_json::json!({
+        "success": success,
+        "message": message,
+        "affected_workers": affected_workers,
+        "aborted_workers": aborted_workers,
+        "model": model,
+        "rid": request_id,
+    }))
+    .into_response())
 }
 
 pub async fn update_weights_from_disk(

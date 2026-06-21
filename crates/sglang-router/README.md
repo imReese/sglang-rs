@@ -6,8 +6,8 @@ Slim, KV-aware, OpenAI-compatible router for SGLang workers.
 shape. Exposes `/v1/tokenize`, `/v1/detokenize`, `/v1/models`,
 `/v1/chat/completions` (buffered and SSE), `/generate`, plus `/healthz` /
 `/readyz`. Control-plane forwarding covers `/update_weights_from_disk`,
-`/flush_cache`, `/pause_generation`, and `/continue_generation` across plain
-workers and PD prefill/decode pools.
+`/flush_cache`, `/pause_generation`, `/continue_generation`, and
+`/abort_request` across plain workers and PD prefill/decode pools.
 
 ## Building
 
