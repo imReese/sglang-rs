@@ -6,13 +6,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::engine_info_bootstrap::EngineInfoBootstrapService;
 use crate::openai_classify::{classify_response_json, parse_classify_request};
 use crate::openai_embedding::{embeddings_response_json, parse_embedding_request};
 use crate::openai_rerank::{
@@ -39,6 +41,7 @@ pub struct HttpRouterService<T, W> {
     profile: Arc<Mutex<Option<ProfileSession>>>,
     profile_attributes: HashMap<String, String>,
     server_info: HttpServerInfo,
+    engine_info_bootstrap: Option<EngineInfoBootstrapService>,
     allow_disaggregated_requests: bool,
     max_transfer_polls: usize,
 }
@@ -51,6 +54,7 @@ impl<T, W> Clone for HttpRouterService<T, W> {
             profile: Arc::clone(&self.profile),
             profile_attributes: self.profile_attributes.clone(),
             server_info: self.server_info.clone(),
+            engine_info_bootstrap: self.engine_info_bootstrap.clone(),
             allow_disaggregated_requests: self.allow_disaggregated_requests,
             max_transfer_polls: self.max_transfer_polls,
         }
@@ -106,6 +110,7 @@ impl<T, W> HttpRouterService<T, W> {
             profile: Arc::new(Mutex::new(None)),
             profile_attributes: HashMap::from([("transport".to_string(), "axum-http".to_string())]),
             server_info: HttpServerInfo::default(),
+            engine_info_bootstrap: None,
             allow_disaggregated_requests: false,
             max_transfer_polls: 0,
         }
@@ -143,6 +148,14 @@ impl<T, W> HttpRouterService<T, W> {
         self
     }
 
+    pub fn with_engine_info_bootstrap_service(
+        mut self,
+        engine_info_bootstrap: EngineInfoBootstrapService,
+    ) -> Self {
+        self.engine_info_bootstrap = Some(engine_info_bootstrap);
+        self
+    }
+
     pub fn with_max_transfer_polls(mut self, max_transfer_polls: usize) -> Self {
         self.max_transfer_polls = max_transfer_polls;
         self
@@ -162,6 +175,14 @@ where
             .route("/get_model_info", get(model_info::<T, W>))
             .route("/server_info", get(server_info::<T, W>))
             .route("/get_server_info", get(server_info::<T, W>))
+            .route(
+                "/remote_instance_transfer_engine_info",
+                get(remote_instance_transfer_engine_info::<T, W>),
+            )
+            .route(
+                "/get_remote_instance_transfer_engine_info",
+                get(remote_instance_transfer_engine_info::<T, W>),
+            )
             .route("/v1/loads", get(loads::<T, W>))
             .route("/get_loads", get(loads::<T, W>))
             .route("/get_load", get(legacy_load::<T, W>))
@@ -326,6 +347,61 @@ where
     }
 
     Json(body).into_response()
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct RemoteInstanceTransferEngineInfoQuery {
+    rank: Option<i32>,
+}
+
+async fn remote_instance_transfer_engine_info<T, W>(
+    State(service): State<HttpRouterService<T, W>>,
+    Query(query): Query<RemoteInstanceTransferEngineInfoQuery>,
+) -> Response
+where
+    T: Send + 'static,
+    W: Send + 'static,
+{
+    let Some(rank) = query.rank.filter(|rank| *rank >= 0) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {"message": "Missing or invalid rank parameter"}
+            })),
+        )
+            .into_response();
+    };
+
+    let Some(engine_info_bootstrap) = service.engine_info_bootstrap else {
+        return failed_transfer_engine_info_response(rank);
+    };
+    let Some(info) = engine_info_bootstrap.transfer_engine_info(rank) else {
+        return failed_transfer_engine_info_response(rank);
+    };
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "rank": rank,
+            "remote_instance_transfer_engine_info": [
+                info.session_id,
+                info.weights_info_dict,
+            ],
+        })),
+    )
+        .into_response()
+}
+
+fn failed_transfer_engine_info_response(rank: i32) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": {
+                "message": format!("Failed to get transfer engine info for rank {rank}")
+            }
+        })),
+    )
+        .into_response()
 }
 
 async fn model_info<T, W>(State(service): State<HttpRouterService<T, W>>) -> Response

@@ -12,6 +12,9 @@ use tokio::sync::oneshot;
 use sglang_srt::cache::{CachePageAllocator, RadixCache};
 use sglang_srt::cli::ServerArgs;
 use sglang_srt::engine::Engine;
+use sglang_srt::engine_info_bootstrap::{
+    EngineInfoBootstrapService, TransferEngineInfo, TransferEngineInfoRegistration,
+};
 use sglang_srt::http::{HttpRouterService, serve_http_router_with_shutdown};
 use sglang_srt::pd_bootstrap::{PrefillBootstrapService, serve_prefill_bootstrap_with_shutdown};
 use sglang_srt::router::{RouterGetModelInfoResponse, RouterRuntime};
@@ -1197,6 +1200,88 @@ async fn http_server_update_weight_version_updates_model_info() {
     let legacy_model_info = get_json_with_retry(addr, "/get_model_info").await;
     assert_eq!(model_info["weight_version"], "checkpoint-42");
     assert_eq!(legacy_model_info["weight_version"], "checkpoint-42");
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_reports_remote_instance_transfer_engine_info() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "tiny-http",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let engine_info = EngineInfoBootstrapService::default();
+    engine_info
+        .state()
+        .lock()
+        .expect("engine info state should lock")
+        .register_transfer_engine_info(TransferEngineInfoRegistration {
+            tp_rank: 0,
+            transfer_engine_info: TransferEngineInfo {
+                session_id: "session-a".to_string(),
+                weights_info_dict: serde_json::json!({
+                    "layer.0": {
+                        "addr": 4096,
+                        "length": 8192,
+                    }
+                }),
+            },
+        });
+    let addr = unused_local_addr();
+    let service =
+        build_bootstrap_http_router_service(&args).with_engine_info_bootstrap_service(engine_info);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let response = get_json_with_retry(addr, "/remote_instance_transfer_engine_info?rank=0").await;
+    let legacy_response =
+        get_json_with_retry(addr, "/get_remote_instance_transfer_engine_info?rank=0").await;
+
+    assert_eq!(response["rank"], 0);
+    assert_eq!(
+        response["remote_instance_transfer_engine_info"][0],
+        "session-a"
+    );
+    assert_eq!(
+        response["remote_instance_transfer_engine_info"][1]["layer.0"]["addr"],
+        4096
+    );
+    assert_eq!(legacy_response, response);
+
+    let missing_rank =
+        request_raw_with_retry(addr, "GET", "/remote_instance_transfer_engine_info", None).await;
+    assert!(missing_rank.starts_with("HTTP/1.1 400"));
+    assert!(missing_rank.contains("Missing or invalid rank parameter"));
+
+    let missing_info = request_raw_with_retry(
+        addr,
+        "GET",
+        "/remote_instance_transfer_engine_info?rank=1",
+        None,
+    )
+    .await;
+    assert!(missing_info.starts_with("HTTP/1.1 400"));
+    assert!(missing_info.contains("Failed to get transfer engine info for rank 1"));
 
     shutdown_tx
         .send(())

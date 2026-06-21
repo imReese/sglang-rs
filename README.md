@@ -118,8 +118,9 @@ This repository currently contains the first `sglang-srt` runtime crate and the
   validates token budgets before scheduler dispatch, maps protocol errors to
   router status classes for the future gRPC bridge, and exposes `/flush_cache`
   plus `/update_weights_from_disk`, `/update_weight_version`, `/get_weights_by_name`,
-  `/pause_generation`, `/continue_generation`, `/abort_request`, `/start_profile`, and
-  `/stop_profile` forwarding for gateway control-plane calls. `/abort_request`
+  `/remote_instance_transfer_engine_info`, `/pause_generation`, `/continue_generation`,
+  `/abort_request`, `/start_profile`, and `/stop_profile` forwarding for gateway
+  control-plane calls. `/abort_request`
   supports both targeted `rid` aborts and SGLang-compatible `abort_all`.
   The Rust router also exposes gateway-compatible `/v1/loads` and `/get_loads`
   worker-load aggregation across HTTP and gRPC workers.
@@ -141,7 +142,9 @@ This repository currently contains the first `sglang-srt` runtime crate and the
   SGLang's transfer-engine info registration flow. It stores per-rank
   `session_id` and `weights_info_dict` payloads via
   `/register_transfer_engine_info` and serves `/get_transfer_engine_info` for
-  remote instance weight-transfer discovery.
+  remote instance weight-transfer discovery. The SRT HTTP service can expose
+  the same data through the community `/remote_instance_transfer_engine_info`
+  and deprecated `/get_remote_instance_transfer_engine_info` endpoints.
 - `tokenizer`: tokenizer trait plus a temporary byte tokenizer for tests.
 - `transfer`: PD disaggregation mode/backend normalization, including
   SGLang-compatible `mooncake_tcp` handling, decode bootstrap session tracking,
