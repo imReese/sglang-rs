@@ -12,6 +12,7 @@ mod openai_embedding;
 mod openai_rerank;
 mod openai_score;
 pub mod pd_bootstrap;
+mod profile;
 pub mod proto;
 pub mod router;
 pub mod scheduler;

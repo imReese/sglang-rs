@@ -201,6 +201,38 @@ pub async fn abort_request(
     .into_response())
 }
 
+pub async fn start_profile(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    forward_generation_control(
+        ctx,
+        headers,
+        body,
+        "/start_profile",
+        "profile started",
+        "started profile",
+    )
+    .await
+}
+
+pub async fn stop_profile(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    forward_generation_control(
+        ctx,
+        headers,
+        body,
+        "/stop_profile",
+        "profile stopped",
+        "stopped profile",
+    )
+    .await
+}
+
 pub async fn update_weights_from_disk(
     State(ctx): State<Arc<AppContext>>,
     headers: HeaderMap,

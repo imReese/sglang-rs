@@ -69,6 +69,8 @@ impl MockWorker {
             .route("/pause_generation", post(chat))
             .route("/continue_generation", post(chat))
             .route("/abort_request", post(chat))
+            .route("/start_profile", post(chat))
+            .route("/stop_profile", post(chat))
             .route("/server_info", get(serve_tiny_server_info))
             .with_state(state);
 
@@ -474,6 +476,20 @@ async fn chat(
         return Json(serde_json::json!({
             "success": true,
             "message": "request aborted",
+        }))
+        .into_response();
+    }
+    if uri.path() == "/start_profile" {
+        return Json(serde_json::json!({
+            "success": true,
+            "message": "profile started",
+        }))
+        .into_response();
+    }
+    if uri.path() == "/stop_profile" {
+        return Json(serde_json::json!({
+            "success": true,
+            "message": "profile stopped",
         }))
         .into_response();
     }

@@ -118,12 +118,13 @@ This repository currently contains the first `sglang-srt` runtime crate and the
   validates token budgets before scheduler dispatch, maps protocol errors to
   router status classes for the future gRPC bridge, and exposes `/flush_cache`
   plus `/update_weights_from_disk`, `/pause_generation`,
-  `/continue_generation`, and `/abort_request` forwarding for gateway
-  control-plane calls.
+  `/continue_generation`, `/abort_request`, `/start_profile`, and
+  `/stop_profile` forwarding for gateway control-plane calls.
 - `grpc`: gRPC boundary helpers and the initial `GrpcRouterService` adapter for
   the generated Tonic service trait. It wires tokenized `Generate`,
   `HealthCheck`, `FlushCache`, `PauseGeneration`, `ContinueGeneration`,
-  `Abort`, and `UpdateWeightsFromDisk` into `RouterRuntime`, converts router protocol errors to canonical
+  `Abort`, `StartProfile`, `StopProfile`, and `UpdateWeightsFromDisk` into
+  `RouterRuntime`, converts router protocol errors to canonical
   `tonic::Status` codes, and leaves unsupported RPCs as explicit
   `UNIMPLEMENTED` responses while the runtime surface grows.
 - `server`: bootstrap helpers for launching the Rust gRPC router service from

@@ -301,6 +301,116 @@ async fn abort_request_proxies_to_prefill_and_decode_pd_workers() {
 }
 
 #[tokio::test]
+async fn start_and_stop_profile_proxy_to_single_plain_worker() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let cfg = config(&["tiny"]);
+    let ctx = build_ctx(
+        cfg,
+        vec![WorkerSpec {
+            id: WorkerId("plain-1".into()),
+            url: worker.url.clone(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+        }],
+    );
+    let app = build_router(ctx);
+
+    let start = app
+        .clone()
+        .oneshot(admin_request(
+            "/start_profile",
+            serde_json::json!({"model": "tiny", "output_dir": "/tmp/sglang-profile"}),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(start.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&start.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["success"], true);
+    assert_eq!(body["affected_workers"], 1);
+
+    let captured_start = worker
+        .captured
+        .lock()
+        .unwrap()
+        .last_body
+        .clone()
+        .expect("plain worker should receive start_profile request");
+    let forwarded_start: serde_json::Value = serde_json::from_slice(&captured_start).unwrap();
+    assert_eq!(forwarded_start["model"], "tiny");
+    assert_eq!(forwarded_start["output_dir"], "/tmp/sglang-profile");
+
+    let stop = app
+        .oneshot(admin_request(
+            "/stop_profile",
+            serde_json::json!({"model": "tiny"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stop.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&stop.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["success"], true);
+    assert_eq!(body["affected_workers"], 1);
+}
+
+#[tokio::test]
+async fn start_profile_proxies_to_prefill_and_decode_pd_workers() {
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let cfg = config(&["tiny"]);
+    let ctx = build_ctx(
+        cfg,
+        vec![
+            WorkerSpec {
+                id: WorkerId("prefill-1".into()),
+                url: prefill.url.clone(),
+                mode: WorkerMode::Prefill,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: Some(8997),
+            },
+            WorkerSpec {
+                id: WorkerId("decode-1".into()),
+                url: decode.url.clone(),
+                mode: WorkerMode::Decode,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: None,
+            },
+        ],
+    );
+    let app = build_router(ctx);
+
+    let start = app
+        .oneshot(admin_request(
+            "/start_profile",
+            serde_json::json!({"model": "tiny", "output_dir": "/tmp/sglang-pd-profile"}),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(start.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&start.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["success"], true);
+    assert_eq!(body["affected_workers"], 2);
+
+    for worker in [&prefill, &decode] {
+        let captured = worker
+            .captured
+            .lock()
+            .unwrap()
+            .last_body
+            .clone()
+            .expect("PD worker should receive start_profile request");
+        let forwarded: serde_json::Value = serde_json::from_slice(&captured).unwrap();
+        assert_eq!(forwarded["model"], "tiny");
+        assert_eq!(forwarded["output_dir"], "/tmp/sglang-pd-profile");
+    }
+}
+
+#[tokio::test]
 async fn flush_cache_proxies_to_single_plain_worker() {
     let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let cfg = config(&["tiny"]);

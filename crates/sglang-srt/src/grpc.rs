@@ -1,12 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::fs;
 use std::future::{Future, pending};
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use serde_json::{Value, json};
 use tonic::{Code, Request, Response, Status};
@@ -21,6 +19,9 @@ use crate::openai_rerank::{
     parse_rerank_request, rerank_results_to_json, score_rerank_documents, truncate_rerank_results,
 };
 use crate::openai_score::{parse_score_request, score_response_json};
+use crate::profile::{
+    ProfileError, ProfileSession, ensure_profile_output_dir, profile_output_dir, write_profile_file,
+};
 use crate::proto::sglang::runtime::v1::generate_response::Body as ProtoGenerateResponseBody;
 use crate::proto::sglang::runtime::v1::sglang_service_server::{
     SglangService, SglangServiceServer,
@@ -81,13 +82,7 @@ pub struct GrpcRouterService<T, W> {
     model_info: Arc<Mutex<Option<RouterGetModelInfoResponse>>>,
     max_transfer_polls: usize,
     server_info_attributes: HashMap<String, String>,
-    profile: Arc<Mutex<Option<GrpcProfileSession>>>,
-}
-
-#[derive(Clone, Debug)]
-struct GrpcProfileSession {
-    output_dir: PathBuf,
-    started_at: SystemTime,
+    profile: Arc<Mutex<Option<ProfileSession>>>,
 }
 
 #[derive(Debug)]
@@ -684,60 +679,11 @@ fn proto_usage(prompt_tokens: usize) -> Result<Usage, Status> {
     })
 }
 
-fn profile_output_dir(request: StartProfileRequest) -> Result<PathBuf, Status> {
-    let output_dir = request.output_dir.unwrap_or_else(|| {
-        std::env::temp_dir()
-            .join("sglang-rs-profile")
-            .to_string_lossy()
-            .to_string()
-    });
-    if output_dir.trim().is_empty() {
-        return Err(Status::invalid_argument(
-            "profile output_dir cannot be empty or whitespace only",
-        ));
+fn profile_error_to_status(error: ProfileError) -> Status {
+    match error {
+        ProfileError::InvalidArgument(message) => Status::invalid_argument(message),
+        ProfileError::Internal(message) => Status::internal(message),
     }
-    Ok(PathBuf::from(output_dir))
-}
-
-fn unix_millis(time: SystemTime) -> u128 {
-    time.duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-}
-
-fn write_profile_file(
-    session: GrpcProfileSession,
-    stopped_at: SystemTime,
-    attributes: &HashMap<String, String>,
-) -> Result<PathBuf, Status> {
-    fs::create_dir_all(&session.output_dir)
-        .map_err(|error| Status::internal(format!("create profile output directory: {error}")))?;
-
-    let started_unix_ms = unix_millis(session.started_at);
-    let stopped_unix_ms = unix_millis(stopped_at);
-    let duration_ms = stopped_at
-        .duration_since(session.started_at)
-        .unwrap_or_default()
-        .as_millis();
-    let profile_path = session.output_dir.join(format!(
-        "sglang-profile-{started_unix_ms}-{stopped_unix_ms}.json"
-    ));
-    let profile = json!({
-        "profile": {
-            "transport": attributes.get("transport").map(String::as_str).unwrap_or("tonic-grpc"),
-            "output_dir": session.output_dir,
-            "started_unix_ms": started_unix_ms,
-            "stopped_unix_ms": stopped_unix_ms,
-            "duration_ms": duration_ms,
-            "attributes": attributes,
-        }
-    });
-    let bytes = serde_json::to_vec_pretty(&profile)
-        .map_err(|error| Status::internal(format!("serialize profile JSON: {error}")))?;
-    fs::write(&profile_path, bytes)
-        .map_err(|error| Status::internal(format!("write profile JSON: {error}")))?;
-
-    Ok(profile_path)
 }
 
 #[tonic::async_trait]
@@ -1252,10 +1198,9 @@ where
         &self,
         request: Request<StartProfileRequest>,
     ) -> Result<Response<ControlResponse>, Status> {
-        let output_dir = profile_output_dir(request.into_inner())?;
-        fs::create_dir_all(&output_dir).map_err(|error| {
-            Status::internal(format!("create profile output directory: {error}"))
-        })?;
+        let output_dir =
+            profile_output_dir(request.into_inner().output_dir).map_err(profile_error_to_status)?;
+        ensure_profile_output_dir(&output_dir).map_err(profile_error_to_status)?;
         let mut profile = self
             .profile
             .lock()
@@ -1263,10 +1208,7 @@ where
         if profile.is_some() {
             return Err(Status::already_exists("profile is already running"));
         }
-        *profile = Some(GrpcProfileSession {
-            output_dir: output_dir.clone(),
-            started_at: SystemTime::now(),
-        });
+        *profile = Some(ProfileSession::new(output_dir.clone()));
 
         Ok(Response::new(ControlResponse {
             success: true,
@@ -1285,7 +1227,8 @@ where
             .take()
             .ok_or_else(|| Status::failed_precondition("profile is not running"))?;
         let profile_path =
-            write_profile_file(session, SystemTime::now(), &self.server_info_attributes)?;
+            write_profile_file(session, SystemTime::now(), &self.server_info_attributes)
+                .map_err(profile_error_to_status)?;
 
         Ok(Response::new(ControlResponse {
             success: true,

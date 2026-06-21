@@ -1,10 +1,11 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -18,6 +19,9 @@ use crate::openai_rerank::{
     parse_rerank_request, rerank_results_to_json, score_rerank_documents, truncate_rerank_results,
 };
 use crate::openai_score::{parse_score_request, score_response_json};
+use crate::profile::{
+    ProfileError, ProfileSession, ensure_profile_output_dir, profile_output_dir, write_profile_file,
+};
 use crate::router::{
     RouterDisaggregatedParams, RouterGenerateComplete, RouterGenerateRequest,
     RouterGenerateResponse, RouterGenerateResponseBody, RouterGetModelInfoResponse,
@@ -32,6 +36,8 @@ use crate::worker::WorkerExecutor;
 pub struct HttpRouterService<T, W> {
     runtime: Arc<Mutex<RouterRuntime<T, W>>>,
     model_info: Arc<Mutex<RouterGetModelInfoResponse>>,
+    profile: Arc<Mutex<Option<ProfileSession>>>,
+    profile_attributes: HashMap<String, String>,
     server_info: HttpServerInfo,
     allow_disaggregated_requests: bool,
     max_transfer_polls: usize,
@@ -42,6 +48,8 @@ impl<T, W> Clone for HttpRouterService<T, W> {
         Self {
             runtime: Arc::clone(&self.runtime),
             model_info: Arc::clone(&self.model_info),
+            profile: Arc::clone(&self.profile),
+            profile_attributes: self.profile_attributes.clone(),
             server_info: self.server_info.clone(),
             allow_disaggregated_requests: self.allow_disaggregated_requests,
             max_transfer_polls: self.max_transfer_polls,
@@ -95,6 +103,8 @@ impl<T, W> HttpRouterService<T, W> {
         Self {
             runtime: Arc::new(Mutex::new(runtime)),
             model_info: Arc::new(Mutex::new(model_info)),
+            profile: Arc::new(Mutex::new(None)),
+            profile_attributes: HashMap::from([("transport".to_string(), "axum-http".to_string())]),
             server_info: HttpServerInfo::default(),
             allow_disaggregated_requests: false,
             max_transfer_polls: 0,
@@ -162,6 +172,14 @@ where
             .route("/pause_generation", post(pause_generation::<T, W>))
             .route("/continue_generation", post(continue_generation::<T, W>))
             .route("/abort_request", post(abort_request::<T, W>))
+            .route(
+                "/start_profile",
+                get(start_profile::<T, W>).post(start_profile::<T, W>),
+            )
+            .route(
+                "/stop_profile",
+                get(stop_profile::<T, W>).post(stop_profile::<T, W>),
+            )
             .route(
                 "/update_weights_from_disk",
                 post(update_weights_from_disk::<T, W>),
@@ -500,6 +518,121 @@ where
         "message": response.message,
     }))
     .into_response()
+}
+
+async fn start_profile<T, W>(
+    State(service): State<HttpRouterService<T, W>>,
+    body: Bytes,
+) -> Response
+where
+    T: Send + 'static,
+    W: Send + 'static,
+{
+    let requested_dir = match profile_output_dir_from_body(&body) {
+        Ok(output_dir) => output_dir,
+        Err(response) => return response,
+    };
+    let output_dir = match profile_output_dir(requested_dir) {
+        Ok(output_dir) => output_dir,
+        Err(error) => return profile_error_json(error),
+    };
+    if let Err(error) = ensure_profile_output_dir(&output_dir) {
+        return profile_error_json(error);
+    }
+
+    let mut profile = match service.profile.lock() {
+        Ok(profile) => profile,
+        Err(_) => return internal_error_json("profile mutex poisoned"),
+    };
+    if profile.is_some() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": { "message": "profile is already running" } })),
+        )
+            .into_response();
+    }
+
+    *profile = Some(ProfileSession::new(output_dir.clone()));
+    Json(json!({
+        "success": true,
+        "message": format!("profile started: {}", output_dir.display()),
+    }))
+    .into_response()
+}
+
+async fn stop_profile<T, W>(State(service): State<HttpRouterService<T, W>>) -> Response
+where
+    T: Send + 'static,
+    W: Send + 'static,
+{
+    let session = match service.profile.lock() {
+        Ok(mut profile) => match profile.take() {
+            Some(session) => session,
+            None => {
+                return (
+                    StatusCode::PRECONDITION_FAILED,
+                    Json(json!({ "error": { "message": "profile is not running" } })),
+                )
+                    .into_response();
+            }
+        },
+        Err(_) => return internal_error_json("profile mutex poisoned"),
+    };
+    let profile_path =
+        match write_profile_file(session, SystemTime::now(), &service.profile_attributes) {
+            Ok(profile_path) => profile_path,
+            Err(error) => return profile_error_json(error),
+        };
+
+    Json(json!({
+        "success": true,
+        "message": format!("profile stopped: {}", profile_path.display()),
+    }))
+    .into_response()
+}
+
+fn profile_output_dir_from_body(body: &[u8]) -> Result<Option<String>, Response> {
+    if body.is_empty() {
+        return Ok(None);
+    }
+    let value: Value = serde_json::from_slice(body).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": { "message": "request body must be a JSON object" } })),
+        )
+            .into_response()
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": { "message": "request body must be a JSON object" } })),
+        )
+            .into_response()
+    })?;
+    match object.get("output_dir") {
+        Some(Value::String(output_dir)) => Ok(Some(output_dir.clone())),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": { "message": "output_dir must be a string when provided" } })),
+        )
+            .into_response()),
+    }
+}
+
+fn profile_error_json(error: ProfileError) -> Response {
+    match error {
+        ProfileError::InvalidArgument(message) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": { "message": message } })),
+        )
+            .into_response(),
+        ProfileError::Internal(message) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": { "message": message } })),
+        )
+            .into_response(),
+    }
 }
 
 async fn update_weights_from_disk<T, W>(

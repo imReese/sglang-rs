@@ -4,9 +4,10 @@
 //! the router must be able to forward OpenAI-compatible HTTP traffic to
 //! a `grpc://` worker, not only register it.
 
+use std::fs;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -70,6 +71,17 @@ fn build_ctx_with_grpc_worker(addr: SocketAddr) -> Arc<AppContext> {
     let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
     Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
+}
+
+fn unique_profile_dir() -> std::path::PathBuf {
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "sglang-rs-router-grpc-profile-{}-{suffix}",
+        std::process::id()
+    ))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -339,6 +351,104 @@ async fn router_flush_cache_reaches_real_rust_srt_grpc_worker() {
         .await
         .expect("gRPC server task should join")
         .expect("gRPC server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn router_start_and_stop_profile_reach_real_rust_srt_grpc_worker() {
+    let addr = unused_local_addr();
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "tiny",
+        "--host",
+        &addr.ip().to_string(),
+        "--port",
+        &addr.port().to_string(),
+        "--grpc-mode",
+        "--num-reserved-decode-tokens",
+        "8",
+    ])
+    .expect("gRPC SRT args should parse");
+    let output_dir = unique_profile_dir();
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(launch_grpc_server_with_shutdown(args, async move {
+        let _ = shutdown_rx.await;
+    }));
+    wait_for_grpc_health(addr).await;
+
+    let app = build_router(build_ctx_with_grpc_worker(addr));
+    let start = Request::builder()
+        .method("POST")
+        .uri("/start_profile")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(
+                &json!({"model": "tiny", "output_dir": output_dir.to_string_lossy()}),
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+    let start_response = app
+        .clone()
+        .oneshot(start)
+        .await
+        .expect("router should respond");
+    assert_eq!(start_response.status(), StatusCode::OK);
+    let body = start_response
+        .into_body()
+        .collect()
+        .await
+        .expect("router response body should collect")
+        .to_bytes();
+    let body: serde_json::Value =
+        serde_json::from_slice(&body).expect("response should be profile JSON");
+    assert_eq!(body["success"], true);
+    assert_eq!(body["affected_workers"], 1);
+
+    let stop = Request::builder()
+        .method("POST")
+        .uri("/stop_profile")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({"model": "tiny"})).unwrap(),
+        ))
+        .unwrap();
+    let stop_response = app.oneshot(stop).await.expect("router should respond");
+    assert_eq!(stop_response.status(), StatusCode::OK);
+    let body = stop_response
+        .into_body()
+        .collect()
+        .await
+        .expect("router response body should collect")
+        .to_bytes();
+    let body: serde_json::Value =
+        serde_json::from_slice(&body).expect("response should be profile JSON");
+    assert_eq!(body["success"], true);
+    assert_eq!(body["affected_workers"], 1);
+
+    let entries = fs::read_dir(&output_dir)
+        .expect("profile output directory should exist")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("profile directory should be readable");
+    assert_eq!(entries.len(), 1);
+    let profile: serde_json::Value = serde_json::from_slice(
+        &fs::read(entries[0].path()).expect("profile file should be readable"),
+    )
+    .expect("profile file should contain JSON");
+    assert_eq!(profile["profile"]["transport"], "tonic-grpc");
+    assert!(profile["profile"]["duration_ms"].as_u64().is_some());
+
+    shutdown_tx
+        .send(())
+        .expect("gRPC worker should still be running");
+    server
+        .await
+        .expect("gRPC server task should join")
+        .expect("gRPC server should stop cleanly");
+    fs::remove_dir_all(output_dir).expect("profile temp directory should clean up");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

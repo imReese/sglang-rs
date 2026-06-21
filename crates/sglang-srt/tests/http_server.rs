@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -46,6 +47,17 @@ impl ModelWorker for HttpTwoStepWorker {
         BatchGeneratedTokens::from_batch(batch, vec![token])
             .expect("output shape should match batch")
     }
+}
+
+fn unique_profile_dir(prefix: &str) -> std::path::PathBuf {
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "sglang-rs-{prefix}-{}-{suffix}",
+        std::process::id()
+    ))
 }
 
 #[derive(Default)]
@@ -1382,6 +1394,74 @@ async fn http_server_pause_and_continue_generation_use_router_runtime_state() {
         .await
         .expect("server task should join")
         .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_start_and_stop_profile_writes_trace_file() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let output_dir = unique_profile_dir("http-profile");
+    let service = build_bootstrap_http_router_service(&args);
+    let addr = unused_local_addr();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let start_body = Box::leak(
+        serde_json::json!({"output_dir": output_dir.to_string_lossy()})
+            .to_string()
+            .into_boxed_str(),
+    );
+    let start = post_json_with_retry(addr, "/start_profile", start_body).await;
+    assert_eq!(start["success"], true);
+    assert!(
+        start["message"]
+            .as_str()
+            .expect("start message should be a string")
+            .contains("profile started")
+    );
+
+    let stop = post_json_with_retry(addr, "/stop_profile", "{}").await;
+    assert_eq!(stop["success"], true);
+    assert!(
+        stop["message"]
+            .as_str()
+            .expect("stop message should be a string")
+            .contains("profile stopped")
+    );
+
+    let entries = fs::read_dir(&output_dir)
+        .expect("profile output directory should exist")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("profile directory should be readable");
+    assert_eq!(entries.len(), 1);
+    let profile: serde_json::Value = serde_json::from_slice(
+        &fs::read(entries[0].path()).expect("profile file should be readable"),
+    )
+    .expect("profile file should contain JSON");
+    assert_eq!(profile["profile"]["transport"], "axum-http");
+    assert!(profile["profile"]["duration_ms"].as_u64().is_some());
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+    fs::remove_dir_all(output_dir).expect("profile temp directory should clean up");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

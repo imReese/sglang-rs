@@ -70,6 +70,18 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
+            "/start_profile",
+            post(crate::server::routes::admin::start_profile)
+                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
+            "/stop_profile",
+            post(crate::server::routes::admin::stop_profile)
+                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
             "/v1/tokenize",
             post(crate::server::routes::tokenize::tokenize),
         )
