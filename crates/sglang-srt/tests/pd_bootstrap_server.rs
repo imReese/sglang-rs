@@ -6,6 +6,9 @@ use tokio::sync::oneshot;
 use zeromq::{PushSocket, Socket, SocketSend, ZmqMessage};
 
 use sglang_srt::cache::{CachePageAllocator, RadixCache};
+use sglang_srt::engine_info_bootstrap::{
+    EngineInfoBootstrapService, serve_engine_info_bootstrap_with_shutdown,
+};
 use sglang_srt::pd_bootstrap::{
     MooncakeDecodeBootstrapPublisher, MooncakeDecodeKvArgsRegistration,
     MooncakeDecodeTransferMetadata, PrefillBootstrapService, query_prefill_route,
@@ -20,6 +23,59 @@ use sglang_srt::transfer::{
 };
 use sglang_srt::types::{BootstrapRoom, DisaggregatedParams, RequestId, SamplingParams};
 use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engine_info_bootstrap_registers_and_serves_transfer_engine_info() {
+    let addr = unused_local_addr();
+    let service = EngineInfoBootstrapService::default();
+    let observed = service.clone();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_engine_info_bootstrap_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let health = get_raw_with_retry(addr, "/health").await;
+    assert!(health.starts_with("HTTP/1.1 200"));
+    assert!(health.ends_with("OK"));
+
+    let missing = get_raw_with_retry(addr, "/get_transfer_engine_info?rank=0").await;
+    assert!(missing.starts_with("HTTP/1.1 404"));
+
+    let register = put_json_with_retry(
+        addr,
+        "/register_transfer_engine_info",
+        r#"{"tp_rank":0,"transfer_engine_info":{"session_id":"session-a","weights_info_dict":{"layer0":{"addr":4096,"nbytes":128},"lm_head":[1,2,3]}}}"#,
+    )
+    .await;
+    assert!(register.starts_with("HTTP/1.1 200"));
+
+    let info = get_json_with_retry(addr, "/get_transfer_engine_info?rank=0").await;
+    assert_eq!(info["rank"], 0);
+    assert_eq!(info["remote_instance_transfer_engine_info"][0], "session-a");
+    assert_eq!(
+        info["remote_instance_transfer_engine_info"][1]["layer0"]["addr"],
+        4096
+    );
+    assert_eq!(
+        observed
+            .transfer_engine_info(0)
+            .expect("registered info should be available")
+            .session_id,
+        "session-a"
+    );
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prefill_bootstrap_route_registers_topology_and_rank_endpoint() {

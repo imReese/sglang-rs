@@ -2,6 +2,7 @@ pub mod cache;
 pub mod cli;
 pub mod deepseek_runtime;
 pub mod engine;
+pub mod engine_info_bootstrap;
 pub mod glm_runtime;
 pub mod grpc;
 pub mod http;

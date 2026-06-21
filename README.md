@@ -137,6 +137,11 @@ This repository currently contains the first `sglang-srt` runtime crate and the
   polling. The bootstrap launcher can run the decode-side PD path with the fake
   transfer backend for local/runtime wiring tests and explicitly rejects
   unsupported real PD backends until Mooncake/model KV memory wiring lands.
+- `engine_info_bootstrap`: lightweight HTTP bootstrap service compatible with
+  SGLang's transfer-engine info registration flow. It stores per-rank
+  `session_id` and `weights_info_dict` payloads via
+  `/register_transfer_engine_info` and serves `/get_transfer_engine_info` for
+  remote instance weight-transfer discovery.
 - `tokenizer`: tokenizer trait plus a temporary byte tokenizer for tests.
 - `transfer`: PD disaggregation mode/backend normalization, including
   SGLang-compatible `mooncake_tcp` handling, decode bootstrap session tracking,
