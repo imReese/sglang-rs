@@ -64,6 +64,7 @@ impl MockWorker {
             .route("/v1/embeddings", post(chat))
             .route("/v1/classify", post(chat))
             .route("/generate", post(chat))
+            .route("/update_weights_from_disk", post(chat))
             .route("/server_info", get(serve_tiny_server_info))
             .with_state(state);
 
@@ -435,6 +436,14 @@ async fn chat(
             })
             .collect();
         return Json(results).into_response();
+    }
+    if uri.path() == "/update_weights_from_disk" {
+        return Json(serde_json::json!({
+            "success": true,
+            "message": "weights updated",
+            "num_paused_requests": 0,
+        }))
+        .into_response();
     }
 
     let streaming = v.get("stream").and_then(|x| x.as_bool()).unwrap_or(false);

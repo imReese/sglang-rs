@@ -218,6 +218,73 @@ async fn router_streaming_chat_completions_reaches_real_rust_srt_grpc_worker() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn router_update_weights_from_disk_reaches_real_rust_srt_grpc_worker() {
+    let addr = unused_local_addr();
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "tiny",
+        "--host",
+        &addr.ip().to_string(),
+        "--port",
+        &addr.port().to_string(),
+        "--grpc-mode",
+        "--num-reserved-decode-tokens",
+        "8",
+    ])
+    .expect("gRPC SRT args should parse");
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(launch_grpc_server_with_shutdown(args, async move {
+        let _ = shutdown_rx.await;
+    }));
+    wait_for_grpc_health(addr).await;
+
+    let app = build_router(build_ctx_with_grpc_worker(addr));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/update_weights_from_disk")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "tiny",
+                "model_path": "/path/that/does/not/exist",
+                "load_format": "safetensors",
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+
+    let response = app.oneshot(request).await.expect("router should respond");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("router response body should collect")
+        .to_bytes();
+    let body: serde_json::Value =
+        serde_json::from_slice(&body).expect("response should be gRPC status JSON");
+    let message = body["error"]["message"]
+        .as_str()
+        .expect("gRPC status response should include an error message");
+    assert!(
+        message.contains("model_path") || message.contains("model path"),
+        "expected worker validation error, got {body}"
+    );
+
+    shutdown_tx
+        .send(())
+        .expect("gRPC worker should still be running");
+    server
+        .await
+        .expect("gRPC server task should join")
+        .expect("gRPC server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn router_completions_reaches_real_rust_srt_grpc_worker() {
     let addr = unused_local_addr();
     let args = ServerArgs::parse_from([

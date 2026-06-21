@@ -10,6 +10,7 @@
 
 mod common;
 
+mod admin_control;
 mod chat_routing;
 mod failover;
 mod graceful_shutdown;

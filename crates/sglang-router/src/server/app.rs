@@ -40,6 +40,12 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
             get(crate::server::routes::models::list_models),
         )
         .route(
+            "/update_weights_from_disk",
+            post(crate::server::routes::admin::update_weights_from_disk)
+                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
             "/v1/tokenize",
             post(crate::server::routes::tokenize::tokenize),
         )

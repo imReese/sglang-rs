@@ -117,12 +117,14 @@ This repository currently contains the first `sglang-srt` runtime crate and the
   worker execution, generates request IDs in Rust when the caller omits one,
   validates token budgets before scheduler dispatch, maps protocol errors to
   router status classes for the future gRPC bridge, and exposes a flush-cache
-  control operation for gateway control-plane calls.
+  control operation plus `/update_weights_from_disk` forwarding for gateway
+  control-plane calls.
 - `grpc`: gRPC boundary helpers and the initial `GrpcRouterService` adapter for
   the generated Tonic service trait. It wires tokenized `Generate`,
-  `HealthCheck`, and `FlushCache` into `RouterRuntime`, converts router
-  protocol errors to canonical `tonic::Status` codes, and leaves unsupported
-  RPCs as explicit `UNIMPLEMENTED` responses while the runtime surface grows.
+  `HealthCheck`, `FlushCache`, and `UpdateWeightsFromDisk` into
+  `RouterRuntime`, converts router protocol errors to canonical
+  `tonic::Status` codes, and leaves unsupported RPCs as explicit
+  `UNIMPLEMENTED` responses while the runtime surface grows.
 - `server`: bootstrap helpers for launching the Rust gRPC router service from
   parsed `ServerArgs`, including model metadata propagation and an injectable PD
   service builder that wraps the bootstrap model runner with
@@ -175,9 +177,10 @@ This repository currently contains the first `sglang-srt` runtime crate and the
 
 The implementation is intentionally small while the architecture is being
 carved out. The current worker is test-driven and mockable; CUDA integration is
-not implemented yet. PD support currently covers the scheduler/router execution
-split; network bootstrap metadata and KV transfer are still future integration
-work.
+not implemented yet. PD support covers the scheduler/router execution split,
+bootstrap metadata propagation, bounded transfer polling, fake/local snapshot
+transfer paths, and the Mooncake-linked transfer-engine boundary; real device
+KV memory wiring remains the next deeper integration layer.
 
 ## Development
 
