@@ -119,9 +119,10 @@ This repository currently contains the first `sglang-srt` runtime crate and the
   router status classes for the future gRPC bridge, and exposes `/flush_cache`
   plus `/update_weights_from_disk`, `/pause_generation`,
   `/continue_generation`, `/abort_request`, `/start_profile`, and
-  `/stop_profile` forwarding for gateway control-plane calls. The Rust router
-  also exposes gateway-compatible `/v1/loads` and `/get_loads` worker-load
-  aggregation across HTTP and gRPC workers.
+  `/stop_profile` forwarding for gateway control-plane calls. `/abort_request`
+  supports both targeted `rid` aborts and SGLang-compatible `abort_all`.
+  The Rust router also exposes gateway-compatible `/v1/loads` and `/get_loads`
+  worker-load aggregation across HTTP and gRPC workers.
 - `grpc`: gRPC boundary helpers and the initial `GrpcRouterService` adapter for
   the generated Tonic service trait. It wires tokenized `Generate`,
   `HealthCheck`, `FlushCache`, `PauseGeneration`, `ContinueGeneration`,

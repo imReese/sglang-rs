@@ -760,6 +760,17 @@ impl<T, W> RouterRuntime<T, W> {
         })
     }
 
+    pub fn abort_all_requests(&mut self) -> RouterControlResponse
+    where
+        W: WorkerExecutor,
+    {
+        let aborted = self.engine.abort_all_requests();
+        RouterControlResponse {
+            success: true,
+            message: format!("aborted {aborted} request(s)"),
+        }
+    }
+
     fn ensure_generation_ready(&self) -> Result<(), RouterProtocolError> {
         if self.generation_paused {
             return Err(RouterProtocolError::GenerationPaused);

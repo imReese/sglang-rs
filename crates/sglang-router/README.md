@@ -9,6 +9,8 @@ shape. Exposes `/v1/tokenize`, `/v1/detokenize`, `/v1/models`,
 `/update_weights_from_disk`, `/flush_cache`, `/pause_generation`,
 `/continue_generation`, `/abort_request`, `/start_profile`, and
 `/stop_profile` across plain workers and PD prefill/decode pools.
+`/abort_request` supports targeted `rid` aborts and SGLang-compatible
+`abort_all`.
 
 ## Building
 

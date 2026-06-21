@@ -86,6 +86,13 @@ impl<T, W> Engine<T, W> {
     {
         self.scheduler.abort_request(request_id)
     }
+
+    pub fn abort_all_requests(&mut self) -> usize
+    where
+        W: WorkerExecutor,
+    {
+        self.scheduler.abort_all_requests()
+    }
 }
 
 impl<T, W> Engine<T, W>

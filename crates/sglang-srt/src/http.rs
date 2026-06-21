@@ -497,7 +497,16 @@ where
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        return bad_request_json("abort_all is not supported by the Rust HTTP runtime yet");
+        let response = match service.runtime.lock() {
+            Ok(mut runtime) => runtime.abort_all_requests(),
+            Err(_) => return internal_error_json("router runtime mutex poisoned"),
+        };
+
+        return Json(json!({
+            "success": response.success,
+            "message": response.message,
+        }))
+        .into_response();
     }
     let request_id = payload
         .get("rid")

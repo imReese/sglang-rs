@@ -895,12 +895,19 @@ where
         &self,
         request: Request<AbortRequest>,
     ) -> Result<Response<ControlResponse>, Status> {
-        let response = self
-            .runtime
-            .lock()
-            .map_err(|_| Status::internal("router runtime mutex poisoned"))?
-            .abort_request(&request.into_inner().request_id)
-            .map_err(router_protocol_error_to_status)?;
+        let request = request.into_inner();
+        let response = if request.abort_all {
+            self.runtime
+                .lock()
+                .map_err(|_| Status::internal("router runtime mutex poisoned"))?
+                .abort_all_requests()
+        } else {
+            self.runtime
+                .lock()
+                .map_err(|_| Status::internal("router runtime mutex poisoned"))?
+                .abort_request(&request.request_id)
+                .map_err(router_protocol_error_to_status)?
+        };
 
         Ok(Response::new(ControlResponse {
             success: response.success,

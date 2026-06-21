@@ -1271,6 +1271,63 @@ async fn http_server_abort_request_removes_queued_request() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_abort_all_removes_all_queued_requests() {
+    let mut scheduler = Scheduler::with_cache_resources(
+        HttpTwoStepWorker,
+        RadixCache::default(),
+        CachePageAllocator::new(4),
+    );
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("http-abort-a"),
+        vec![1],
+        RuntimeSamplingParams::new(1),
+    ));
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("http-abort-b"),
+        vec![2],
+        RuntimeSamplingParams::new(1),
+    ));
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "glm-abort-all",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let runtime = RouterRuntime::new(Engine::new(ByteTokenizer, scheduler));
+    let service =
+        HttpRouterService::new(runtime, RouterGetModelInfoResponse::from_server_args(&args));
+    let addr = unused_local_addr();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let aborted = post_json_with_retry(addr, "/abort_request", r#"{"abort_all":true}"#).await;
+    assert_eq!(aborted["success"], true);
+    assert_eq!(aborted["message"], "aborted 2 request(s)");
+
+    let loads = get_json_with_retry(addr, "/get_loads").await;
+    assert_eq!(loads["loads"][0]["waiting_queue_depth"], 0);
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_server_flush_cache_uses_router_runtime_state() {
     let mut busy_scheduler = Scheduler::new(HttpTwoStepWorker);
     busy_scheduler.enqueue(ScheduledRequest::new(

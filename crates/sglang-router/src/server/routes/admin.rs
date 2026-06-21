@@ -171,17 +171,12 @@ pub async fn abort_request(
 ) -> Result<Response<Body>, ApiError> {
     let probe: AbortProbe = serde_json::from_slice(&body)
         .map_err(|_| ApiError::BadRequest("request body must be a JSON object".to_string()))?;
-    if probe.abort_all {
-        return Err(ApiError::BadRequest(
-            "abort_all is not supported by the Rust router yet".to_string(),
-        ));
-    }
     let request_id = probe
         .rid
         .as_deref()
         .or(probe.request_id.as_deref())
         .unwrap_or_default();
-    if request_id.is_empty() {
+    if !probe.abort_all && request_id.is_empty() {
         return Err(ApiError::BadRequest("rid must be non-empty".to_string()));
     }
 
@@ -242,6 +237,7 @@ pub async fn abort_request(
         "affected_workers": affected_workers,
         "aborted_workers": aborted_workers,
         "model": model,
+        "abort_all": probe.abort_all,
         "rid": request_id,
     }))
     .into_response())

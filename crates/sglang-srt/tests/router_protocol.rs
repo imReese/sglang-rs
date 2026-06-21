@@ -1020,6 +1020,30 @@ fn router_runtime_abort_request_removes_queued_request() {
 }
 
 #[test]
+fn router_runtime_abort_all_requests_removes_all_queued_requests() {
+    let tokenizer = ByteTokenizer::default();
+    let mut scheduler = Scheduler::new(RouterEchoWorker::default());
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("abort-a"),
+        vec![1],
+        SamplingParams::new(1),
+    ));
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("abort-b"),
+        vec![2],
+        SamplingParams::new(1),
+    ));
+    let engine = Engine::new(tokenizer, scheduler);
+    let mut runtime = RouterRuntime::new(engine);
+
+    let response = runtime.abort_all_requests();
+
+    assert!(response.success);
+    assert_eq!(response.message, "aborted 2 request(s)");
+    assert_eq!(runtime.load().waiting_queue_depth, 0);
+}
+
+#[test]
 fn router_runtime_reports_running_request_limit_as_resource_exhausted_without_queuing_request() {
     let tokenizer = ByteTokenizer::default();
     let mut scheduler =

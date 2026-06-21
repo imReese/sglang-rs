@@ -1552,6 +1552,7 @@ async fn grpc_abort_removes_queued_request() {
     let response = service
         .abort(Request::new(AbortRequest {
             request_id: "grpc-abort".to_string(),
+            abort_all: false,
         }))
         .await
         .expect("abort should execute")
@@ -1571,6 +1572,7 @@ async fn grpc_abort_removes_queued_request() {
     let missing = service
         .abort(Request::new(AbortRequest {
             request_id: "missing".to_string(),
+            abort_all: false,
         }))
         .await
         .expect("abort for missing request should execute")
@@ -1578,6 +1580,43 @@ async fn grpc_abort_removes_queued_request() {
 
     assert!(!missing.success);
     assert_eq!(missing.message, "request not found");
+}
+
+#[tokio::test]
+async fn grpc_abort_all_removes_all_queued_requests() {
+    let mut scheduler = Scheduler::new(GrpcTwoStepWorker);
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("grpc-abort-a"),
+        vec![1],
+        RuntimeSamplingParams::new(1),
+    ));
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("grpc-abort-b"),
+        vec![2],
+        RuntimeSamplingParams::new(1),
+    ));
+    let runtime = RouterRuntime::new(Engine::new(ByteTokenizer, scheduler));
+    let service = GrpcRouterService::new(runtime);
+
+    let response = service
+        .abort(Request::new(AbortRequest {
+            request_id: String::new(),
+            abort_all: true,
+        }))
+        .await
+        .expect("abort_all should execute")
+        .into_inner();
+
+    assert!(response.success);
+    assert_eq!(response.message, "aborted 2 request(s)");
+
+    let load = service
+        .get_load(Request::new(GetLoadRequest {}))
+        .await
+        .expect("load should execute")
+        .into_inner();
+
+    assert_eq!(load.waiting_queue_depth, 0);
 }
 
 #[tokio::test]
@@ -1590,6 +1629,7 @@ async fn grpc_abort_rejects_empty_request_id() {
     let error = service
         .abort(Request::new(AbortRequest {
             request_id: String::new(),
+            abort_all: false,
         }))
         .await
         .expect_err("empty request id should be rejected");

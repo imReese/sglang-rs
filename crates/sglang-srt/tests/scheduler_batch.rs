@@ -204,6 +204,31 @@ fn abort_request_removes_decode_request_by_id() {
 }
 
 #[test]
+fn abort_all_requests_clears_waiting_and_decode_queues() {
+    let mut scheduler = Scheduler::new(UnfinishedWorker);
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("decode-a"),
+        vec![3],
+        SamplingParams::new(2),
+    ));
+
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should leave one request in decode queue");
+    enqueue_request(&mut scheduler, "waiting-a", &[1]);
+    enqueue_request(&mut scheduler, "waiting-b", &[2]);
+
+    assert_eq!(scheduler.waiting_queue_depth(), 2);
+    assert_eq!(scheduler.decode_queue_depth(), 1);
+
+    let aborted = scheduler.abort_all_requests();
+
+    assert_eq!(aborted, 3);
+    assert_eq!(scheduler.waiting_queue_depth(), 0);
+    assert_eq!(scheduler.decode_queue_depth(), 0);
+}
+
+#[test]
 fn next_prefill_batch_respects_max_running_request_capacity() {
     let mut scheduler = Scheduler::new(UnfinishedWorker).with_max_running_requests(Some(1));
     scheduler.enqueue(ScheduledRequest::new(

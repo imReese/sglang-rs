@@ -392,24 +392,25 @@ fn proto_abort_request_from_json(body: &[u8]) -> Result<ProtoAbortRequest, tonic
     let object = value
         .as_object()
         .ok_or_else(|| grpc_generate_status("abort_request body must be a JSON object"))?;
-    if object
+    let abort_all = object
         .get("abort_all")
         .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err(grpc_generate_status(
-            "abort_all is not supported by the Rust gRPC bridge yet",
-        ));
-    }
+        .unwrap_or(false);
     let request_id = object
         .get("rid")
         .or_else(|| object.get("request_id"))
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| grpc_generate_status("rid is required and must be a string"))?
-        .to_string();
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    if !abort_all && request_id.is_empty() {
+        return Err(grpc_generate_status("rid is required and must be a string"));
+    }
 
-    Ok(ProtoAbortRequest { request_id })
+    Ok(ProtoAbortRequest {
+        request_id,
+        abort_all,
+    })
 }
 
 fn proto_start_profile_request_from_json(

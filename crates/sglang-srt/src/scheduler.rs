@@ -352,6 +352,22 @@ impl<W> Scheduler<W> {
         false
     }
 
+    pub fn abort_all_requests(&mut self) -> usize
+    where
+        W: WorkerExecutor,
+    {
+        let mut aborted = 0;
+        while let Some(request) = self.waiting_queue.pop_front() {
+            self.worker.complete_request(&request);
+            aborted += 1;
+        }
+        while let Some(request) = self.decode_queue.pop_front() {
+            self.worker.complete_request(&request);
+            aborted += 1;
+        }
+        aborted
+    }
+
     pub fn worker(&self) -> &W {
         &self.worker
     }

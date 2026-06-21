@@ -587,6 +587,61 @@ async fn flush_cache_proxies_to_prefill_and_decode_pd_workers() {
 }
 
 #[tokio::test]
+async fn abort_all_proxies_to_prefill_and_decode_pd_workers() {
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let cfg = config(&["tiny"]);
+    let ctx = build_ctx(
+        cfg,
+        vec![
+            WorkerSpec {
+                id: WorkerId("prefill-1".into()),
+                url: prefill.url.clone(),
+                mode: WorkerMode::Prefill,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: Some(8997),
+            },
+            WorkerSpec {
+                id: WorkerId("decode-1".into()),
+                url: decode.url.clone(),
+                mode: WorkerMode::Decode,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: None,
+            },
+        ],
+    );
+    let app = build_router(ctx);
+
+    let response = app
+        .oneshot(admin_request(
+            "/abort_request",
+            serde_json::json!({"model": "tiny", "abort_all": true}),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["success"], true);
+    assert_eq!(body["affected_workers"], 2);
+    assert_eq!(body["aborted_workers"], 2);
+
+    for worker in [&prefill, &decode] {
+        let captured = worker
+            .captured
+            .lock()
+            .unwrap()
+            .last_body
+            .clone()
+            .expect("PD worker should receive abort_all request");
+        let forwarded: serde_json::Value = serde_json::from_slice(&captured).unwrap();
+        assert_eq!(forwarded["abort_all"], true);
+        assert_eq!(forwarded["model"], "tiny");
+    }
+}
+
+#[tokio::test]
 async fn update_weights_from_disk_proxies_to_single_plain_worker() {
     let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let cfg = config(&["tiny"]);

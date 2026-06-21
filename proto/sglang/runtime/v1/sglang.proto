@@ -224,6 +224,7 @@ message LoadResponse {
 
 message AbortRequest {
   string request_id = 1;
+  bool abort_all = 2;
 }
 
 message FlushCacheRequest {}
