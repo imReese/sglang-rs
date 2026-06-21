@@ -5,6 +5,7 @@
 //! a `grpc://` worker, not only register it.
 
 use std::fs;
+use std::mem::size_of;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -26,7 +27,9 @@ use sglang_router::tokenizer::TokenizerRegistry;
 use sglang_router::workers::WorkerRegistry;
 use sglang_srt::cli::ServerArgs;
 use sglang_srt::proto::sglang::runtime::v1::sglang_service_client::SglangServiceClient;
-use sglang_srt::proto::sglang::runtime::v1::{GetModelInfoRequest, HealthCheckRequest};
+use sglang_srt::proto::sglang::runtime::v1::{
+    GetModelInfoRequest, GetWeightsByNameRequest, HealthCheckRequest,
+};
 use sglang_srt::server::launch_grpc_server_with_shutdown;
 use tokio::sync::oneshot;
 use tower::ServiceExt;
@@ -82,6 +85,49 @@ fn unique_profile_dir() -> std::path::PathBuf {
         "sglang-rs-router-grpc-profile-{}-{suffix}",
         std::process::id()
     ))
+}
+
+fn unique_model_dir(name: &str) -> std::path::PathBuf {
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "sglang-rs-router-grpc-{name}-{}-{suffix}",
+        std::process::id()
+    ))
+}
+
+fn write_minimal_generic_model_artifacts_with_weight_values(
+    model_dir: &std::path::Path,
+    values: &[f32],
+) {
+    fs::create_dir_all(model_dir).expect("model directory should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "architectures": ["TinyForCausalLM"],
+  "model_type": "tiny",
+  "vocab_size": 128,
+  "max_position_embeddings": 4096,
+  "eos_token_id": [2, 3]
+}"#,
+    )
+    .expect("config should be written");
+    let byte_len = values.len() * size_of::<f32>();
+    let header = format!(
+        r#"{{"model.embed_tokens.weight":{{"dtype":"F32","shape":[{}],"data_offsets":[0,{}]}}}}"#,
+        values.len(),
+        byte_len
+    );
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(header.as_bytes());
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    fs::write(model_dir.join("model.safetensors"), bytes)
+        .expect("safetensors shard should be written");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -367,6 +413,84 @@ async fn router_update_weight_version_reaches_real_rust_srt_grpc_worker() {
         .await
         .expect("gRPC server task should join")
         .expect("gRPC server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn router_get_weights_by_name_reaches_real_rust_srt_grpc_worker() {
+    let model_dir = unique_model_dir("get-weights");
+    write_minimal_generic_model_artifacts_with_weight_values(&model_dir, &[1.5, 2.5, 3.5]);
+    let addr = unused_local_addr();
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_dir.to_str().expect("model dir should be utf-8"),
+        "--served-model-name",
+        "tiny",
+        "--host",
+        &addr.ip().to_string(),
+        "--port",
+        &addr.port().to_string(),
+        "--grpc-mode",
+        "--num-reserved-decode-tokens",
+        "8",
+    ])
+    .expect("gRPC SRT args should parse");
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(launch_grpc_server_with_shutdown(args, async move {
+        let _ = shutdown_rx.await;
+    }));
+    wait_for_grpc_health(addr).await;
+
+    let app = build_router(build_ctx_with_grpc_worker(addr));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/get_weights_by_name")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "tiny",
+                "name": "model.embed_tokens.weight",
+                "truncate_size": 2,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+
+    let response = app.oneshot(request).await.expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("router response body should collect")
+        .to_bytes();
+    let body: serde_json::Value =
+        serde_json::from_slice(&body).expect("response should be parameter JSON");
+    assert_eq!(body["parameter"], serde_json::json!([1.5, 2.5]));
+    assert_eq!(body["queried_workers"], 1);
+
+    let mut client = SglangServiceClient::connect(format!("http://{addr}"))
+        .await
+        .expect("gRPC client should connect");
+    let direct = client
+        .get_weights_by_name(GetWeightsByNameRequest {
+            name: "model.embed_tokens.weight".to_string(),
+            truncate_size: Some(2),
+        })
+        .await
+        .expect("direct gRPC parameter read should work")
+        .into_inner();
+    assert_eq!(direct.parameter, vec![1.5, 2.5]);
+
+    shutdown_tx
+        .send(())
+        .expect("gRPC worker should still be running");
+    server
+        .await
+        .expect("gRPC server task should join")
+        .expect("gRPC server should stop cleanly");
+    fs::remove_dir_all(model_dir).expect("model temp directory should clean up");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

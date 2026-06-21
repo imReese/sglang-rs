@@ -30,7 +30,7 @@ use crate::router::{
 };
 use crate::tokenizer::Tokenizer;
 use crate::types::BootstrapRoom;
-use crate::weight_update::update_model_info_from_disk;
+use crate::weight_update::{get_weights_by_name_from_disk, update_model_info_from_disk};
 use crate::worker::WorkerExecutor;
 
 pub struct HttpRouterService<T, W> {
@@ -187,6 +187,10 @@ where
             .route(
                 "/update_weight_version",
                 post(update_weight_version::<T, W>),
+            )
+            .route(
+                "/get_weights_by_name",
+                get(get_weights_by_name::<T, W>).post(get_weights_by_name::<T, W>),
             )
             .route("/v1/tokenize", post(tokenize::<T, W>))
             .route("/tokenize", post(tokenize::<T, W>))
@@ -758,6 +762,66 @@ where
         })),
     )
         .into_response()
+}
+
+async fn get_weights_by_name<T, W>(
+    State(service): State<HttpRouterService<T, W>>,
+    Json(payload): Json<Value>,
+) -> Response
+where
+    T: Tokenizer + Send + 'static,
+    W: WorkerExecutor + Send + 'static,
+{
+    let name = match payload.get("name").and_then(Value::as_str) {
+        Some(name) => name,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": { "message": "name is required and must be a string" }
+                })),
+            )
+                .into_response();
+        }
+    };
+    let truncate_size = match payload.get("truncate_size") {
+        Some(Value::Number(value)) => {
+            match value.as_u64().and_then(|value| usize::try_from(value).ok()) {
+                Some(value) => Some(value),
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": { "message": "truncate_size must be a non-negative integer" }
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        Some(Value::Null) | None => None,
+        Some(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": { "message": "truncate_size must be a non-negative integer" }
+                })),
+            )
+                .into_response();
+        }
+    };
+    let model_info = match service.model_info_snapshot() {
+        Ok(info) => info,
+        Err(message) => return internal_error_json(message),
+    };
+    match get_weights_by_name_from_disk(&model_info, name, truncate_size) {
+        Ok(parameter) => (StatusCode::OK, Json(json!({ "parameter": parameter }))).into_response(),
+        Err(message) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": { "message": message } })),
+        )
+            .into_response(),
+    }
 }
 
 fn update_weights_bad_request(message: String) -> Response {

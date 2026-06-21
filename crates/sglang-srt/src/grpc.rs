@@ -32,12 +32,13 @@ use crate::proto::sglang::runtime::v1::{
     FlushCacheRequest, GenerateComplete as ProtoGenerateComplete,
     GenerateError as ProtoGenerateError, GenerateRequest as ProtoGenerateRequest,
     GenerateResponse as ProtoGenerateResponse, GenerateStreamChunk as ProtoGenerateStreamChunk,
-    GetLoadRequest, GetModelInfoRequest, GetServerInfoRequest, HealthCheckRequest,
-    HealthCheckResponse, ListModelsRequest, ListModelsResponse, LoadResponse, ModelInfoResponse,
-    OpenAiJsonRequest, OpenAiJsonResponse, PauseGenerationRequest,
-    SamplingParams as ProtoSamplingParams, ServerInfoResponse, StartProfileRequest,
-    StopProfileRequest, TextEmbedRequest, TextGenerateRequest, TokenizeRequest, TokenizeResponse,
-    TokenizedInput, UpdateWeightVersionRequest, UpdateWeightsFromDiskRequest, Usage,
+    GetLoadRequest, GetModelInfoRequest, GetServerInfoRequest, GetWeightsByNameRequest,
+    GetWeightsByNameResponse, HealthCheckRequest, HealthCheckResponse, ListModelsRequest,
+    ListModelsResponse, LoadResponse, ModelInfoResponse, OpenAiJsonRequest, OpenAiJsonResponse,
+    PauseGenerationRequest, SamplingParams as ProtoSamplingParams, ServerInfoResponse,
+    StartProfileRequest, StopProfileRequest, TextEmbedRequest, TextGenerateRequest,
+    TokenizeRequest, TokenizeResponse, TokenizedInput, UpdateWeightVersionRequest,
+    UpdateWeightsFromDiskRequest, Usage,
 };
 use crate::router::{
     RouterDisaggregatedParams, RouterGenerateComplete, RouterGenerateError, RouterGenerateRequest,
@@ -47,7 +48,7 @@ use crate::router::{
 };
 use crate::tokenizer::Tokenizer;
 use crate::transfer::PdConfig;
-use crate::weight_update::update_model_info_from_disk;
+use crate::weight_update::{get_weights_by_name_from_disk, update_model_info_from_disk};
 use crate::worker::WorkerExecutor;
 
 type GenerateResponseStream = Pin<
@@ -1307,6 +1308,19 @@ where
             success: true,
             message: format!("Weight version updated to {new_version}"),
         }))
+    }
+
+    async fn get_weights_by_name(
+        &self,
+        request: Request<GetWeightsByNameRequest>,
+    ) -> Result<Response<GetWeightsByNameResponse>, Status> {
+        let request = request.into_inner();
+        let model_info = self.model_info()?;
+        let truncate_size = request.truncate_size.map(|value| value as usize);
+        let parameter = get_weights_by_name_from_disk(&model_info, &request.name, truncate_size)
+            .map_err(Status::invalid_argument)?;
+
+        Ok(Response::new(GetWeightsByNameResponse { parameter }))
     }
 }
 

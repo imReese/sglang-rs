@@ -29,6 +29,7 @@ service SglangService {
   rpc StopProfile(StopProfileRequest) returns (ControlResponse);
   rpc UpdateWeightsFromDisk(UpdateWeightsFromDiskRequest) returns (ControlResponse);
   rpc UpdateWeightVersion(UpdateWeightVersionRequest) returns (ControlResponse);
+  rpc GetWeightsByName(GetWeightsByNameRequest) returns (GetWeightsByNameResponse);
 }
 
 message SamplingParams {
@@ -262,6 +263,15 @@ message UpdateWeightsFromDiskRequest {
 message UpdateWeightVersionRequest {
   string new_version = 1;
   optional bool abort_all_requests = 2;
+}
+
+message GetWeightsByNameRequest {
+  string name = 1;
+  optional uint32 truncate_size = 2;
+}
+
+message GetWeightsByNameResponse {
+  repeated float parameter = 1;
 }
 
 message Usage {

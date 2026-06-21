@@ -22,10 +22,11 @@ use sglang_srt::proto::sglang::runtime::v1::{
     AbortRequest as ProtoAbortRequest, ContinueGenerationRequest as ProtoContinueGenerationRequest,
     DisaggregatedParams as ProtoDisaggregatedParams, FlushCacheRequest as ProtoFlushCacheRequest,
     GenerateRequest as ProtoGenerateRequest, GenerateResponse as ProtoGenerateResponse,
-    GetLoadRequest as ProtoGetLoadRequest, OpenAiJsonRequest, OpenAiJsonResponse,
-    PauseGenerationRequest as ProtoPauseGenerationRequest, RequestOptions as ProtoRequestOptions,
-    SamplingParams as ProtoSamplingParams, StartProfileRequest as ProtoStartProfileRequest,
-    StopProfileRequest as ProtoStopProfileRequest, TextGenerateRequest as ProtoTextGenerateRequest,
+    GetLoadRequest as ProtoGetLoadRequest, GetWeightsByNameRequest as ProtoGetWeightsByNameRequest,
+    OpenAiJsonRequest, OpenAiJsonResponse, PauseGenerationRequest as ProtoPauseGenerationRequest,
+    RequestOptions as ProtoRequestOptions, SamplingParams as ProtoSamplingParams,
+    StartProfileRequest as ProtoStartProfileRequest, StopProfileRequest as ProtoStopProfileRequest,
+    TextGenerateRequest as ProtoTextGenerateRequest,
     UpdateWeightVersionRequest as ProtoUpdateWeightVersionRequest,
     UpdateWeightsFromDiskRequest as ProtoUpdateWeightsFromDiskRequest,
 };
@@ -412,6 +413,43 @@ fn proto_update_weight_version_request_from_json(
     })
 }
 
+fn proto_get_weights_by_name_request_from_json(
+    body: &[u8],
+) -> Result<ProtoGetWeightsByNameRequest, tonic::Status> {
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|e| grpc_generate_status(format!("invalid get_weights_by_name JSON: {e}")))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| grpc_generate_status("get_weights_by_name body must be a JSON object"))?;
+    let name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| grpc_generate_status("name is required and must be a string"))?
+        .to_string();
+    let truncate_size = match object.get("truncate_size") {
+        Some(Value::Number(value)) => Some(
+            value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| {
+                    grpc_generate_status("truncate_size must be a non-negative integer")
+                })?,
+        ),
+        Some(Value::Null) | None => None,
+        Some(_) => {
+            return Err(grpc_generate_status(
+                "truncate_size must be a non-negative integer",
+            ));
+        }
+    };
+
+    Ok(ProtoGetWeightsByNameRequest {
+        name,
+        truncate_size,
+    })
+}
+
 fn proto_abort_request_from_json(body: &[u8]) -> Result<ProtoAbortRequest, tonic::Status> {
     let value: Value = serde_json::from_slice(body)
         .map_err(|e| grpc_generate_status(format!("invalid abort_request JSON: {e}")))?;
@@ -774,6 +812,11 @@ impl Proxy {
         if path == "/update_weight_version" {
             return self
                 .forward_grpc_update_weight_version(worker_url, breaker, body)
+                .await;
+        }
+        if path == "/get_weights_by_name" {
+            return self
+                .forward_grpc_get_weights_by_name(worker_url, breaker, body)
                 .await;
         }
         if path == "/abort_request" {
@@ -1266,6 +1309,85 @@ impl Proxy {
         });
         let mut out = Response::new(Body::from(
             serde_json::to_vec(&body).expect("control response JSON should serialize"),
+        ));
+        out.headers_mut().insert(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("application/json"),
+        );
+        Ok(out)
+    }
+
+    async fn forward_grpc_get_weights_by_name(
+        &self,
+        worker_url: &str,
+        breaker: &CircuitBreaker,
+        body: Bytes,
+    ) -> Result<Response<Body>, ApiError> {
+        let parsed = parse_worker_url(worker_url, breaker)?;
+        let endpoint = grpc_endpoint_from_worker_url(&parsed).ok_or_else(|| {
+            breaker.record_failure();
+            ApiError::WorkerMisconfigured {
+                worker: worker_url.to_string(),
+                source: anyhow::anyhow!("unsupported gRPC worker URL scheme {}", parsed.scheme()),
+            }
+        })?;
+
+        let fut = async {
+            let request = proto_get_weights_by_name_request_from_json(&body)
+                .map_err(GrpcForwardError::Status)?;
+            let channel = tonic::transport::Endpoint::from_shared(endpoint.clone())
+                .map_err(|e| {
+                    GrpcForwardError::Transport(anyhow::anyhow!(
+                        "invalid gRPC endpoint {endpoint}: {e}"
+                    ))
+                })?
+                .connect_timeout(self.request_timeout)
+                .timeout(self.request_timeout)
+                .connect()
+                .await
+                .map_err(|e| {
+                    GrpcForwardError::Transport(anyhow::anyhow!(
+                        "connect gRPC worker {endpoint}: {e}"
+                    ))
+                })?;
+            let mut client = SglangServiceClient::new(channel);
+            client
+                .get_weights_by_name(GrpcRequest::new(request))
+                .await
+                .map(|response| response.into_inner())
+                .map_err(GrpcForwardError::Status)
+        };
+
+        let response = match tokio::time::timeout(self.request_timeout, fut).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(GrpcForwardError::Status(status))) => {
+                let response = grpc_status_response(status);
+                if response.status().is_server_error() {
+                    breaker.record_failure();
+                } else {
+                    breaker.record_success();
+                }
+                return Ok(response);
+            }
+            Ok(Err(GrpcForwardError::Transport(source))) => {
+                breaker.record_failure();
+                return Err(ApiError::UpstreamUnreachable {
+                    worker: parsed,
+                    source,
+                });
+            }
+            Err(_) => {
+                breaker.record_failure();
+                return Err(ApiError::UpstreamTimeout { worker: parsed });
+            }
+        };
+
+        breaker.record_success();
+        let body = json!({
+            "parameter": response.parameter,
+        });
+        let mut out = Response::new(Body::from(
+            serde_json::to_vec(&body).expect("get weights response JSON should serialize"),
         ));
         out.headers_mut().insert(
             HeaderName::from_static("content-type"),

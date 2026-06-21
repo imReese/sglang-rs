@@ -117,8 +117,8 @@ This repository currently contains the first `sglang-srt` runtime crate and the
   worker execution, generates request IDs in Rust when the caller omits one,
   validates token budgets before scheduler dispatch, maps protocol errors to
   router status classes for the future gRPC bridge, and exposes `/flush_cache`
-  plus `/update_weights_from_disk`, `/update_weight_version`, `/pause_generation`,
-  `/continue_generation`, `/abort_request`, `/start_profile`, and
+  plus `/update_weights_from_disk`, `/update_weight_version`, `/get_weights_by_name`,
+  `/pause_generation`, `/continue_generation`, `/abort_request`, `/start_profile`, and
   `/stop_profile` forwarding for gateway control-plane calls. `/abort_request`
   supports both targeted `rid` aborts and SGLang-compatible `abort_all`.
   The Rust router also exposes gateway-compatible `/v1/loads` and `/get_loads`
@@ -126,9 +126,9 @@ This repository currently contains the first `sglang-srt` runtime crate and the
 - `grpc`: gRPC boundary helpers and the initial `GrpcRouterService` adapter for
   the generated Tonic service trait. It wires tokenized `Generate`,
   `HealthCheck`, `FlushCache`, `PauseGeneration`, `ContinueGeneration`,
-  `Abort`, `StartProfile`, `StopProfile`, `UpdateWeightsFromDisk`, and
-  `UpdateWeightVersion` into `RouterRuntime`, converts router protocol errors to canonical
-  `tonic::Status` codes, and leaves unsupported RPCs as explicit
+  `Abort`, `StartProfile`, `StopProfile`, `UpdateWeightsFromDisk`,
+  `UpdateWeightVersion`, and `GetWeightsByName` into `RouterRuntime`, converts
+  router protocol errors to canonical `tonic::Status` codes, and leaves unsupported RPCs as explicit
   `UNIMPLEMENTED` responses while the runtime surface grows.
 - `server`: bootstrap helpers for launching the Rust gRPC router service from
   parsed `ServerArgs`, including model metadata propagation and an injectable PD

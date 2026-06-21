@@ -1208,6 +1208,56 @@ async fn http_server_update_weight_version_updates_model_info() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_get_weights_by_name_reads_safetensors_parameter() {
+    let model_dir = temp_model_dir("http-get-weights");
+    write_minimal_generic_model_artifacts_with_weight_values(&model_dir, &[1.5, 2.5, 3.5]);
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_dir.to_str().expect("temp model dir should be utf-8"),
+        "--served-model-name",
+        "tiny-http",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let service = build_bootstrap_http_router_service(&args);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let response = request_json_dynamic_with_retry(
+        addr,
+        "POST",
+        "/get_weights_by_name",
+        serde_json::json!({
+            "name": "model.embed_tokens.weight",
+            "truncate_size": 2
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(response["parameter"], serde_json::json!([1.5, 2.5]));
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_server_reports_runtime_loads_for_sglang_control_plane() {
     let mut scheduler = Scheduler::with_cache_resources(
         HttpTwoStepWorker,
@@ -2513,6 +2563,22 @@ fn write_minimal_generic_model_artifacts(model_dir: &Path) {
     write_minimal_safetensors_file(&model_dir.join("model.safetensors"));
 }
 
+fn write_minimal_generic_model_artifacts_with_weight_values(model_dir: &Path, values: &[f32]) {
+    fs::create_dir_all(model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "architectures": ["TinyForCausalLM"],
+  "model_type": "tiny",
+  "vocab_size": 128,
+  "max_position_embeddings": 4096,
+  "eos_token_id": [2, 3]
+}"#,
+    )
+    .expect("config should be written");
+    write_safetensors_weight_values(&model_dir.join("model.safetensors"), values);
+}
+
 fn write_minimal_safetensors_file(path: &Path) {
     let header =
         br#"{"model.embed_tokens.weight":{"dtype":"F32","shape":[1,1],"data_offsets":[0,4]}}"#;
@@ -2520,6 +2586,22 @@ fn write_minimal_safetensors_file(path: &Path) {
     bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
     bytes.extend_from_slice(header);
     bytes.extend_from_slice(&0.0f32.to_le_bytes());
+    fs::write(path, bytes).expect("safetensors shard should be written");
+}
+
+fn write_safetensors_weight_values(path: &Path, values: &[f32]) {
+    let byte_len = values.len() * std::mem::size_of::<f32>();
+    let header = format!(
+        r#"{{"model.embed_tokens.weight":{{"dtype":"F32","shape":[{}],"data_offsets":[0,{}]}}}}"#,
+        values.len(),
+        byte_len
+    );
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(header.as_bytes());
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
     fs::write(path, bytes).expect("safetensors shard should be written");
 }
 

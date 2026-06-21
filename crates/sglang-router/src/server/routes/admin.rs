@@ -32,6 +32,15 @@ struct UpdateWeightVersionProbe {
     new_version: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct GetWeightsByNameProbe {
+    #[serde(default)]
+    model: Option<String>,
+    name: String,
+    #[serde(default)]
+    truncate_size: Option<u32>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct AdminModelProbe {
     #[serde(default)]
@@ -376,6 +385,62 @@ pub async fn update_weight_version(
     .into_response())
 }
 
+pub async fn get_weights_by_name(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    let probe: GetWeightsByNameProbe = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::BadRequest("request body must be a JSON object".to_string()))?;
+    if probe.name.is_empty() {
+        return Err(ApiError::BadRequest("name must be non-empty".to_string()));
+    }
+
+    let model = select_admin_model(&ctx, probe.model)?;
+    let model_id = ModelId(model.clone());
+    let worker = admin_read_worker(&ctx, &model_id, &model)?;
+    let worker_type = worker_type_json(worker.mode());
+
+    let response = ctx
+        .proxy
+        .forward_json_to(
+            &worker.url,
+            &worker.breaker,
+            "/get_weights_by_name",
+            &headers,
+            body,
+        )
+        .await?;
+    if !response.status().is_success() {
+        return Ok(response);
+    }
+
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .map_err(|error| {
+            ApiError::Internal(anyhow::anyhow!("read get weights response body: {error}"))
+        })?;
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        ApiError::Internal(anyhow::anyhow!("decode get weights response body: {error}"))
+    })?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        ApiError::Internal(anyhow::anyhow!(
+            "get_weights_by_name response body must be a JSON object"
+        ))
+    })?;
+    object.insert("queried_workers".to_string(), serde_json::json!(1));
+    object.insert("model".to_string(), serde_json::json!(model));
+    object.insert("worker_type".to_string(), serde_json::json!(worker_type));
+    if let Some(truncate_size) = probe.truncate_size {
+        object.insert(
+            "truncate_size".to_string(),
+            serde_json::json!(truncate_size),
+        );
+    }
+
+    Ok(Json(value).into_response())
+}
+
 async fn forward_generation_control(
     ctx: Arc<AppContext>,
     headers: HeaderMap,
@@ -477,6 +542,51 @@ fn admin_control_workers(
                 });
             }
             Ok(prefill.into_iter().chain(decode).collect())
+        }
+        Err(PdResolveError::NoHealthyWorkers) => Err(ApiError::NoHealthyWorkers {
+            model: model.to_string(),
+        }),
+        Err(PdResolveError::NoPrefillWorkersAvailable) => {
+            Err(ApiError::NoPrefillWorkersAvailable {
+                model: model.to_string(),
+            })
+        }
+        Err(PdResolveError::NoDecodeWorkersAvailable) => Err(ApiError::NoDecodeWorkersAvailable {
+            model: model.to_string(),
+        }),
+    }
+}
+
+fn admin_read_worker(
+    ctx: &AppContext,
+    model_id: &ModelId,
+    model: &str,
+) -> Result<Arc<Worker>, ApiError> {
+    let resolver = PdPoolResolver::new(Arc::clone(&ctx.registry));
+    match resolver.resolve(model_id) {
+        Ok(PdPools::Plain { workers }) => {
+            workers
+                .into_iter()
+                .next()
+                .ok_or_else(|| ApiError::NoHealthyWorkers {
+                    model: model.to_string(),
+                })
+        }
+        Ok(PdPools::Pd { prefill, decode }) => {
+            if prefill.is_empty() {
+                return Err(ApiError::NoPrefillWorkersAvailable {
+                    model: model.to_string(),
+                });
+            }
+            if decode.is_empty() {
+                return Err(ApiError::NoDecodeWorkersAvailable {
+                    model: model.to_string(),
+                });
+            }
+            Ok(prefill
+                .into_iter()
+                .next()
+                .expect("prefill emptiness checked above"))
         }
         Err(PdResolveError::NoHealthyWorkers) => Err(ApiError::NoHealthyWorkers {
             model: model.to_string(),

@@ -4,6 +4,8 @@ use crate::model_artifacts::LocalModelArtifacts;
 use crate::router::RouterGetModelInfoResponse;
 use crate::worker::WorkerWeightUpdateRequest;
 
+const DEFAULT_GET_WEIGHTS_TRUNCATE_SIZE: usize = 100;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WeightMetadataUpdate {
     pub model_info: RouterGetModelInfoResponse,
@@ -45,6 +47,29 @@ pub(crate) fn update_model_info_from_disk(
         worker_request,
         message,
     })
+}
+
+pub(crate) fn get_weights_by_name_from_disk(
+    model_info: &RouterGetModelInfoResponse,
+    name: &str,
+    truncate_size: Option<usize>,
+) -> Result<Vec<f32>, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("name is required and must be non-empty".to_string());
+    }
+    let truncate_size = truncate_size.unwrap_or(DEFAULT_GET_WEIGHTS_TRUNCATE_SIZE);
+    let artifacts = LocalModelArtifacts::from_model_path(&model_info.model_path)
+        .map_err(|error| format!("invalid local model artifacts: {error}"))?;
+    let tensor = artifacts
+        .safetensors()
+        .read_tensor(name)
+        .map_err(|error| format!("failed to read tensor {name}: {error}"))?
+        .ok_or_else(|| format!("tensor {name:?} not found"))?;
+    let values = tensor
+        .decode_f32_values()
+        .map_err(|error| format!("failed to decode tensor {name}: {error}"))?;
+    Ok(values.into_iter().take(truncate_size).collect())
 }
 
 fn validate_update_weights_load_format(load_format: Option<&str>) -> Result<&'static str, String> {

@@ -66,6 +66,7 @@ impl MockWorker {
             .route("/generate", post(chat))
             .route("/update_weights_from_disk", post(chat))
             .route("/update_weight_version", post(chat))
+            .route("/get_weights_by_name", post(chat))
             .route("/flush_cache", post(chat))
             .route("/pause_generation", post(chat))
             .route("/continue_generation", post(chat))
@@ -467,6 +468,12 @@ async fn chat(
             "success": true,
             "message": "weights updated",
             "num_paused_requests": 0,
+        }))
+        .into_response();
+    }
+    if uri.path() == "/get_weights_by_name" {
+        return Json(serde_json::json!({
+            "parameter": [1.5, 2.5],
         }))
         .into_response();
     }

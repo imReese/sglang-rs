@@ -840,3 +840,107 @@ async fn update_weight_version_proxies_to_prefill_and_decode_pd_workers() {
         assert_eq!(forwarded["abort_all_requests"], true);
     }
 }
+
+#[tokio::test]
+async fn get_weights_by_name_proxies_to_single_plain_worker() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let cfg = config(&["tiny"]);
+    let ctx = build_ctx(
+        cfg,
+        vec![WorkerSpec {
+            id: WorkerId("plain-1".into()),
+            url: worker.url.clone(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+        }],
+    );
+    let app = build_router(ctx);
+
+    let res = app
+        .oneshot(admin_request(
+            "/get_weights_by_name",
+            serde_json::json!({
+                "name": "model.embed_tokens.weight",
+                "truncate_size": 2
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["parameter"], serde_json::json!([1.5, 2.5]));
+    assert_eq!(body["queried_workers"], 1);
+
+    let captured = worker
+        .captured
+        .lock()
+        .unwrap()
+        .last_body
+        .clone()
+        .expect("plain worker should receive get weights request");
+    let forwarded: serde_json::Value = serde_json::from_slice(&captured).unwrap();
+    assert_eq!(forwarded["name"], "model.embed_tokens.weight");
+    assert_eq!(forwarded["truncate_size"], 2);
+}
+
+#[tokio::test]
+async fn get_weights_by_name_queries_prefill_worker_for_pd_pool() {
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let cfg = config(&["tiny"]);
+    let ctx = build_ctx(
+        cfg,
+        vec![
+            WorkerSpec {
+                id: WorkerId("prefill-1".into()),
+                url: prefill.url.clone(),
+                mode: WorkerMode::Prefill,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: Some(8997),
+            },
+            WorkerSpec {
+                id: WorkerId("decode-1".into()),
+                url: decode.url.clone(),
+                mode: WorkerMode::Decode,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: None,
+            },
+        ],
+    );
+    let app = build_router(ctx);
+
+    let res = app
+        .oneshot(admin_request(
+            "/get_weights_by_name",
+            serde_json::json!({
+                "model": "tiny",
+                "name": "model.embed_tokens.weight",
+                "truncate_size": 2
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["parameter"], serde_json::json!([1.5, 2.5]));
+    assert_eq!(body["queried_workers"], 1);
+    assert_eq!(body["worker_type"], "prefill");
+
+    let captured = prefill
+        .captured
+        .lock()
+        .unwrap()
+        .last_body
+        .clone()
+        .expect("prefill worker should receive get weights request");
+    let forwarded: serde_json::Value = serde_json::from_slice(&captured).unwrap();
+    assert_eq!(forwarded["model"], "tiny");
+    assert_eq!(forwarded["name"], "model.embed_tokens.weight");
+    assert_eq!(forwarded["truncate_size"], 2);
+    assert!(decode.captured.lock().unwrap().last_body.is_none());
+}
