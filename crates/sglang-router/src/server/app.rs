@@ -39,6 +39,8 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
             "/v1/models",
             get(crate::server::routes::models::list_models),
         )
+        .route("/v1/loads", get(crate::server::routes::admin::get_loads))
+        .route("/get_loads", get(crate::server::routes::admin::get_loads))
         .route(
             "/update_weights_from_disk",
             post(crate::server::routes::admin::update_weights_from_disk)

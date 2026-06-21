@@ -71,6 +71,7 @@ impl MockWorker {
             .route("/abort_request", post(chat))
             .route("/start_profile", post(chat))
             .route("/stop_profile", post(chat))
+            .route("/v1/loads", get(loads))
             .route("/server_info", get(serve_tiny_server_info))
             .with_state(state);
 
@@ -404,6 +405,23 @@ impl MockWorker {
 #[allow(dead_code)] // shared across all axum variants
 async fn serve_tiny_server_info() -> Json<Value> {
     Json(serde_json::json!({"served_model_name": "tiny"}))
+}
+
+#[allow(dead_code)] // Used by `MockWorker::start`, only some test files need it.
+async fn loads() -> Json<Value> {
+    Json(serde_json::json!({
+        "timestamp": 1,
+        "version": "mock-worker",
+        "aggregate": {
+            "total_tokens": 7,
+        },
+        "loads": [{
+            "dp_rank": 0,
+            "num_running_reqs": 3,
+            "num_waiting_reqs": 4,
+            "num_reqs": 7,
+        }]
+    }))
 }
 
 #[allow(dead_code)] // Used by `MockWorker::start`, only some test files need it.

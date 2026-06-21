@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::discovery::ModelId;
+use crate::discovery::{ModelId, WorkerMode};
 use crate::policies::registry::{PdPoolResolver, PdPools, PdResolveError};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
@@ -12,6 +12,7 @@ use axum::http::{HeaderMap, Response};
 use axum::response::IntoResponse;
 use axum::Json;
 use bytes::Bytes;
+use futures::future;
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -82,6 +83,51 @@ pub async fn flush_cache(
         "message": format!("flushed cache on {flushed_workers} worker(s)"),
         "flushed_workers": flushed_workers,
         "model": model,
+    }))
+    .into_response())
+}
+
+pub async fn get_loads(State(ctx): State<Arc<AppContext>>) -> Result<Response<Body>, ApiError> {
+    let workers = ctx.registry.workers();
+    let total_workers = workers.len();
+    let futures = workers.iter().map(|worker| {
+        let proxy = Arc::clone(&ctx.proxy);
+        let worker = Arc::clone(worker);
+        async move {
+            let load = match proxy.load_for_worker(&worker.url, &worker.breaker).await {
+                Ok(load) => load,
+                Err(error) => {
+                    tracing::warn!(
+                        worker = %worker.url,
+                        error = %error,
+                        "failed to read worker load",
+                    );
+                    -1
+                }
+            };
+            serde_json::json!({
+                "worker": worker.url,
+                "worker_type": worker_type_json(worker.mode()),
+                "load": load,
+            })
+        }
+    });
+    let loads = future::join_all(futures).await;
+    let successful = loads
+        .iter()
+        .filter(|load| {
+            load.get("load")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(-1)
+                >= 0
+        })
+        .count();
+
+    Ok(Json(serde_json::json!({
+        "loads": loads,
+        "total_workers": total_workers,
+        "successful": successful,
+        "failed": total_workers.saturating_sub(successful),
     }))
     .into_response())
 }
@@ -321,6 +367,14 @@ async fn forward_generation_control(
         "action": action,
     }))
     .into_response())
+}
+
+fn worker_type_json(mode: WorkerMode) -> Option<&'static str> {
+    match mode {
+        WorkerMode::Plain => None,
+        WorkerMode::Prefill => Some("prefill"),
+        WorkerMode::Decode => Some("decode"),
+    }
 }
 
 fn parse_admin_model_probe(body: &[u8]) -> Result<AdminModelProbe, ApiError> {

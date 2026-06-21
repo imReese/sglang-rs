@@ -179,6 +179,13 @@ impl WorkerRegistry {
             .unwrap_or_default()
     }
 
+    pub fn workers(&self) -> Vec<Arc<Worker>> {
+        self.by_id
+            .iter()
+            .map(|entry| Arc::clone(entry.value()))
+            .collect()
+    }
+
     pub fn healthy_workers_for(&self, model: &ModelId) -> Vec<Arc<Worker>> {
         // Use `would_allow` (non-mutating) for filtering — `allow()` would
         // claim a half-open probe slot for every enumerated candidate,

@@ -22,10 +22,10 @@ use sglang_srt::proto::sglang::runtime::v1::{
     AbortRequest as ProtoAbortRequest, ContinueGenerationRequest as ProtoContinueGenerationRequest,
     DisaggregatedParams as ProtoDisaggregatedParams, FlushCacheRequest as ProtoFlushCacheRequest,
     GenerateRequest as ProtoGenerateRequest, GenerateResponse as ProtoGenerateResponse,
-    OpenAiJsonRequest, OpenAiJsonResponse, PauseGenerationRequest as ProtoPauseGenerationRequest,
-    RequestOptions as ProtoRequestOptions, SamplingParams as ProtoSamplingParams,
-    StartProfileRequest as ProtoStartProfileRequest, StopProfileRequest as ProtoStopProfileRequest,
-    TextGenerateRequest as ProtoTextGenerateRequest,
+    GetLoadRequest as ProtoGetLoadRequest, OpenAiJsonRequest, OpenAiJsonResponse,
+    PauseGenerationRequest as ProtoPauseGenerationRequest, RequestOptions as ProtoRequestOptions,
+    SamplingParams as ProtoSamplingParams, StartProfileRequest as ProtoStartProfileRequest,
+    StopProfileRequest as ProtoStopProfileRequest, TextGenerateRequest as ProtoTextGenerateRequest,
     UpdateWeightsFromDiskRequest as ProtoUpdateWeightsFromDiskRequest,
 };
 use std::collections::HashMap;
@@ -113,6 +113,21 @@ fn grpc_status_response(status: tonic::Status) -> Response<Body> {
 
 fn grpc_generate_status(message: impl Into<String>) -> tonic::Status {
     tonic::Status::invalid_argument(message.into())
+}
+
+fn load_from_worker_load_json(value: &Value) -> Option<i64> {
+    value
+        .get("aggregate")
+        .and_then(|aggregate| aggregate.get("total_tokens"))
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            value.get("loads").and_then(Value::as_array).map(|loads| {
+                loads
+                    .iter()
+                    .filter_map(|load| load.get("num_reqs").and_then(Value::as_i64))
+                    .sum::<i64>()
+            })
+        })
 }
 
 fn value_as_i32(value: &Value, field: &'static str) -> Result<i32, tonic::Status> {
@@ -662,6 +677,55 @@ impl Proxy {
         Ok(out)
     }
 
+    pub async fn load_for_worker(
+        &self,
+        worker_url: &str,
+        breaker: &CircuitBreaker,
+    ) -> Result<i64, ApiError> {
+        if !breaker.allow() {
+            return Err(ApiError::BreakerOpen {
+                worker: worker_url.to_string(),
+            });
+        }
+        if is_grpc_worker_url(worker_url) {
+            return self.load_for_grpc_worker(worker_url, breaker).await;
+        }
+
+        let worker_url = parse_worker_url(worker_url, breaker)?;
+        let mut url = worker_url.join("/v1/loads").map_err(|e| {
+            ApiError::Internal(anyhow::Error::new(e).context("join worker path /v1/loads"))
+        })?;
+        url.query_pairs_mut().append_pair("include", "core");
+
+        let response = self
+            .client
+            .get(url.clone())
+            .timeout(self.request_timeout)
+            .send()
+            .await
+            .map_err(|e| {
+                breaker.record_failure();
+                Self::classify_reqwest_error_for(worker_url.clone(), e, "/v1/loads")
+            })?;
+        let status = response.status();
+        let json = response.json::<Value>().await.map_err(|error| {
+            breaker.record_failure();
+            ApiError::Internal(anyhow::anyhow!(
+                "decode worker load response from {url}: {error}"
+            ))
+        })?;
+        if status.is_server_error() {
+            breaker.record_failure();
+        } else {
+            breaker.record_success();
+        }
+        if !status.is_success() {
+            return Err(ApiError::UpstreamStatus { status });
+        }
+
+        Ok(load_from_worker_load_json(&json).unwrap_or(-1))
+    }
+
     async fn forward_grpc_json_to(
         &self,
         worker_url: &str,
@@ -842,6 +906,73 @@ impl Proxy {
             HeaderValue::from_static("application/json"),
         );
         Ok(out)
+    }
+
+    async fn load_for_grpc_worker(
+        &self,
+        worker_url: &str,
+        breaker: &CircuitBreaker,
+    ) -> Result<i64, ApiError> {
+        let parsed = parse_worker_url(worker_url, breaker)?;
+        let endpoint = grpc_endpoint_from_worker_url(&parsed).ok_or_else(|| {
+            breaker.record_failure();
+            ApiError::WorkerMisconfigured {
+                worker: worker_url.to_string(),
+                source: anyhow::anyhow!("unsupported gRPC worker URL scheme {}", parsed.scheme()),
+            }
+        })?;
+
+        let fut = async {
+            let channel = tonic::transport::Endpoint::from_shared(endpoint.clone())
+                .map_err(|e| {
+                    GrpcForwardError::Transport(anyhow::anyhow!(
+                        "invalid gRPC endpoint {endpoint}: {e}"
+                    ))
+                })?
+                .connect_timeout(self.request_timeout)
+                .timeout(self.request_timeout)
+                .connect()
+                .await
+                .map_err(|e| {
+                    GrpcForwardError::Transport(anyhow::anyhow!(
+                        "connect gRPC worker {endpoint}: {e}"
+                    ))
+                })?;
+            let mut client = SglangServiceClient::new(channel);
+            client
+                .get_load(GrpcRequest::new(ProtoGetLoadRequest {}))
+                .await
+                .map(|response| response.into_inner())
+                .map_err(GrpcForwardError::Status)
+        };
+
+        let response = match tokio::time::timeout(self.request_timeout, fut).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(GrpcForwardError::Status(status))) => {
+                if grpc_status_to_http_status(status.code()).is_server_error() {
+                    breaker.record_failure();
+                } else {
+                    breaker.record_success();
+                }
+                return Err(ApiError::UpstreamStatus {
+                    status: grpc_status_to_http_status(status.code()),
+                });
+            }
+            Ok(Err(GrpcForwardError::Transport(source))) => {
+                breaker.record_failure();
+                return Err(ApiError::UpstreamUnreachable {
+                    worker: parsed,
+                    source,
+                });
+            }
+            Err(_) => {
+                breaker.record_failure();
+                return Err(ApiError::UpstreamTimeout { worker: parsed });
+            }
+        };
+
+        breaker.record_success();
+        Ok(i64::from(response.waiting_queue_depth) + i64::from(response.decode_queue_depth))
     }
 
     async fn forward_grpc_flush_cache(

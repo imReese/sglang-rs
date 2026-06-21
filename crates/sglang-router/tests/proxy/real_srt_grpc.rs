@@ -758,6 +758,65 @@ async fn router_streaming_completions_reaches_real_rust_srt_grpc_worker() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn router_v1_loads_reaches_real_rust_srt_grpc_worker() {
+    let addr = unused_local_addr();
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "tiny",
+        "--host",
+        &addr.ip().to_string(),
+        "--port",
+        &addr.port().to_string(),
+        "--grpc-mode",
+        "--num-reserved-decode-tokens",
+        "8",
+    ])
+    .expect("gRPC SRT args should parse");
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(launch_grpc_server_with_shutdown(args, async move {
+        let _ = shutdown_rx.await;
+    }));
+    wait_for_grpc_health(addr).await;
+
+    let app = build_router(build_ctx_with_grpc_worker(addr));
+    let request = Request::builder()
+        .method("GET")
+        .uri("/v1/loads")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("router response body should collect")
+        .to_bytes();
+    let body: serde_json::Value =
+        serde_json::from_slice(&body).expect("response should be load JSON");
+
+    assert_eq!(body["total_workers"], 1);
+    assert_eq!(body["successful"], 1);
+    assert_eq!(body["failed"], 0);
+    assert_eq!(body["loads"][0]["worker"], format!("grpc://{addr}"));
+    assert!(body["loads"][0]["worker_type"].is_null());
+    assert_eq!(body["loads"][0]["load"], 0);
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn router_generate_reaches_real_rust_srt_grpc_worker() {
     let addr = unused_local_addr();
     let args = ServerArgs::parse_from([

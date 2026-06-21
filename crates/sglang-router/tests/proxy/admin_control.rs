@@ -86,6 +86,94 @@ fn admin_request(path: &str, body: serde_json::Value) -> Request<Body> {
         .unwrap()
 }
 
+fn get_request(path: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(path)
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn get_loads_reports_single_plain_worker_load() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let cfg = config(&["tiny"]);
+    let ctx = build_ctx(
+        cfg,
+        vec![WorkerSpec {
+            id: WorkerId("plain-1".into()),
+            url: worker.url.clone(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+        }],
+    );
+    let app = build_router(ctx);
+
+    let response = app
+        .oneshot(get_request("/get_loads"))
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+
+    assert_eq!(body["total_workers"], 1);
+    assert_eq!(body["successful"], 1);
+    assert_eq!(body["failed"], 0);
+    assert_eq!(body["loads"][0]["worker"], worker.url);
+    assert!(body["loads"][0]["worker_type"].is_null());
+    assert_eq!(body["loads"][0]["load"], 7);
+}
+
+#[tokio::test]
+async fn v1_loads_reports_prefill_and_decode_pd_worker_loads() {
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let cfg = config(&["tiny"]);
+    let ctx = build_ctx(
+        cfg,
+        vec![
+            WorkerSpec {
+                id: WorkerId("prefill-1".into()),
+                url: prefill.url.clone(),
+                mode: WorkerMode::Prefill,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: Some(8997),
+            },
+            WorkerSpec {
+                id: WorkerId("decode-1".into()),
+                url: decode.url.clone(),
+                mode: WorkerMode::Decode,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: None,
+            },
+        ],
+    );
+    let app = build_router(ctx);
+
+    let response = app
+        .oneshot(get_request("/v1/loads"))
+        .await
+        .expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+
+    assert_eq!(body["total_workers"], 2);
+    assert_eq!(body["successful"], 2);
+    assert_eq!(body["failed"], 0);
+
+    let loads = body["loads"].as_array().expect("loads should be an array");
+    assert_eq!(loads.len(), 2);
+    assert!(loads.iter().any(|load| {
+        load["worker"] == prefill.url && load["worker_type"] == "prefill" && load["load"] == 7
+    }));
+    assert!(loads.iter().any(|load| {
+        load["worker"] == decode.url && load["worker_type"] == "decode" && load["load"] == 7
+    }));
+}
+
 #[tokio::test]
 async fn pause_and_continue_generation_proxy_to_single_plain_worker() {
     let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
