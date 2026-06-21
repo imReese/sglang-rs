@@ -116,9 +116,8 @@ This repository currently contains the first `sglang-srt` runtime crate and the
   metadata (`bootstrap_host`, `bootstrap_port`, `bootstrap_room`) for downstream
   worker execution, generates request IDs in Rust when the caller omits one,
   validates token budgets before scheduler dispatch, maps protocol errors to
-  router status classes for the future gRPC bridge, and exposes a flush-cache
-  control operation plus `/update_weights_from_disk` forwarding for gateway
-  control-plane calls.
+  router status classes for the future gRPC bridge, and exposes `/flush_cache`
+  plus `/update_weights_from_disk` forwarding for gateway control-plane calls.
 - `grpc`: gRPC boundary helpers and the initial `GrpcRouterService` adapter for
   the generated Tonic service trait. It wires tokenized `Generate`,
   `HealthCheck`, `FlushCache`, and `UpdateWeightsFromDisk` into

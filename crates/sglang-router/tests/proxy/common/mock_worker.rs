@@ -65,6 +65,7 @@ impl MockWorker {
             .route("/v1/classify", post(chat))
             .route("/generate", post(chat))
             .route("/update_weights_from_disk", post(chat))
+            .route("/flush_cache", post(chat))
             .route("/server_info", get(serve_tiny_server_info))
             .with_state(state);
 
@@ -442,6 +443,13 @@ async fn chat(
             "success": true,
             "message": "weights updated",
             "num_paused_requests": 0,
+        }))
+        .into_response();
+    }
+    if uri.path() == "/flush_cache" {
+        return Json(serde_json::json!({
+            "success": true,
+            "message": "cache flushed",
         }))
         .into_response();
     }

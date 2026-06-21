@@ -24,6 +24,49 @@ struct UpdateWeightsProbe {
     load_format: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct AdminModelProbe {
+    #[serde(default)]
+    model: Option<String>,
+}
+
+pub async fn flush_cache(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    let probe = parse_admin_model_probe(&body)?;
+    let model = select_admin_model(&ctx, probe.model)?;
+    let model_id = ModelId(model.clone());
+    let workers = admin_control_workers(&ctx, &model_id, &model)?;
+    let mut flushed_workers = 0usize;
+
+    for worker in workers {
+        let response = ctx
+            .proxy
+            .forward_json_to(
+                &worker.url,
+                &worker.breaker,
+                "/flush_cache",
+                &headers,
+                body.clone(),
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Ok(response);
+        }
+        flushed_workers += 1;
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": format!("flushed cache on {flushed_workers} worker(s)"),
+        "flushed_workers": flushed_workers,
+        "model": model,
+    }))
+    .into_response())
+}
+
 pub async fn update_weights_from_disk(
     State(ctx): State<Arc<AppContext>>,
     headers: HeaderMap,
@@ -39,7 +82,7 @@ pub async fn update_weights_from_disk(
 
     let model = select_admin_model(&ctx, probe.model)?;
     let model_id = ModelId(model.clone());
-    let workers = admin_update_workers(&ctx, &model_id, &model)?;
+    let workers = admin_control_workers(&ctx, &model_id, &model)?;
     let mut updated_workers = 0usize;
 
     for worker in workers {
@@ -73,6 +116,14 @@ pub async fn update_weights_from_disk(
     .into_response())
 }
 
+fn parse_admin_model_probe(body: &[u8]) -> Result<AdminModelProbe, ApiError> {
+    if body.is_empty() {
+        return Ok(AdminModelProbe::default());
+    }
+    serde_json::from_slice(body)
+        .map_err(|_| ApiError::BadRequest("request body must be a JSON object".to_string()))
+}
+
 fn select_admin_model(ctx: &AppContext, requested: Option<String>) -> Result<String, ApiError> {
     if let Some(model) = requested {
         if ctx
@@ -97,7 +148,7 @@ fn select_admin_model(ctx: &AppContext, requested: Option<String>) -> Result<Str
     }
 }
 
-fn admin_update_workers(
+fn admin_control_workers(
     ctx: &AppContext,
     model_id: &ModelId,
     model: &str,

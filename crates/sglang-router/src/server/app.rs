@@ -46,6 +46,12 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
+            "/flush_cache",
+            post(crate::server::routes::admin::flush_cache)
+                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
             "/v1/tokenize",
             post(crate::server::routes::tokenize::tokenize),
         )

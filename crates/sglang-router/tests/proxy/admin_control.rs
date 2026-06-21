@@ -68,6 +68,103 @@ fn update_weights_request(body: serde_json::Value) -> Request<Body> {
         .unwrap()
 }
 
+fn flush_cache_request(body: serde_json::Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/flush_cache")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn flush_cache_proxies_to_single_plain_worker() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let cfg = config(&["tiny"]);
+    let ctx = build_ctx(
+        cfg,
+        vec![WorkerSpec {
+            id: WorkerId("plain-1".into()),
+            url: worker.url.clone(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+        }],
+    );
+    let app = build_router(ctx);
+
+    let res = app
+        .oneshot(flush_cache_request(serde_json::json!({})))
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["success"], true);
+    assert_eq!(body["flushed_workers"], 1);
+
+    let captured = worker
+        .captured
+        .lock()
+        .unwrap()
+        .last_body
+        .clone()
+        .expect("plain worker should receive flush request");
+    let forwarded: serde_json::Value = serde_json::from_slice(&captured).unwrap();
+    assert_eq!(forwarded, serde_json::json!({}));
+}
+
+#[tokio::test]
+async fn flush_cache_proxies_to_prefill_and_decode_pd_workers() {
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let cfg = config(&["tiny"]);
+    let ctx = build_ctx(
+        cfg,
+        vec![
+            WorkerSpec {
+                id: WorkerId("prefill-1".into()),
+                url: prefill.url.clone(),
+                mode: WorkerMode::Prefill,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: Some(8997),
+            },
+            WorkerSpec {
+                id: WorkerId("decode-1".into()),
+                url: decode.url.clone(),
+                mode: WorkerMode::Decode,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: None,
+            },
+        ],
+    );
+    let app = build_router(ctx);
+
+    let res = app
+        .oneshot(flush_cache_request(serde_json::json!({"model": "tiny"})))
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["success"], true);
+    assert_eq!(body["flushed_workers"], 2);
+
+    for worker in [&prefill, &decode] {
+        let captured = worker
+            .captured
+            .lock()
+            .unwrap()
+            .last_body
+            .clone()
+            .expect("PD worker should receive flush request");
+        let forwarded: serde_json::Value = serde_json::from_slice(&captured).unwrap();
+        assert_eq!(forwarded["model"], "tiny");
+    }
+}
+
 #[tokio::test]
 async fn update_weights_from_disk_proxies_to_single_plain_worker() {
     let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
