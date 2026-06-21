@@ -20,7 +20,11 @@ use sglang_router::server::app_context::AppContext;
 use sglang_router::tokenizer::TokenizerRegistry;
 use sglang_router::workers::WorkerRegistry;
 use sglang_srt::cli::ServerArgs;
-use sglang_srt::server::launch_http_server_with_shutdown;
+use sglang_srt::engine_info_bootstrap::{
+    EngineInfoBootstrapService, TransferEngineInfo, TransferEngineInfoRegistration,
+};
+use sglang_srt::http::serve_http_router_with_shutdown;
+use sglang_srt::server::{build_bootstrap_http_router_service, launch_http_server_with_shutdown};
 use tokio::sync::oneshot;
 use tower::ServiceExt;
 
@@ -315,6 +319,80 @@ async fn router_classify_reaches_real_rust_srt_http_worker() {
     assert_eq!(body["data"].as_array().unwrap().len(), 2);
     assert_eq!(body["data"][0]["num_classes"], 3);
     assert!(body["usage"]["prompt_tokens"].as_i64().unwrap() > 0);
+
+    shutdown_tx
+        .send(())
+        .expect("HTTP worker should still be running");
+    server
+        .await
+        .expect("HTTP server task should join")
+        .expect("HTTP server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn router_remote_instance_transfer_engine_info_reaches_real_rust_srt_http_worker() {
+    let addr = unused_local_addr();
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "tiny-reranker",
+        "--host",
+        &addr.ip().to_string(),
+        "--port",
+        &addr.port().to_string(),
+    ])
+    .expect("HTTP SRT args should parse");
+    let engine_info = EngineInfoBootstrapService::default();
+    engine_info
+        .state()
+        .lock()
+        .expect("engine info state should lock")
+        .register_transfer_engine_info(TransferEngineInfoRegistration {
+            tp_rank: 0,
+            transfer_engine_info: TransferEngineInfo {
+                session_id: "session-a".to_string(),
+                weights_info_dict: json!({
+                    "layer.0": {
+                        "addr": 4096,
+                        "length": 8192,
+                    }
+                }),
+            },
+        });
+    let service =
+        build_bootstrap_http_router_service(&args).with_engine_info_bootstrap_service(engine_info);
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(serve_http_router_with_shutdown(addr, service, async move {
+        let _ = shutdown_rx.await;
+    }));
+    wait_for_http_health(addr).await;
+
+    let app = build_router(build_ctx_with_http_worker(addr));
+    let request = Request::builder()
+        .method("GET")
+        .uri("/remote_instance_transfer_engine_info?rank=0")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("router response body should collect")
+        .to_bytes();
+    let body: serde_json::Value =
+        serde_json::from_slice(&body).expect("response should be transfer engine info JSON");
+    assert_eq!(body["rank"], 0);
+    assert_eq!(body["remote_instance_transfer_engine_info"][0], "session-a");
+    assert_eq!(
+        body["remote_instance_transfer_engine_info"][1]["layer.0"]["length"],
+        8192
+    );
 
     shutdown_tx
         .send(())

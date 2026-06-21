@@ -60,6 +60,14 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
+            "/remote_instance_transfer_engine_info",
+            get(crate::server::routes::admin::remote_instance_transfer_engine_info),
+        )
+        .route(
+            "/get_remote_instance_transfer_engine_info",
+            get(crate::server::routes::admin::remote_instance_transfer_engine_info),
+        )
+        .route(
             "/flush_cache",
             post(crate::server::routes::admin::flush_cache)
                 .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))

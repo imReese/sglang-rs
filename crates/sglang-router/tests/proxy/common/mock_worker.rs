@@ -24,6 +24,7 @@ pub struct CapturedHeaders {
     pub seen: HashSet<String>,            // names (kept for backwards compat)
     pub headers: HashMap<String, String>, // name -> value (last write wins)
     pub last_body: Option<Bytes>,
+    pub last_uri: Option<String>,
 }
 
 #[derive(Clone)]
@@ -67,6 +68,14 @@ impl MockWorker {
             .route("/update_weights_from_disk", post(chat))
             .route("/update_weight_version", post(chat))
             .route("/get_weights_by_name", post(chat))
+            .route(
+                "/remote_instance_transfer_engine_info",
+                get(remote_instance_transfer_engine_info),
+            )
+            .route(
+                "/get_remote_instance_transfer_engine_info",
+                get(remote_instance_transfer_engine_info),
+            )
             .route("/flush_cache", post(chat))
             .route("/pause_generation", post(chat))
             .route("/continue_generation", post(chat))
@@ -436,6 +445,7 @@ async fn chat(
     {
         let mut g = s.captured.lock().unwrap();
         g.last_body = Some(body.clone());
+        g.last_uri = Some(uri.to_string());
         for (k, v) in headers.iter() {
             g.seen.insert(k.as_str().to_string());
             if let Ok(val) = v.to_str() {
@@ -547,4 +557,42 @@ async fn chat(
         }]
     });
     Json(resp).into_response()
+}
+
+async fn remote_instance_transfer_engine_info(
+    State(s): State<MockWorkerState>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    {
+        let mut g = s.captured.lock().unwrap();
+        g.last_body = Some(Bytes::new());
+        g.last_uri = Some(uri.to_string());
+        for (k, v) in headers.iter() {
+            g.seen.insert(k.as_str().to_string());
+            if let Ok(val) = v.to_str() {
+                g.headers.insert(k.as_str().to_string(), val.to_string());
+            }
+        }
+    }
+    let rank = uri
+        .query()
+        .unwrap_or_default()
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find_map(|(key, value)| (key == "rank").then_some(value))
+        .unwrap_or("0");
+    Json(serde_json::json!({
+        "rank": rank.parse::<i32>().unwrap_or_default(),
+        "remote_instance_transfer_engine_info": [
+            "session-a",
+            {
+                "layer.0": {
+                    "addr": 4096,
+                    "length": 8192
+                }
+            }
+        ]
+    }))
+    .into_response()
 }

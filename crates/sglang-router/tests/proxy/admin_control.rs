@@ -944,3 +944,125 @@ async fn get_weights_by_name_queries_prefill_worker_for_pd_pool() {
     assert_eq!(forwarded["truncate_size"], 2);
     assert!(decode.captured.lock().unwrap().last_body.is_none());
 }
+
+#[tokio::test]
+async fn remote_instance_transfer_engine_info_proxies_to_single_plain_worker() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let cfg = config(&["tiny"]);
+    let ctx = build_ctx(
+        cfg,
+        vec![WorkerSpec {
+            id: WorkerId("plain-1".into()),
+            url: worker.url.clone(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+        }],
+    );
+    let app = build_router(ctx);
+
+    let res = app
+        .oneshot(get_request("/remote_instance_transfer_engine_info?rank=0"))
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["rank"], 0);
+    assert_eq!(body["remote_instance_transfer_engine_info"][0], "session-a");
+    assert_eq!(
+        body["remote_instance_transfer_engine_info"][1]["layer.0"]["addr"],
+        4096
+    );
+
+    let captured = worker
+        .captured
+        .lock()
+        .unwrap()
+        .last_uri
+        .clone()
+        .expect("plain worker should receive transfer engine info query");
+    assert_eq!(captured, "/remote_instance_transfer_engine_info?rank=0");
+}
+
+#[tokio::test]
+async fn remote_instance_transfer_engine_info_queries_prefill_worker_for_pd_pool() {
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let cfg = config(&["tiny"]);
+    let ctx = build_ctx(
+        cfg,
+        vec![
+            WorkerSpec {
+                id: WorkerId("prefill-1".into()),
+                url: prefill.url.clone(),
+                mode: WorkerMode::Prefill,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: Some(8997),
+            },
+            WorkerSpec {
+                id: WorkerId("decode-1".into()),
+                url: decode.url.clone(),
+                mode: WorkerMode::Decode,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: None,
+            },
+        ],
+    );
+    let app = build_router(ctx);
+
+    let res = app
+        .oneshot(get_request(
+            "/get_remote_instance_transfer_engine_info?model=tiny&rank=1",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["rank"], 1);
+    assert_eq!(body["remote_instance_transfer_engine_info"][0], "session-a");
+
+    let captured = prefill
+        .captured
+        .lock()
+        .unwrap()
+        .last_uri
+        .clone()
+        .expect("prefill worker should receive transfer engine info query");
+    assert_eq!(captured, "/remote_instance_transfer_engine_info?rank=1");
+    assert!(decode.captured.lock().unwrap().last_uri.is_none());
+}
+
+#[tokio::test]
+async fn remote_instance_transfer_engine_info_rejects_missing_rank_without_worker_call() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let cfg = config(&["tiny"]);
+    let ctx = build_ctx(
+        cfg,
+        vec![WorkerSpec {
+            id: WorkerId("plain-1".into()),
+            url: worker.url.clone(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+        }],
+    );
+    let app = build_router(ctx);
+
+    let res = app
+        .oneshot(get_request("/remote_instance_transfer_engine_info"))
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(
+        body["error"]["message"],
+        "Missing or invalid rank parameter"
+    );
+    assert!(worker.captured.lock().unwrap().last_uri.is_none());
+}

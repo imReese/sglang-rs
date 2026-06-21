@@ -649,7 +649,7 @@ impl Proxy {
     /// misses both the wrapped reqwest timeout and the `io::ErrorKind::TimedOut`
     /// cases.
     fn classify_reqwest_error_for(worker: Url, e: reqwest::Error, path: &str) -> ApiError {
-        let source = anyhow::Error::new(e).context(format!("worker {worker}: post {path}"));
+        let source = anyhow::Error::new(e).context(format!("worker {worker}: request {path}"));
         let is_timeout = source.chain().any(|c| {
             c.downcast_ref::<reqwest::Error>()
                 .is_some_and(|r| r.is_timeout())
@@ -715,6 +715,80 @@ impl Proxy {
         // a misbehaving worker stay eligible. For 5xx the early bail is
         // safe (no body to consume meaningfully), but we still wait
         // until after the read attempt to record exactly once.
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    upstream = %url,
+                    status = %status,
+                    error = ?e,
+                    "upstream dropped connection mid-body",
+                );
+                breaker.record_failure();
+                return Err(ApiError::UpstreamStatus { status });
+            }
+        };
+        if status.is_server_error() {
+            breaker.record_failure();
+        } else {
+            breaker.record_success();
+        }
+        let mut out = Response::new(Body::from(bytes));
+        *out.status_mut() = status;
+        out.headers_mut().insert(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("application/json"),
+        );
+        Ok(out)
+    }
+
+    pub async fn forward_get_to(
+        &self,
+        worker_url: &str,
+        breaker: &CircuitBreaker,
+        path: &str,
+        headers: &HeaderMap,
+        query: &[(&str, String)],
+    ) -> Result<Response<Body>, ApiError> {
+        if !breaker.allow() {
+            return Err(ApiError::BreakerOpen {
+                worker: worker_url.to_string(),
+            });
+        }
+        if is_grpc_worker_url(worker_url) {
+            breaker.record_failure();
+            return Err(ApiError::WorkerMisconfigured {
+                worker: worker_url.to_string(),
+                source: anyhow::anyhow!("gRPC worker transport does not support GET path {path}"),
+            });
+        }
+
+        let worker_url = parse_worker_url(worker_url, breaker)?;
+        let mut url = worker_url.join(path).map_err(|e| {
+            ApiError::Internal(anyhow::Error::new(e).context(format!("join worker path {path}")))
+        })?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            for (key, value) in query {
+                pairs.append_pair(key, value);
+            }
+        }
+
+        let mut req = self.client.get(url.clone());
+        for (k, v) in headers {
+            if should_forward_request_header(k) {
+                req = req.header(k, v);
+            }
+        }
+        let resp = req
+            .timeout(self.request_timeout)
+            .send()
+            .await
+            .map_err(|e| {
+                breaker.record_failure();
+                Self::classify_reqwest_error_for(worker_url.clone(), e, path)
+            })?;
+        let status = resp.status();
         let bytes = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {

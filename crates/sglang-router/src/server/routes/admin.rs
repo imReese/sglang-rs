@@ -7,8 +7,8 @@ use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::workers::Worker;
 use axum::body::{to_bytes, Body};
-use axum::extract::State;
-use axum::http::{HeaderMap, Response};
+use axum::extract::{Query, State};
+use axum::http::{HeaderMap, Response, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use bytes::Bytes;
@@ -39,6 +39,14 @@ struct GetWeightsByNameProbe {
     name: String,
     #[serde(default)]
     truncate_size: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RemoteInstanceTransferEngineInfoQuery {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    rank: Option<i32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -439,6 +447,36 @@ pub async fn get_weights_by_name(
     }
 
     Ok(Json(value).into_response())
+}
+
+pub async fn remote_instance_transfer_engine_info(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    Query(query): Query<RemoteInstanceTransferEngineInfoQuery>,
+) -> Result<Response<Body>, ApiError> {
+    let Some(rank) = query.rank.filter(|rank| *rank >= 0) else {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {"message": "Missing or invalid rank parameter"}
+            })),
+        )
+            .into_response());
+    };
+
+    let model = select_admin_model(&ctx, query.model)?;
+    let model_id = ModelId(model.clone());
+    let worker = admin_read_worker(&ctx, &model_id, &model)?;
+
+    ctx.proxy
+        .forward_get_to(
+            &worker.url,
+            &worker.breaker,
+            "/remote_instance_transfer_engine_info",
+            &headers,
+            &[("rank", rank.to_string())],
+        )
+        .await
 }
 
 async fn forward_generation_control(
