@@ -128,6 +128,8 @@ fn parse_pd_disaggregation_args_matches_sglang_server_args() {
         "mooncake",
         "--disaggregation-bootstrap-port",
         "8999",
+        "--engine-info-bootstrap-port",
+        "6790",
         "--disaggregation-ib-device",
         "mlx5_0",
         "--disaggregation-decode-enable-radix-cache",
@@ -142,12 +144,21 @@ fn parse_pd_disaggregation_args_matches_sglang_server_args() {
     assert_eq!(parsed.disaggregation_mode, "prefill");
     assert_eq!(parsed.disaggregation_transfer_backend, "mooncake");
     assert_eq!(parsed.disaggregation_bootstrap_port, 8999);
+    assert_eq!(parsed.engine_info_bootstrap_port, 6790);
     assert_eq!(parsed.disaggregation_ib_device.as_deref(), Some("mlx5_0"));
     assert!(parsed.disaggregation_decode_enable_radix_cache);
     assert!(parsed.disaggregation_decode_enable_offload_kvcache);
     assert_eq!(parsed.num_reserved_decode_tokens, 1024);
     assert_eq!(parsed.disaggregation_decode_polling_interval, 2);
     assert!(parsed.extra_args.is_empty());
+}
+
+#[test]
+fn parse_engine_info_bootstrap_port_defaults_to_sglang_value() {
+    let parsed =
+        ServerArgs::parse_from(["serve", "--model-path", "dummy"]).expect("args should parse");
+
+    assert_eq!(parsed.engine_info_bootstrap_port, 6789);
 }
 
 #[test]

@@ -135,9 +135,12 @@ This repository currently contains the first `sglang-srt` runtime crate and the
   parsed `ServerArgs`, including model metadata propagation and an injectable PD
   service builder that wraps the bootstrap model runner with
   `KvTransferModelWorker`, a finite decode KV page pool, and bounded transfer
-  polling. The bootstrap launcher can run the decode-side PD path with the fake
-  transfer backend for local/runtime wiring tests and explicitly rejects
-  unsupported real PD backends until Mooncake/model KV memory wiring lands.
+  polling. The HTTP launcher also starts the SGLang-compatible engine-info
+  bootstrap service on `--engine-info-bootstrap-port` (default `6789`) and
+  shares that state with `/remote_instance_transfer_engine_info`. The bootstrap
+  launcher can run the decode-side PD path with the fake transfer backend for
+  local/runtime wiring tests and explicitly rejects unsupported real PD backends
+  until Mooncake/model KV memory wiring lands.
 - `engine_info_bootstrap`: lightweight HTTP bootstrap service compatible with
   SGLang's transfer-engine info registration flow. It stores per-rank
   `session_id` and `weights_info_dict` payloads via

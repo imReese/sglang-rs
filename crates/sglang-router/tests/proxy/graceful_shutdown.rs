@@ -14,7 +14,6 @@
 //! guards, or in the SSE pump's `tx.send().await` race — all of which
 //! would be silently skipped by a synthetic-handler test.
 
-use bytes::Bytes;
 use sglang_router::config::{
     ActiveLoadConfig, Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig,
     PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
@@ -128,12 +127,12 @@ async fn shutdown_drains_100_inflight_streaming_chat_completions() {
     }))
     .unwrap();
 
-    let mut handles = Vec::with_capacity(N);
+    let mut send_handles = Vec::with_capacity(N);
     for i in 0..N {
         let c = client.clone();
         let u = url.clone();
         let b = body.clone();
-        handles.push(tokio::spawn(async move {
+        send_handles.push(tokio::spawn(async move {
             let resp = c
                 .post(&u)
                 .header("content-type", "application/json")
@@ -144,15 +143,21 @@ async fn shutdown_drains_100_inflight_streaming_chat_completions() {
             if !resp.status().is_success() {
                 return Err(format!("client {i} non-2xx: {}", resp.status()));
             }
-            let bytes: Bytes = resp
-                .bytes()
-                .await
-                .map_err(|e| format!("client {i} body: {e}"))?;
-            Ok::<Bytes, String>(bytes)
+            Ok::<reqwest::Response, String>(resp)
         }));
     }
 
-    // 4. Let every request grab a connection and start receiving data.
+    // 4. Wait for every request to receive response headers. This makes
+    //    the shutdown assertion about in-flight streams, not about clients
+    //    still racing to connect after the listener stops accepting.
+    let mut responses = Vec::with_capacity(N);
+    for h in send_handles {
+        responses.push(
+            h.await
+                .expect("client task panicked")
+                .expect("client response headers received"),
+        );
+    }
     //    100 ms is past the first chunk delay (60 ms) for every stream
     //    but well before the last chunk fires.
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -164,9 +169,18 @@ async fn shutdown_drains_100_inflight_streaming_chat_completions() {
 
     // 6. Every in-flight request must complete with a `[DONE]` terminator
     //    — proving the stream was NOT truncated by shutdown.
+    let mut body_handles = Vec::with_capacity(N);
+    for (i, response) in responses.into_iter().enumerate() {
+        body_handles.push(tokio::spawn(async move {
+            response
+                .bytes()
+                .await
+                .map_err(|e| format!("client {i} body: {e}"))
+        }));
+    }
     let mut bytes_total: usize = 0;
     let mut done_count: usize = 0;
-    for h in handles {
+    for h in body_handles {
         let result = h
             .await
             .expect("client task panicked")

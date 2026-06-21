@@ -2393,6 +2393,62 @@ async fn prefill_http_launch_rejects_dummy_mooncake_runtime_without_transferable
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_launch_starts_engine_info_bootstrap_and_serves_remote_info() {
+    let http_addr = unused_local_addr();
+    let engine_info_addr = unused_local_addr();
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "tiny-http",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &http_addr.port().to_string(),
+        "--engine-info-bootstrap-port",
+        &engine_info_addr.port().to_string(),
+    ])
+    .expect("args should parse");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(launch_http_server_with_shutdown(args, async move {
+        let _ = shutdown_rx.await;
+    }));
+
+    let registration = request_raw_with_retry(
+        engine_info_addr,
+        "PUT",
+        "/register_transfer_engine_info",
+        Some(
+            r#"{"tp_rank":0,"transfer_engine_info":{"session_id":"session-launch","weights_info_dict":{"layer.0":{"addr":4096,"length":8192}}}}"#,
+        ),
+    )
+    .await;
+    assert!(registration.starts_with("HTTP/1.1 200"), "{registration}");
+
+    let response =
+        get_json_with_retry(http_addr, "/remote_instance_transfer_engine_info?rank=0").await;
+    assert_eq!(response["rank"], 0);
+    assert_eq!(
+        response["remote_instance_transfer_engine_info"][0],
+        "session-launch"
+    );
+    assert_eq!(
+        response["remote_instance_transfer_engine_info"][1]["layer.0"]["length"],
+        8192
+    );
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prefill_http_launch_routes_reject_dummy_mooncake_runtime_without_transferable_kv_memory() {
     let http_addr = unused_local_addr();
     let bootstrap_addr = unused_local_addr();

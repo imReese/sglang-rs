@@ -46,6 +46,7 @@ pub struct ServerArgs {
     pub disaggregation_mode: String,
     pub disaggregation_transfer_backend: String,
     pub disaggregation_bootstrap_port: u16,
+    pub engine_info_bootstrap_port: u16,
     pub disaggregation_mooncake_rpc_port: Option<u16>,
     pub disaggregation_ib_device: Option<String>,
     pub disaggregation_zmq_ports: Option<ZmqPortRange>,
@@ -304,6 +305,12 @@ impl ArgParser {
                         .parse::<u16>()
                         .map_err(|_| CliParseError::InvalidPort(value))?;
                 }
+                "--engine-info-bootstrap-port" => {
+                    let value = self.take_value("--engine-info-bootstrap-port")?;
+                    self.parsed.engine_info_bootstrap_port = value
+                        .parse::<u16>()
+                        .map_err(|_| CliParseError::InvalidPort(value))?;
+                }
                 "--disaggregation-mooncake-rpc-port" => {
                     let value = self.take_value("--disaggregation-mooncake-rpc-port")?;
                     self.parsed.disaggregation_mooncake_rpc_port = Some(
@@ -471,6 +478,7 @@ impl ArgParser {
             disaggregation_mode: self.parsed.disaggregation_mode.clone(),
             disaggregation_transfer_backend: self.parsed.disaggregation_transfer_backend.clone(),
             disaggregation_bootstrap_port: self.parsed.disaggregation_bootstrap_port,
+            engine_info_bootstrap_port: self.parsed.engine_info_bootstrap_port,
             disaggregation_mooncake_rpc_port: self.parsed.disaggregation_mooncake_rpc_port,
             disaggregation_ib_device: self.parsed.disaggregation_ib_device.clone(),
             disaggregation_zmq_ports: self.parsed.disaggregation_zmq_ports,
@@ -580,6 +588,7 @@ struct PartialServerArgs {
     disaggregation_mode: String,
     disaggregation_transfer_backend: String,
     disaggregation_bootstrap_port: u16,
+    engine_info_bootstrap_port: u16,
     disaggregation_mooncake_rpc_port: Option<u16>,
     disaggregation_ib_device: Option<String>,
     disaggregation_zmq_ports: Option<ZmqPortRange>,
@@ -646,6 +655,7 @@ impl Default for PartialServerArgs {
             disaggregation_mode: "null".to_string(),
             disaggregation_transfer_backend: "mooncake".to_string(),
             disaggregation_bootstrap_port: 8998,
+            engine_info_bootstrap_port: 6789,
             disaggregation_mooncake_rpc_port: None,
             disaggregation_ib_device: None,
             disaggregation_zmq_ports: None,
