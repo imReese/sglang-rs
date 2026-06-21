@@ -184,6 +184,10 @@ where
                 "/update_weights_from_disk",
                 post(update_weights_from_disk::<T, W>),
             )
+            .route(
+                "/update_weight_version",
+                post(update_weight_version::<T, W>),
+            )
             .route("/v1/tokenize", post(tokenize::<T, W>))
             .route("/tokenize", post(tokenize::<T, W>))
             .route("/v1/detokenize", post(detokenize::<T, W>))
@@ -696,6 +700,61 @@ where
             "success": true,
             "message": update.message,
             "num_paused_requests": 0,
+        })),
+    )
+        .into_response()
+}
+
+async fn update_weight_version<T, W>(
+    State(service): State<HttpRouterService<T, W>>,
+    Json(payload): Json<Value>,
+) -> Response
+where
+    T: Tokenizer + Send + 'static,
+    W: WorkerExecutor + Send + 'static,
+{
+    let new_version = match payload.get("new_version").and_then(Value::as_str) {
+        Some(new_version) if !new_version.is_empty() => new_version.to_string(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "success": false,
+                    "message": "new_version is required and must be a non-empty string",
+                })),
+            )
+                .into_response();
+        }
+    };
+    let abort_all_requests = payload
+        .get("abort_all_requests")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    if abort_all_requests {
+        match service.runtime.lock() {
+            Ok(mut runtime) => {
+                runtime.abort_all_requests();
+            }
+            Err(_) => return internal_error_json("router runtime mutex poisoned"),
+        }
+    }
+
+    let mut model_info = match service.model_info_snapshot() {
+        Ok(info) => info,
+        Err(message) => return internal_error_json(message),
+    };
+    model_info.weight_version = new_version.clone();
+    if let Err(message) = service.replace_model_info(model_info) {
+        return internal_error_json(message);
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "success": true,
+            "message": format!("Weight version updated to {new_version}"),
+            "new_version": new_version,
         })),
     )
         .into_response()

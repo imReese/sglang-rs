@@ -25,6 +25,13 @@ struct UpdateWeightsProbe {
     load_format: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct UpdateWeightVersionProbe {
+    #[serde(default)]
+    model: Option<String>,
+    new_version: String,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct AdminModelProbe {
     #[serde(default)]
@@ -320,6 +327,51 @@ pub async fn update_weights_from_disk(
         "updated_workers": updated_workers,
         "model": model,
         "load_format": probe.load_format,
+    }))
+    .into_response())
+}
+
+pub async fn update_weight_version(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    let probe: UpdateWeightVersionProbe = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::BadRequest("request body must be a JSON object".to_string()))?;
+    if probe.new_version.is_empty() {
+        return Err(ApiError::BadRequest(
+            "new_version must be non-empty".to_string(),
+        ));
+    }
+
+    let model = select_admin_model(&ctx, probe.model)?;
+    let model_id = ModelId(model.clone());
+    let workers = admin_control_workers(&ctx, &model_id, &model)?;
+    let mut updated_workers = 0usize;
+
+    for worker in workers {
+        let response = ctx
+            .proxy
+            .forward_json_to(
+                &worker.url,
+                &worker.breaker,
+                "/update_weight_version",
+                &headers,
+                body.clone(),
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Ok(response);
+        }
+        updated_workers += 1;
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": format!("updated weight version to {} on {updated_workers} worker(s)", probe.new_version),
+        "new_version": probe.new_version,
+        "updated_workers": updated_workers,
+        "model": model,
     }))
     .into_response())
 }

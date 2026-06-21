@@ -20,7 +20,7 @@ use sglang_srt::proto::sglang::runtime::v1::{
     GetModelInfoRequest, GetServerInfoRequest, ListModelsRequest, OpenAiJsonRequest,
     PauseGenerationRequest, RequestOptions, SamplingParams, StartProfileRequest,
     StopProfileRequest, TextEmbedRequest, TextGenerateRequest, TokenizeRequest, TokenizedInput,
-    UpdateWeightsFromDiskRequest,
+    UpdateWeightVersionRequest, UpdateWeightsFromDiskRequest,
 };
 use sglang_srt::router::{RouterProtocolError, RouterRuntime};
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
@@ -1536,6 +1536,43 @@ async fn grpc_update_weights_from_disk_rejects_invalid_requests() {
         .expect_err("unsupported load formats should be rejected");
     assert_eq!(unsupported_format.code(), Code::InvalidArgument);
     assert!(unsupported_format.message().contains("load_format"));
+}
+
+#[tokio::test]
+async fn grpc_update_weight_version_updates_model_info() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "old-model",
+        "--served-model-name",
+        "tiny",
+    ])
+    .expect("server args should parse");
+    let service = GrpcRouterService::with_server_args(
+        RouterRuntime::new(Engine::new(
+            ByteTokenizer,
+            Scheduler::new(GrpcTwoStepWorker),
+        )),
+        &args,
+    );
+
+    let response = service
+        .update_weight_version(Request::new(UpdateWeightVersionRequest {
+            new_version: "grpc-checkpoint-7".to_string(),
+            abort_all_requests: Some(false),
+        }))
+        .await
+        .expect("weight version update should execute")
+        .into_inner();
+    assert!(response.success);
+    assert!(response.message.contains("grpc-checkpoint-7"));
+
+    let model_info = service
+        .get_model_info(Request::new(GetModelInfoRequest {}))
+        .await
+        .expect("updated model info should be readable")
+        .into_inner();
+    assert_eq!(model_info.weight_version, "grpc-checkpoint-7");
 }
 
 #[tokio::test]

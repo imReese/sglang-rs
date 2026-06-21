@@ -65,6 +65,7 @@ impl MockWorker {
             .route("/v1/classify", post(chat))
             .route("/generate", post(chat))
             .route("/update_weights_from_disk", post(chat))
+            .route("/update_weight_version", post(chat))
             .route("/flush_cache", post(chat))
             .route("/pause_generation", post(chat))
             .route("/continue_generation", post(chat))

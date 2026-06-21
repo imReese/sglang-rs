@@ -37,7 +37,7 @@ use crate::proto::sglang::runtime::v1::{
     OpenAiJsonRequest, OpenAiJsonResponse, PauseGenerationRequest,
     SamplingParams as ProtoSamplingParams, ServerInfoResponse, StartProfileRequest,
     StopProfileRequest, TextEmbedRequest, TextGenerateRequest, TokenizeRequest, TokenizeResponse,
-    TokenizedInput, UpdateWeightsFromDiskRequest, Usage,
+    TokenizedInput, UpdateWeightVersionRequest, UpdateWeightsFromDiskRequest, Usage,
 };
 use crate::router::{
     RouterDisaggregatedParams, RouterGenerateComplete, RouterGenerateError, RouterGenerateRequest,
@@ -1273,6 +1273,39 @@ where
         Ok(Response::new(ControlResponse {
             success: true,
             message: update.message,
+        }))
+    }
+
+    async fn update_weight_version(
+        &self,
+        request: Request<UpdateWeightVersionRequest>,
+    ) -> Result<Response<ControlResponse>, Status> {
+        let request = request.into_inner();
+        let new_version = request.new_version.trim();
+        if new_version.is_empty() {
+            return Err(Status::invalid_argument(
+                "new_version is required and must be a non-empty string",
+            ));
+        }
+
+        if request.abort_all_requests.unwrap_or(true) {
+            let mut runtime = self
+                .runtime
+                .lock()
+                .map_err(|_| Status::internal("router runtime mutex poisoned"))?;
+            runtime.abort_all_requests();
+        }
+
+        let mut model_info = self.model_info()?;
+        model_info.weight_version = new_version.to_string();
+        *self
+            .model_info
+            .lock()
+            .map_err(|_| Status::internal("model info mutex poisoned"))? = Some(model_info);
+
+        Ok(Response::new(ControlResponse {
+            success: true,
+            message: format!("Weight version updated to {new_version}"),
         }))
     }
 }

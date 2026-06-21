@@ -26,6 +26,7 @@ use sglang_srt::proto::sglang::runtime::v1::{
     PauseGenerationRequest as ProtoPauseGenerationRequest, RequestOptions as ProtoRequestOptions,
     SamplingParams as ProtoSamplingParams, StartProfileRequest as ProtoStartProfileRequest,
     StopProfileRequest as ProtoStopProfileRequest, TextGenerateRequest as ProtoTextGenerateRequest,
+    UpdateWeightVersionRequest as ProtoUpdateWeightVersionRequest,
     UpdateWeightsFromDiskRequest as ProtoUpdateWeightsFromDiskRequest,
 };
 use std::collections::HashMap;
@@ -386,6 +387,31 @@ fn proto_update_weights_from_disk_request_from_json(
     })
 }
 
+fn proto_update_weight_version_request_from_json(
+    body: &[u8],
+) -> Result<ProtoUpdateWeightVersionRequest, tonic::Status> {
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|e| grpc_generate_status(format!("invalid update_weight_version JSON: {e}")))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| grpc_generate_status("update_weight_version body must be a JSON object"))?;
+    let new_version = object
+        .get("new_version")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| grpc_generate_status("new_version is required and must be a string"))?
+        .to_string();
+    let abort_all_requests = object
+        .get("abort_all_requests")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    Ok(ProtoUpdateWeightVersionRequest {
+        new_version,
+        abort_all_requests: Some(abort_all_requests),
+    })
+}
+
 fn proto_abort_request_from_json(body: &[u8]) -> Result<ProtoAbortRequest, tonic::Status> {
     let value: Value = serde_json::from_slice(body)
         .map_err(|e| grpc_generate_status(format!("invalid abort_request JSON: {e}")))?;
@@ -743,6 +769,11 @@ impl Proxy {
         if path == "/update_weights_from_disk" {
             return self
                 .forward_grpc_update_weights_from_disk(worker_url, breaker, body)
+                .await;
+        }
+        if path == "/update_weight_version" {
+            return self
+                .forward_grpc_update_weight_version(worker_url, breaker, body)
                 .await;
         }
         if path == "/abort_request" {
@@ -1152,6 +1183,86 @@ impl Proxy {
             "success": response.success,
             "message": response.message,
             "num_paused_requests": 0,
+        });
+        let mut out = Response::new(Body::from(
+            serde_json::to_vec(&body).expect("control response JSON should serialize"),
+        ));
+        out.headers_mut().insert(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("application/json"),
+        );
+        Ok(out)
+    }
+
+    async fn forward_grpc_update_weight_version(
+        &self,
+        worker_url: &str,
+        breaker: &CircuitBreaker,
+        body: Bytes,
+    ) -> Result<Response<Body>, ApiError> {
+        let parsed = parse_worker_url(worker_url, breaker)?;
+        let endpoint = grpc_endpoint_from_worker_url(&parsed).ok_or_else(|| {
+            breaker.record_failure();
+            ApiError::WorkerMisconfigured {
+                worker: worker_url.to_string(),
+                source: anyhow::anyhow!("unsupported gRPC worker URL scheme {}", parsed.scheme()),
+            }
+        })?;
+
+        let fut = async {
+            let request = proto_update_weight_version_request_from_json(&body)
+                .map_err(GrpcForwardError::Status)?;
+            let channel = tonic::transport::Endpoint::from_shared(endpoint.clone())
+                .map_err(|e| {
+                    GrpcForwardError::Transport(anyhow::anyhow!(
+                        "invalid gRPC endpoint {endpoint}: {e}"
+                    ))
+                })?
+                .connect_timeout(self.request_timeout)
+                .timeout(self.request_timeout)
+                .connect()
+                .await
+                .map_err(|e| {
+                    GrpcForwardError::Transport(anyhow::anyhow!(
+                        "connect gRPC worker {endpoint}: {e}"
+                    ))
+                })?;
+            let mut client = SglangServiceClient::new(channel);
+            client
+                .update_weight_version(GrpcRequest::new(request))
+                .await
+                .map(|response| response.into_inner())
+                .map_err(GrpcForwardError::Status)
+        };
+
+        let response = match tokio::time::timeout(self.request_timeout, fut).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(GrpcForwardError::Status(status))) => {
+                let response = grpc_status_response(status);
+                if response.status().is_server_error() {
+                    breaker.record_failure();
+                } else {
+                    breaker.record_success();
+                }
+                return Ok(response);
+            }
+            Ok(Err(GrpcForwardError::Transport(source))) => {
+                breaker.record_failure();
+                return Err(ApiError::UpstreamUnreachable {
+                    worker: parsed,
+                    source,
+                });
+            }
+            Err(_) => {
+                breaker.record_failure();
+                return Err(ApiError::UpstreamTimeout { worker: parsed });
+            }
+        };
+
+        breaker.record_success();
+        let body = json!({
+            "success": response.success,
+            "message": response.message,
         });
         let mut out = Response::new(Body::from(
             serde_json::to_vec(&body).expect("control response JSON should serialize"),

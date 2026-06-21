@@ -736,3 +736,107 @@ async fn update_weights_from_disk_proxies_to_prefill_and_decode_pd_workers() {
         assert_eq!(forwarded["model_path"], "/models/tiny-v3");
     }
 }
+
+#[tokio::test]
+async fn update_weight_version_proxies_to_single_plain_worker() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let cfg = config(&["tiny"]);
+    let ctx = build_ctx(
+        cfg,
+        vec![WorkerSpec {
+            id: WorkerId("plain-1".into()),
+            url: worker.url.clone(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+        }],
+    );
+    let app = build_router(ctx);
+
+    let res = app
+        .oneshot(admin_request(
+            "/update_weight_version",
+            serde_json::json!({
+                "new_version": "checkpoint-plain",
+                "abort_all_requests": false
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["success"], true);
+    assert_eq!(body["updated_workers"], 1);
+
+    let captured = worker
+        .captured
+        .lock()
+        .unwrap()
+        .last_body
+        .clone()
+        .expect("plain worker should receive version update request");
+    let forwarded: serde_json::Value = serde_json::from_slice(&captured).unwrap();
+    assert_eq!(forwarded["new_version"], "checkpoint-plain");
+    assert_eq!(forwarded["abort_all_requests"], false);
+}
+
+#[tokio::test]
+async fn update_weight_version_proxies_to_prefill_and_decode_pd_workers() {
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let cfg = config(&["tiny"]);
+    let ctx = build_ctx(
+        cfg,
+        vec![
+            WorkerSpec {
+                id: WorkerId("prefill-1".into()),
+                url: prefill.url.clone(),
+                mode: WorkerMode::Prefill,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: Some(8997),
+            },
+            WorkerSpec {
+                id: WorkerId("decode-1".into()),
+                url: decode.url.clone(),
+                mode: WorkerMode::Decode,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: None,
+            },
+        ],
+    );
+    let app = build_router(ctx);
+
+    let res = app
+        .oneshot(admin_request(
+            "/update_weight_version",
+            serde_json::json!({
+                "model": "tiny",
+                "new_version": "checkpoint-pd",
+                "abort_all_requests": true
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["success"], true);
+    assert_eq!(body["updated_workers"], 2);
+
+    for worker in [&prefill, &decode] {
+        let captured = worker
+            .captured
+            .lock()
+            .unwrap()
+            .last_body
+            .clone()
+            .expect("PD worker should receive version update request");
+        let forwarded: serde_json::Value = serde_json::from_slice(&captured).unwrap();
+        assert_eq!(forwarded["model"], "tiny");
+        assert_eq!(forwarded["new_version"], "checkpoint-pd");
+        assert_eq!(forwarded["abort_all_requests"], true);
+    }
+}

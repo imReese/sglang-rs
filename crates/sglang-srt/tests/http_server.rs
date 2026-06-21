@@ -1149,6 +1149,65 @@ async fn http_server_update_weights_from_disk_rejects_invalid_requests() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_update_weight_version_updates_model_info() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "old-model",
+        "--served-model-name",
+        "tiny-http",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let service = build_bootstrap_http_router_service(&args);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let update = request_json_dynamic_with_retry(
+        addr,
+        "POST",
+        "/update_weight_version",
+        serde_json::json!({
+            "new_version": "checkpoint-42",
+            "abort_all_requests": false
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(update["success"], true, "update response: {update}");
+    assert_eq!(update["new_version"], "checkpoint-42");
+    assert!(
+        update["message"]
+            .as_str()
+            .unwrap()
+            .contains("checkpoint-42")
+    );
+
+    let model_info = get_json_with_retry(addr, "/model_info").await;
+    let legacy_model_info = get_json_with_retry(addr, "/get_model_info").await;
+    assert_eq!(model_info["weight_version"], "checkpoint-42");
+    assert_eq!(legacy_model_info["weight_version"], "checkpoint-42");
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_server_reports_runtime_loads_for_sglang_control_plane() {
     let mut scheduler = Scheduler::with_cache_resources(
         HttpTwoStepWorker,

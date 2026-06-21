@@ -28,6 +28,7 @@ service SglangService {
   rpc StartProfile(StartProfileRequest) returns (ControlResponse);
   rpc StopProfile(StopProfileRequest) returns (ControlResponse);
   rpc UpdateWeightsFromDisk(UpdateWeightsFromDiskRequest) returns (ControlResponse);
+  rpc UpdateWeightVersion(UpdateWeightVersionRequest) returns (ControlResponse);
 }
 
 message SamplingParams {
@@ -256,6 +257,11 @@ message StopProfileRequest {}
 message UpdateWeightsFromDiskRequest {
   string model_path = 1;
   optional string load_format = 2;
+}
+
+message UpdateWeightVersionRequest {
+  string new_version = 1;
+  optional bool abort_all_requests = 2;
 }
 
 message Usage {

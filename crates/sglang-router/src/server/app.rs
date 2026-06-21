@@ -48,6 +48,12 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
+            "/update_weight_version",
+            post(crate::server::routes::admin::update_weight_version)
+                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
             "/flush_cache",
             post(crate::server::routes::admin::flush_cache)
                 .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))

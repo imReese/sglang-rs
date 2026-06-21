@@ -26,7 +26,7 @@ use sglang_router::tokenizer::TokenizerRegistry;
 use sglang_router::workers::WorkerRegistry;
 use sglang_srt::cli::ServerArgs;
 use sglang_srt::proto::sglang::runtime::v1::sglang_service_client::SglangServiceClient;
-use sglang_srt::proto::sglang::runtime::v1::HealthCheckRequest;
+use sglang_srt::proto::sglang::runtime::v1::{GetModelInfoRequest, HealthCheckRequest};
 use sglang_srt::server::launch_grpc_server_with_shutdown;
 use tokio::sync::oneshot;
 use tower::ServiceExt;
@@ -286,6 +286,79 @@ async fn router_update_weights_from_disk_reaches_real_rust_srt_grpc_worker() {
         message.contains("model_path") || message.contains("model path"),
         "expected worker validation error, got {body}"
     );
+
+    shutdown_tx
+        .send(())
+        .expect("gRPC worker should still be running");
+    server
+        .await
+        .expect("gRPC server task should join")
+        .expect("gRPC server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn router_update_weight_version_reaches_real_rust_srt_grpc_worker() {
+    let addr = unused_local_addr();
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "tiny",
+        "--host",
+        &addr.ip().to_string(),
+        "--port",
+        &addr.port().to_string(),
+        "--grpc-mode",
+        "--num-reserved-decode-tokens",
+        "8",
+    ])
+    .expect("gRPC SRT args should parse");
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(launch_grpc_server_with_shutdown(args, async move {
+        let _ = shutdown_rx.await;
+    }));
+    wait_for_grpc_health(addr).await;
+
+    let app = build_router(build_ctx_with_grpc_worker(addr));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/update_weight_version")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "tiny",
+                "new_version": "router-grpc-checkpoint",
+                "abort_all_requests": false,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+
+    let response = app.oneshot(request).await.expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("router response body should collect")
+        .to_bytes();
+    let body: serde_json::Value =
+        serde_json::from_slice(&body).expect("response should be control JSON");
+    assert_eq!(body["success"], true);
+    assert_eq!(body["new_version"], "router-grpc-checkpoint");
+    assert_eq!(body["updated_workers"], 1);
+
+    let mut client = SglangServiceClient::connect(format!("http://{addr}"))
+        .await
+        .expect("gRPC client should connect");
+    let model_info = client
+        .get_model_info(GetModelInfoRequest {})
+        .await
+        .expect("model info should be readable after router update")
+        .into_inner();
+    assert_eq!(model_info.weight_version, "router-grpc-checkpoint");
 
     shutdown_tx
         .send(())
