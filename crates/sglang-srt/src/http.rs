@@ -187,6 +187,10 @@ where
             .route("/get_loads", get(loads::<T, W>))
             .route("/get_load", get(legacy_load::<T, W>))
             .route(
+                "/poll_transfers",
+                get(poll_transfers::<T, W>).post(poll_transfers::<T, W>),
+            )
+            .route(
                 "/flush_cache",
                 get(flush_cache::<T, W>).post(flush_cache::<T, W>),
             )
@@ -499,6 +503,26 @@ where
         "num_tokens": 0,
         "num_pending_tokens": 0,
     }]))
+    .into_response()
+}
+
+async fn poll_transfers<T, W>(State(service): State<HttpRouterService<T, W>>) -> Response
+where
+    T: Send + 'static,
+    W: WorkerExecutor + Send + 'static,
+{
+    let response = match service.runtime.lock() {
+        Ok(mut runtime) => match runtime.poll_transfers() {
+            Ok(response) => response,
+            Err(error) => return router_runtime_error_json(error),
+        },
+        Err(_) => return internal_error_json("router runtime mutex poisoned"),
+    };
+
+    Json(json!({
+        "completed_batches": response.completed_batches,
+        "pending_batches": response.pending_batches,
+    }))
     .into_response()
 }
 

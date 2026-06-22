@@ -2264,6 +2264,82 @@ async fn http_pd_server_polls_async_transfer_before_decode() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_poll_transfers_advances_async_pd_batches() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "glm-pd-http-poll",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--disaggregation-mode",
+        "prefill",
+        "--disaggregation-decode-polling-interval",
+        "0",
+        "--num-reserved-decode-tokens",
+        "8",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let transfer_executor = MooncakeKvCacheTransferExecutor::new(
+        RecordingMooncakeBackend::completed(),
+        MooncakeKvCacheLayout {
+            source_base_addr: 0x4000,
+            page_size_bytes: 64,
+            target_base_offset: 0,
+        },
+        MooncakeTransferTarget { target_id: 18 },
+    );
+    let service = build_bootstrap_pd_http_router_service(
+        &args,
+        DecodeBootstrapRegistry::default(),
+        transfer_executor,
+    );
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let waiting = request_raw_with_retry(
+        addr,
+        "POST",
+        "/generate",
+        Some(
+            r#"{"request_id":"http-pd-poll","text":"hi","sampling_params":{"max_new_tokens":2},"bootstrap_host":"10.0.0.8","bootstrap_port":8200,"bootstrap_room":42}"#,
+        ),
+    )
+    .await;
+    assert!(
+        waiting.contains("500 Internal Server Error"),
+        "first response should wait on async KV transfer, got {waiting}"
+    );
+    assert!(
+        waiting.contains("decode request http-pd-poll is not ready"),
+        "first response should expose decode wait, got {waiting}"
+    );
+
+    let poll = post_json_with_retry(addr, "/poll_transfers", "{}").await;
+
+    assert_eq!(poll["completed_batches"], 1);
+    assert_eq!(poll["pending_batches"], 0);
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mooncake_prefill_http_uses_bootstrap_kv_layout_for_transfer() {
     let args = ServerArgs::parse_from([
         "serve",
