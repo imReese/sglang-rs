@@ -179,7 +179,8 @@ This repository currently contains the first `sglang-srt` runtime crate and the
   publish allocated pages back into RadixCache for future prefix reuse, while
   asynchronous PD prefill pages are staged and only published after transfer
   polling observes KV readiness; failed transfers release unpublished decode
-  pages and remove the failed decode request from the running queue. The dispatch path
+  pages and aborts cancel submitted transfer batches before removing decode
+  requests from the running queue. The dispatch path
   can run in local PD mode by routing prefill and decode batches to separate
   worker executors, matching the split execution boundary used by SGLang
   disaggregation.

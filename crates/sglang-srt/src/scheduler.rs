@@ -349,6 +349,7 @@ impl<W> Scheduler<W> {
         }
 
         if let Some(request) = remove_request_from_queue(&mut self.decode_queue, request_id) {
+            self.release_pending_prefix_cache_insert(request_id);
             self.worker.complete_request(&request);
             return true;
         }
@@ -366,6 +367,12 @@ impl<W> Scheduler<W> {
             aborted += 1;
         }
         while let Some(request) = self.decode_queue.pop_front() {
+            self.release_pending_prefix_cache_insert(request.request_id());
+            self.worker.complete_request(&request);
+            aborted += 1;
+        }
+        for request in std::mem::take(&mut self.pending_prefix_cache_inserts) {
+            self.release_unpublished_cache_pages(&request);
             self.worker.complete_request(&request);
             aborted += 1;
         }
@@ -809,13 +816,31 @@ where
     }
 
     fn release_failed_pending_prefix_cache(&mut self, request: ScheduledRequest) {
-        if let Some(allocator) = self.cache_page_allocator.as_mut() {
-            allocator.release(request.allocated_cache_pages());
-        }
+        self.release_unpublished_cache_pages(&request);
 
         let request = remove_request_from_queue(&mut self.decode_queue, request.request_id())
             .unwrap_or(request);
         self.worker.complete_request(&request);
+    }
+
+    fn release_pending_prefix_cache_insert(&mut self, request_id: &RequestId) -> bool {
+        let Some(index) = self
+            .pending_prefix_cache_inserts
+            .iter()
+            .position(|request| request.request_id() == request_id)
+        else {
+            return false;
+        };
+
+        let request = self.pending_prefix_cache_inserts.remove(index);
+        self.release_unpublished_cache_pages(&request);
+        true
+    }
+
+    fn release_unpublished_cache_pages(&mut self, request: &ScheduledRequest) {
+        if let Some(allocator) = self.cache_page_allocator.as_mut() {
+            allocator.release(request.allocated_cache_pages());
+        }
     }
 }
 

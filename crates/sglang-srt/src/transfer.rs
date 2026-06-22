@@ -1333,6 +1333,13 @@ pub trait KvCacheTransferExecutor {
     ) -> Result<MooncakeTransferPollSummary, KvCacheTransferError> {
         Ok(MooncakeTransferPollSummary::default())
     }
+
+    fn cancel_transfer_room(
+        &mut self,
+        _bootstrap_room: BootstrapRoom,
+    ) -> Result<(), KvCacheTransferError> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1613,6 +1620,9 @@ where
     fn complete_request(&mut self, request: &ScheduledRequest) {
         if let Some(disaggregated_params) = request.disaggregated_params() {
             self.registry.remove(disaggregated_params.bootstrap_room);
+            let _ = self
+                .transfer_executor
+                .cancel_transfer_room(disaggregated_params.bootstrap_room);
         }
 
         self.worker.complete_request(request)
@@ -2642,6 +2652,33 @@ impl<S, R> MooncakeKvCacheTransferExecutor<S, R>
 where
     S: MooncakeTransferStatusReader + MooncakeBatchReleaser,
 {
+    pub fn cancel_submitted_transfers_for_room(
+        &mut self,
+        bootstrap_room: BootstrapRoom,
+    ) -> Result<(), KvCacheTransferError> {
+        let submitted_transfers = self.submitted_transfers.clone();
+        let mut pending_transfers = Vec::new();
+
+        for transfer in submitted_transfers {
+            if transfer.bootstrap_room() == bootstrap_room {
+                self.submitter
+                    .free_batch(transfer.batch_id())
+                    .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
+            } else {
+                pending_transfers.push(transfer);
+            }
+        }
+
+        self.submitted_transfers = pending_transfers;
+        self.submitted_batches = self
+            .submitted_transfers
+            .iter()
+            .map(MooncakeSubmittedBatch::batch_id)
+            .collect();
+
+        Ok(())
+    }
+
     pub fn poll_submitted_transfers(
         &mut self,
         registry: &mut DecodeBootstrapRegistry,
@@ -2757,6 +2794,13 @@ where
         registry: &mut DecodeBootstrapRegistry,
     ) -> Result<MooncakeTransferPollSummary, KvCacheTransferError> {
         self.poll_submitted_transfers(registry)
+    }
+
+    fn cancel_transfer_room(
+        &mut self,
+        bootstrap_room: BootstrapRoom,
+    ) -> Result<(), KvCacheTransferError> {
+        self.cancel_submitted_transfers_for_room(bootstrap_room)
     }
 }
 #[cfg(feature = "mooncake-link")]

@@ -854,6 +854,87 @@ fn async_pd_poll_failure_releases_unpublished_decode_cache_pages() {
 }
 
 #[test]
+fn aborting_pending_async_pd_request_releases_pages_and_cancels_transfer() {
+    let worker = KvTransferModelWorker::new(
+        UnfinishedWorker,
+        registry_with_session("pd-abort-pending", 35),
+        MooncakeKvCacheTransferExecutor::new(
+            RecordingMooncakeSubmitter::default(),
+            MooncakeKvCacheLayout {
+                source_base_addr: 0x4400,
+                page_size_bytes: 64,
+                target_base_offset: 0,
+            },
+            MooncakeTransferTarget { target_id: 19 },
+        ),
+    );
+    let mut scheduler =
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(4));
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("pd-abort-pending"),
+            vec![1, 2],
+            SamplingParams::new(2),
+        )
+        .with_disaggregated_params(Some(disaggregated_params(35))),
+    );
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should submit async KV transfer");
+    assert_eq!(scheduler.available_cache_pages(), Some(2));
+    assert_eq!(scheduler.decode_queue_depth(), 1);
+    assert_eq!(
+        scheduler.worker().transfer_executor().submitted_batches(),
+        &[100]
+    );
+
+    assert!(scheduler.abort_request(&RequestId::from("pd-abort-pending")));
+
+    assert_eq!(scheduler.available_cache_pages(), Some(4));
+    assert_eq!(scheduler.decode_queue_depth(), 0);
+    assert!(scheduler.worker().registry().get(35).is_none());
+    assert!(
+        scheduler
+            .worker()
+            .transfer_executor()
+            .submitted_batches()
+            .is_empty()
+    );
+    assert_eq!(
+        scheduler
+            .worker()
+            .transfer_executor()
+            .submitter()
+            .freed_batches,
+        vec![100]
+    );
+    let summary = scheduler
+        .poll_transfers()
+        .expect("polling after abort should not see the canceled transfer");
+    assert_eq!(summary.completed_batches(), 0);
+    assert_eq!(summary.pending_batches(), 0);
+
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("same-prefix-after-abort"),
+        vec![1, 2, 3],
+        SamplingParams::new(1),
+    ));
+    let batch = scheduler
+        .next_prefill_batch(1)
+        .expect("second prefill should be schedulable after abort cleanup");
+
+    assert_eq!(batch.requests()[0].cached_token_count(), 0);
+    assert_eq!(
+        batch.requests()[0].allocated_cache_pages(),
+        &[
+            CachePageId::from(0),
+            CachePageId::from(1),
+            CachePageId::from(2)
+        ]
+    );
+}
+
+#[test]
 fn transfer_model_worker_fails_default_decode_dispatch_when_kv_failed() {
     let worker = KvTransferModelWorker::new(
         UnfinishedWorker,
