@@ -150,6 +150,10 @@ fn transfer_plan_uses_uncached_prefill_pages_as_pd_delta() {
         span.cache_pages(),
         &[CachePageId::from(0), CachePageId::from(1)]
     );
+    assert_eq!(
+        span.descriptor_checksum(),
+        "24c270a0572dbe8028f483c5744cd95bf75c80e566442e62979b8fab9c8a8763"
+    );
     assert!(!span.is_noop());
 }
 
@@ -1239,6 +1243,10 @@ fn mooncake_executor_submits_built_requests_through_transfer_submitter() {
 
     assert_eq!(summary.submitted_spans(), 1);
     assert_eq!(executor.submitted_batches(), &[100]);
+    assert_eq!(
+        executor.submitted_transfers()[0].descriptor_checksum(),
+        transfer_plan.spans()[0].descriptor_checksum()
+    );
     let submitted_requests = &executor.submitter().submitted_requests;
     assert_eq!(submitted_requests.len(), 1);
     assert_eq!(submitted_requests[0].len(), 2);

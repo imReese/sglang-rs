@@ -8,6 +8,8 @@ use std::path::Path;
 #[cfg(feature = "mooncake-link")]
 use std::sync::{Arc, Mutex};
 
+use sha2::{Digest, Sha256};
+
 use crate::cache::CachePageId;
 use crate::cli::{ServerArgs, ZmqPortRange};
 use crate::model_artifacts::{HfModelConfig, resolve_model_path};
@@ -919,9 +921,43 @@ impl KvCacheTransferSpan {
         &self.cache_pages
     }
 
+    pub fn descriptor_checksum(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"sglang-rs.kv-transfer-span.v1\0");
+        update_len_prefixed_str(&mut hasher, self.request_id.as_str());
+        update_len_prefixed_str(&mut hasher, &self.disaggregated_params.bootstrap_host);
+        hasher.update(self.disaggregated_params.bootstrap_port.to_le_bytes());
+        hasher.update(self.disaggregated_params.bootstrap_room.to_le_bytes());
+        hasher.update(self.data_parallel_rank.to_le_bytes());
+        hasher.update((self.token_offset as u64).to_le_bytes());
+        hasher.update((self.token_count as u64).to_le_bytes());
+        hasher.update((self.cache_pages.len() as u64).to_le_bytes());
+        for cache_page in &self.cache_pages {
+            hasher.update((cache_page.as_usize() as u64).to_le_bytes());
+        }
+
+        let digest = hasher.finalize();
+        hex_encode(&digest)
+    }
+
     pub fn is_noop(&self) -> bool {
         self.token_count == 0
     }
+}
+
+fn update_len_prefixed_str(hasher: &mut Sha256, value: &str) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value.as_bytes());
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -2232,6 +2268,7 @@ pub struct MooncakeSubmittedBatch {
     bootstrap_room: BootstrapRoom,
     batch_id: MooncakeBatchId,
     task_count: usize,
+    descriptor_checksum: String,
 }
 
 impl MooncakeSubmittedBatch {
@@ -2244,6 +2281,20 @@ impl MooncakeSubmittedBatch {
             bootstrap_room,
             batch_id,
             task_count,
+            descriptor_checksum: String::new(),
+        }
+    }
+
+    pub fn from_span(
+        span: &KvCacheTransferSpan,
+        batch_id: MooncakeBatchId,
+        task_count: usize,
+    ) -> Self {
+        Self {
+            bootstrap_room: span.bootstrap_room(),
+            batch_id,
+            task_count,
+            descriptor_checksum: span.descriptor_checksum(),
         }
     }
 
@@ -2257,6 +2308,10 @@ impl MooncakeSubmittedBatch {
 
     pub fn task_count(&self) -> usize {
         self.task_count
+    }
+
+    pub fn descriptor_checksum(&self) -> &str {
+        &self.descriptor_checksum
     }
 }
 
@@ -2615,11 +2670,10 @@ where
             .submit_transfer(&mut requests)
             .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
         self.submitted_batches.push(batch_id);
-        self.submitted_transfers.push(MooncakeSubmittedBatch::new(
-            span.bootstrap_room(),
-            batch_id,
-            task_count,
-        ));
+        self.submitted_transfers
+            .push(MooncakeSubmittedBatch::from_span(
+                span, batch_id, task_count,
+            ));
         Ok(())
     }
 
