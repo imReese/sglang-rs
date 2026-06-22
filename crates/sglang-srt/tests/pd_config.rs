@@ -51,7 +51,7 @@ fn pd_config_normalizes_mooncake_tcp_to_mooncake_with_forced_tcp() {
 }
 
 #[test]
-fn pd_config_rejects_fake_backend_for_prefill() {
+fn pd_config_accepts_fake_backend_for_prefill_smoke_tests() {
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
@@ -63,9 +63,10 @@ fn pd_config_rejects_fake_backend_for_prefill() {
     ])
     .expect("args should parse");
 
-    let error = PdConfig::from_server_args(&args).expect_err("prefill fake should fail");
+    let config = PdConfig::from_server_args(&args).expect("prefill fake should normalize");
 
-    assert_eq!(error, PdConfigError::FakePrefillUnsupported);
+    assert_eq!(config.mode, DisaggregationMode::Prefill);
+    assert_eq!(config.transfer_backend, TransferBackend::Fake);
 }
 
 #[test]

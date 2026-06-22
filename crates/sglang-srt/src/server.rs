@@ -1388,11 +1388,21 @@ where
             let service = try_build_bootstrap_grpc_router_service(&args)?;
             serve_grpc_router_with_shutdown(addr, service, true, shutdown).await?;
         }
-        DisaggregationMode::Decode if pd_config.transfer_backend == TransferBackend::Fake => {
+        DisaggregationMode::Prefill if pd_config.transfer_backend == TransferBackend::Fake => {
             let service = try_build_bootstrap_pd_grpc_router_service(
                 &args,
                 DecodeBootstrapRegistry::default(),
                 FakeKvCacheTransferExecutor::default(),
+            )?;
+            serve_grpc_router_with_shutdown(addr, service, true, shutdown).await?;
+        }
+        DisaggregationMode::Decode if pd_config.transfer_backend == TransferBackend::Fake => {
+            let service = try_build_bootstrap_pd_grpc_router_service_with_decode_publisher(
+                &args,
+                DecodeBootstrapRegistry::default(),
+                FakeKvCacheTransferExecutor::default(),
+                crate::transfer::NoopDecodeBootstrapPublisher,
+                true,
             )?;
             serve_grpc_router_with_shutdown(addr, service, true, shutdown).await?;
         }
@@ -1457,6 +1467,40 @@ where
         DisaggregationMode::Null => {
             let service = try_build_bootstrap_http_router_service(&args)?
                 .with_engine_info_bootstrap_service(engine_info_service.clone());
+            serve_http_and_engine_info_bootstrap(
+                addr,
+                service,
+                engine_info_addr,
+                engine_info_service,
+                shutdown,
+            )
+            .await?;
+        }
+        DisaggregationMode::Prefill if pd_config.transfer_backend == TransferBackend::Fake => {
+            let service = try_build_bootstrap_pd_http_router_service(
+                &args,
+                DecodeBootstrapRegistry::default(),
+                FakeKvCacheTransferExecutor::default(),
+            )?
+            .with_engine_info_bootstrap_service(engine_info_service.clone());
+            serve_http_and_engine_info_bootstrap(
+                addr,
+                service,
+                engine_info_addr,
+                engine_info_service,
+                shutdown,
+            )
+            .await?;
+        }
+        DisaggregationMode::Decode if pd_config.transfer_backend == TransferBackend::Fake => {
+            let service = try_build_bootstrap_pd_http_router_service_with_decode_publisher(
+                &args,
+                DecodeBootstrapRegistry::default(),
+                FakeKvCacheTransferExecutor::default(),
+                crate::transfer::NoopDecodeBootstrapPublisher,
+                true,
+            )?
+            .with_engine_info_bootstrap_service(engine_info_service.clone());
             serve_http_and_engine_info_bootstrap(
                 addr,
                 service,

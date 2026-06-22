@@ -504,10 +504,6 @@ impl PdConfig {
         let backend = TransferBackend::parse(&args.disaggregation_transfer_backend)?;
         let kv_cache_dtype = KvCacheDtype::parse(&args.kv_cache_dtype)?;
 
-        if mode == DisaggregationMode::Prefill && backend.backend == TransferBackend::Fake {
-            return Err(PdConfigError::FakePrefillUnsupported);
-        }
-
         Ok(Self {
             mode,
             transfer_backend: backend.backend,
@@ -602,7 +598,6 @@ pub enum PdConfigError {
     MissingMooncakeKvCacheModelLayout,
     KvCacheDtypeRequiresModelMetadata(KvCacheDtype),
     KvCacheLayoutOverflow,
-    FakePrefillUnsupported,
 }
 
 impl fmt::Display for PdConfigError {
@@ -638,9 +633,6 @@ impl fmt::Display for PdConfigError {
             }
             Self::KvCacheLayoutOverflow => {
                 formatter.write_str("kv cache layout byte size overflow")
-            }
-            Self::FakePrefillUnsupported => {
-                formatter.write_str("prefill server does not support fake transfer backend")
             }
         }
     }
