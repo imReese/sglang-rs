@@ -1118,6 +1118,11 @@ async fn router_poll_transfers_reaches_real_rust_srt_grpc_worker() {
 
     assert_eq!(body["completed_batches"], 0);
     assert_eq!(body["pending_batches"], 0);
+    assert_eq!(
+        body["completed_descriptor_checksums"],
+        serde_json::json!([])
+    );
+    assert_eq!(body["pending_descriptor_checksums"], serde_json::json!([]));
     assert_eq!(body["polled_workers"], 1);
     assert_eq!(body["model"], "tiny");
     assert!(body["worker_type"].is_null());

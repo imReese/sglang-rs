@@ -1065,6 +1065,11 @@ async fn poll_transfers_proxies_to_single_plain_worker() {
         serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(body["completed_batches"], 1);
     assert_eq!(body["pending_batches"], 0);
+    assert_eq!(
+        body["completed_descriptor_checksums"],
+        serde_json::json!(["mock-completed-transfer"])
+    );
+    assert_eq!(body["pending_descriptor_checksums"], serde_json::json!([]));
     assert_eq!(body["polled_workers"], 1);
     assert!(body["worker_type"].is_null());
 
@@ -1118,6 +1123,11 @@ async fn poll_transfers_queries_prefill_worker_for_pd_pool() {
         serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(body["completed_batches"], 1);
     assert_eq!(body["pending_batches"], 0);
+    assert_eq!(
+        body["completed_descriptor_checksums"],
+        serde_json::json!(["mock-completed-transfer"])
+    );
+    assert_eq!(body["pending_descriptor_checksums"], serde_json::json!([]));
     assert_eq!(body["polled_workers"], 1);
     assert_eq!(body["worker_type"], "prefill");
 

@@ -499,6 +499,8 @@ async fn chat(
         return Json(serde_json::json!({
             "completed_batches": 1,
             "pending_batches": 0,
+            "completed_descriptor_checksums": ["mock-completed-transfer"],
+            "pending_descriptor_checksums": [],
         }))
         .into_response();
     }

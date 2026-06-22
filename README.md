@@ -118,7 +118,8 @@ This repository currently contains the first `sglang-srt` runtime crate and the
   validates token budgets before scheduler dispatch, maps protocol errors to
   router status classes for the future gRPC bridge, and exposes `/flush_cache`
   plus `/update_weights_from_disk`, `/update_weight_version`, `/get_weights_by_name`,
-  `/remote_instance_transfer_engine_info`, `/pause_generation`, `/continue_generation`,
+  `/remote_instance_transfer_engine_info`, `/poll_transfers` with descriptor
+  checksum preservation, `/pause_generation`, `/continue_generation`,
   `/abort_request`, `/start_profile`, and `/stop_profile` forwarding for gateway
   control-plane calls. `/abort_request`
   supports both targeted `rid` aborts and SGLang-compatible `abort_all`.

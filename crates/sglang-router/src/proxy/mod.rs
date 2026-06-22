@@ -1202,6 +1202,8 @@ impl Proxy {
         let body = json!({
             "completed_batches": response.completed_batches,
             "pending_batches": response.pending_batches,
+            "completed_descriptor_checksums": response.completed_descriptor_checksums,
+            "pending_descriptor_checksums": response.pending_descriptor_checksums,
         });
         let mut out = Response::new(Body::from(
             serde_json::to_vec(&body).expect("poll transfers response JSON should serialize"),
