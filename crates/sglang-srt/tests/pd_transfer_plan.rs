@@ -788,6 +788,72 @@ fn async_pd_poll_success_publishes_decode_radix_cache() {
 }
 
 #[test]
+fn async_pd_poll_failure_releases_unpublished_decode_cache_pages() {
+    let backend = RecordingMooncakeBackend::failed();
+    let worker = KvTransferModelWorker::new(
+        UnfinishedWorker,
+        registry_with_session("pd-cache-failed", 34),
+        MooncakeKvCacheTransferExecutor::new(
+            backend,
+            MooncakeKvCacheLayout {
+                source_base_addr: 0x4300,
+                page_size_bytes: 64,
+                target_base_offset: 0,
+            },
+            MooncakeTransferTarget { target_id: 18 },
+        ),
+    );
+    let mut scheduler =
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(4));
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("pd-cache-failed"),
+            vec![1, 2],
+            SamplingParams::new(2),
+        )
+        .with_disaggregated_params(Some(disaggregated_params(34))),
+    );
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should submit async KV transfer");
+    assert_eq!(scheduler.available_cache_pages(), Some(2));
+    assert_eq!(scheduler.decode_queue_depth(), 1);
+
+    let error = scheduler
+        .poll_transfers()
+        .expect_err("failed transfer poll should surface the Mooncake failure");
+    assert_eq!(
+        error,
+        KvCacheTransferError::Runtime(
+            "Mooncake transfer batch 300 task 0 failed with status 6".to_string()
+        )
+    );
+
+    assert_eq!(scheduler.available_cache_pages(), Some(4));
+    assert_eq!(scheduler.decode_queue_depth(), 0);
+    assert!(scheduler.worker().registry().get(34).is_none());
+
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("same-prefix-after-failure"),
+        vec![1, 2, 3],
+        SamplingParams::new(1),
+    ));
+    let batch = scheduler
+        .next_prefill_batch(1)
+        .expect("second prefill should be schedulable after cleanup");
+
+    assert_eq!(batch.requests()[0].cached_token_count(), 0);
+    assert_eq!(
+        batch.requests()[0].allocated_cache_pages(),
+        &[
+            CachePageId::from(0),
+            CachePageId::from(1),
+            CachePageId::from(2)
+        ]
+    );
+}
+
+#[test]
 fn transfer_model_worker_fails_default_decode_dispatch_when_kv_failed() {
     let worker = KvTransferModelWorker::new(
         UnfinishedWorker,

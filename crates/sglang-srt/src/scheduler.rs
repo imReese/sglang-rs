@@ -778,12 +778,19 @@ where
     }
 
     pub fn poll_transfers(&mut self) -> Result<MooncakeTransferPollSummary, KvCacheTransferError> {
-        let summary = self.worker.poll_transfers()?;
-        self.publish_ready_pending_prefix_cache_inserts()?;
-        Ok(summary)
+        match self.worker.poll_transfers() {
+            Ok(summary) => {
+                self.reconcile_pending_prefix_cache_inserts()?;
+                Ok(summary)
+            }
+            Err(error) => {
+                self.reconcile_pending_prefix_cache_inserts()?;
+                Err(error)
+            }
+        }
     }
 
-    fn publish_ready_pending_prefix_cache_inserts(&mut self) -> Result<(), KvCacheTransferError> {
+    fn reconcile_pending_prefix_cache_inserts(&mut self) -> Result<(), KvCacheTransferError> {
         let pending = std::mem::take(&mut self.pending_prefix_cache_inserts);
 
         for request in pending {
@@ -794,11 +801,21 @@ where
             {
                 DecodeRequestState::Ready => self.publish_prefill_cache_pages(&request),
                 DecodeRequestState::Pending => self.pending_prefix_cache_inserts.push(request),
-                DecodeRequestState::Failed(_) => {}
+                DecodeRequestState::Failed(_) => self.release_failed_pending_prefix_cache(request),
             }
         }
 
         Ok(())
+    }
+
+    fn release_failed_pending_prefix_cache(&mut self, request: ScheduledRequest) {
+        if let Some(allocator) = self.cache_page_allocator.as_mut() {
+            allocator.release(request.allocated_cache_pages());
+        }
+
+        let request = remove_request_from_queue(&mut self.decode_queue, request.request_id())
+            .unwrap_or(request);
+        self.worker.complete_request(&request);
     }
 }
 
