@@ -1470,6 +1470,11 @@ async fn grpc_poll_transfers_advances_async_pd_batches() {
 
     assert_eq!(response.completed_batches, 1);
     assert_eq!(response.pending_batches, 0);
+    assert_eq!(
+        response.completed_descriptor_checksums,
+        vec!["ad7c0f474c403432d07c9165fb35d01a3f728314d9585dad67faa03d59760569".to_string()]
+    );
+    assert!(response.pending_descriptor_checksums.is_empty());
 }
 
 #[tokio::test]

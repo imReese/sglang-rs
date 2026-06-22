@@ -942,6 +942,10 @@ fn router_runtime_poll_transfers_exposes_control_plane_counts() {
         RouterTransferPollResponse {
             completed_batches: 1,
             pending_batches: 0,
+            completed_descriptor_checksums: vec![
+                "07d08cbaad6ac874955f90fbdf5d0394be5dd750712bf2cd43b0265ea8813f71".to_string()
+            ],
+            pending_descriptor_checksums: Vec::new(),
         }
     );
 }

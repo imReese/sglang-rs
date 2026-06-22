@@ -2329,6 +2329,11 @@ async fn http_server_poll_transfers_advances_async_pd_batches() {
 
     assert_eq!(poll["completed_batches"], 1);
     assert_eq!(poll["pending_batches"], 0);
+    assert_eq!(
+        poll["completed_descriptor_checksums"],
+        serde_json::json!(["3a28678f92e361c8779d100ed9bf59682510b6fd5ad51f0cfc9b3b14494f491b"])
+    );
+    assert_eq!(poll["pending_descriptor_checksums"], serde_json::json!([]));
 
     shutdown_tx
         .send(())

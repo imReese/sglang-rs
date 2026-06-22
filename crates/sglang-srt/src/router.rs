@@ -515,6 +515,8 @@ pub struct RouterControlResponse {
 pub struct RouterTransferPollResponse {
     pub completed_batches: usize,
     pub pending_batches: usize,
+    pub completed_descriptor_checksums: Vec<String>,
+    pub pending_descriptor_checksums: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -805,6 +807,8 @@ where
         Ok(RouterTransferPollResponse {
             completed_batches: summary.completed_batches(),
             pending_batches: summary.pending_batches(),
+            completed_descriptor_checksums: summary.completed_descriptor_checksums().to_vec(),
+            pending_descriptor_checksums: summary.pending_descriptor_checksums().to_vec(),
         })
     }
 

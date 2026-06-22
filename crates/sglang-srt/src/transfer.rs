@@ -2360,6 +2360,8 @@ impl MooncakeSubmittedBatch {
 pub struct MooncakeTransferPollSummary {
     completed_batches: usize,
     pending_batches: usize,
+    completed_descriptor_checksums: Vec<String>,
+    pending_descriptor_checksums: Vec<String>,
 }
 
 impl MooncakeTransferPollSummary {
@@ -2369,6 +2371,14 @@ impl MooncakeTransferPollSummary {
 
     pub fn pending_batches(&self) -> usize {
         self.pending_batches
+    }
+
+    pub fn completed_descriptor_checksums(&self) -> &[String] {
+        &self.completed_descriptor_checksums
+    }
+
+    pub fn pending_descriptor_checksums(&self) -> &[String] {
+        &self.pending_descriptor_checksums
     }
 }
 
@@ -2411,8 +2421,18 @@ where
         if completed_tasks == batch.task_count() {
             registry.update_status(batch.bootstrap_room(), KvPoll::Success)?;
             summary.completed_batches += 1;
+            if !batch.descriptor_checksum().is_empty() {
+                summary
+                    .completed_descriptor_checksums
+                    .push(batch.descriptor_checksum().to_string());
+            }
         } else {
             summary.pending_batches += 1;
+            if !batch.descriptor_checksum().is_empty() {
+                summary
+                    .pending_descriptor_checksums
+                    .push(batch.descriptor_checksum().to_string());
+            }
         }
     }
 
@@ -2648,8 +2668,18 @@ where
                         .free_batch(transfer.batch_id())
                         .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
                     summary.completed_batches += 1;
+                    if !transfer.descriptor_checksum().is_empty() {
+                        summary
+                            .completed_descriptor_checksums
+                            .push(transfer.descriptor_checksum().to_string());
+                    }
                 }
                 Ok(MooncakePolledBatchState::Pending) => {
+                    if !transfer.descriptor_checksum().is_empty() {
+                        summary
+                            .pending_descriptor_checksums
+                            .push(transfer.descriptor_checksum().to_string());
+                    }
                     pending_transfers.push(transfer);
                     summary.pending_batches += 1;
                 }

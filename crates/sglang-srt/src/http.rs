@@ -522,6 +522,8 @@ where
     Json(json!({
         "completed_batches": response.completed_batches,
         "pending_batches": response.pending_batches,
+        "completed_descriptor_checksums": response.completed_descriptor_checksums,
+        "pending_descriptor_checksums": response.pending_descriptor_checksums,
     }))
     .into_response()
 }

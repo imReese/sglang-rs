@@ -906,6 +906,8 @@ where
         Ok(Response::new(PollTransfersResponse {
             completed_batches: usize_to_u32(response.completed_batches)?,
             pending_batches: usize_to_u32(response.pending_batches)?,
+            completed_descriptor_checksums: response.completed_descriptor_checksums,
+            pending_descriptor_checksums: response.pending_descriptor_checksums,
         }))
     }
 

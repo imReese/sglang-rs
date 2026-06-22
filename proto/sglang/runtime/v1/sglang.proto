@@ -230,6 +230,8 @@ message PollTransfersRequest {}
 message PollTransfersResponse {
   uint32 completed_batches = 1;
   uint32 pending_batches = 2;
+  repeated string completed_descriptor_checksums = 3;
+  repeated string pending_descriptor_checksums = 4;
 }
 
 message AbortRequest {
