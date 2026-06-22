@@ -175,8 +175,10 @@ This repository currently contains the first `sglang-srt` runtime crate and the
   `max_new_tokens` stopping, prefix-cache application, and KV cache page
   allocation for uncached prefill tokens. Decode batching consults worker
   readiness before dispatch so PD decode requests do not leave the decode queue
-  before KV transfer is complete. Successful prefill dispatches publish
-  allocated pages back into RadixCache for future prefix reuse. The dispatch path
+  before KV transfer is complete. Successful local/ready prefill dispatches
+  publish allocated pages back into RadixCache for future prefix reuse, while
+  asynchronous PD prefill pages are staged and only published after transfer
+  polling observes KV readiness. The dispatch path
   can run in local PD mode by routing prefill and decode batches to separate
   worker executors, matching the split execution boundary used by SGLang
   disaggregation.

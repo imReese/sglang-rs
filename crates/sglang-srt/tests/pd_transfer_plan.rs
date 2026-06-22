@@ -684,6 +684,110 @@ fn transfer_model_worker_blocks_default_decode_dispatch_until_kv_success() {
 }
 
 #[test]
+fn async_pd_prefill_does_not_publish_decode_radix_cache_before_kv_success() {
+    let worker = KvTransferModelWorker::new(
+        UnfinishedWorker,
+        registry_with_session("pd-cache-wait", 32),
+        MooncakeKvCacheTransferExecutor::new(
+            RecordingMooncakeSubmitter::default(),
+            MooncakeKvCacheLayout {
+                source_base_addr: 0x4100,
+                page_size_bytes: 64,
+                target_base_offset: 0,
+            },
+            MooncakeTransferTarget { target_id: 16 },
+        ),
+    );
+    let mut scheduler =
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(8));
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("pd-cache-wait"),
+            vec![1, 2],
+            SamplingParams::new(2),
+        )
+        .with_disaggregated_params(Some(disaggregated_params(32))),
+    );
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should submit async KV transfer");
+
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("same-prefix-before-ready"),
+        vec![1, 2, 3],
+        SamplingParams::new(1),
+    ));
+    let batch = scheduler
+        .next_prefill_batch(1)
+        .expect("second prefill should be schedulable");
+
+    assert_eq!(batch.requests()[0].cached_token_count(), 0);
+    assert_eq!(
+        batch.requests()[0].allocated_cache_pages(),
+        &[
+            CachePageId::from(2),
+            CachePageId::from(3),
+            CachePageId::from(4)
+        ]
+    );
+}
+
+#[test]
+fn async_pd_poll_success_publishes_decode_radix_cache() {
+    let backend = RecordingMooncakeBackend::completed();
+    let worker = KvTransferModelWorker::new(
+        UnfinishedWorker,
+        registry_with_session("pd-cache-ready", 33),
+        MooncakeKvCacheTransferExecutor::new(
+            backend,
+            MooncakeKvCacheLayout {
+                source_base_addr: 0x4200,
+                page_size_bytes: 64,
+                target_base_offset: 0,
+            },
+            MooncakeTransferTarget { target_id: 17 },
+        ),
+    );
+    let mut scheduler =
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(8));
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("pd-cache-ready"),
+            vec![1, 2],
+            SamplingParams::new(2),
+        )
+        .with_disaggregated_params(Some(disaggregated_params(33))),
+    );
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should submit async KV transfer");
+
+    let summary = scheduler
+        .poll_transfers()
+        .expect("completed transfer poll should publish cache");
+    assert_eq!(summary.completed_batches(), 1);
+
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("same-prefix-after-ready"),
+        vec![1, 2, 3],
+        SamplingParams::new(1),
+    ));
+    let batch = scheduler
+        .next_prefill_batch(1)
+        .expect("second prefill should be schedulable");
+
+    assert_eq!(batch.requests()[0].cached_token_count(), 2);
+    assert_eq!(
+        batch.requests()[0].prefix_cache_pages(),
+        &[CachePageId::from(0), CachePageId::from(1)]
+    );
+    assert_eq!(
+        batch.requests()[0].allocated_cache_pages(),
+        &[CachePageId::from(2)]
+    );
+}
+
+#[test]
 fn transfer_model_worker_fails_default_decode_dispatch_when_kv_failed() {
     let worker = KvTransferModelWorker::new(
         UnfinishedWorker,

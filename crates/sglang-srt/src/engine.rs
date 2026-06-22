@@ -100,7 +100,7 @@ where
     W: WorkerExecutor,
 {
     pub fn poll_transfers(&mut self) -> Result<MooncakeTransferPollSummary, RuntimeError> {
-        Ok(self.scheduler.worker_mut().poll_transfers()?)
+        Ok(self.scheduler.poll_transfers()?)
     }
 
     pub fn update_weights_from_disk(

@@ -4,6 +4,7 @@ use std::fmt;
 use crate::cache::{
     CacheAllocationError, CachePageAllocator, CachePageId, PrefixMatch, RadixCache,
 };
+use crate::transfer::{KvCacheTransferError, MooncakeTransferPollSummary};
 use crate::types::{DisaggregatedParams, FAKE_BOOTSTRAP_HOST, RequestId, SamplingParams};
 use crate::worker::{DecodeRequestState, GeneratedToken, WorkerExecutionError, WorkerExecutor};
 
@@ -227,6 +228,7 @@ pub struct Scheduler<W> {
     waiting_queue: VecDeque<ScheduledRequest>,
     decode_queue: VecDeque<ScheduledRequest>,
     prefix_cache: RadixCache,
+    pending_prefix_cache_inserts: Vec<ScheduledRequest>,
     cache_page_allocator: Option<CachePageAllocator>,
     max_running_requests: Option<usize>,
     worker: W,
@@ -287,6 +289,7 @@ impl<W> Scheduler<W> {
             waiting_queue: VecDeque::new(),
             decode_queue: VecDeque::new(),
             prefix_cache,
+            pending_prefix_cache_inserts: Vec::new(),
             cache_page_allocator: None,
             max_running_requests: None,
             worker,
@@ -302,6 +305,7 @@ impl<W> Scheduler<W> {
             waiting_queue: VecDeque::new(),
             decode_queue: VecDeque::new(),
             prefix_cache,
+            pending_prefix_cache_inserts: Vec::new(),
             cache_page_allocator: Some(cache_page_allocator),
             max_running_requests: None,
             worker,
@@ -382,6 +386,7 @@ impl<W> Scheduler<W> {
         }
 
         self.prefix_cache.clear();
+        self.pending_prefix_cache_inserts.clear();
         if let Some(allocator) = self.cache_page_allocator.as_mut() {
             allocator.reset();
         }
@@ -693,7 +698,7 @@ where
 
         for (mut request, generated_token) in requests.into_iter().zip(tokens.into_iter()) {
             if forward_mode == ForwardMode::Prefill {
-                self.publish_prefill_cache_pages(&request);
+                self.stage_prefill_cache_pages(&request)?;
             }
 
             request.append_output_ids(generated_token.token_ids());
@@ -724,11 +729,34 @@ where
         }
     }
 
-    fn publish_prefill_cache_pages(&mut self, request: &ScheduledRequest) {
+    fn stage_prefill_cache_pages(
+        &mut self,
+        request: &ScheduledRequest,
+    ) -> Result<(), SchedulerError> {
         if request.allocated_cache_pages().is_empty() || request.skips_radix_cache_insert() {
-            return;
+            return Ok(());
         }
 
+        if request.disaggregated_params().is_some() {
+            match self.worker.decode_request_state(request)? {
+                DecodeRequestState::Ready => self.publish_prefill_cache_pages(request),
+                DecodeRequestState::Pending => {
+                    self.pending_prefix_cache_inserts.push(request.clone())
+                }
+                DecodeRequestState::Failed(message) => {
+                    return Err(SchedulerError::Worker(WorkerExecutionError::Runtime(
+                        message,
+                    )));
+                }
+            }
+            return Ok(());
+        }
+
+        self.publish_prefill_cache_pages(request);
+        Ok(())
+    }
+
+    fn publish_prefill_cache_pages(&mut self, request: &ScheduledRequest) {
         let input_ids = request.input_ids();
         let prefix_pages = request.prefix_cache_pages();
         let allocated_pages = request.allocated_cache_pages();
@@ -747,6 +775,30 @@ where
         self.dispatch_prefill_batch(1)?
             .pop()
             .ok_or(SchedulerError::EmptyQueue)
+    }
+
+    pub fn poll_transfers(&mut self) -> Result<MooncakeTransferPollSummary, KvCacheTransferError> {
+        let summary = self.worker.poll_transfers()?;
+        self.publish_ready_pending_prefix_cache_inserts()?;
+        Ok(summary)
+    }
+
+    fn publish_ready_pending_prefix_cache_inserts(&mut self) -> Result<(), KvCacheTransferError> {
+        let pending = std::mem::take(&mut self.pending_prefix_cache_inserts);
+
+        for request in pending {
+            match self
+                .worker
+                .decode_request_state(&request)
+                .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?
+            {
+                DecodeRequestState::Ready => self.publish_prefill_cache_pages(&request),
+                DecodeRequestState::Pending => self.pending_prefix_cache_inserts.push(request),
+                DecodeRequestState::Failed(_) => {}
+            }
+        }
+
+        Ok(())
     }
 }
 
