@@ -214,7 +214,8 @@ Run a local process-level PD smoke with a tiny real safetensors model:
 ```
 
 The smoke builds `sglang-rs` and `sgl-router` in debug mode, creates a temporary
-CPU embedding LM checkpoint, starts prefill/decode HTTP workers plus the PD
-router, sends an OpenAI chat request, verifies the model-generated `world`
-token, and then shuts the stack down. Use `KEEP_RUNNING=1` to leave the
-services running after the request.
+CPU embedding LM checkpoint, starts prefill/decode workers plus the PD router,
+sends an OpenAI chat request, verifies the model-generated `world` token, and
+then shuts the stack down. Use `KEEP_RUNNING=1` to leave the services running
+after the request. Set `TRANSPORT=grpc` to run the same router smoke against
+gRPC SRT workers.

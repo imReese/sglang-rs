@@ -4,8 +4,8 @@ set -euo pipefail
 # Local CPU PD-disaggregation smoke launcher for sglang-rs.
 #
 # This script starts a real process stack:
-#   1. Rust SRT HTTP prefill worker
-#   2. Rust SRT HTTP decode worker
+#   1. Rust SRT HTTP or gRPC prefill worker
+#   2. Rust SRT HTTP or gRPC decode worker
 #   3. Rust sgl-router in PD mode
 #
 # It generates a tiny safetensors-backed CPU embedding LM at runtime, sends an
@@ -18,6 +18,7 @@ cd "$ROOT_DIR"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-tiny}"
 BUILD="${BUILD:-1}"
 PROFILE="${PROFILE:-debug}"
+TRANSPORT="${TRANSPORT:-http}"
 KEEP_RUNNING="${KEEP_RUNNING:-0}"
 LOG_DIR="${LOG_DIR:-$ROOT_DIR/target/cpu-pd-smoke-logs}"
 MODEL_DIR="${MODEL_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/sglang-rs-cpu-pd-model.XXXXXX")}"
@@ -53,6 +54,15 @@ case "$PROFILE" in
         ;;
     *)
         echo "PROFILE must be 'debug' or 'release', got '$PROFILE'" >&2
+        exit 2
+        ;;
+esac
+
+case "$TRANSPORT" in
+    http | grpc)
+        ;;
+    *)
+        echo "TRANSPORT must be 'http' or 'grpc', got '$TRANSPORT'" >&2
         exit 2
         ;;
 esac
@@ -140,6 +150,29 @@ wait_for_http() {
     done
 }
 
+wait_for_tcp() {
+    local host=$1
+    local port=$2
+    local name=$3
+    local deadline=$((SECONDS + ${WAIT_TIMEOUT_SECS:-30}))
+    until python3 - "$host" "$port" <<'PY' >/dev/null 2>&1
+import socket
+import sys
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+with socket.create_connection((host, port), timeout=0.5):
+    pass
+PY
+    do
+        if ((SECONDS >= deadline)); then
+            echo "timed out waiting for ${name}: ${host}:${port}" >&2
+            return 1
+        fi
+        sleep 0.2
+    done
+}
+
 pids=()
 cleanup() {
     local exit_code=$?
@@ -189,13 +222,22 @@ decode_args=(
     --num-reserved-decode-tokens 8
 )
 
+prefill_url="http://${PREFILL_HOST}:${PREFILL_PORT}"
+decode_url="http://${DECODE_HOST}:${DECODE_PORT}"
+if [[ "$TRANSPORT" == "grpc" ]]; then
+    prefill_args+=(--grpc-mode)
+    decode_args+=(--grpc-mode)
+    prefill_url="grpc://${PREFILL_HOST}:${PREFILL_PORT}"
+    decode_url="grpc://${DECODE_HOST}:${DECODE_PORT}"
+fi
+
 router_args=(
     launch
     --host "$ROUTER_HOST"
     --port "$ROUTER_PORT"
     --pd-disaggregation
-    --prefill "http://${PREFILL_HOST}:${PREFILL_PORT}" "$BOOTSTRAP_PORT"
-    --decode "http://${DECODE_HOST}:${DECODE_PORT}"
+    --prefill "$prefill_url" "$BOOTSTRAP_PORT"
+    --decode "$decode_url"
     --served-model-name "$SERVED_MODEL_NAME"
     --tokenizer-path "$MODEL_DIR/tokenizer.json"
     --policy round_robin
@@ -204,14 +246,23 @@ router_args=(
 
 echo "logs: $LOG_DIR"
 echo "model fixture: $MODEL_DIR"
+echo "worker transport: $TRANSPORT"
 
 "$SGLANG_RS_BIN" "${prefill_args[@]}" >"$LOG_DIR/prefill.log" 2>&1 &
 pids+=("$!")
-wait_for_http "http://${PREFILL_HOST}:${PREFILL_PORT}/health" prefill
+if [[ "$TRANSPORT" == "grpc" ]]; then
+    wait_for_tcp "$PREFILL_HOST" "$PREFILL_PORT" prefill
+else
+    wait_for_http "http://${PREFILL_HOST}:${PREFILL_PORT}/health" prefill
+fi
 
 "$SGLANG_RS_BIN" "${decode_args[@]}" >"$LOG_DIR/decode.log" 2>&1 &
 pids+=("$!")
-wait_for_http "http://${DECODE_HOST}:${DECODE_PORT}/health" decode
+if [[ "$TRANSPORT" == "grpc" ]]; then
+    wait_for_tcp "$DECODE_HOST" "$DECODE_PORT" decode
+else
+    wait_for_http "http://${DECODE_HOST}:${DECODE_PORT}/health" decode
+fi
 
 "$SGL_ROUTER_BIN" "${router_args[@]}" >"$LOG_DIR/router.log" 2>&1 &
 pids+=("$!")

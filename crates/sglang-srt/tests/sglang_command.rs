@@ -53,6 +53,10 @@ fn cpu_pd_smoke_script_is_syntax_checked_and_asserts_real_generation() {
     assert!(content.contains("--pd-disaggregation"));
     assert!(content.contains("--disaggregation-transfer-backend"));
     assert!(content.contains("fake"));
+    assert!(content.contains("TRANSPORT"));
+    assert!(content.contains("grpc"));
+    assert!(content.contains("--grpc-mode"));
+    assert!(content.contains("grpc://${PREFILL_HOST}:${PREFILL_PORT}"));
 
     let status = Command::new("bash")
         .arg("-n")
