@@ -18,9 +18,9 @@ use sglang_srt::proto::sglang::runtime::v1::{
     AbortRequest, ClassifyRequest, ContinueGenerationRequest, DetokenizeRequest,
     DisaggregatedParams, EmbedRequest, FlushCacheRequest, GenerateRequest, GetLoadRequest,
     GetModelInfoRequest, GetServerInfoRequest, GetWeightsByNameRequest, ListModelsRequest,
-    OpenAiJsonRequest, PauseGenerationRequest, RequestOptions, SamplingParams, StartProfileRequest,
-    StopProfileRequest, TextEmbedRequest, TextGenerateRequest, TokenizeRequest, TokenizedInput,
-    UpdateWeightVersionRequest, UpdateWeightsFromDiskRequest,
+    OpenAiJsonRequest, PauseGenerationRequest, PollTransfersRequest, RequestOptions,
+    SamplingParams, StartProfileRequest, StopProfileRequest, TextEmbedRequest, TextGenerateRequest,
+    TokenizeRequest, TokenizedInput, UpdateWeightVersionRequest, UpdateWeightsFromDiskRequest,
 };
 use sglang_srt::router::{RouterProtocolError, RouterRuntime};
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
@@ -1413,6 +1413,63 @@ async fn grpc_get_load_reports_scheduler_metrics() {
     assert_eq!(response.waiting_queue_depth, 1);
     assert_eq!(response.decode_queue_depth, 0);
     assert_eq!(response.available_cache_pages, Some(4));
+}
+
+#[tokio::test]
+async fn grpc_poll_transfers_advances_async_pd_batches() {
+    let worker = KvTransferModelWorker::new(
+        GrpcTwoStepWorker,
+        grpc_registry_with_session("grpc-poll-control", 33),
+        MooncakeKvCacheTransferExecutor::new(
+            RecordingMooncakeBackend::completed(),
+            MooncakeKvCacheLayout {
+                source_base_addr: 0x3000,
+                page_size_bytes: 64,
+                target_base_offset: 0,
+            },
+            MooncakeTransferTarget { target_id: 11 },
+        ),
+    );
+    let service = GrpcRouterService::from_engine(Engine::new(
+        ByteTokenizer,
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(3)),
+    ));
+
+    let error = match service
+        .generate(Request::new(GenerateRequest {
+            input_ids: vec![1, 2],
+            original_text: String::new(),
+            sampling_params: Some(SamplingParams {
+                max_new_tokens: Some(2),
+                ..Default::default()
+            }),
+            options: Some(RequestOptions {
+                request_id: Some("grpc-poll-control".to_string()),
+                stream: true,
+                data_parallel_rank: 0,
+                trace_headers: Default::default(),
+            }),
+            disaggregated_params: Some(DisaggregatedParams {
+                bootstrap_host: "10.0.0.7".to_string(),
+                bootstrap_port: 8998,
+                bootstrap_room: 33,
+            }),
+        }))
+        .await
+    {
+        Ok(_) => panic!("decode should wait before explicit transfer poll"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), Code::Internal);
+
+    let response = service
+        .poll_transfers(Request::new(PollTransfersRequest {}))
+        .await
+        .expect("poll transfers should execute")
+        .into_inner();
+
+    assert_eq!(response.completed_batches, 1);
+    assert_eq!(response.pending_batches, 0);
 }
 
 #[tokio::test]

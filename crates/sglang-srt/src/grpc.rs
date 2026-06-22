@@ -35,10 +35,10 @@ use crate::proto::sglang::runtime::v1::{
     GetLoadRequest, GetModelInfoRequest, GetServerInfoRequest, GetWeightsByNameRequest,
     GetWeightsByNameResponse, HealthCheckRequest, HealthCheckResponse, ListModelsRequest,
     ListModelsResponse, LoadResponse, ModelInfoResponse, OpenAiJsonRequest, OpenAiJsonResponse,
-    PauseGenerationRequest, SamplingParams as ProtoSamplingParams, ServerInfoResponse,
-    StartProfileRequest, StopProfileRequest, TextEmbedRequest, TextGenerateRequest,
-    TokenizeRequest, TokenizeResponse, TokenizedInput, UpdateWeightVersionRequest,
-    UpdateWeightsFromDiskRequest, Usage,
+    PauseGenerationRequest, PollTransfersRequest, PollTransfersResponse,
+    SamplingParams as ProtoSamplingParams, ServerInfoResponse, StartProfileRequest,
+    StopProfileRequest, TextEmbedRequest, TextGenerateRequest, TokenizeRequest, TokenizeResponse,
+    TokenizedInput, UpdateWeightVersionRequest, UpdateWeightsFromDiskRequest, Usage,
 };
 use crate::router::{
     RouterDisaggregatedParams, RouterGenerateComplete, RouterGenerateError, RouterGenerateRequest,
@@ -889,6 +889,23 @@ where
                 .available_cache_pages
                 .map(usize_to_u32)
                 .transpose()?,
+        }))
+    }
+
+    async fn poll_transfers(
+        &self,
+        _request: Request<PollTransfersRequest>,
+    ) -> Result<Response<PollTransfersResponse>, Status> {
+        let response = self
+            .runtime
+            .lock()
+            .map_err(|_| Status::internal("router runtime mutex poisoned"))?
+            .poll_transfers()
+            .map_err(router_runtime_error_to_status)?;
+
+        Ok(Response::new(PollTransfersResponse {
+            completed_batches: usize_to_u32(response.completed_batches)?,
+            pending_batches: usize_to_u32(response.pending_batches)?,
         }))
     }
 

@@ -24,9 +24,9 @@ use sglang_srt::proto::sglang::runtime::v1::{
     GenerateRequest as ProtoGenerateRequest, GenerateResponse as ProtoGenerateResponse,
     GetLoadRequest as ProtoGetLoadRequest, GetWeightsByNameRequest as ProtoGetWeightsByNameRequest,
     OpenAiJsonRequest, OpenAiJsonResponse, PauseGenerationRequest as ProtoPauseGenerationRequest,
-    RequestOptions as ProtoRequestOptions, SamplingParams as ProtoSamplingParams,
-    StartProfileRequest as ProtoStartProfileRequest, StopProfileRequest as ProtoStopProfileRequest,
-    TextGenerateRequest as ProtoTextGenerateRequest,
+    PollTransfersRequest as ProtoPollTransfersRequest, RequestOptions as ProtoRequestOptions,
+    SamplingParams as ProtoSamplingParams, StartProfileRequest as ProtoStartProfileRequest,
+    StopProfileRequest as ProtoStopProfileRequest, TextGenerateRequest as ProtoTextGenerateRequest,
     UpdateWeightVersionRequest as ProtoUpdateWeightVersionRequest,
     UpdateWeightsFromDiskRequest as ProtoUpdateWeightsFromDiskRequest,
 };
@@ -911,6 +911,9 @@ impl Proxy {
         if path == "/flush_cache" {
             return self.forward_grpc_flush_cache(worker_url, breaker).await;
         }
+        if path == "/poll_transfers" {
+            return self.forward_grpc_poll_transfers(worker_url, breaker).await;
+        }
         if path == "/pause_generation" {
             return self
                 .forward_grpc_control_rpc(worker_url, breaker, GrpcControlRpc::PauseGeneration)
@@ -1131,6 +1134,83 @@ impl Proxy {
     ) -> Result<Response<Body>, ApiError> {
         self.forward_grpc_control_rpc(worker_url, breaker, GrpcControlRpc::FlushCache)
             .await
+    }
+
+    async fn forward_grpc_poll_transfers(
+        &self,
+        worker_url: &str,
+        breaker: &CircuitBreaker,
+    ) -> Result<Response<Body>, ApiError> {
+        let parsed = parse_worker_url(worker_url, breaker)?;
+        let endpoint = grpc_endpoint_from_worker_url(&parsed).ok_or_else(|| {
+            breaker.record_failure();
+            ApiError::WorkerMisconfigured {
+                worker: worker_url.to_string(),
+                source: anyhow::anyhow!("unsupported gRPC worker URL scheme {}", parsed.scheme()),
+            }
+        })?;
+
+        let fut = async {
+            let channel = tonic::transport::Endpoint::from_shared(endpoint.clone())
+                .map_err(|e| {
+                    GrpcForwardError::Transport(anyhow::anyhow!(
+                        "invalid gRPC endpoint {endpoint}: {e}"
+                    ))
+                })?
+                .connect_timeout(self.request_timeout)
+                .timeout(self.request_timeout)
+                .connect()
+                .await
+                .map_err(|e| {
+                    GrpcForwardError::Transport(anyhow::anyhow!(
+                        "connect gRPC worker {endpoint}: {e}"
+                    ))
+                })?;
+            let mut client = SglangServiceClient::new(channel);
+            client
+                .poll_transfers(GrpcRequest::new(ProtoPollTransfersRequest {}))
+                .await
+                .map(|response| response.into_inner())
+                .map_err(GrpcForwardError::Status)
+        };
+
+        let response = match tokio::time::timeout(self.request_timeout, fut).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(GrpcForwardError::Status(status))) => {
+                let response = grpc_status_response(status);
+                if response.status().is_server_error() {
+                    breaker.record_failure();
+                } else {
+                    breaker.record_success();
+                }
+                return Ok(response);
+            }
+            Ok(Err(GrpcForwardError::Transport(source))) => {
+                breaker.record_failure();
+                return Err(ApiError::UpstreamUnreachable {
+                    worker: parsed,
+                    source,
+                });
+            }
+            Err(_) => {
+                breaker.record_failure();
+                return Err(ApiError::UpstreamTimeout { worker: parsed });
+            }
+        };
+
+        breaker.record_success();
+        let body = json!({
+            "completed_batches": response.completed_batches,
+            "pending_batches": response.pending_batches,
+        });
+        let mut out = Response::new(Body::from(
+            serde_json::to_vec(&body).expect("poll transfers response JSON should serialize"),
+        ));
+        out.headers_mut().insert(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("application/json"),
+        );
+        Ok(out)
     }
 
     async fn forward_grpc_control_rpc(

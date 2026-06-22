@@ -15,6 +15,7 @@ service SglangService {
   rpc GetServerInfo(GetServerInfoRequest) returns (ServerInfoResponse);
   rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
   rpc GetLoad(GetLoadRequest) returns (LoadResponse);
+  rpc PollTransfers(PollTransfersRequest) returns (PollTransfersResponse);
   rpc Abort(AbortRequest) returns (ControlResponse);
   rpc FlushCache(FlushCacheRequest) returns (ControlResponse);
   rpc PauseGeneration(PauseGenerationRequest) returns (ControlResponse);
@@ -222,6 +223,13 @@ message LoadResponse {
   uint32 waiting_queue_depth = 1;
   uint32 decode_queue_depth = 2;
   optional uint32 available_cache_pages = 3;
+}
+
+message PollTransfersRequest {}
+
+message PollTransfersResponse {
+  uint32 completed_batches = 1;
+  uint32 pending_batches = 2;
 }
 
 message AbortRequest {
