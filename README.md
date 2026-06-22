@@ -206,3 +206,15 @@ Run all checks:
 cargo fmt --all --check
 cargo test --workspace
 ```
+
+Run a local process-level PD smoke with a tiny real safetensors model:
+
+```bash
+./scripts/run_cpu_pd_smoke.sh
+```
+
+The smoke builds `sglang-rs` and `sgl-router` in debug mode, creates a temporary
+CPU embedding LM checkpoint, starts prefill/decode HTTP workers plus the PD
+router, sends an OpenAI chat request, verifies the model-generated `world`
+token, and then shuts the stack down. Use `KEEP_RUNNING=1` to leave the
+services running after the request.
