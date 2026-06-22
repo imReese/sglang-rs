@@ -1085,7 +1085,7 @@ async fn poll_transfers_proxies_to_single_plain_worker() {
 }
 
 #[tokio::test]
-async fn poll_transfers_queries_prefill_worker_for_pd_pool() {
+async fn poll_transfers_polls_all_workers_for_pd_pool() {
     let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let cfg = config(&["tiny"]);
@@ -1121,15 +1121,18 @@ async fn poll_transfers_queries_prefill_worker_for_pd_pool() {
     assert_eq!(res.status(), StatusCode::OK);
     let body: serde_json::Value =
         serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    assert_eq!(body["completed_batches"], 1);
+    assert_eq!(body["completed_batches"], 2);
     assert_eq!(body["pending_batches"], 0);
     assert_eq!(
         body["completed_descriptor_checksums"],
-        serde_json::json!(["mock-completed-transfer"])
+        serde_json::json!(["mock-completed-transfer", "mock-completed-transfer"])
     );
     assert_eq!(body["pending_descriptor_checksums"], serde_json::json!([]));
-    assert_eq!(body["polled_workers"], 1);
-    assert_eq!(body["worker_type"], "prefill");
+    assert_eq!(body["polled_workers"], 2);
+    assert_eq!(
+        body["worker_types"],
+        serde_json::json!(["prefill", "decode"])
+    );
 
     prefill
         .captured
@@ -1138,7 +1141,13 @@ async fn poll_transfers_queries_prefill_worker_for_pd_pool() {
         .last_body
         .clone()
         .expect("prefill worker should receive poll transfers request");
-    assert!(decode.captured.lock().unwrap().last_body.is_none());
+    decode
+        .captured
+        .lock()
+        .unwrap()
+        .last_body
+        .clone()
+        .expect("decode worker should receive poll transfers request");
 }
 
 #[tokio::test]

@@ -487,39 +487,92 @@ pub async fn poll_transfers(
     let probe = parse_admin_model_probe(&body)?;
     let model = select_admin_model(&ctx, probe.model)?;
     let model_id = ModelId(model.clone());
-    let worker = admin_read_worker(&ctx, &model_id, &model)?;
-    let worker_type = worker_type_json(worker.mode());
+    let workers = admin_control_workers(&ctx, &model_id, &model)?;
+    let mut responses = Vec::with_capacity(workers.len());
 
-    let response = ctx
-        .proxy
-        .forward_json_to(
-            &worker.url,
-            &worker.breaker,
-            "/poll_transfers",
-            &headers,
-            body,
-        )
-        .await?;
-    if !response.status().is_success() {
-        return Ok(response);
+    for worker in &workers {
+        let response = ctx
+            .proxy
+            .forward_json_to(
+                &worker.url,
+                &worker.breaker,
+                "/poll_transfers",
+                &headers,
+                body.clone(),
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Ok(response);
+        }
+
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map_err(|error| {
+                ApiError::Internal(anyhow::anyhow!("read poll response body: {error}"))
+            })?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+            ApiError::Internal(anyhow::anyhow!("decode poll response body: {error}"))
+        })?;
+        if !value.is_object() {
+            return Err(ApiError::Internal(anyhow::anyhow!(
+                "poll_transfers response body must be a JSON object"
+            )));
+        }
+        responses.push((worker_type_json(worker.mode()), value));
     }
 
-    let bytes = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .map_err(|error| ApiError::Internal(anyhow::anyhow!("read poll response body: {error}")))?;
-    let mut value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
-        ApiError::Internal(anyhow::anyhow!("decode poll response body: {error}"))
-    })?;
-    let object = value.as_object_mut().ok_or_else(|| {
-        ApiError::Internal(anyhow::anyhow!(
-            "poll_transfers response body must be a JSON object"
-        ))
-    })?;
-    object.insert("polled_workers".to_string(), serde_json::json!(1));
-    object.insert("model".to_string(), serde_json::json!(model));
-    object.insert("worker_type".to_string(), serde_json::json!(worker_type));
+    if responses.len() == 1 {
+        let (worker_type, mut value) = responses
+            .pop()
+            .expect("single poll response must exist after length check");
+        let object = value.as_object_mut().expect("validated as JSON object");
+        object.insert("polled_workers".to_string(), serde_json::json!(1));
+        object.insert("model".to_string(), serde_json::json!(model));
+        object.insert("worker_type".to_string(), serde_json::json!(worker_type));
+        return Ok(Json(value).into_response());
+    }
 
-    Ok(Json(value).into_response())
+    let mut completed_batches = 0u64;
+    let mut pending_batches = 0u64;
+    let mut completed_descriptor_checksums = Vec::new();
+    let mut pending_descriptor_checksums = Vec::new();
+    let mut worker_types = Vec::with_capacity(responses.len());
+
+    for (worker_type, value) in &responses {
+        worker_types.push(serde_json::json!(worker_type));
+        let object = value.as_object().expect("validated as JSON object");
+        completed_batches += object
+            .get("completed_batches")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        pending_batches += object
+            .get("pending_batches")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        if let Some(checksums) = object
+            .get("completed_descriptor_checksums")
+            .and_then(serde_json::Value::as_array)
+        {
+            completed_descriptor_checksums.extend(checksums.iter().cloned());
+        }
+        if let Some(checksums) = object
+            .get("pending_descriptor_checksums")
+            .and_then(serde_json::Value::as_array)
+        {
+            pending_descriptor_checksums.extend(checksums.iter().cloned());
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "completed_batches": completed_batches,
+        "pending_batches": pending_batches,
+        "completed_descriptor_checksums": completed_descriptor_checksums,
+        "pending_descriptor_checksums": pending_descriptor_checksums,
+        "polled_workers": responses.len(),
+        "model": model,
+        "worker_types": worker_types,
+    }))
+    .into_response())
 }
 
 async fn forward_generation_control(
