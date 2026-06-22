@@ -479,6 +479,49 @@ pub async fn remote_instance_transfer_engine_info(
         .await
 }
 
+pub async fn poll_transfers(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    let probe = parse_admin_model_probe(&body)?;
+    let model = select_admin_model(&ctx, probe.model)?;
+    let model_id = ModelId(model.clone());
+    let worker = admin_read_worker(&ctx, &model_id, &model)?;
+    let worker_type = worker_type_json(worker.mode());
+
+    let response = ctx
+        .proxy
+        .forward_json_to(
+            &worker.url,
+            &worker.breaker,
+            "/poll_transfers",
+            &headers,
+            body,
+        )
+        .await?;
+    if !response.status().is_success() {
+        return Ok(response);
+    }
+
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .map_err(|error| ApiError::Internal(anyhow::anyhow!("read poll response body: {error}")))?;
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        ApiError::Internal(anyhow::anyhow!("decode poll response body: {error}"))
+    })?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        ApiError::Internal(anyhow::anyhow!(
+            "poll_transfers response body must be a JSON object"
+        ))
+    })?;
+    object.insert("polled_workers".to_string(), serde_json::json!(1));
+    object.insert("model".to_string(), serde_json::json!(model));
+    object.insert("worker_type".to_string(), serde_json::json!(worker_type));
+
+    Ok(Json(value).into_response())
+}
+
 async fn forward_generation_control(
     ctx: Arc<AppContext>,
     headers: HeaderMap,

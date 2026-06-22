@@ -1037,6 +1037,101 @@ async fn remote_instance_transfer_engine_info_queries_prefill_worker_for_pd_pool
 }
 
 #[tokio::test]
+async fn poll_transfers_proxies_to_single_plain_worker() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let cfg = config(&["tiny"]);
+    let ctx = build_ctx(
+        cfg,
+        vec![WorkerSpec {
+            id: WorkerId("plain-1".into()),
+            url: worker.url.clone(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+        }],
+    );
+    let app = build_router(ctx);
+
+    let res = app
+        .oneshot(admin_request(
+            "/poll_transfers",
+            serde_json::json!({"model": "tiny"}),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["completed_batches"], 1);
+    assert_eq!(body["pending_batches"], 0);
+    assert_eq!(body["polled_workers"], 1);
+    assert!(body["worker_type"].is_null());
+
+    let captured = worker
+        .captured
+        .lock()
+        .unwrap()
+        .last_body
+        .clone()
+        .expect("plain worker should receive poll transfers request");
+    let forwarded: serde_json::Value = serde_json::from_slice(&captured).unwrap();
+    assert_eq!(forwarded["model"], "tiny");
+}
+
+#[tokio::test]
+async fn poll_transfers_queries_prefill_worker_for_pd_pool() {
+    let prefill = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let cfg = config(&["tiny"]);
+    let ctx = build_ctx(
+        cfg,
+        vec![
+            WorkerSpec {
+                id: WorkerId("prefill-1".into()),
+                url: prefill.url.clone(),
+                mode: WorkerMode::Prefill,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: Some(8997),
+            },
+            WorkerSpec {
+                id: WorkerId("decode-1".into()),
+                url: decode.url.clone(),
+                mode: WorkerMode::Decode,
+                model_ids: vec![ModelId("tiny".into())],
+                bootstrap_port: None,
+            },
+        ],
+    );
+    let app = build_router(ctx);
+
+    let res = app
+        .oneshot(admin_request(
+            "/poll_transfers",
+            serde_json::json!({"model": "tiny"}),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["completed_batches"], 1);
+    assert_eq!(body["pending_batches"], 0);
+    assert_eq!(body["polled_workers"], 1);
+    assert_eq!(body["worker_type"], "prefill");
+
+    prefill
+        .captured
+        .lock()
+        .unwrap()
+        .last_body
+        .clone()
+        .expect("prefill worker should receive poll transfers request");
+    assert!(decode.captured.lock().unwrap().last_body.is_none());
+}
+
+#[tokio::test]
 async fn remote_instance_transfer_engine_info_rejects_missing_rank_without_worker_call() {
     let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let cfg = config(&["tiny"]);

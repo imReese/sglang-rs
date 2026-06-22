@@ -74,6 +74,12 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
+            "/poll_transfers",
+            post(crate::server::routes::admin::poll_transfers)
+                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
             "/pause_generation",
             post(crate::server::routes::admin::pause_generation)
                 .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))

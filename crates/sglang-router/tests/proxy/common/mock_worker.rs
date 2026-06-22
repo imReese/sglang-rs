@@ -77,6 +77,7 @@ impl MockWorker {
                 get(remote_instance_transfer_engine_info),
             )
             .route("/flush_cache", post(chat))
+            .route("/poll_transfers", post(chat))
             .route("/pause_generation", post(chat))
             .route("/continue_generation", post(chat))
             .route("/abort_request", post(chat))
@@ -491,6 +492,13 @@ async fn chat(
         return Json(serde_json::json!({
             "success": true,
             "message": "cache flushed",
+        }))
+        .into_response();
+    }
+    if uri.path() == "/poll_transfers" {
+        return Json(serde_json::json!({
+            "completed_batches": 1,
+            "pending_batches": 0,
         }))
         .into_response();
     }
