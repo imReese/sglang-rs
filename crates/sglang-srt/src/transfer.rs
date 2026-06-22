@@ -1075,6 +1075,7 @@ impl std::error::Error for KvCacheTransferPlanError {}
 pub struct KvCacheTransferSummary {
     submitted_spans: usize,
     noop_spans: usize,
+    snapshot_content_checksums: Vec<String>,
 }
 
 impl KvCacheTransferSummary {
@@ -1084,6 +1085,10 @@ impl KvCacheTransferSummary {
 
     pub fn noop_spans(&self) -> usize {
         self.noop_spans
+    }
+
+    pub fn snapshot_content_checksums(&self) -> &[String] {
+        &self.snapshot_content_checksums
     }
 }
 
@@ -1106,6 +1111,38 @@ pub trait KvCachePageSnapshotProvider {
         &self,
         cache_pages: &[CachePageId],
     ) -> Result<Vec<Self::Snapshot>, KvCacheTransferError>;
+}
+
+pub trait KvCachePageSnapshotChecksum {
+    fn update_content_checksum(&self, hasher: &mut Sha256);
+
+    fn content_checksum(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"sglang-rs.kv-page-snapshot.v1\0");
+        self.update_content_checksum(&mut hasher);
+        let digest = hasher.finalize();
+        hex_encode(&digest)
+    }
+}
+
+impl KvCachePageSnapshotChecksum for CachePageId {
+    fn update_content_checksum(&self, hasher: &mut Sha256) {
+        hasher.update((self.as_usize() as u64).to_le_bytes());
+    }
+}
+
+pub fn snapshot_content_checksum<S>(snapshots: &[S]) -> String
+where
+    S: KvCachePageSnapshotChecksum,
+{
+    let mut hasher = Sha256::new();
+    hasher.update(b"sglang-rs.kv-page-snapshot-batch.v1\0");
+    hasher.update((snapshots.len() as u64).to_le_bytes());
+    for snapshot in snapshots {
+        snapshot.update_content_checksum(&mut hasher);
+    }
+    let digest = hasher.finalize();
+    hex_encode(&digest)
 }
 
 pub trait KvCachePageSnapshotImporter {
@@ -1184,6 +1221,7 @@ impl<P, D> LocalSnapshotTransferPdModelWorkers<P, D> {
 impl<P, D> FallibleModelWorker for LocalSnapshotTransferPdModelWorkers<P, D>
 where
     P: FallibleModelWorker + KvCachePageSnapshotProvider,
+    P::Snapshot: KvCachePageSnapshotChecksum,
     D: FallibleModelWorker + KvCachePageSnapshotImporter<Snapshot = P::Snapshot>,
 {
     fn try_generate_batch(
@@ -1224,6 +1262,7 @@ where
 impl<P, D> LocalSnapshotTransferPdModelWorkers<P, D>
 where
     P: FallibleModelWorker + KvCachePageSnapshotProvider,
+    P::Snapshot: KvCachePageSnapshotChecksum,
     D: FallibleModelWorker + KvCachePageSnapshotImporter<Snapshot = P::Snapshot>,
 {
     fn try_generate_prefill_batch(
@@ -1252,6 +1291,7 @@ where
                         "local KV snapshot export failed: {error}"
                     ))
                 })?;
+            let content_checksum = snapshot_content_checksum(&snapshots);
             self.decode
                 .import_kv_cache_pages(snapshots)
                 .map_err(|error| {
@@ -1259,6 +1299,7 @@ where
                         "local KV snapshot import failed: {error}"
                     ))
                 })?;
+            summary.snapshot_content_checksums.push(content_checksum);
             summary.submitted_spans += 1;
         }
         self.last_transfer_summary = Some(summary);

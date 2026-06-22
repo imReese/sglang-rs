@@ -155,8 +155,9 @@ This repository currently contains the first `sglang-srt` runtime crate and the
   executor abstraction that drives bootstrap-room status transitions,
   bootstrap-room-aware Mooncake target resolution, Mooncake KV transfer request
   construction, per-span descriptor checksums carried into submitted Mooncake
-  batch records, batch status polling, and a `KvTransferModelWorker` wrapper
-  that registers PD bootstrap sessions from prefill request metadata and runs
+  batch records, local snapshot content checksums for CPU-verifiable KV
+  transfer, batch status polling, and a `KvTransferModelWorker` wrapper that
+  registers PD bootstrap sessions from prefill request metadata and runs
   transfer as part of scheduler prefill dispatch. It also exposes a
   decode-side KV-ready predicate used by scheduler decode batching to keep PD
   decode requests queued until their bootstrap room reaches `Success`, plus
@@ -196,9 +197,9 @@ The implementation is intentionally small while the architecture is being
 carved out. The current worker is test-driven and mockable; CUDA integration is
 not implemented yet. PD support covers the scheduler/router execution split,
 bootstrap metadata propagation, bounded transfer polling, fake/local snapshot
-transfer paths, transfer descriptor checksums, and the Mooncake-linked
-transfer-engine boundary; real device KV memory wiring remains the next deeper
-integration layer.
+transfer paths, descriptor and snapshot-content checksums, and the
+Mooncake-linked transfer-engine boundary; real device KV memory wiring remains
+the next deeper integration layer.
 
 ## Development
 

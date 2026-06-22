@@ -12,8 +12,9 @@ use sglang_srt::model_artifacts::SafetensorsTensorDecodeError;
 use sglang_srt::model_executor::{ForwardModel, ModelRunner, ModelWorkerBatch};
 use sglang_srt::scheduler::{ScheduledRequest, Scheduler};
 use sglang_srt::transfer::{
-    DecodeBootstrapRegistry, FakeKvCacheTransferExecutor, KvCacheDtype, KvTransferModelWorker,
-    LocalSnapshotTransferPdModelWorkers, MooncakeKvCacheMemoryProvider,
+    DecodeBootstrapRegistry, FakeKvCacheTransferExecutor, KvCacheDtype,
+    KvCachePageSnapshotChecksum, KvTransferModelWorker, LocalSnapshotTransferPdModelWorkers,
+    MooncakeKvCacheMemoryProvider,
 };
 use sglang_srt::types::{BootstrapRoom, DisaggregatedParams, RequestId, SamplingParams};
 use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
@@ -652,6 +653,10 @@ fn glm_moe_dsa_cached_forward_model_imports_transferred_prefix_pages_for_decode(
         .model()
         .export_kv_cache_pages(&[CachePageId::from(0)])
         .expect("prefill should export the page selected by the transfer plan");
+    assert_eq!(
+        transferred_pages[0].content_checksum(),
+        "82259a02c63dfa35ab0235722db39685409b5a3ee02629600484d414d3229c8f"
+    );
     decode_model
         .import_kv_cache_pages(transferred_pages)
         .expect("decode worker should import transferred KV pages");
@@ -840,6 +845,14 @@ fn glm_moe_dsa_local_snapshot_pd_workers_transfer_prefill_pages_before_decode() 
             .expect("prefill should record a transfer summary")
             .submitted_spans(),
         1
+    );
+    assert_eq!(
+        scheduler
+            .worker()
+            .last_transfer_summary()
+            .expect("prefill should record a transfer summary")
+            .snapshot_content_checksums(),
+        &["6b77d8cea14e59b766b5d8461b24a9f923c1e3198eb273d6257b27208ffd94c0".to_string()]
     );
     assert!(
         scheduler

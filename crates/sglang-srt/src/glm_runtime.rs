@@ -5,6 +5,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::PathBuf;
 
+use sha2::{Digest, Sha256};
+
 use crate::cache::CachePageId;
 use crate::model_artifacts::{
     GlmMoeDsaLayerCheckpointWeights, GlmMoeDsaLayerFeedForwardCheckpointWeights,
@@ -17,9 +19,9 @@ use crate::model_executor::{
     ForwardModel, ModelForwardError, ModelForwardOutput, ModelWorkerBatch,
 };
 use crate::transfer::{
-    KvCacheModelLayout, KvCachePageSnapshotImporter, KvCachePageSnapshotProvider,
-    KvCacheTransferError, MooncakeKvCacheMemoryProvider, PdConfigError, TransferableKvCacheMemory,
-    TransferableKvCacheRegion,
+    KvCacheModelLayout, KvCachePageSnapshotChecksum, KvCachePageSnapshotImporter,
+    KvCachePageSnapshotProvider, KvCacheTransferError, MooncakeKvCacheMemoryProvider,
+    PdConfigError, TransferableKvCacheMemory, TransferableKvCacheRegion,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1062,6 +1064,26 @@ impl GlmMoeDsaF32KvPageSnapshot {
 
     pub fn projection(&self) -> &GlmMoeDsaF32AttentionProjectionOutput {
         &self.projection
+    }
+}
+
+impl KvCachePageSnapshotChecksum for GlmMoeDsaF32KvPageSnapshot {
+    fn update_content_checksum(&self, hasher: &mut Sha256) {
+        hasher.update((self.layer_id as u64).to_le_bytes());
+        hasher.update((self.cache_page.as_usize() as u64).to_le_bytes());
+        hasher.update((self.position as u64).to_le_bytes());
+        update_f32_slice_checksum(hasher, self.projection.q_lora());
+        update_f32_slice_checksum(hasher, self.projection.q());
+        update_f32_slice_checksum(hasher, self.projection.kv_lora());
+        update_f32_slice_checksum(hasher, self.projection.k_rope());
+        update_f32_slice_checksum(hasher, self.projection.kv());
+    }
+}
+
+fn update_f32_slice_checksum(hasher: &mut Sha256, values: &[f32]) {
+    hasher.update((values.len() as u64).to_le_bytes());
+    for value in values {
+        hasher.update(value.to_le_bytes());
     }
 }
 
