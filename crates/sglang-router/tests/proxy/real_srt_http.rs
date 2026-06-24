@@ -143,6 +143,100 @@ async fn router_rerank_reaches_real_rust_srt_http_worker() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn router_responses_streaming_reaches_real_rust_srt_http_worker() {
+    let addr = unused_local_addr();
+    let engine_info_addr = unused_local_addr();
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "tiny-reranker",
+        "--host",
+        &addr.ip().to_string(),
+        "--port",
+        &addr.port().to_string(),
+        "--engine-info-bootstrap-port",
+        &engine_info_addr.port().to_string(),
+    ])
+    .expect("HTTP SRT args should parse");
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(launch_http_server_with_shutdown(args, async move {
+        let _ = shutdown_rx.await;
+    }));
+    wait_for_http_health(addr).await;
+
+    let app = build_router(build_ctx_with_http_worker(addr));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "model": "tiny-reranker",
+                "input": "hi",
+                "max_output_tokens": 2,
+                "stream": true,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+
+    let response = app.oneshot(request).await.expect("router should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "text/event-stream"
+    );
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("router response body should collect")
+        .to_bytes();
+    let events = crate::common::streaming::parse_sse_data(&body);
+    assert_eq!(events.last().map(String::as_str), Some("[DONE]"));
+    let chunks = events
+        .iter()
+        .filter(|event| event.as_str() != "[DONE]")
+        .map(|event| serde_json::from_str::<serde_json::Value>(event))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("SSE data chunks should be JSON");
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| chunk["type"] == "response.output_text.delta"
+                && chunk["delta"]
+                    .as_str()
+                    .is_some_and(|delta| !delta.is_empty())),
+        "expected output text deltas, got {chunks:?}"
+    );
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| chunk["type"] == "response.output_text.done" && chunk["text"] == "  "),
+        "expected output text done event, got {chunks:?}"
+    );
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| chunk["type"] == "response.completed"
+                && chunk["response"]["status"] == "completed"
+                && chunk["response"]["output_text"] == "  "),
+        "expected completed response event, got {chunks:?}"
+    );
+
+    shutdown_tx
+        .send(())
+        .expect("HTTP worker should still be running");
+    server
+        .await
+        .expect("HTTP server task should join")
+        .expect("HTTP server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn router_score_reaches_real_rust_srt_http_worker() {
     let addr = unused_local_addr();
     let engine_info_addr = unused_local_addr();

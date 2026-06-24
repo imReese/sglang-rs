@@ -268,6 +268,7 @@ async fn routed_plain_json(
     pd_unsupported_message: &'static str,
 ) -> Result<Response<Body>, ApiError> {
     let probe = parse_probe(&body)?;
+    let streaming = upstream_path == "/v1/responses" && probe.stream.unwrap_or(false);
     let model_str = select_model(&ctx, probe.model, ModelSelection::RequireBodyModel)?;
     let model_id = ModelId(model_str.clone());
 
@@ -309,7 +310,22 @@ async fn routed_plain_json(
     let metrics_worker_url = worker.url.clone();
     let metrics_model = model_str.clone();
 
-    let result = {
+    let result = if streaming {
+        let stream_guards: Box<dyn Send + 'static> = Box::new((guard, active_guard));
+        let fetch = ctx.proxy.forward_streaming_to(
+            &worker.url,
+            &worker.breaker,
+            upstream_path,
+            &headers,
+            body,
+            Some(stream_guards),
+        );
+        tokio::select! {
+            biased;
+            r = fetch => r,
+            _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str.clone() }),
+        }
+    } else {
         let _holds: (LoadGuard, _) = (guard, active_guard);
         let fetch =
             ctx.proxy
@@ -317,10 +333,9 @@ async fn routed_plain_json(
         tokio::select! {
             biased;
             r = fetch => r,
-            _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str }),
+            _ = stale_token.cancelled() => Err(ApiError::StaleRequestExpired { model: model_str.clone() }),
         }
     };
-
     let outcome = match &result {
         Ok(_) => RequestOutcome::Success,
         Err(ApiError::StaleRequestExpired { .. }) => {

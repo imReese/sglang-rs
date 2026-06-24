@@ -273,6 +273,59 @@ async fn responses_plain_mode_proxies_without_bootstrap_fields() {
 }
 
 #[tokio::test]
+async fn responses_streaming_plain_mode_returns_before_upstream_finishes() {
+    let chunks: Vec<&'static str> = vec![
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"first\"}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let worker = crate::common::mock_worker::MockWorker::start_slow_stream(
+        chunks,
+        Duration::from_millis(800),
+    )
+    .await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "input": "hi",
+                "stream": true,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+
+    let res = tokio::time::timeout(Duration::from_millis(1_200), app.oneshot(req))
+        .await
+        .expect("streaming router response should arrive before upstream stream completes")
+        .expect("router should respond");
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers().get("content-type").unwrap(),
+        "text/event-stream"
+    );
+
+    let mut body = res.into_body();
+    let frame = tokio::time::timeout(Duration::from_millis(1_200), body.frame())
+        .await
+        .expect("first streaming frame should arrive before upstream stream completes")
+        .expect("streaming body should produce a frame")
+        .expect("streaming frame should be ok");
+    let data = frame
+        .into_data()
+        .expect("first streaming frame should contain data");
+    assert!(
+        data.windows(5).any(|window| window == b"first"),
+        "first streaming frame should contain output delta, got {data:?}"
+    );
+}
+
+#[tokio::test]
 async fn rerank_plain_mode_wraps_worker_results_like_gateway() {
     let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx_with_worker(&worker.url);

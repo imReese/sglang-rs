@@ -232,6 +232,7 @@ impl MockWorker {
         };
         let app = axum::Router::new()
             .route("/v1/chat/completions", post(slow_chat))
+            .route("/v1/responses", post(slow_chat))
             .route("/server_info", get(serve_tiny_server_info))
             .with_state(state);
 

@@ -1936,9 +1936,7 @@ where
             Ok(request) => request,
             Err(error) => return bad_request_json(error),
         };
-    if request.request.stream {
-        return bad_request_json("streaming /v1/responses is not supported yet");
-    }
+    let stream = request.request.stream;
     if request.request.disaggregated_params.is_some() && !service.allow_disaggregated_requests {
         return (
             StatusCode::NOT_IMPLEMENTED,
@@ -1969,6 +1967,9 @@ where
     };
 
     match responses {
+        Ok(responses) if stream => {
+            http_responses_stream_response_from_router_responses(responses, &response_model)
+        }
         Ok(responses) => http_responses_response_from_router_responses(responses, &response_model),
         Err(error) => router_runtime_error_json(error),
     }
@@ -2119,44 +2120,289 @@ fn http_responses_response_from_router_responses(
     };
 
     match response.body {
-        RouterGenerateResponseBody::Complete(complete) => {
-            let response_id = openai_response_id("resp-", &response.request_id);
-            let output_text = complete.text;
-            (
-                StatusCode::OK,
-                Json(json!({
-                    "id": response_id,
-                    "object": "response",
-                    "created_at": unix_timestamp_secs(),
-                    "status": "completed",
-                    "model": model,
-                    "output": [{
-                        "id": format!("msg_{}", response.request_id),
-                        "type": "message",
-                        "status": "completed",
-                        "role": "assistant",
-                        "content": [{
-                            "type": "output_text",
-                            "text": output_text.clone(),
-                            "annotations": [],
-                        }],
-                    }],
-                    "output_text": output_text,
-                    "usage": {
-                        "input_tokens": complete.prompt_tokens,
-                        "output_tokens": complete.completion_tokens,
-                        "total_tokens": complete.prompt_tokens + complete.completion_tokens,
-                        "cached_tokens": complete.cached_tokens,
-                    },
-                })),
-            )
-                .into_response()
-        }
+        RouterGenerateResponseBody::Complete(complete) => (
+            StatusCode::OK,
+            Json(responses_complete_json(
+                model,
+                &response.request_id,
+                complete,
+            )),
+        )
+            .into_response(),
         RouterGenerateResponseBody::Chunk(_) => {
             internal_error_json("non-stream HTTP responses returned a stream chunk")
         }
         RouterGenerateResponseBody::Error(error) => internal_error_json(error.message),
     }
+}
+
+fn http_responses_stream_response_from_router_responses(
+    responses: Vec<RouterGenerateResponse>,
+    model: &str,
+) -> Response {
+    let mut body = String::new();
+    let mut sequence_number = 0_i32;
+    let mut message_open = false;
+    let mut response_id = String::new();
+    let mut item_id = String::new();
+
+    for response in responses {
+        if response_id.is_empty() {
+            response_id = openai_response_id("resp-", &response.request_id);
+            item_id = responses_message_id(&response.request_id);
+            let created = json!({
+                "id": response_id,
+                "object": "response",
+                "created_at": unix_timestamp_secs(),
+                "status": "in_progress",
+                "model": model,
+                "output": [],
+                "output_text": "",
+            });
+            if !push_responses_sse_event(
+                &mut body,
+                &mut sequence_number,
+                json!({
+                    "type": "response.created",
+                    "response": created,
+                }),
+            ) {
+                return serialize_responses_stream_error();
+            }
+        }
+
+        match response.body {
+            RouterGenerateResponseBody::Chunk(chunk) => {
+                if !message_open {
+                    if !push_responses_message_open_events(
+                        &mut body,
+                        &mut sequence_number,
+                        &item_id,
+                    ) {
+                        return serialize_responses_stream_error();
+                    }
+                    message_open = true;
+                }
+                if !chunk.text.is_empty()
+                    && !push_responses_sse_event(
+                        &mut body,
+                        &mut sequence_number,
+                        json!({
+                            "type": "response.output_text.delta",
+                            "output_index": chunk.index,
+                            "content_index": 0,
+                            "item_id": item_id,
+                            "delta": chunk.text,
+                            "logprobs": [],
+                        }),
+                    )
+                {
+                    return serialize_responses_stream_error();
+                }
+            }
+            RouterGenerateResponseBody::Complete(complete) => {
+                if !message_open {
+                    if !push_responses_message_open_events(
+                        &mut body,
+                        &mut sequence_number,
+                        &item_id,
+                    ) {
+                        return serialize_responses_stream_error();
+                    }
+                    message_open = true;
+                }
+                let output_index = complete.index;
+                let output_text = complete.text.clone();
+                if !push_responses_sse_event(
+                    &mut body,
+                    &mut sequence_number,
+                    json!({
+                        "type": "response.output_text.done",
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "item_id": item_id,
+                        "text": output_text,
+                        "logprobs": [],
+                    }),
+                ) {
+                    return serialize_responses_stream_error();
+                }
+
+                let text_part = json!({
+                    "type": "output_text",
+                    "text": output_text,
+                    "annotations": [],
+                });
+                if !push_responses_sse_event(
+                    &mut body,
+                    &mut sequence_number,
+                    json!({
+                        "type": "response.content_part.done",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "part": text_part,
+                    }),
+                ) {
+                    return serialize_responses_stream_error();
+                }
+
+                let message_item = json!({
+                    "id": item_id,
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [text_part],
+                });
+                if !push_responses_sse_event(
+                    &mut body,
+                    &mut sequence_number,
+                    json!({
+                        "type": "response.output_item.done",
+                        "output_index": output_index,
+                        "item": message_item,
+                    }),
+                ) {
+                    return serialize_responses_stream_error();
+                }
+
+                if !push_responses_sse_event(
+                    &mut body,
+                    &mut sequence_number,
+                    json!({
+                        "type": "response.completed",
+                        "response": responses_complete_json(model, &response.request_id, complete),
+                    }),
+                ) {
+                    return serialize_responses_stream_error();
+                }
+            }
+            RouterGenerateResponseBody::Error(error) => {
+                if !push_responses_sse_event(
+                    &mut body,
+                    &mut sequence_number,
+                    json!({
+                        "type": "response.failed",
+                        "error": {
+                            "message": error.message,
+                        },
+                    }),
+                ) {
+                    return serialize_responses_stream_error();
+                }
+            }
+        }
+    }
+    body.push_str("data: [DONE]\n\n");
+
+    let mut response = Response::new(Body::from(body));
+    response.headers_mut().insert(
+        HeaderName::from_static("content-type"),
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response
+}
+
+fn push_responses_message_open_events(
+    body: &mut String,
+    sequence_number: &mut i32,
+    item_id: &str,
+) -> bool {
+    push_responses_sse_event(
+        body,
+        sequence_number,
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": item_id,
+                "type": "message",
+                "status": "in_progress",
+                "role": "assistant",
+                "content": [],
+            },
+        }),
+    ) && push_responses_sse_event(
+        body,
+        sequence_number,
+        json!({
+            "type": "response.content_part.added",
+            "item_id": item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": {
+                "type": "output_text",
+                "text": "",
+                "annotations": [],
+                "logprobs": Value::Null,
+            },
+        }),
+    )
+}
+
+fn push_responses_sse_event(
+    body: &mut String,
+    sequence_number: &mut i32,
+    mut event: Value,
+) -> bool {
+    if let Some(object) = event.as_object_mut() {
+        object.insert("sequence_number".to_string(), json!(*sequence_number));
+    }
+    *sequence_number += 1;
+    let Ok(json) = serde_json::to_string(&event) else {
+        return false;
+    };
+    body.push_str("data: ");
+    body.push_str(&json);
+    body.push_str("\n\n");
+    true
+}
+
+fn serialize_responses_stream_error() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": { "message": "serialize OpenAI responses stream JSON" } })),
+    )
+        .into_response()
+}
+
+fn responses_complete_json(
+    model: &str,
+    request_id: &str,
+    complete: RouterGenerateComplete,
+) -> Value {
+    let response_id = openai_response_id("resp-", request_id);
+    let item_id = responses_message_id(request_id);
+    let output_text = complete.text;
+    json!({
+        "id": response_id,
+        "object": "response",
+        "created_at": unix_timestamp_secs(),
+        "status": "completed",
+        "model": model,
+        "output": [{
+            "id": item_id,
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": output_text.clone(),
+                "annotations": [],
+            }],
+        }],
+        "output_text": output_text,
+        "usage": {
+            "input_tokens": complete.prompt_tokens,
+            "output_tokens": complete.completion_tokens,
+            "total_tokens": complete.prompt_tokens + complete.completion_tokens,
+            "cached_tokens": complete.cached_tokens,
+        },
+    })
+}
+
+fn responses_message_id(request_id: &str) -> String {
+    format!("msg_{request_id}")
 }
 
 async fn completions<T, W>(

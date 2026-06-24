@@ -719,6 +719,92 @@ async fn http_server_accepts_non_streaming_responses_for_openai_clients() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_accepts_streaming_responses_for_openai_clients() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "glm-responses-http-stream",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let service = build_bootstrap_http_router_service(&args);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let response = request_raw_with_retry(
+        addr,
+        "POST",
+        "/v1/responses",
+        Some(
+            r#"{"model":"glm-responses-http-stream","input":"hi","max_output_tokens":2,"stream":true}"#,
+        ),
+    )
+    .await;
+
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "streaming responses should succeed, got response: {response}"
+    );
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("content-type: text/event-stream"),
+        "streaming responses must return SSE content-type, got response: {response}"
+    );
+    let events = parse_sse_data(&response);
+    assert_eq!(events.last().map(String::as_str), Some("[DONE]"));
+    let chunks = events
+        .iter()
+        .filter(|event| event.as_str() != "[DONE]")
+        .map(|event| serde_json::from_str::<Value>(event))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("SSE data chunks should be JSON");
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| chunk["type"] == "response.output_text.delta"
+                && chunk["delta"]
+                    .as_str()
+                    .is_some_and(|delta| !delta.is_empty())),
+        "expected output text deltas, got {chunks:?}"
+    );
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| chunk["type"] == "response.output_text.done" && chunk["text"] == "  "),
+        "expected output text done event, got {chunks:?}"
+    );
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| chunk["type"] == "response.completed"
+                && chunk["response"]["status"] == "completed"
+                && chunk["response"]["output_text"] == "  "),
+        "expected completed response event, got {chunks:?}"
+    );
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_server_preserves_prefixed_openai_chat_request_id() {
     let args = ServerArgs::parse_from([
         "serve",
