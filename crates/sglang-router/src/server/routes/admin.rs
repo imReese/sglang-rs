@@ -146,9 +146,20 @@ pub async fn get_loads(State(ctx): State<Arc<AppContext>>) -> Result<Response<Bo
                 >= 0
         })
         .count();
+    let aggregate_total_tokens: i64 = loads
+        .iter()
+        .filter_map(|load| {
+            load.get("load")
+                .and_then(serde_json::Value::as_i64)
+                .filter(|load| *load >= 0)
+        })
+        .sum();
 
     Ok(Json(serde_json::json!({
         "loads": loads,
+        "aggregate": {
+            "total_tokens": aggregate_total_tokens,
+        },
         "total_workers": total_workers,
         "successful": successful,
         "failed": total_workers.saturating_sub(successful),

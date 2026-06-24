@@ -461,15 +461,19 @@ where
     };
     let num_running_reqs = load.decode_queue_depth;
     let num_waiting_reqs = load.waiting_queue_depth;
+    let total_tokens = num_running_reqs + num_waiting_reqs;
 
     Json(json!({
         "timestamp": unix_timestamp_secs(),
         "version": env!("CARGO_PKG_VERSION"),
+        "aggregate": {
+            "total_tokens": total_tokens,
+        },
         "loads": [{
             "dp_rank": 0,
             "num_running_reqs": num_running_reqs,
             "num_waiting_reqs": num_waiting_reqs,
-            "num_reqs": num_running_reqs + num_waiting_reqs,
+            "num_reqs": total_tokens,
             "waiting_queue_depth": load.waiting_queue_depth,
             "decode_queue_depth": load.decode_queue_depth,
             "available_cache_pages": load.available_cache_pages,

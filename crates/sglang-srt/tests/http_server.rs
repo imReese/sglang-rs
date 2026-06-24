@@ -1559,11 +1559,15 @@ async fn http_server_reports_runtime_loads_for_sglang_control_plane() {
         .await
     });
 
-    let loads = get_json_with_retry(addr, "/v1/loads").await;
+    let loads = get_json_with_retry(addr, "/v1/loads?include=core").await;
     let legacy_load = get_json_with_retry(addr, "/get_load").await;
 
     assert_eq!(loads["version"], env!("CARGO_PKG_VERSION"));
     assert!(loads["timestamp"].as_u64().is_some());
+    assert_eq!(
+        loads["aggregate"]["total_tokens"], 1,
+        "sgl-model-gateway reads aggregate.total_tokens from /v1/loads?include=core"
+    );
     assert_eq!(loads["loads"][0]["dp_rank"], 0);
     assert_eq!(loads["loads"][0]["num_waiting_reqs"], 1);
     assert_eq!(loads["loads"][0]["num_running_reqs"], 0);

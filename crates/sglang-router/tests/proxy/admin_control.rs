@@ -121,6 +121,10 @@ async fn get_loads_reports_single_plain_worker_load() {
     assert_eq!(body["total_workers"], 1);
     assert_eq!(body["successful"], 1);
     assert_eq!(body["failed"], 0);
+    assert_eq!(
+        body["aggregate"]["total_tokens"], 7,
+        "sgl-model-gateway reads aggregate.total_tokens from /v1/loads"
+    );
     assert_eq!(body["loads"][0]["worker"], worker.url);
     assert!(body["loads"][0]["worker_type"].is_null());
     assert_eq!(body["loads"][0]["load"], 7);
@@ -163,6 +167,10 @@ async fn v1_loads_reports_prefill_and_decode_pd_worker_loads() {
     assert_eq!(body["total_workers"], 2);
     assert_eq!(body["successful"], 2);
     assert_eq!(body["failed"], 0);
+    assert_eq!(
+        body["aggregate"]["total_tokens"], 14,
+        "router aggregate should sum successful worker loads for gateway compatibility"
+    );
 
     let loads = body["loads"].as_array().expect("loads should be an array");
     assert_eq!(loads.len(), 2);
