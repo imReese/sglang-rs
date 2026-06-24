@@ -516,6 +516,11 @@ pub fn prefill_mooncake_zmq_endpoints(args: &ServerArgs) -> Vec<String> {
 
 fn http_server_info_from_args(args: &ServerArgs) -> HttpServerInfo {
     let mut server_info = HttpServerInfo {
+        tp_size: args.tp_size,
+        dp_size: args.dp_size,
+        max_running_requests: args.max_running_requests,
+        max_prefill_tokens: args.max_prefill_tokens,
+        max_total_tokens: args.max_total_tokens,
         disaggregation_mode: args.disaggregation_mode.clone(),
         disaggregation_bootstrap_port: if args.disaggregation_mode == "prefill" {
             Some(args.disaggregation_bootstrap_port)

@@ -64,6 +64,11 @@ impl<T, W> Clone for HttpRouterService<T, W> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpServerInfo {
+    pub tp_size: usize,
+    pub dp_size: usize,
+    pub max_running_requests: Option<usize>,
+    pub max_prefill_tokens: Option<usize>,
+    pub max_total_tokens: Option<usize>,
     pub disaggregation_mode: String,
     pub disaggregation_bootstrap_port: Option<u16>,
     pub kv_events: Option<HttpKvEventsInfo>,
@@ -73,6 +78,11 @@ pub struct HttpServerInfo {
 impl Default for HttpServerInfo {
     fn default() -> Self {
         Self {
+            tp_size: 1,
+            dp_size: 1,
+            max_running_requests: None,
+            max_prefill_tokens: None,
+            max_total_tokens: None,
             disaggregation_mode: "null".to_string(),
             disaggregation_bootstrap_port: None,
             kv_events: None,
@@ -323,9 +333,22 @@ where
     };
     let mut body = json!({
         "served_model_name": info.served_model_name,
+        "model_path": info.model_path,
+        "tp_size": service.server_info.tp_size,
+        "dp_size": service.server_info.dp_size,
         "disaggregation_mode": service.server_info.disaggregation_mode,
     });
 
+    if let Some(max_running_requests) = service.server_info.max_running_requests {
+        body["max_running_requests"] = json!(max_running_requests);
+        body["max_num_reqs"] = json!(max_running_requests);
+    }
+    if let Some(max_prefill_tokens) = service.server_info.max_prefill_tokens {
+        body["max_prefill_tokens"] = json!(max_prefill_tokens);
+    }
+    if let Some(max_total_tokens) = service.server_info.max_total_tokens {
+        body["max_total_tokens"] = json!(max_total_tokens);
+    }
     if let Some(port) = service.server_info.disaggregation_bootstrap_port {
         body["disaggregation_bootstrap_port"] = json!(port);
     }

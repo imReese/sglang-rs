@@ -1062,6 +1062,16 @@ async fn http_server_reports_plain_worker_server_info_for_sgl_router() {
         "dummy",
         "--served-model-name",
         "glm-router-plain",
+        "--tp-size",
+        "2",
+        "--dp-size",
+        "3",
+        "--max-running-requests",
+        "17",
+        "--max-prefill-tokens",
+        "2048",
+        "--max-total-tokens",
+        "4096",
         "--host",
         "127.0.0.1",
         "--port",
@@ -1082,6 +1092,13 @@ async fn http_server_reports_plain_worker_server_info_for_sgl_router() {
     let server_info = get_json_with_retry(addr, "/server_info").await;
 
     assert_eq!(server_info["served_model_name"], "glm-router-plain");
+    assert_eq!(server_info["model_path"], "dummy");
+    assert_eq!(server_info["tp_size"], 2);
+    assert_eq!(server_info["dp_size"], 3);
+    assert_eq!(server_info["max_running_requests"], 17);
+    assert_eq!(server_info["max_num_reqs"], 17);
+    assert_eq!(server_info["max_prefill_tokens"], 2048);
+    assert_eq!(server_info["max_total_tokens"], 4096);
     assert_eq!(server_info["disaggregation_mode"], "null");
     assert!(server_info.get("disaggregation_bootstrap_port").is_none());
     assert!(server_info.get("kv_events").is_none());
