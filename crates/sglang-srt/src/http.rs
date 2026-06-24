@@ -224,6 +224,7 @@ where
             .route("/detokenize", post(detokenize::<T, W>))
             .route("/v1/chat/completions", post(chat_completions::<T, W>))
             .route("/v1/completions", post(completions::<T, W>))
+            .route("/v1/responses", post(responses::<T, W>))
             .route("/v1/rerank", post(rerank::<T, W>))
             .route("/rerank", post(rerank::<T, W>))
             .route("/v1/score", post(score::<T, W>))
@@ -1917,6 +1918,247 @@ fn http_chat_stream_response_from_router_responses(
     response
 }
 
+async fn responses<T, W>(
+    State(service): State<HttpRouterService<T, W>>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response
+where
+    T: Tokenizer + Send + 'static,
+    W: WorkerExecutor + Send + 'static,
+{
+    let model = match service.model_info_snapshot() {
+        Ok(info) => info.served_model_name,
+        Err(message) => return internal_error_json(message),
+    };
+    let request =
+        match http_responses_payload_to_router_request_with_headers(payload, &model, &headers) {
+            Ok(request) => request,
+            Err(error) => return bad_request_json(error),
+        };
+    if request.request.stream {
+        return bad_request_json("streaming /v1/responses is not supported yet");
+    }
+    if request.request.disaggregated_params.is_some() && !service.allow_disaggregated_requests {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({
+                "error": {
+                    "message": "disaggregated HTTP responses require a PD transfer-enabled runtime"
+                }
+            })),
+        )
+            .into_response();
+    }
+
+    let response_model = request.model;
+    let router_request = request.request;
+    let responses = {
+        let mut runtime = service
+            .runtime
+            .lock()
+            .expect("HTTP router runtime lock should be held");
+        if service.max_transfer_polls == 0 {
+            runtime.generate_text_stream(router_request)
+        } else {
+            runtime.generate_text_stream_with_transfer_polling(
+                router_request,
+                service.max_transfer_polls,
+            )
+        }
+    };
+
+    match responses {
+        Ok(responses) => http_responses_response_from_router_responses(responses, &response_model),
+        Err(error) => router_runtime_error_json(error),
+    }
+}
+
+pub(crate) struct HttpResponsesRequest {
+    model: String,
+    request: RouterTextGenerateRequest,
+}
+
+fn http_responses_payload_to_router_request_with_headers(
+    payload: Value,
+    served_model_name: &str,
+    headers: &HeaderMap,
+) -> Result<HttpResponsesRequest, String> {
+    http_responses_payload_to_router_request(
+        payload_with_routed_dp_rank_header(payload, headers)?,
+        served_model_name,
+    )
+}
+
+pub(crate) fn http_responses_payload_to_router_request(
+    payload: Value,
+    served_model_name: &str,
+) -> Result<HttpResponsesRequest, String> {
+    let model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing model".to_string())?;
+    if model != served_model_name {
+        return Err(format!(
+            "model {model} is not served by this worker ({served_model_name})"
+        ));
+    }
+
+    let mut sampling_params = payload
+        .get("sampling_params")
+        .map(json_to_sampling_params)
+        .transpose()?
+        .unwrap_or_default();
+    if let Some(max_output_tokens) = optional_i32(&payload, "max_output_tokens")? {
+        sampling_params.max_new_tokens = Some(max_output_tokens);
+    }
+    if let Some(temperature) = optional_f32(&payload, "temperature")? {
+        sampling_params.temperature = Some(temperature);
+    }
+    if let Some(top_p) = optional_f32(&payload, "top_p")? {
+        sampling_params.top_p = Some(top_p);
+    }
+    if let Some(frequency_penalty) = optional_f32(&payload, "frequency_penalty")? {
+        sampling_params.frequency_penalty = Some(frequency_penalty);
+    }
+    if let Some(presence_penalty) = optional_f32(&payload, "presence_penalty")? {
+        sampling_params.presence_penalty = Some(presence_penalty);
+    }
+
+    let mut text = responses_input_to_text(&payload)?;
+    if let Some(instructions) = optional_string(&payload, "instructions")? {
+        text = if text.is_empty() {
+            instructions.to_string()
+        } else {
+            format!("{instructions}\n{text}")
+        };
+    }
+
+    Ok(HttpResponsesRequest {
+        model: model.to_string(),
+        request: RouterTextGenerateRequest {
+            request_id: payload
+                .get("request_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            text,
+            sampling_params: Some(sampling_params),
+            disaggregated_params: json_to_disaggregated_params(&payload)?,
+            stream: optional_bool(&payload, "stream")?.unwrap_or(false),
+            data_parallel_rank: optional_routed_dp_rank(&payload)?.unwrap_or_default(),
+            ..Default::default()
+        },
+    })
+}
+
+fn responses_input_to_text(payload: &Value) -> Result<String, String> {
+    let input = payload
+        .get("input")
+        .ok_or_else(|| "missing input".to_string())?;
+    responses_input_value_to_text(input)
+}
+
+fn responses_input_value_to_text(value: &Value) -> Result<String, String> {
+    if let Some(text) = value.as_str() {
+        return Ok(text.to_string());
+    }
+    let Some(items) = value.as_array() else {
+        return Err("input must be a string or array".to_string());
+    };
+    if items.is_empty() {
+        return Err("input array must not be empty".to_string());
+    }
+
+    items
+        .iter()
+        .map(responses_input_item_to_text)
+        .collect::<Result<Vec<_>, _>>()
+        .map(|texts| texts.join("\n"))
+}
+
+fn responses_input_item_to_text(value: &Value) -> Result<String, String> {
+    if let Some(text) = value.as_str() {
+        return Ok(text.to_string());
+    }
+
+    let content = value
+        .get("content")
+        .ok_or_else(|| "responses input item content is required".to_string())?;
+    responses_content_to_text(content)
+}
+
+fn responses_content_to_text(value: &Value) -> Result<String, String> {
+    if let Some(text) = value.as_str() {
+        return Ok(text.to_string());
+    }
+    let Some(parts) = value.as_array() else {
+        return Err("responses content must be a string or array".to_string());
+    };
+
+    let mut text = String::new();
+    for part in parts {
+        let part_type = part.get("type").and_then(Value::as_str);
+        if matches!(part_type, Some("input_text" | "text")) {
+            let part_text = part
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "responses text content part requires text".to_string())?;
+            text.push_str(part_text);
+        }
+    }
+    Ok(text)
+}
+
+fn http_responses_response_from_router_responses(
+    mut responses: Vec<RouterGenerateResponse>,
+    model: &str,
+) -> Response {
+    let Some(response) = responses.pop() else {
+        return internal_error_json("generation produced no response");
+    };
+
+    match response.body {
+        RouterGenerateResponseBody::Complete(complete) => {
+            let response_id = openai_response_id("resp-", &response.request_id);
+            let output_text = complete.text;
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "id": response_id,
+                    "object": "response",
+                    "created_at": unix_timestamp_secs(),
+                    "status": "completed",
+                    "model": model,
+                    "output": [{
+                        "id": format!("msg_{}", response.request_id),
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": output_text.clone(),
+                            "annotations": [],
+                        }],
+                    }],
+                    "output_text": output_text,
+                    "usage": {
+                        "input_tokens": complete.prompt_tokens,
+                        "output_tokens": complete.completion_tokens,
+                        "total_tokens": complete.prompt_tokens + complete.completion_tokens,
+                        "cached_tokens": complete.cached_tokens,
+                    },
+                })),
+            )
+                .into_response()
+        }
+        RouterGenerateResponseBody::Chunk(_) => {
+            internal_error_json("non-stream HTTP responses returned a stream chunk")
+        }
+        RouterGenerateResponseBody::Error(error) => internal_error_json(error.message),
+    }
+}
+
 async fn completions<T, W>(
     State(service): State<HttpRouterService<T, W>>,
     headers: HeaderMap,
@@ -3032,6 +3274,15 @@ fn optional_bool(value: &Value, field: &'static str) -> Result<Option<bool>, Str
     raw.as_bool()
         .map(Some)
         .ok_or_else(|| format!("{field} must be a boolean"))
+}
+
+fn optional_string<'a>(value: &'a Value, field: &'static str) -> Result<Option<&'a str>, String> {
+    let Some(raw) = value.get(field) else {
+        return Ok(None);
+    };
+    raw.as_str()
+        .map(Some)
+        .ok_or_else(|| format!("{field} must be a string"))
 }
 
 fn optional_i32_array(value: &Value, field: &'static str) -> Result<Option<Vec<i32>>, String> {

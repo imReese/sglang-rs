@@ -668,6 +668,57 @@ async fn http_server_accepts_non_streaming_chat_completions_for_sgl_router() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_accepts_non_streaming_responses_for_openai_clients() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "glm-responses-http",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let service = build_bootstrap_http_router_service(&args);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let response = post_json_with_retry(
+        addr,
+        "/v1/responses",
+        r#"{"model":"glm-responses-http","input":"hi","max_output_tokens":2}"#,
+    )
+    .await;
+
+    assert_eq!(response["object"], "response");
+    assert_eq!(response["model"], "glm-responses-http");
+    assert_eq!(response["status"], "completed");
+    assert_eq!(response["output"][0]["type"], "message");
+    assert_eq!(response["output"][0]["role"], "assistant");
+    assert_eq!(response["output"][0]["content"][0]["type"], "output_text");
+    assert_eq!(response["output"][0]["content"][0]["text"], "  ");
+    assert_eq!(response["usage"]["input_tokens"], 2);
+    assert_eq!(response["usage"]["output_tokens"], 2);
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_server_preserves_prefixed_openai_chat_request_id() {
     let args = ServerArgs::parse_from([
         "serve",

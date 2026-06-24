@@ -18,6 +18,8 @@ const REQUEST_ID_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrst
 fn generate_request_id(path: &str) -> String {
     let prefix = if path.contains("/chat/completions") {
         "chatcmpl-"
+    } else if path.contains("/responses") {
+        "resp-"
     } else if path.contains("/completions") {
         "cmpl-"
     } else if path.contains("/generate") {
@@ -177,6 +179,12 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route(
             "/v1/completions",
             post(crate::server::routes::chat::completions)
+                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(middleware::from_fn(log_413)),
+        )
+        .route(
+            "/v1/responses",
+            post(crate::server::routes::chat::responses)
                 .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
                 .layer(middleware::from_fn(log_413)),
         )

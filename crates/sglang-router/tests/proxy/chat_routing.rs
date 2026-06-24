@@ -133,6 +133,37 @@ async fn missing_request_id_is_generated_forwarded_and_returned() {
 }
 
 #[tokio::test]
+async fn responses_request_id_uses_openai_responses_prefix() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "input": "hi",
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let response_request_id = res
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("router should return generated x-request-id");
+    assert!(
+        response_request_id.starts_with("resp-"),
+        "responses request IDs should use the OpenAI-compatible prefix"
+    );
+}
+
+#[tokio::test]
 async fn inbound_request_id_is_preserved_in_worker_and_response_headers() {
     let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx_with_worker(&worker.url);
@@ -201,6 +232,41 @@ async fn rerank_plain_mode_proxies_without_bootstrap_fields() {
         .expect("worker should capture rerank body");
     let v: serde_json::Value = serde_json::from_slice(&captured).unwrap();
     assert_eq!(v["query"], "rust router");
+    assert!(v.get("bootstrap_host").is_none());
+    assert!(v.get("bootstrap_port").is_none());
+    assert!(v.get("bootstrap_room").is_none());
+}
+
+#[tokio::test]
+async fn responses_plain_mode_proxies_without_bootstrap_fields() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "input": "rust responses",
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let captured = worker
+        .captured
+        .lock()
+        .unwrap()
+        .last_body
+        .clone()
+        .expect("worker should capture responses body");
+    let v: serde_json::Value = serde_json::from_slice(&captured).unwrap();
+    assert_eq!(v["input"], "rust responses");
     assert!(v.get("bootstrap_host").is_none());
     assert!(v.get("bootstrap_port").is_none());
     assert!(v.get("bootstrap_room").is_none());

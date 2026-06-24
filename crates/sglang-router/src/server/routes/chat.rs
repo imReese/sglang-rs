@@ -101,6 +101,25 @@ pub async fn completions(
     .await
 }
 
+/// POST /v1/responses — gateway-compatible proxy for OpenAI's Responses
+/// API. Like sgl-model-gateway, the router treats this as a JSON worker
+/// route; PD dual-dispatch can be added once the worker-side contract
+/// supports a Responses RPC/HTTP disaggregated payload.
+pub async fn responses(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response<Body>, ApiError> {
+    routed_plain_json(
+        ctx,
+        headers,
+        body,
+        "/v1/responses",
+        "PD mode does not support /v1/responses",
+    )
+    .await
+}
+
 /// POST /generate — SGLang-native text generation. The native endpoint
 /// historically omits `model`, so single-model router configs infer the
 /// target model from config while multi-model configs require an explicit
