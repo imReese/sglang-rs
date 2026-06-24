@@ -2314,7 +2314,7 @@ fn http_generate_payload_to_router_text_requests(
             })
             .collect::<Result<Vec<_>, _>>()?;
         let request_ids = optional_string_values(&payload, "request_id", batch_size)?;
-        let data_parallel_ranks = optional_i32_values(&payload, "data_parallel_rank", batch_size)?;
+        let data_parallel_ranks = optional_routed_dp_rank_values(&payload, batch_size)?;
         let disaggregated_params = json_to_disaggregated_params_values(&payload, batch_size)?;
         let mut requests = Vec::with_capacity(batch_size);
 
@@ -2343,7 +2343,7 @@ fn http_generate_payload_to_router_text_requests(
         .unwrap_or_default()
         .to_string();
     let disaggregated_params = json_to_disaggregated_params(&payload)?;
-    let data_parallel_rank = optional_i32(&payload, "data_parallel_rank")?.unwrap_or_default();
+    let data_parallel_rank = optional_routed_dp_rank(&payload)?.unwrap_or_default();
 
     Ok(HttpTextGenerateRequests::Single(
         RouterTextGenerateRequest {
@@ -2387,7 +2387,7 @@ fn http_generate_payload_to_router_token_requests(
         let batch_size = input_batches.len();
         let request_ids = optional_string_values(&payload, "request_id", batch_size)?;
         let original_texts = optional_string_values(&payload, "original_text", batch_size)?;
-        let data_parallel_ranks = optional_i32_values(&payload, "data_parallel_rank", batch_size)?;
+        let data_parallel_ranks = optional_routed_dp_rank_values(&payload, batch_size)?;
         let disaggregated_params = json_to_disaggregated_params_values(&payload, batch_size)?;
         let mut requests = Vec::with_capacity(batch_size);
 
@@ -2421,7 +2421,7 @@ fn http_generate_payload_to_router_token_requests(
         .unwrap_or_default()
         .to_string();
     let disaggregated_params = json_to_disaggregated_params(&payload)?;
-    let data_parallel_rank = optional_i32(&payload, "data_parallel_rank")?.unwrap_or_default();
+    let data_parallel_rank = optional_routed_dp_rank(&payload)?.unwrap_or_default();
 
     Ok(HttpTokenGenerateRequests::Single(RouterGenerateRequest {
         request_id,
@@ -2520,6 +2520,20 @@ fn optional_i32_values(
         .collect()
 }
 
+fn optional_routed_dp_rank(payload: &Value) -> Result<Option<i32>, String> {
+    match optional_i32(payload, "routed_dp_rank")? {
+        Some(rank) => Ok(Some(rank)),
+        None => optional_i32(payload, "data_parallel_rank"),
+    }
+}
+
+fn optional_routed_dp_rank_values(payload: &Value, batch_size: usize) -> Result<Vec<i32>, String> {
+    if payload.get("routed_dp_rank").is_some() {
+        return optional_i32_values(payload, "routed_dp_rank", batch_size);
+    }
+    optional_i32_values(payload, "data_parallel_rank", batch_size)
+}
+
 pub(crate) fn http_completion_payload_to_router_request(
     payload: Value,
     served_model_name: &str,
@@ -2556,8 +2570,7 @@ pub(crate) fn http_completion_payload_to_router_request(
                 sampling_params: Some(sampling_params),
                 disaggregated_params: json_to_disaggregated_params(&payload)?,
                 stream,
-                data_parallel_rank: optional_i32(&payload, "data_parallel_rank")?
-                    .unwrap_or_default(),
+                data_parallel_rank: optional_routed_dp_rank(&payload)?.unwrap_or_default(),
                 ..Default::default()
             }))
         }
@@ -2567,8 +2580,7 @@ pub(crate) fn http_completion_payload_to_router_request(
                 return Err("prompt array must not be empty".to_string());
             }
             let request_ids = optional_string_values(&payload, "request_id", batch_size)?;
-            let data_parallel_ranks =
-                optional_i32_values(&payload, "data_parallel_rank", batch_size)?;
+            let data_parallel_ranks = optional_routed_dp_rank_values(&payload, batch_size)?;
             let disaggregated_params = json_to_disaggregated_params_values(&payload, batch_size)?;
             let mut requests = Vec::with_capacity(batch_size);
 
@@ -2629,14 +2641,14 @@ pub(crate) fn http_chat_payload_to_router_request(
             sampling_params: Some(sampling_params),
             disaggregated_params: json_to_disaggregated_params(&payload)?,
             stream,
-            data_parallel_rank: optional_i32(&payload, "data_parallel_rank")?.unwrap_or_default(),
+            data_parallel_rank: optional_routed_dp_rank(&payload)?.unwrap_or_default(),
             ..Default::default()
         }));
     }
 
     let batch_size = usize::try_from(n).map_err(|_| "n is out of range".to_string())?;
     let request_ids = optional_string_values(&payload, "request_id", batch_size)?;
-    let data_parallel_ranks = optional_i32_values(&payload, "data_parallel_rank", batch_size)?;
+    let data_parallel_ranks = optional_routed_dp_rank_values(&payload, batch_size)?;
     let disaggregated_params = json_to_disaggregated_params_values(&payload, batch_size)?;
     let mut requests = Vec::with_capacity(batch_size);
 
@@ -2985,4 +2997,89 @@ fn unix_timestamp_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn generate_payload_accepts_routed_dp_rank_for_text_request() {
+        let request = http_generate_payload_to_router_request(json!({
+            "text": "hello",
+            "routed_dp_rank": 3
+        }))
+        .expect("generate payload should parse");
+
+        match request {
+            HttpGenerateRequest::Text(request) => {
+                assert_eq!(request.data_parallel_rank, 3);
+            }
+            _ => panic!("expected text request"),
+        }
+    }
+
+    #[test]
+    fn token_batch_payload_accepts_routed_dp_rank_array() {
+        let request = http_generate_payload_to_router_request(json!({
+            "input_ids": [[1, 2], [3, 4]],
+            "routed_dp_rank": [1, 2]
+        }))
+        .expect("batch token payload should parse");
+
+        match request {
+            HttpGenerateRequest::BatchTokenized(requests) => {
+                assert_eq!(
+                    requests
+                        .iter()
+                        .map(|request| request.data_parallel_rank)
+                        .collect::<Vec<_>>(),
+                    vec![1, 2]
+                );
+            }
+            _ => panic!("expected token batch request"),
+        }
+    }
+
+    #[test]
+    fn chat_payload_prefers_routed_dp_rank_over_deprecated_data_parallel_rank() {
+        let request = http_chat_payload_to_router_request(
+            json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hello"}],
+                "data_parallel_rank": 1,
+                "routed_dp_rank": 4
+            }),
+            "tiny",
+        )
+        .expect("chat payload should parse");
+
+        match request {
+            HttpChatRequest::Single(request) => {
+                assert_eq!(request.data_parallel_rank, 4);
+            }
+            _ => panic!("expected single chat request"),
+        }
+    }
+
+    #[test]
+    fn completion_payload_accepts_routed_dp_rank() {
+        let request = http_completion_payload_to_router_request(
+            json!({
+                "model": "tiny",
+                "prompt": "hello",
+                "routed_dp_rank": 5
+            }),
+            "tiny",
+        )
+        .expect("completion payload should parse");
+
+        match request {
+            HttpCompletionRequest::Single(request) => {
+                assert_eq!(request.data_parallel_rank, 5);
+            }
+            _ => panic!("expected single completion request"),
+        }
+    }
 }
