@@ -216,14 +216,14 @@ impl RouteDispatchPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PdDispatchMetadata {
     decode_url: String,
-    bootstrap: Option<BootstrapMetadata>,
+    bootstrap_rooms: Option<Vec<u64>>,
 }
 
 impl PdDispatchMetadata {
     pub(crate) fn new(decode_url: impl Into<String>) -> Self {
         Self {
             decode_url: decode_url.into(),
-            bootstrap: None,
+            bootstrap_rooms: None,
         }
     }
 
@@ -234,12 +234,12 @@ impl PdDispatchMetadata {
     ) -> Self {
         Self {
             decode_url: decode_url.into(),
-            bootstrap: Some(bootstrap),
+            bootstrap_rooms: Some(vec![bootstrap.room()]),
         }
     }
 
-    pub(crate) fn set_bootstrap(&mut self, bootstrap: BootstrapMetadata) {
-        self.bootstrap = Some(bootstrap);
+    pub(crate) fn set_bootstrap_rooms(&mut self, bootstrap_rooms: Vec<u64>) {
+        self.bootstrap_rooms = Some(bootstrap_rooms);
     }
 
     pub(crate) fn insert_request_headers(&self, headers: &mut HeaderMap) {
@@ -248,8 +248,8 @@ impl PdDispatchMetadata {
 
     pub(crate) fn insert_response_headers(&self, headers: &mut HeaderMap) {
         self.insert_decode_header(headers, "response");
-        if let Some(bootstrap) = &self.bootstrap {
-            bootstrap.insert_response_header(headers);
+        if let Some(bootstrap_rooms) = &self.bootstrap_rooms {
+            insert_bootstrap_rooms_response_header(headers, bootstrap_rooms);
         }
     }
 
@@ -279,6 +279,7 @@ pub(crate) struct PdDispatchPlan {
     metadata: PdDispatchMetadata,
     body: Bytes,
     bootstrap_room: u64,
+    bootstrap_rooms: Vec<u64>,
 }
 
 impl PdDispatchPlan {
@@ -303,14 +304,19 @@ impl PdDispatchPlan {
         body: &Bytes,
         batch_size: Option<usize>,
     ) -> Result<Self, ApiError> {
-        let injected_body = bootstrap.inject_into_body(body, batch_size)?;
-        let bootstrap_room = bootstrap.room();
+        let injection = bootstrap.inject_into_body_with_rooms(body, batch_size)?;
+        let bootstrap_room = injection
+            .rooms
+            .first()
+            .copied()
+            .unwrap_or_else(|| bootstrap.room());
         let mut metadata = PdDispatchMetadata::new(decode_url);
-        metadata.set_bootstrap(bootstrap);
+        metadata.set_bootstrap_rooms(injection.rooms.clone());
         Ok(Self {
             metadata,
-            body: injected_body,
+            body: injection.body,
             bootstrap_room,
+            bootstrap_rooms: injection.rooms,
         })
     }
 
@@ -329,6 +335,11 @@ impl PdDispatchPlan {
 
     pub(crate) fn bootstrap_room(&self) -> u64 {
         self.bootstrap_room
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bootstrap_rooms(&self) -> &[u64] {
+        &self.bootstrap_rooms
     }
 
     pub(crate) fn insert_request_headers(&self, headers: &mut HeaderMap) {
@@ -379,25 +390,37 @@ impl BootstrapMetadata {
     /// * `bootstrap_port` — the prefill worker's bootstrap server port.
     /// * `bootstrap_room` — a 63-bit random `u64` identifying this
     ///   request on both prefill and decode sides.
+    #[cfg(test)]
     pub(crate) fn inject_into_body(
         &self,
         body: &Bytes,
         batch_size: Option<usize>,
     ) -> Result<Bytes, ApiError> {
+        Ok(self.inject_into_body_with_rooms(body, batch_size)?.body)
+    }
+
+    fn inject_into_body_with_rooms(
+        &self,
+        body: &Bytes,
+        batch_size: Option<usize>,
+    ) -> Result<BootstrapInjection, ApiError> {
         let mut obj: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(body)
             .map_err(|e| {
                 tracing::debug!(error = %e, "re-parse for bootstrap injection failed");
                 ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
             })?;
+        let mut room_ids = Vec::new();
         match batch_size {
             Some(batch_size) => {
                 let mut hosts = Vec::with_capacity(batch_size);
                 let mut ports = Vec::with_capacity(batch_size);
                 let mut rooms = Vec::with_capacity(batch_size);
                 for _ in 0..batch_size {
+                    let room_id = generate_room_id();
                     hosts.push(serde_json::Value::String(self.host.clone()));
                     ports.push(serde_json::Value::Number(self.port.into()));
-                    rooms.push(serde_json::Value::Number(generate_room_id().into()));
+                    rooms.push(serde_json::Value::Number(room_id.into()));
+                    room_ids.push(room_id);
                 }
                 obj.insert(
                     "bootstrap_host".to_string(),
@@ -413,6 +436,7 @@ impl BootstrapMetadata {
                 );
             }
             None => {
+                room_ids.push(self.room);
                 obj.insert(
                     "bootstrap_host".to_string(),
                     serde_json::Value::String(self.host.clone()),
@@ -432,13 +456,42 @@ impl BootstrapMetadata {
                 anyhow::Error::new(e).context("re-serialize bootstrap-injected body"),
             )
         })?;
-        Ok(Bytes::from(bytes))
+        Ok(BootstrapInjection {
+            body: Bytes::from(bytes),
+            rooms: room_ids,
+        })
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_response_header(&self, headers: &mut HeaderMap) {
-        if let Ok(value) = HeaderValue::from_str(&self.room.to_string()) {
-            headers.insert(X_SGL_BOOTSTRAP_ROOM, value);
-        }
+        insert_bootstrap_rooms_response_header(headers, &[self.room]);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BootstrapInjection {
+    body: Bytes,
+    rooms: Vec<u64>,
+}
+
+fn insert_bootstrap_rooms_response_header(headers: &mut HeaderMap, rooms: &[u64]) {
+    let value = match rooms {
+        [] => return,
+        [room] => room.to_string(),
+        rooms => match serde_json::to_string(rooms) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "failed to serialize PD bootstrap rooms response header"
+                );
+                return;
+            }
+        },
+    };
+
+    if let Ok(value) = HeaderValue::from_str(&value) {
+        headers.insert(X_SGL_BOOTSTRAP_ROOM, value);
     }
 }
 
@@ -556,6 +609,35 @@ mod tests {
         assert!(rooms
             .iter()
             .all(|room| room.as_u64().unwrap() <= i64::MAX as u64));
+    }
+
+    #[test]
+    fn dispatch_plan_tracks_batch_bootstrap_rooms_from_injected_body() {
+        let body = Bytes::from_static(br#"{"input_ids":[[1,2],[3,4]]}"#);
+        let bootstrap = BootstrapMetadata::with_room("prefill.local", 8200, 42);
+        let plan =
+            PdDispatchPlan::from_bootstrap("grpc://decode.local:30000", bootstrap, &body, Some(2))
+                .unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_slice(plan.body()).unwrap();
+        let body_rooms: Vec<u64> = parsed["bootstrap_room"]
+            .as_array()
+            .expect("batch bootstrap_room should be an array")
+            .iter()
+            .map(|room| room.as_u64().expect("room should be u64"))
+            .collect();
+
+        assert_eq!(plan.bootstrap_rooms(), body_rooms.as_slice());
+
+        let mut response_headers = HeaderMap::new();
+        plan.insert_response_headers(&mut response_headers);
+        let expected_header = serde_json::to_string(&body_rooms).expect("rooms should serialize");
+        assert_eq!(
+            response_headers
+                .get(X_SGL_BOOTSTRAP_ROOM)
+                .and_then(|v| v.to_str().ok()),
+            Some(expected_header.as_str())
+        );
     }
 
     #[test]
