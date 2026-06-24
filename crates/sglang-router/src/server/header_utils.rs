@@ -11,7 +11,12 @@ pub fn should_forward_request_header(name: &HeaderName) -> bool {
     let n = name.as_str();
     matches!(
         n,
-        "authorization" | "x-request-id" | "x-correlation-id" | "traceparent" | "tracestate"
+        "authorization"
+            | "x-request-id"
+            | "x-correlation-id"
+            | "traceparent"
+            | "tracestate"
+            | "x-data-parallel-rank"
     ) || n.starts_with("x-request-id-")
         || n.starts_with("x-sgl-")
 }
@@ -41,6 +46,9 @@ mod tests {
         )));
         assert!(should_forward_request_header(&HeaderName::from_static(
             "x-sgl-route-key"
+        )));
+        assert!(should_forward_request_header(&HeaderName::from_static(
+            "x-data-parallel-rank"
         )));
         assert!(should_forward_request_header(&HeaderName::from_static(
             "x-request-id-extra"

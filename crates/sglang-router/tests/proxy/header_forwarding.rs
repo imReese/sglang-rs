@@ -72,6 +72,7 @@ async fn forwards_whitelisted_headers_strips_others() {
         .header("authorization", "Bearer test")
         .header("x-request-id", "abc-123")
         .header("x-sgl-route-key", "k1")
+        .header("x-data-parallel-rank", "4")
         .header("cookie", "should-not-forward=true")
         .header("host", "example.com")
         .header("content-length", spoofed_content_length)
@@ -98,6 +99,11 @@ async fn forwards_whitelisted_headers_strips_others() {
         seen.headers.get("x-sgl-route-key").map(String::as_str),
         Some("k1"),
         "x-sgl-route-key must be forwarded with its inbound value verbatim",
+    );
+    assert_eq!(
+        seen.headers.get("x-data-parallel-rank").map(String::as_str),
+        Some("4"),
+        "x-data-parallel-rank must be forwarded with its inbound value verbatim",
     );
     // Cookie must be stripped.
     assert!(!seen.seen.contains("cookie"));

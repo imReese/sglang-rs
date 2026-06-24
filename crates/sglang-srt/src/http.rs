@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Query, State};
-use axum::http::{HeaderName, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -1285,13 +1285,14 @@ fn internal_error_json(message: impl Into<String>) -> Response {
 
 async fn generate<T, W>(
     State(service): State<HttpRouterService<T, W>>,
+    headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> Response
 where
     T: Tokenizer + Send + 'static,
     W: WorkerExecutor + Send + 'static,
 {
-    let request = match http_generate_payload_to_router_request(payload) {
+    let request = match http_generate_payload_to_router_request_with_headers(payload, &headers) {
         Ok(request) => request,
         Err(error) => {
             return (
@@ -1586,6 +1587,7 @@ fn router_status_code_to_http_status(status_code: RouterStatusCode) -> StatusCod
 
 async fn chat_completions<T, W>(
     State(service): State<HttpRouterService<T, W>>,
+    headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> Response
 where
@@ -1596,7 +1598,8 @@ where
         Ok(info) => info.served_model_name,
         Err(message) => return internal_error_json(message),
     };
-    let request = match http_chat_payload_to_router_request(payload, &model) {
+    let request = match http_chat_payload_to_router_request_with_headers(payload, &model, &headers)
+    {
         Ok(request) => request,
         Err(error) => {
             return (
@@ -1733,6 +1736,17 @@ where
 pub(crate) enum HttpChatRequest {
     Single(RouterTextGenerateRequest),
     Batch(Vec<RouterTextGenerateRequest>),
+}
+
+fn http_chat_payload_to_router_request_with_headers(
+    payload: Value,
+    served_model_name: &str,
+    headers: &HeaderMap,
+) -> Result<HttpChatRequest, String> {
+    http_chat_payload_to_router_request(
+        payload_with_routed_dp_rank_header(payload, headers)?,
+        served_model_name,
+    )
 }
 
 impl HttpChatRequest {
@@ -1904,6 +1918,7 @@ fn http_chat_stream_response_from_router_responses(
 
 async fn completions<T, W>(
     State(service): State<HttpRouterService<T, W>>,
+    headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> Response
 where
@@ -1914,16 +1929,17 @@ where
         Ok(info) => info.served_model_name,
         Err(message) => return internal_error_json(message),
     };
-    let request = match http_completion_payload_to_router_request(payload, &model) {
-        Ok(request) => request,
-        Err(error) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": { "message": error } })),
-            )
-                .into_response();
-        }
-    };
+    let request =
+        match http_completion_payload_to_router_request_with_headers(payload, &model, &headers) {
+            Ok(request) => request,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": { "message": error } })),
+                )
+                    .into_response();
+            }
+        };
     let stream = request.stream();
     if request.disaggregated_params().is_some() && !service.allow_disaggregated_requests {
         return (
@@ -2007,6 +2023,17 @@ where
 pub(crate) enum HttpCompletionRequest {
     Single(RouterTextGenerateRequest),
     Batch(Vec<RouterTextGenerateRequest>),
+}
+
+fn http_completion_payload_to_router_request_with_headers(
+    payload: Value,
+    served_model_name: &str,
+    headers: &HeaderMap,
+) -> Result<HttpCompletionRequest, String> {
+    http_completion_payload_to_router_request(
+        payload_with_routed_dp_rank_header(payload, headers)?,
+        served_model_name,
+    )
 }
 
 impl HttpCompletionRequest {
@@ -2268,6 +2295,13 @@ impl HttpGenerateRequest {
     }
 }
 
+fn http_generate_payload_to_router_request_with_headers(
+    payload: Value,
+    headers: &HeaderMap,
+) -> Result<HttpGenerateRequest, String> {
+    http_generate_payload_to_router_request(payload_with_routed_dp_rank_header(payload, headers)?)
+}
+
 fn http_generate_payload_to_router_request(payload: Value) -> Result<HttpGenerateRequest, String> {
     if payload.get("input_ids").is_some() {
         return match http_generate_payload_to_router_token_requests(payload)? {
@@ -2283,6 +2317,32 @@ fn http_generate_payload_to_router_request(payload: Value) -> Result<HttpGenerat
         HttpTextGenerateRequests::Single(request) => Ok(HttpGenerateRequest::Text(request)),
         HttpTextGenerateRequests::Batch(requests) => Ok(HttpGenerateRequest::BatchText(requests)),
     }
+}
+
+fn payload_with_routed_dp_rank_header(
+    mut payload: Value,
+    headers: &HeaderMap,
+) -> Result<Value, String> {
+    let Some(rank) = routed_dp_rank_header(headers)? else {
+        return Ok(payload);
+    };
+    let Some(object) = payload.as_object_mut() else {
+        return Err("request body must be a JSON object".to_string());
+    };
+    object.insert("routed_dp_rank".to_string(), json!(rank));
+    Ok(payload)
+}
+
+fn routed_dp_rank_header(headers: &HeaderMap) -> Result<Option<i32>, String> {
+    let Some(value) = headers.get("x-data-parallel-rank") else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| "Invalid X-Data-Parallel-Rank header: must be an integer".to_string())?;
+    value.parse::<i32>().map(Some).map_err(|_| {
+        format!("Invalid X-Data-Parallel-Rank header: must be an integer, got '{value}'")
+    })
 }
 
 enum HttpTextGenerateRequests {
@@ -3081,5 +3141,87 @@ mod tests {
             }
             _ => panic!("expected single completion request"),
         }
+    }
+
+    #[test]
+    fn chat_payload_prefers_routed_dp_rank_header_over_body() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-data-parallel-rank",
+            axum::http::HeaderValue::from_static("6"),
+        );
+        let request = http_chat_payload_to_router_request_with_headers(
+            json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hello"}],
+                "routed_dp_rank": 2
+            }),
+            "tiny",
+            &headers,
+        )
+        .expect("chat payload should parse");
+
+        match request {
+            HttpChatRequest::Single(request) => {
+                assert_eq!(request.data_parallel_rank, 6);
+            }
+            _ => panic!("expected single chat request"),
+        }
+    }
+
+    #[test]
+    fn generate_batch_payload_uses_routed_dp_rank_header_for_each_item() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-data-parallel-rank",
+            axum::http::HeaderValue::from_static("7"),
+        );
+        let request = http_generate_payload_to_router_request_with_headers(
+            json!({
+                "text": ["hello", "there"],
+                "routed_dp_rank": [1, 2]
+            }),
+            &headers,
+        )
+        .expect("batch generate payload should parse");
+
+        match request {
+            HttpGenerateRequest::BatchText(requests) => {
+                assert_eq!(
+                    requests
+                        .iter()
+                        .map(|request| request.data_parallel_rank)
+                        .collect::<Vec<_>>(),
+                    vec![7, 7]
+                );
+            }
+            _ => panic!("expected text batch request"),
+        }
+    }
+
+    #[test]
+    fn completion_payload_rejects_invalid_routed_dp_rank_header() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-data-parallel-rank",
+            axum::http::HeaderValue::from_static("not-a-rank"),
+        );
+        let result = http_completion_payload_to_router_request_with_headers(
+            json!({
+                "model": "tiny",
+                "prompt": "hello"
+            }),
+            "tiny",
+            &headers,
+        );
+        let error = match result {
+            Ok(_) => panic!("invalid header should reject request"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            "Invalid X-Data-Parallel-Rank header: must be an integer, got 'not-a-rank'"
+        );
     }
 }
