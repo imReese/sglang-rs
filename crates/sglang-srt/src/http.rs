@@ -66,6 +66,7 @@ impl<T, W> Clone for HttpRouterService<T, W> {
 pub struct HttpServerInfo {
     pub tp_size: usize,
     pub dp_size: usize,
+    pub load_balance_method: String,
     pub max_running_requests: Option<usize>,
     pub max_prefill_tokens: Option<usize>,
     pub max_total_tokens: Option<usize>,
@@ -80,6 +81,7 @@ impl Default for HttpServerInfo {
         Self {
             tp_size: 1,
             dp_size: 1,
+            load_balance_method: "round_robin".to_string(),
             max_running_requests: None,
             max_prefill_tokens: None,
             max_total_tokens: None,
@@ -336,6 +338,7 @@ where
         "model_path": info.model_path,
         "tp_size": service.server_info.tp_size,
         "dp_size": service.server_info.dp_size,
+        "load_balance_method": service.server_info.load_balance_method,
         "disaggregation_mode": service.server_info.disaggregation_mode,
     });
 

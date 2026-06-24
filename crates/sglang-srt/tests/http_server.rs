@@ -1095,6 +1095,7 @@ async fn http_server_reports_plain_worker_server_info_for_sgl_router() {
     assert_eq!(server_info["model_path"], "dummy");
     assert_eq!(server_info["tp_size"], 2);
     assert_eq!(server_info["dp_size"], 3);
+    assert_eq!(server_info["load_balance_method"], "round_robin");
     assert_eq!(server_info["max_running_requests"], 17);
     assert_eq!(server_info["max_num_reqs"], 17);
     assert_eq!(server_info["max_prefill_tokens"], 2048);
@@ -1102,6 +1103,56 @@ async fn http_server_reports_plain_worker_server_info_for_sgl_router() {
     assert_eq!(server_info["disaggregation_mode"], "null");
     assert!(server_info.get("disaggregation_bootstrap_port").is_none());
     assert!(server_info.get("kv_events").is_none());
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_prefill_server_info_reports_follow_bootstrap_room_for_gateway_policy() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "glm-prefill",
+        "--disaggregation-mode",
+        "prefill",
+        "--disaggregation-bootstrap-port",
+        "8999",
+        "--tp-size",
+        "2",
+        "--dp-size",
+        "4",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let service = build_bootstrap_http_router_service(&args);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let server_info = get_json_with_retry(addr, "/server_info").await;
+
+    assert_eq!(server_info["served_model_name"], "glm-prefill");
+    assert_eq!(server_info["disaggregation_mode"], "prefill");
+    assert_eq!(server_info["load_balance_method"], "follow_bootstrap_room");
+    assert_eq!(server_info["tp_size"], 2);
+    assert_eq!(server_info["dp_size"], 4);
 
     shutdown_tx
         .send(())

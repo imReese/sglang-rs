@@ -33,6 +33,7 @@ fn parse_sglang_serve_style_worker_args() {
     assert_eq!(parsed.port, 8080);
     assert_eq!(parsed.tp_size, 1);
     assert_eq!(parsed.dp_size, 8);
+    assert_eq!(parsed.load_balance_method, "round_robin");
     assert_eq!(parsed.kv_cache_dtype, "bfloat16");
     assert_eq!(parsed.page_size, 64);
     assert_eq!(parsed.base_gpu_id, 2);
@@ -142,6 +143,7 @@ fn parse_pd_disaggregation_args_matches_sglang_server_args() {
     .expect("pd args should parse");
 
     assert_eq!(parsed.disaggregation_mode, "prefill");
+    assert_eq!(parsed.load_balance_method, "follow_bootstrap_room");
     assert_eq!(parsed.disaggregation_transfer_backend, "mooncake");
     assert_eq!(parsed.disaggregation_bootstrap_port, 8999);
     assert_eq!(parsed.engine_info_bootstrap_port, 6790);
@@ -150,6 +152,21 @@ fn parse_pd_disaggregation_args_matches_sglang_server_args() {
     assert!(parsed.disaggregation_decode_enable_offload_kvcache);
     assert_eq!(parsed.num_reserved_decode_tokens, 1024);
     assert_eq!(parsed.disaggregation_decode_polling_interval, 2);
+    assert!(parsed.extra_args.is_empty());
+}
+
+#[test]
+fn parse_load_balance_method_accepts_explicit_sglang_value() {
+    let parsed = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--load-balance-method",
+        "total_tokens",
+    ])
+    .expect("load balance method should parse");
+
+    assert_eq!(parsed.load_balance_method, "total_tokens");
     assert!(parsed.extra_args.is_empty());
 }
 

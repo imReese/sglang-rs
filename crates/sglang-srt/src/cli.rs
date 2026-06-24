@@ -20,6 +20,7 @@ pub struct ServerArgs {
     pub log_level: Option<String>,
     pub tp_size: usize,
     pub dp_size: usize,
+    pub load_balance_method: String,
     pub kv_cache_dtype: String,
     pub kv_cache_num_layers: Option<usize>,
     pub kv_cache_kv_heads: Option<usize>,
@@ -108,6 +109,7 @@ pub enum CliParseError {
         value: String,
         message: String,
     },
+    InvalidLoadBalanceMethod(String),
     InvalidZmqPortRange(String),
 }
 
@@ -126,6 +128,9 @@ impl fmt::Display for CliParseError {
                 message,
             } => {
                 write!(formatter, "invalid JSON for {flag}: {value}: {message}")
+            }
+            Self::InvalidLoadBalanceMethod(value) => {
+                write!(formatter, "invalid --load-balance-method: {value}")
             }
             Self::InvalidZmqPortRange(value) => {
                 write!(formatter, "invalid --disaggregation-zmq-ports: {value}")
@@ -194,6 +199,10 @@ impl ArgParser {
                 }
                 "--dp-size" | "--dp" => {
                     self.parsed.dp_size = parse_usize("--dp-size", self.take_value("--dp-size")?)?;
+                }
+                "--load-balance-method" => {
+                    self.parsed.load_balance_method =
+                        parse_load_balance_method(self.take_value("--load-balance-method")?)?;
                 }
                 "--kv-cache-dtype" => {
                     self.parsed.kv_cache_dtype = self.take_value("--kv-cache-dtype")?;
@@ -440,6 +449,11 @@ impl ArgParser {
             }
         }
 
+        let load_balance_method = normalize_load_balance_method(
+            &self.parsed.load_balance_method,
+            &self.parsed.disaggregation_mode,
+        );
+
         Ok(ServerArgs {
             command: CliCommand::Serve,
             model_path: self
@@ -452,6 +466,7 @@ impl ArgParser {
             log_level: self.parsed.log_level.clone(),
             tp_size: self.parsed.tp_size,
             dp_size: self.parsed.dp_size,
+            load_balance_method,
             kv_cache_dtype: self.parsed.kv_cache_dtype.clone(),
             kv_cache_num_layers: self.parsed.kv_cache_num_layers,
             kv_cache_kv_heads: self.parsed.kv_cache_kv_heads,
@@ -562,6 +577,7 @@ struct PartialServerArgs {
     log_level: Option<String>,
     tp_size: usize,
     dp_size: usize,
+    load_balance_method: String,
     kv_cache_dtype: String,
     kv_cache_num_layers: Option<usize>,
     kv_cache_kv_heads: Option<usize>,
@@ -629,6 +645,7 @@ impl Default for PartialServerArgs {
             log_level: None,
             tp_size: 1,
             dp_size: 1,
+            load_balance_method: "auto".to_string(),
             kv_cache_dtype: "auto".to_string(),
             kv_cache_num_layers: None,
             kv_cache_kv_heads: None,
@@ -712,6 +729,27 @@ fn parse_json_value(flag: &'static str, value: String) -> Result<serde_json::Val
         value,
         message: error.to_string(),
     })
+}
+
+fn parse_load_balance_method(value: String) -> Result<String, CliParseError> {
+    match value.as_str() {
+        "auto" | "round_robin" | "follow_bootstrap_room" | "total_requests" | "total_tokens" => {
+            Ok(value)
+        }
+        _ => Err(CliParseError::InvalidLoadBalanceMethod(value)),
+    }
+}
+
+fn normalize_load_balance_method(method: &str, disaggregation_mode: &str) -> String {
+    if method != "auto" {
+        return method.to_string();
+    }
+
+    if disaggregation_mode == "prefill" {
+        "follow_bootstrap_room".to_string()
+    } else {
+        "round_robin".to_string()
+    }
 }
 
 fn parse_zmq_port_range(value: String) -> Result<ZmqPortRange, CliParseError> {

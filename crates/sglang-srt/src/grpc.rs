@@ -1626,6 +1626,10 @@ fn server_info_attributes_from_args(args: &ServerArgs) -> HashMap<String, String
         "disaggregation_mode".to_string(),
         args.disaggregation_mode.clone(),
     );
+    attributes.insert(
+        "load_balance_method".to_string(),
+        args.load_balance_method.clone(),
+    );
 
     if args.disaggregation_mode == "prefill" {
         attributes.insert(

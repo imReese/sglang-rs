@@ -1428,6 +1428,10 @@ async fn grpc_get_server_info_reports_pd_prefill_attributes() {
         Some(&"prefill".to_string())
     );
     assert_eq!(
+        response.attributes.get("load_balance_method"),
+        Some(&"follow_bootstrap_room".to_string())
+    );
+    assert_eq!(
         response.attributes.get("disaggregation_bootstrap_port"),
         Some(&"8200".to_string())
     );

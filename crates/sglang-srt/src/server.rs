@@ -518,6 +518,7 @@ fn http_server_info_from_args(args: &ServerArgs) -> HttpServerInfo {
     let mut server_info = HttpServerInfo {
         tp_size: args.tp_size,
         dp_size: args.dp_size,
+        load_balance_method: args.load_balance_method.clone(),
         max_running_requests: args.max_running_requests,
         max_prefill_tokens: args.max_prefill_tokens,
         max_total_tokens: args.max_total_tokens,
