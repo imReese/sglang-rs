@@ -668,6 +668,49 @@ async fn http_server_accepts_non_streaming_chat_completions_for_sgl_router() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_preserves_prefixed_openai_chat_request_id() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "glm-chat-prefixed-id",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let addr = unused_local_addr();
+    let service = build_bootstrap_http_router_service(&args);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let response = post_json_with_retry(
+        addr,
+        "/v1/chat/completions",
+        r#"{"model":"glm-chat-prefixed-id","messages":[{"role":"user","content":"hi"}],"request_id":"chatcmpl-http-prefixed","max_tokens":2}"#,
+    )
+    .await;
+
+    assert_eq!(response["id"], "chatcmpl-http-prefixed");
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_server_accepts_streaming_chat_completions_for_openai_clients() {
     let args = ServerArgs::parse_from([
         "serve",

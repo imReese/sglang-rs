@@ -10,6 +10,7 @@ pub mod model_artifacts;
 pub mod model_executor;
 mod openai_classify;
 mod openai_embedding;
+mod openai_id;
 mod openai_rerank;
 mod openai_score;
 pub mod pd_bootstrap;

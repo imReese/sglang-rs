@@ -91,6 +91,86 @@ async fn non_streaming_returns_200() {
 }
 
 #[tokio::test]
+async fn missing_request_id_is_generated_forwarded_and_returned() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let response_request_id = res
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("router should return generated x-request-id")
+        .to_string();
+    assert!(
+        response_request_id.starts_with("chatcmpl-"),
+        "chat completion request IDs should use the OpenAI-compatible prefix"
+    );
+
+    let captured_request_id = worker
+        .captured
+        .lock()
+        .unwrap()
+        .headers
+        .get("x-request-id")
+        .cloned()
+        .expect("router should forward generated x-request-id to worker");
+    assert_eq!(captured_request_id, response_request_id);
+}
+
+#[tokio::test]
+async fn inbound_request_id_is_preserved_in_worker_and_response_headers() {
+    let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("x-request-id", "client-request-42")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("client-request-42")
+    );
+
+    let captured_request_id = worker
+        .captured
+        .lock()
+        .unwrap()
+        .headers
+        .get("x-request-id")
+        .cloned();
+    assert_eq!(captured_request_id.as_deref(), Some("client-request-42"));
+}
+
+#[tokio::test]
 async fn rerank_plain_mode_proxies_without_bootstrap_fields() {
     let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let ctx = build_ctx_with_worker(&worker.url);

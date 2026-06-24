@@ -559,6 +559,54 @@ async fn grpc_chat_complete_returns_openai_chat_json() {
 }
 
 #[tokio::test]
+async fn grpc_chat_complete_preserves_prefixed_openai_request_id() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "tiny",
+        "--grpc-mode",
+    ])
+    .expect("args should parse");
+    let runtime = RouterRuntime::new(Engine::new(
+        ByteTokenizer,
+        Scheduler::new(GrpcTwoStepWorker),
+    ));
+    let service = GrpcRouterService::with_server_args(runtime, &args);
+    let payload = serde_json::json!({
+        "model": "tiny",
+        "messages": [{"role": "user", "content": "hi"}],
+        "request_id": "chatcmpl-client-prefixed",
+        "max_tokens": 2,
+    });
+
+    let mut stream = service
+        .chat_complete(Request::new(OpenAiJsonRequest {
+            json: serde_json::to_vec(&payload).expect("payload should serialize"),
+            options: Some(RequestOptions {
+                request_id: Some("chatcmpl-client-prefixed".to_string()),
+                stream: false,
+                data_parallel_rank: 0,
+                trace_headers: Default::default(),
+            }),
+        }))
+        .await
+        .expect("chat complete should execute")
+        .into_inner();
+    let response = stream
+        .next()
+        .await
+        .expect("chat complete response")
+        .expect("chat complete response ok");
+    assert!(stream.next().await.is_none());
+
+    let body: serde_json::Value =
+        serde_json::from_slice(&response.json).expect("response should be JSON");
+    assert_eq!(body["id"], "chatcmpl-client-prefixed");
+}
+
+#[tokio::test]
 async fn grpc_chat_complete_streams_openai_chat_chunks() {
     let args = ServerArgs::parse_from([
         "serve",

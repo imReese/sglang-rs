@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use crate::engine_info_bootstrap::EngineInfoBootstrapService;
 use crate::openai_classify::{classify_response_json, parse_classify_request};
 use crate::openai_embedding::{embeddings_response_json, parse_embedding_request};
+use crate::openai_id::openai_response_id;
 use crate::openai_rerank::{
     parse_rerank_request, rerank_results_to_json, score_rerank_documents, truncate_rerank_results,
 };
@@ -1687,7 +1688,7 @@ where
                 RouterGenerateResponseBody::Complete(complete) => (
                     StatusCode::OK,
                     Json(json!({
-                        "id": format!("chatcmpl-{}", response.request_id),
+                        "id": openai_response_id("chatcmpl-", &response.request_id),
                         "object": "chat.completion",
                         "model": model,
                         "choices": [{
@@ -1839,7 +1840,7 @@ fn http_chat_batch_response_from_router_responses(
     (
         StatusCode::OK,
         Json(json!({
-            "id": format!("chatcmpl-{}", response_id.unwrap_or_default()),
+            "id": openai_response_id("chatcmpl-", response_id.as_deref().unwrap_or_default()),
             "object": "chat.completion",
             "model": model,
             "choices": choices,
@@ -1861,7 +1862,7 @@ fn http_chat_stream_response_from_router_responses(
     for response in responses {
         let json = match response.body {
             RouterGenerateResponseBody::Chunk(chunk) => json!({
-                "id": format!("chatcmpl-{}", response.request_id),
+                "id": openai_response_id("chatcmpl-", &response.request_id),
                 "object": "chat.completion.chunk",
                 "model": model,
                 "choices": [{
@@ -1873,7 +1874,7 @@ fn http_chat_stream_response_from_router_responses(
                 }],
             }),
             RouterGenerateResponseBody::Complete(complete) => json!({
-                "id": format!("chatcmpl-{}", response.request_id),
+                "id": openai_response_id("chatcmpl-", &response.request_id),
                 "object": "chat.completion.chunk",
                 "model": model,
                 "choices": [{
@@ -2078,7 +2079,7 @@ fn http_completion_response_from_router_responses(
         RouterGenerateResponseBody::Complete(complete) => (
             StatusCode::OK,
             Json(json!({
-                "id": format!("cmpl-{}", response.request_id),
+                "id": openai_response_id("cmpl-", &response.request_id),
                 "object": "text_completion",
                 "model": model,
                 "choices": [{
@@ -2181,7 +2182,7 @@ fn http_completion_batch_response_from_router_responses(
     (
         StatusCode::OK,
         Json(json!({
-            "id": format!("cmpl-{}", response_id.unwrap_or_default()),
+            "id": openai_response_id("cmpl-", response_id.as_deref().unwrap_or_default()),
             "object": "text_completion",
             "model": model,
             "choices": choices,
@@ -2204,7 +2205,7 @@ fn http_completion_stream_response_from_router_responses(
     for response in responses {
         let json = match response.body {
             RouterGenerateResponseBody::Chunk(chunk) => json!({
-                "id": format!("cmpl-{}", response.request_id),
+                "id": openai_response_id("cmpl-", &response.request_id),
                 "object": "text_completion",
                 "model": model,
                 "choices": [{
@@ -2215,7 +2216,7 @@ fn http_completion_stream_response_from_router_responses(
                 }],
             }),
             RouterGenerateResponseBody::Complete(complete) => json!({
-                "id": format!("cmpl-{}", response.request_id),
+                "id": openai_response_id("cmpl-", &response.request_id),
                 "object": "text_completion",
                 "model": model,
                 "choices": [{

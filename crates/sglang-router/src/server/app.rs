@@ -4,12 +4,63 @@
 use crate::server::app_context::AppContext;
 use crate::server::routes::chat::MAX_CHAT_BODY_BYTES;
 use axum::extract::{DefaultBodyLimit, Request};
-use axum::http::StatusCode;
+use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::Router;
+use rand::Rng;
 use std::sync::Arc;
+
+const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
+const REQUEST_ID_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+fn generate_request_id(path: &str) -> String {
+    let prefix = if path.contains("/chat/completions") {
+        "chatcmpl-"
+    } else if path.contains("/completions") {
+        "cmpl-"
+    } else if path.contains("/generate") {
+        "gnt-"
+    } else {
+        "req-"
+    };
+
+    let mut rng = rand::thread_rng();
+    let suffix: String = (0..24)
+        .map(|_| {
+            let idx = rng.gen_range(0..REQUEST_ID_CHARS.len());
+            REQUEST_ID_CHARS[idx] as char
+        })
+        .collect();
+    format!("{prefix}{suffix}")
+}
+
+fn request_id_from_headers(req: &Request) -> Option<String> {
+    req.headers()
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+async fn request_id(req: Request, next: Next) -> Response {
+    let mut req = req;
+    let request_id =
+        request_id_from_headers(&req).unwrap_or_else(|| generate_request_id(req.uri().path()));
+
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        req.headers_mut().insert(REQUEST_ID_HEADER, value);
+    }
+
+    let mut response = next.run(req).await;
+    let response_value = HeaderValue::from_str(&request_id)
+        .unwrap_or_else(|_| HeaderValue::from_static("invalid-request-id"));
+    response
+        .headers_mut()
+        .insert(REQUEST_ID_HEADER, response_value);
+    response
+}
 
 /// Middleware: log 413 PAYLOAD_TOO_LARGE responses with the request method
 /// and URI so an operator investigating "client X gets 413s" has a
@@ -160,4 +211,5 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
                 .layer(middleware::from_fn(log_413)),
         )
         .with_state(ctx)
+        .layer(middleware::from_fn(request_id))
 }
