@@ -16,6 +16,7 @@ pub fn should_forward_request_header(name: &HeaderName) -> bool {
             | "x-correlation-id"
             | "traceparent"
             | "tracestate"
+            | "x-smg-routing-key"
             | "x-data-parallel-rank"
     ) || n.starts_with("x-request-id-")
         || n.starts_with("x-sgl-")
@@ -46,6 +47,9 @@ mod tests {
         )));
         assert!(should_forward_request_header(&HeaderName::from_static(
             "x-sgl-route-key"
+        )));
+        assert!(should_forward_request_header(&HeaderName::from_static(
+            "x-smg-routing-key"
         )));
         assert!(should_forward_request_header(&HeaderName::from_static(
             "x-data-parallel-rank"
