@@ -1976,8 +1976,8 @@ where
 }
 
 pub(crate) struct HttpResponsesRequest {
-    model: String,
-    request: RouterTextGenerateRequest,
+    pub(crate) model: String,
+    pub(crate) request: RouterTextGenerateRequest,
 }
 
 fn http_responses_payload_to_router_request_with_headers(
@@ -2366,7 +2366,7 @@ fn serialize_responses_stream_error() -> Response {
         .into_response()
 }
 
-fn responses_complete_json(
+pub(crate) fn responses_complete_json(
     model: &str,
     request_id: &str,
     complete: RouterGenerateComplete,

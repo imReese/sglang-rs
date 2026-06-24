@@ -926,6 +926,7 @@ impl Proxy {
         }
         if path != "/v1/chat/completions"
             && path != "/v1/completions"
+            && path != "/v1/responses"
             && path != "/v1/rerank"
             && path != "/v1/score"
             && path != "/v1/embeddings"
@@ -978,6 +979,11 @@ impl Proxy {
                     .into_inner(),
                 "/v1/completions" => client
                     .complete(GrpcRequest::new(request))
+                    .await
+                    .map_err(GrpcForwardError::Status)?
+                    .into_inner(),
+                "/v1/responses" => client
+                    .responses(GrpcRequest::new(request))
                     .await
                     .map_err(GrpcForwardError::Status)?
                     .into_inner(),
@@ -1912,7 +1918,7 @@ impl Proxy {
                 )
                 .await;
         }
-        if path != "/v1/chat/completions" && path != "/v1/completions" {
+        if path != "/v1/chat/completions" && path != "/v1/completions" && path != "/v1/responses" {
             breaker.record_failure();
             return Err(ApiError::WorkerMisconfigured {
                 worker: worker_url.to_string(),
@@ -1959,6 +1965,11 @@ impl Proxy {
                     .map(|response| response.into_inner()),
                 "/v1/completions" => client
                     .complete(GrpcRequest::new(request))
+                    .await
+                    .map_err(GrpcForwardError::Status)
+                    .map(|response| response.into_inner()),
+                "/v1/responses" => client
+                    .responses(GrpcRequest::new(request))
                     .await
                     .map_err(GrpcForwardError::Status)
                     .map(|response| response.into_inner()),

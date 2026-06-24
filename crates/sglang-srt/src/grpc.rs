@@ -4,7 +4,7 @@ use std::future::{Future, pending};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use tonic::{Code, Request, Response, Status};
@@ -543,6 +543,232 @@ fn openai_completion_stream_response_from_router_response(
     Ok(OpenAiJsonResponse { json })
 }
 
+fn openai_responses_response_from_router_responses(
+    mut responses: Vec<RouterGenerateResponse>,
+    model: &str,
+) -> Result<OpenAiJsonResponse, Status> {
+    let Some(response) = responses.pop() else {
+        return Err(Status::internal("generation produced no response"));
+    };
+
+    let json = match response.body {
+        RouterGenerateResponseBody::Complete(complete) => {
+            crate::http::responses_complete_json(model, &response.request_id, complete)
+        }
+        RouterGenerateResponseBody::Chunk(_) => {
+            return Err(Status::internal(
+                "non-stream gRPC responses returned a stream chunk",
+            ));
+        }
+        RouterGenerateResponseBody::Error(error) => {
+            return Err(Status::internal(error.message));
+        }
+    };
+
+    let json = serde_json::to_vec(&json)
+        .map_err(|e| Status::internal(format!("serialize OpenAI responses JSON: {e}")))?;
+    Ok(OpenAiJsonResponse { json })
+}
+
+fn openai_responses_stream_from_router_responses(
+    responses: Vec<RouterGenerateResponse>,
+    model: &str,
+) -> Result<Vec<OpenAiJsonResponse>, Status> {
+    let mut events = Vec::new();
+    let mut sequence_number = 0_i32;
+    let mut message_open = false;
+    let mut response_id = String::new();
+    let mut item_id = String::new();
+
+    for response in responses {
+        if response_id.is_empty() {
+            response_id = openai_response_id("resp-", &response.request_id);
+            item_id = openai_responses_message_id(&response.request_id);
+            events.push(openai_responses_event_json(
+                json!({
+                    "type": "response.created",
+                    "response": {
+                        "id": response_id,
+                        "object": "response",
+                        "created_at": unix_timestamp_secs(),
+                        "status": "in_progress",
+                        "model": model,
+                        "output": [],
+                        "output_text": "",
+                    },
+                }),
+                &mut sequence_number,
+            )?);
+        }
+
+        match response.body {
+            RouterGenerateResponseBody::Chunk(chunk) => {
+                if !message_open {
+                    openai_responses_message_open_events(
+                        &mut events,
+                        &mut sequence_number,
+                        &item_id,
+                    )?;
+                    message_open = true;
+                }
+                if !chunk.text.is_empty() {
+                    events.push(openai_responses_event_json(
+                        json!({
+                            "type": "response.output_text.delta",
+                            "output_index": chunk.index,
+                            "content_index": 0,
+                            "item_id": item_id,
+                            "delta": chunk.text,
+                            "logprobs": [],
+                        }),
+                        &mut sequence_number,
+                    )?);
+                }
+            }
+            RouterGenerateResponseBody::Complete(complete) => {
+                if !message_open {
+                    openai_responses_message_open_events(
+                        &mut events,
+                        &mut sequence_number,
+                        &item_id,
+                    )?;
+                    message_open = true;
+                }
+                let output_index = complete.index;
+                let output_text = complete.text.clone();
+                events.push(openai_responses_event_json(
+                    json!({
+                        "type": "response.output_text.done",
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "item_id": item_id,
+                        "text": output_text,
+                        "logprobs": [],
+                    }),
+                    &mut sequence_number,
+                )?);
+
+                let text_part = json!({
+                    "type": "output_text",
+                    "text": output_text,
+                    "annotations": [],
+                });
+                events.push(openai_responses_event_json(
+                    json!({
+                        "type": "response.content_part.done",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "part": text_part,
+                    }),
+                    &mut sequence_number,
+                )?);
+
+                events.push(openai_responses_event_json(
+                    json!({
+                        "type": "response.output_item.done",
+                        "output_index": output_index,
+                        "item": {
+                            "id": item_id,
+                            "type": "message",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [text_part],
+                        },
+                    }),
+                    &mut sequence_number,
+                )?);
+
+                events.push(openai_responses_event_json(
+                    json!({
+                        "type": "response.completed",
+                        "response": crate::http::responses_complete_json(
+                            model,
+                            &response.request_id,
+                            complete,
+                        ),
+                    }),
+                    &mut sequence_number,
+                )?);
+            }
+            RouterGenerateResponseBody::Error(error) => {
+                events.push(openai_responses_event_json(
+                    json!({
+                        "type": "response.failed",
+                        "error": {
+                            "message": error.message,
+                        },
+                    }),
+                    &mut sequence_number,
+                )?);
+            }
+        }
+    }
+
+    Ok(events)
+}
+
+fn openai_responses_message_open_events(
+    events: &mut Vec<OpenAiJsonResponse>,
+    sequence_number: &mut i32,
+    item_id: &str,
+) -> Result<(), Status> {
+    events.push(openai_responses_event_json(
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": item_id,
+                "type": "message",
+                "status": "in_progress",
+                "role": "assistant",
+                "content": [],
+            },
+        }),
+        sequence_number,
+    )?);
+    events.push(openai_responses_event_json(
+        json!({
+            "type": "response.content_part.added",
+            "item_id": item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": {
+                "type": "output_text",
+                "text": "",
+                "annotations": [],
+                "logprobs": Value::Null,
+            },
+        }),
+        sequence_number,
+    )?);
+    Ok(())
+}
+
+fn openai_responses_event_json(
+    mut event: Value,
+    sequence_number: &mut i32,
+) -> Result<OpenAiJsonResponse, Status> {
+    if let Some(object) = event.as_object_mut() {
+        object.insert("sequence_number".to_string(), json!(*sequence_number));
+    }
+    *sequence_number += 1;
+    let json = serde_json::to_vec(&event)
+        .map_err(|e| Status::internal(format!("serialize OpenAI responses stream JSON: {e}")))?;
+    Ok(OpenAiJsonResponse { json })
+}
+
+fn openai_responses_message_id(request_id: &str) -> String {
+    format!("msg_{request_id}")
+}
+
+fn unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn proto_embed_response_from_batches(
     token_batches: Vec<Vec<u32>>,
 ) -> Result<EmbedResponse, Status> {
@@ -698,6 +924,7 @@ where
     type GenerateStream = GenerateResponseStream;
     type ChatCompleteStream = OpenAiJsonResponseStream;
     type CompleteStream = OpenAiJsonResponseStream;
+    type ResponsesStream = OpenAiJsonResponseStream;
 
     async fn text_generate(
         &self,
@@ -1134,6 +1361,45 @@ where
                 ))))
             }
         }
+    }
+
+    async fn responses(
+        &self,
+        request: Request<OpenAiJsonRequest>,
+    ) -> Result<Response<Self::ResponsesStream>, Status> {
+        let request = request.into_inner();
+        let options = request.options.unwrap_or_default();
+        let payload: Value = serde_json::from_slice(&request.json)
+            .map_err(|e| Status::invalid_argument(format!("invalid OpenAI JSON payload: {e}")))?;
+        let model = self.model_info()?.served_model_name;
+        let mut request = crate::http::http_responses_payload_to_router_request(payload, &model)
+            .map_err(Status::invalid_argument)?;
+        apply_openai_json_options_to_router_request(&mut request.request, options);
+        let stream = request.request.stream;
+        let response_model = request.model;
+
+        let responses = self
+            .runtime
+            .lock()
+            .map_err(|_| Status::internal("router runtime mutex poisoned"))?
+            .generate_text_stream_with_transfer_polling(request.request, self.max_transfer_polls)
+            .map_err(router_runtime_error_to_status)?;
+
+        if stream {
+            let responses =
+                openai_responses_stream_from_router_responses(responses, &response_model)?
+                    .into_iter()
+                    .map(Ok)
+                    .collect::<Vec<_>>();
+            return Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
+                responses,
+            ))));
+        }
+
+        let response = openai_responses_response_from_router_responses(responses, &response_model)?;
+        Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
+            [Ok(response)],
+        ))))
     }
 
     async fn open_ai_embed(

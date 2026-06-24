@@ -22,6 +22,7 @@ service SglangService {
   rpc ContinueGeneration(ContinueGenerationRequest) returns (ControlResponse);
   rpc ChatComplete(OpenAIJsonRequest) returns (stream OpenAIJsonResponse);
   rpc Complete(OpenAIJsonRequest) returns (stream OpenAIJsonResponse);
+  rpc Responses(OpenAIJsonRequest) returns (stream OpenAIJsonResponse);
   rpc OpenAIEmbed(OpenAIJsonRequest) returns (OpenAIJsonResponse);
   rpc OpenAIClassify(OpenAIJsonRequest) returns (OpenAIJsonResponse);
   rpc Score(OpenAIJsonRequest) returns (OpenAIJsonResponse);
