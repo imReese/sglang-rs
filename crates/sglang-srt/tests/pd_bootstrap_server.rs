@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::time::Duration;
 
 use serde_json::Value;
 use tokio::sync::oneshot;
@@ -10,16 +11,19 @@ use sglang_srt::engine_info_bootstrap::{
     EngineInfoBootstrapService, serve_engine_info_bootstrap_with_shutdown,
 };
 use sglang_srt::pd_bootstrap::{
-    MooncakeDecodeBootstrapPublisher, MooncakeDecodeKvArgsRegistration,
-    MooncakeDecodeTransferMetadata, PrefillBootstrapService, query_prefill_route,
-    send_mooncake_kv_args_registration, send_mooncake_transfer_metadata,
+    MooncakeBootstrapKvCacheTransferExecutor, MooncakeDecodeBootstrapPublisher,
+    MooncakeDecodeKvArgsRegistration, MooncakeDecodeTransferMetadata, PrefillBootstrapService,
+    query_prefill_route, send_mooncake_kv_args_registration, send_mooncake_transfer_metadata,
     serve_mooncake_bootstrap_zmq_endpoints_with_shutdown,
     serve_mooncake_bootstrap_zmq_with_shutdown, serve_prefill_bootstrap_with_shutdown,
 };
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::transfer::{
     DecodeBootstrapRegistry, FakeKvCacheTransferExecutor, KvPoll, KvTransferModelWorker,
-    MooncakeKvCacheLayout, MooncakeRemoteKvLayout,
+    MooncakeBatchId, MooncakeBatchReleaser, MooncakeError, MooncakeKvCacheLayout,
+    MooncakeKvCacheTransferExecutor, MooncakeRemoteKvLayout, MooncakeTransferRequest,
+    MooncakeTransferStatus, MooncakeTransferStatusCode, MooncakeTransferStatusReader,
+    MooncakeTransferSubmitter, MooncakeTransferTarget,
 };
 use sglang_srt::types::{BootstrapRoom, DisaggregatedParams, RequestId, SamplingParams};
 use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
@@ -167,6 +171,100 @@ async fn prefill_bootstrap_tracks_room_dp_rank_queries() {
         post_json_value_with_retry(addr, "/query_dp_ranks", r#"{"bootstrap_rooms":[40,41]}"#).await;
     assert!(dp_ranks.get("40").is_none());
     assert_eq!(dp_ranks["41"], 3);
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prefill_transfer_executor_registers_dp_rank_for_bootstrap_queries() {
+    let addr = unused_local_addr();
+    let service = PrefillBootstrapService::default();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let server_service = service.clone();
+    let server = tokio::spawn(async move {
+        serve_prefill_bootstrap_with_shutdown(addr, server_service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    {
+        let mut state = service.state().lock().expect("state lock should be held");
+        state
+            .ingest_mooncake_bootstrap_frame(&vec![
+                b"None".to_vec(),
+                b"127.0.0.1".to_vec(),
+                b"41010".to_vec(),
+                b"decode-rank-session".to_vec(),
+                pack_u64s(&[0x9000]),
+                pack_u64s(&[]),
+                pack_u64_lists(&[]),
+                b"0".to_vec(),
+                b"1".to_vec(),
+                b"128".to_vec(),
+            ])
+            .expect("decode KV args should parse");
+        state
+            .ingest_mooncake_bootstrap_frame(&vec![
+                b"99".to_vec(),
+                b"127.0.0.1".to_vec(),
+                b"41010".to_vec(),
+                b"decode-rank-session".to_vec(),
+                pack_i32s(&[0, 1, 2]),
+                b"0".to_vec(),
+                pack_i32_lists(&[]),
+                b"1".to_vec(),
+                b"3".to_vec(),
+            ])
+            .expect("decode transfer metadata should parse");
+    }
+
+    let inner = MooncakeKvCacheTransferExecutor::new(
+        RecordingMooncakeSubmitter::default(),
+        MooncakeKvCacheLayout {
+            source_base_addr: 0x5000,
+            page_size_bytes: 128,
+            target_base_offset: 0,
+        },
+        MooncakeTransferTarget { target_id: 7 },
+    );
+    let transfer_executor = MooncakeBootstrapKvCacheTransferExecutor::new(service, inner)
+        .with_metadata_wait_timeout(Duration::from_millis(50));
+    let worker = KvTransferModelWorker::new(
+        BootstrapMetadataWorker,
+        DecodeBootstrapRegistry::default(),
+        transfer_executor,
+    );
+    let mut scheduler =
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(4));
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("pd-prefill-rank-register"),
+            vec![1, 2, 3],
+            SamplingParams::new(1),
+        )
+        .with_disaggregated_params(Some(DisaggregatedParams {
+            bootstrap_host: addr.ip().to_string(),
+            bootstrap_port: addr.port(),
+            bootstrap_room: 99,
+        }))
+        .with_data_parallel_rank(5),
+    );
+
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill transfer should submit through Mooncake executor");
+
+    let dp_ranks =
+        post_json_value_with_retry(addr, "/query_dp_ranks", r#"{"bootstrap_rooms":[99]}"#).await;
+    assert_eq!(dp_ranks["99"], 5);
 
     shutdown_tx
         .send(())
@@ -1030,6 +1128,42 @@ impl ModelWorker for BootstrapMetadataWorker {
                 .collect(),
         )
         .expect("output shape should match batch")
+    }
+}
+
+#[derive(Default)]
+struct RecordingMooncakeSubmitter {
+    submitted_requests: Vec<Vec<MooncakeTransferRequest>>,
+    freed_batches: Vec<MooncakeBatchId>,
+}
+
+impl MooncakeTransferSubmitter for RecordingMooncakeSubmitter {
+    fn submit_transfer(
+        &mut self,
+        requests: &mut [MooncakeTransferRequest],
+    ) -> Result<MooncakeBatchId, MooncakeError> {
+        self.submitted_requests.push(requests.to_vec());
+        Ok(100 + self.submitted_requests.len() as MooncakeBatchId - 1)
+    }
+}
+
+impl MooncakeTransferStatusReader for RecordingMooncakeSubmitter {
+    fn transfer_status(
+        &mut self,
+        _batch_id: MooncakeBatchId,
+        _task_id: usize,
+    ) -> Result<MooncakeTransferStatus, MooncakeError> {
+        Ok(MooncakeTransferStatus {
+            status: MooncakeTransferStatusCode::Completed as i32,
+            transferred_bytes: 0,
+        })
+    }
+}
+
+impl MooncakeBatchReleaser for RecordingMooncakeSubmitter {
+    fn free_batch(&mut self, batch_id: MooncakeBatchId) -> Result<(), MooncakeError> {
+        self.freed_batches.push(batch_id);
+        Ok(())
     }
 }
 

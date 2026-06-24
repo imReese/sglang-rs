@@ -107,6 +107,14 @@ impl<E> MooncakeBootstrapKvCacheTransferExecutor<E> {
             }
         }
     }
+
+    fn register_span_dp_rank(&self, span: &KvCacheTransferSpan) {
+        self.bootstrap_service
+            .state()
+            .lock()
+            .expect("prefill bootstrap state lock should be held")
+            .register_dp_rank(span.bootstrap_room(), span.data_parallel_rank());
+    }
 }
 
 impl<S, R> KvCacheTransferExecutor
@@ -119,6 +127,7 @@ where
         &mut self,
         span: &crate::transfer::KvCacheTransferSpan,
     ) -> Result<(), KvCacheTransferError> {
+        self.register_span_dp_rank(span);
         let remote_layouts = self.remote_kv_layouts_for_room(span.bootstrap_room())?;
         for (session_id, layout) in remote_layouts {
             self.inner
