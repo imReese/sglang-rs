@@ -24,6 +24,8 @@ use crate::transfer::{
 };
 use crate::types::BootstrapRoom;
 
+const DP_RANK_ENTRY_CLEANUP_INTERVAL_SECS: u64 = 120;
+
 #[derive(Clone, Debug, Default)]
 pub struct PrefillBootstrapService {
     state: Arc<Mutex<PrefillBootstrapState>>,
@@ -341,6 +343,7 @@ impl PrefillBootstrapState {
     }
 
     fn register_dp_rank(&mut self, bootstrap_room: BootstrapRoom, dp_rank: i32) {
+        self.prune_expired_dp_rank_entries(now_secs());
         self.room_to_dp_rank.insert(
             bootstrap_room,
             RegisteredDpRank {
@@ -348,6 +351,25 @@ impl PrefillBootstrapState {
                 timestamp_secs: now_secs(),
             },
         );
+    }
+
+    fn query_dp_ranks(&mut self, bootstrap_rooms: &[BootstrapRoom]) -> serde_json::Value {
+        self.prune_expired_dp_rank_entries(now_secs());
+        let mut result = serde_json::Map::new();
+        for room in bootstrap_rooms {
+            if let Some(entry) = self.room_to_dp_rank.get(room) {
+                result.insert(room.to_string(), json!(entry.dp_rank));
+            }
+        }
+        serde_json::Value::Object(result)
+    }
+
+    fn prune_expired_dp_rank_entries(&mut self, now_secs: u64) -> usize {
+        let before = self.room_to_dp_rank.len();
+        self.room_to_dp_rank.retain(|_, entry| {
+            now_secs.saturating_sub(entry.timestamp_secs) <= DP_RANK_ENTRY_CLEANUP_INTERVAL_SECS
+        });
+        before.saturating_sub(self.room_to_dp_rank.len())
     }
 }
 
@@ -1361,17 +1383,11 @@ async fn query_dp_ranks(
     State(service): State<PrefillBootstrapService>,
     Json(request): Json<QueryDpRanksRequest>,
 ) -> Json<serde_json::Value> {
-    let state = service
+    let mut state = service
         .state
         .lock()
         .expect("prefill bootstrap state lock should be held");
-    let mut result = serde_json::Map::new();
-    for room in request.bootstrap_rooms {
-        if let Some(entry) = state.room_to_dp_rank.get(&room) {
-            result.insert(room.to_string(), json!(entry.dp_rank));
-        }
-    }
-    Json(serde_json::Value::Object(result))
+    Json(state.query_dp_ranks(&request.bootstrap_rooms))
 }
 
 fn bad_rank_query() -> Response {
@@ -1610,4 +1626,44 @@ fn unpack_list_of_buffers<'a>(
         offset = end;
     }
     Ok(buffers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::Json;
+    use axum::extract::State;
+
+    #[tokio::test]
+    async fn query_dp_ranks_prunes_expired_bootstrap_rooms() {
+        let service = PrefillBootstrapService::default();
+        {
+            let mut state = service.state().lock().expect("state lock should be held");
+            state.register_dp_rank(41, 3);
+            state
+                .room_to_dp_rank
+                .get_mut(&41)
+                .expect("room should be registered")
+                .timestamp_secs = now_secs() - 121;
+        }
+
+        let Json(response) = query_dp_ranks(
+            State(service.clone()),
+            Json(QueryDpRanksRequest {
+                bootstrap_rooms: vec![41],
+            }),
+        )
+        .await;
+
+        assert_eq!(response, serde_json::json!({}));
+        assert!(
+            service
+                .state()
+                .lock()
+                .expect("state lock should be held")
+                .room_to_dp_rank
+                .is_empty(),
+            "expired room-to-dp-rank mappings should be removed"
+        );
+    }
 }
