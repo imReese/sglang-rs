@@ -1881,6 +1881,12 @@ fn router_model_info_to_proto_response(
         routed_expert_actual_group_count: model_info.routed_expert_actual_group_count,
         routed_expert_expected_weight_count: model_info.routed_expert_expected_weight_count,
         routed_expert_actual_weight_count: model_info.routed_expert_actual_weight_count,
+        tp_size: model_info.tp_size,
+        dp_size: model_info.dp_size,
+        max_running_requests: model_info.max_running_requests,
+        max_num_reqs: model_info.max_num_reqs,
+        max_prefill_tokens: model_info.max_prefill_tokens,
+        max_total_tokens: model_info.max_total_tokens,
     }
 }
 

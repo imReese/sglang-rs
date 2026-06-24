@@ -1274,6 +1274,16 @@ async fn grpc_get_model_info_reports_configured_server_args() {
         "llama3",
         "--tokenizer-path",
         "hf-tokenizer",
+        "--tp-size",
+        "2",
+        "--dp-size",
+        "3",
+        "--max-running-requests",
+        "17",
+        "--max-prefill-tokens",
+        "2048",
+        "--max-total-tokens",
+        "4096",
     ])
     .expect("server args should parse");
     let runtime = RouterRuntime::new(Engine::new(
@@ -1291,6 +1301,12 @@ async fn grpc_get_model_info_reports_configured_server_args() {
     assert_eq!(response.model_path, "meta-llama/Llama-3.1-8B-Instruct");
     assert_eq!(response.tokenizer_path, "hf-tokenizer");
     assert_eq!(response.served_model_name, "llama3");
+    assert_eq!(response.tp_size, 2);
+    assert_eq!(response.dp_size, 3);
+    assert_eq!(response.max_running_requests, 17);
+    assert_eq!(response.max_num_reqs, 17);
+    assert_eq!(response.max_prefill_tokens, 2048);
+    assert_eq!(response.max_total_tokens, 4096);
     assert!(response.is_generation);
     assert_eq!(response.preferred_sampling_params_json, "{}");
 }

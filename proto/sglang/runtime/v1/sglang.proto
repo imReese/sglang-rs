@@ -202,6 +202,12 @@ message ModelInfoResponse {
   int32 routed_expert_actual_group_count = 16;
   int32 routed_expert_expected_weight_count = 17;
   int32 routed_expert_actual_weight_count = 18;
+  uint32 tp_size = 19;
+  uint32 dp_size = 20;
+  uint32 max_running_requests = 21;
+  uint32 max_num_reqs = 22;
+  uint32 max_prefill_tokens = 23;
+  uint32 max_total_tokens = 24;
 }
 
 message GetServerInfoRequest {}

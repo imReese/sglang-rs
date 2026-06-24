@@ -557,6 +557,12 @@ pub struct RouterGetModelInfoResponse {
     pub routed_expert_actual_group_count: i32,
     pub routed_expert_expected_weight_count: i32,
     pub routed_expert_actual_weight_count: i32,
+    pub tp_size: u32,
+    pub dp_size: u32,
+    pub max_running_requests: u32,
+    pub max_num_reqs: u32,
+    pub max_prefill_tokens: u32,
+    pub max_total_tokens: u32,
 }
 
 impl RouterGetModelInfoResponse {
@@ -590,6 +596,12 @@ impl RouterGetModelInfoResponse {
             routed_expert_actual_group_count: 0,
             routed_expert_expected_weight_count: 0,
             routed_expert_actual_weight_count: 0,
+            tp_size: usize_to_model_info_u32(args.tp_size),
+            dp_size: usize_to_model_info_u32(args.dp_size),
+            max_running_requests: optional_usize_to_model_info_u32(args.max_running_requests),
+            max_num_reqs: optional_usize_to_model_info_u32(args.max_running_requests),
+            max_prefill_tokens: optional_usize_to_model_info_u32(args.max_prefill_tokens),
+            max_total_tokens: optional_usize_to_model_info_u32(args.max_total_tokens),
         };
 
         if let Ok(config) = HfModelConfig::from_model_path(&args.model_path) {
@@ -630,6 +642,12 @@ impl RouterGetModelInfoResponse {
             routed_expert_actual_group_count: 0,
             routed_expert_expected_weight_count: 0,
             routed_expert_actual_weight_count: 0,
+            tp_size: 0,
+            dp_size: 0,
+            max_running_requests: 0,
+            max_num_reqs: 0,
+            max_prefill_tokens: 0,
+            max_total_tokens: 0,
         };
 
         response.apply_model_config(artifacts.config().clone());
@@ -676,6 +694,14 @@ impl RouterGetModelInfoResponse {
             self.routed_expert_actual_weight_count = value;
         }
     }
+}
+
+fn optional_usize_to_model_info_u32(value: Option<usize>) -> u32 {
+    value.map(usize_to_model_info_u32).unwrap_or_default()
+}
+
+fn usize_to_model_info_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 pub struct RouterRuntime<T, W> {
