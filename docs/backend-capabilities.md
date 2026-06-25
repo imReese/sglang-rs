@@ -4,6 +4,9 @@ This project keeps compute backends, CPU reference execution, and transfer
 backends as separate launch-time capabilities. A worker must fail fast when the
 requested backend does not match the runtime that was actually loaded.
 
+Longer-term implementation rules live in
+[`backend-implementation-standards.md`](backend-implementation-standards.md).
+
 ## Runtime Backends
 
 `--device` is the community-aligned compute device selector:
