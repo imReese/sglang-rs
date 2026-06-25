@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use serde_json::json;
+use sglang_srt::backend::{TransferBackendCapability, TransferBackendClass};
 use sglang_srt::cli::ServerArgs;
 use sglang_srt::cli::ZmqPortRange;
 use sglang_srt::transfer::{
@@ -67,6 +68,19 @@ fn pd_config_accepts_fake_backend_for_prefill_smoke_tests() {
 
     assert_eq!(config.mode, DisaggregationMode::Prefill);
     assert_eq!(config.transfer_backend, TransferBackend::Fake);
+}
+
+#[test]
+fn transfer_backend_capabilities_keep_fake_out_of_production_path() {
+    let fake = TransferBackendCapability::from_backend(TransferBackend::Fake);
+    let mooncake = TransferBackendCapability::from_backend(TransferBackend::Mooncake);
+    let nixl = TransferBackendCapability::from_backend(TransferBackend::Nixl);
+
+    assert_eq!(fake.class, TransferBackendClass::Reference);
+    assert!(fake.is_reference_only());
+    assert_eq!(mooncake.class, TransferBackendClass::Production);
+    assert!(mooncake.is_production());
+    assert_eq!(nixl.class, TransferBackendClass::Planned);
 }
 
 #[test]

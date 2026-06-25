@@ -201,6 +201,7 @@ prefill_args=(
     serve
     --model-path "$MODEL_DIR"
     --served-model-name "$SERVED_MODEL_NAME"
+    --runtime-backend cpu-reference
     --host "$PREFILL_HOST"
     --port "$PREFILL_PORT"
     --disaggregation-mode prefill
@@ -214,6 +215,7 @@ decode_args=(
     serve
     --model-path "$MODEL_DIR"
     --served-model-name "$SERVED_MODEL_NAME"
+    --runtime-backend cpu-reference
     --host "$DECODE_HOST"
     --port "$DECODE_PORT"
     --disaggregation-mode decode

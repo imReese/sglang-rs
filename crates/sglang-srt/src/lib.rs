@@ -1,3 +1,4 @@
+pub mod backend;
 pub mod cache;
 pub mod cli;
 pub mod deepseek_runtime;

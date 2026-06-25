@@ -52,6 +52,36 @@ fn grpc_listen_addr_uses_server_host_and_port() {
     assert_eq!(addr.port(), 30001);
 }
 
+#[test]
+fn bootstrap_cuda_runtime_rejects_space_reference_fallback() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--runtime-backend",
+        "cuda",
+        "--grpc-mode",
+    ])
+    .expect("args should parse");
+
+    let error = match try_build_bootstrap_grpc_router_service(&args) {
+        Ok(_) => panic!("cuda runtime must not fall back to bootstrap Space reference model"),
+        Err(error) => error,
+    };
+
+    assert!(
+        matches!(
+            error,
+            ServerLaunchError::UnsupportedRuntimeBackend {
+                ref requested,
+                ref actual,
+                ..
+            } if requested == "cuda" && actual == "cpu-reference"
+        ),
+        "unexpected error: {error:?}"
+    );
+}
+
 #[tokio::test]
 async fn bootstrap_grpc_router_service_carries_model_metadata() {
     let args = ServerArgs::parse_from([

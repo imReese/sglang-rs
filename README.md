@@ -86,6 +86,12 @@ RoPE, and sampling/grammar helpers. The Rust runtime should depend on traits and
 typed buffers owned by `sglang-kernel`; backend-specific CUDA, CPU, Metal, ROCm,
 or MUSA details should stay behind feature-gated implementations.
 
+Runtime backend selection is an explicit launch-time contract. See
+[`docs/backend-capabilities.md`](docs/backend-capabilities.md) for the current
+production, CPU reference, and transfer backend boundaries. B200 validation is
+the first real GPU target and must use `--runtime-backend cuda`; local MacBook
+smoke paths should use `--runtime-backend cpu-reference`.
+
 ## Current Scope
 
 This repository currently contains the first `sglang-srt` runtime crate and the
@@ -101,7 +107,7 @@ This repository currently contains the first `sglang-srt` runtime crate and the
   available in CI.
 - `cli`: `sglang serve`-style argument parsing for `--model-path`/`--model`,
   `--host`, `--port`, `--tp-size`, `--dp-size`, `--grpc-mode`,
-  `--served-model-name`, `--tokenizer-path`, and the upstream PD
+  `--served-model-name`, `--tokenizer-path`, `--runtime-backend`, and the upstream PD
   disaggregation flags, with unknown server args preserved for incremental
   upstream compatibility. The crate builds both `sglang` and `sglang-rs`
   binaries so the upstream command shape works.
@@ -139,9 +145,10 @@ This repository currently contains the first `sglang-srt` runtime crate and the
   polling. The HTTP launcher also starts the SGLang-compatible engine-info
   bootstrap service on `--engine-info-bootstrap-port` (default `6789`) and
   shares that state with `/remote_instance_transfer_engine_info`. The bootstrap
-  launcher can run the decode-side PD path with the fake transfer backend for
-  local/runtime wiring tests and explicitly rejects unsupported real PD backends
-  until Mooncake/model KV memory wiring lands.
+  launcher validates the requested runtime backend against the loaded model
+  capability before serving, can run the decode-side PD path with the fake
+  transfer backend for local/runtime wiring tests, and explicitly rejects
+  unsupported real PD backends until Mooncake/model KV memory wiring lands.
 - `engine_info_bootstrap`: lightweight HTTP bootstrap service compatible with
   SGLang's transfer-engine info registration flow. It stores per-rank
   `session_id` and `weights_info_dict` payloads via
@@ -169,7 +176,9 @@ This repository currently contains the first `sglang-srt` runtime crate and the
   through a bounded `with_max_transfer_polls` service setting for tokenized and
   text generate RPCs. The
   module also contains the initial Mooncake transfer-engine ABI boundary for
-  memory registration and batch transfer.
+  memory registration and batch transfer. Transfer backend capabilities classify
+  Mooncake as the production path, fake as reference-only, and NIXL/Ascend/Mori
+  as planned targets until real executors are implemented.
 - `scheduler`: waiting queue, prefill/decode batch formation, request stages,
   uncached-token budgeted prefill batching, decode requeueing,
   `max_new_tokens` stopping, prefix-cache application, and KV cache page

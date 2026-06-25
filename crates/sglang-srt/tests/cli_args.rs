@@ -34,6 +34,7 @@ fn parse_sglang_serve_style_worker_args() {
     assert_eq!(parsed.tp_size, 1);
     assert_eq!(parsed.dp_size, 8);
     assert_eq!(parsed.load_balance_method, "round_robin");
+    assert_eq!(parsed.runtime_backend, "auto");
     assert_eq!(parsed.kv_cache_dtype, "bfloat16");
     assert_eq!(parsed.page_size, 64);
     assert_eq!(parsed.base_gpu_id, 2);
@@ -51,6 +52,7 @@ fn parse_model_alias_and_default_network_args() {
     assert_eq!(parsed.port, 30000);
     assert_eq!(parsed.tp_size, 1);
     assert_eq!(parsed.dp_size, 1);
+    assert_eq!(parsed.runtime_backend, "auto");
     assert_eq!(parsed.kv_cache_dtype, "auto");
     assert_eq!(parsed.page_size, 1);
     assert_eq!(parsed.base_gpu_id, 0);
@@ -156,6 +158,35 @@ fn parse_pd_disaggregation_args_matches_sglang_server_args() {
 }
 
 #[test]
+fn parse_runtime_backend_accepts_explicit_production_target() {
+    let parsed = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--runtime-backend",
+        "cuda",
+    ])
+    .expect("runtime backend should parse");
+
+    assert_eq!(parsed.runtime_backend, "cuda");
+    assert!(parsed.extra_args.is_empty());
+}
+
+#[test]
+fn parse_runtime_backend_rejects_unknown_target() {
+    let error = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--runtime-backend",
+        "vulkan",
+    ])
+    .expect_err("unknown runtime backend should fail");
+
+    assert_eq!(error.to_string(), "invalid --runtime-backend: vulkan");
+}
+
+#[test]
 fn parse_load_balance_method_accepts_explicit_sglang_value() {
     let parsed = ServerArgs::parse_from([
         "serve",
@@ -248,6 +279,8 @@ fn parse_glm5_prefill_production_launch_args_as_structured_runtime_config() {
         "info",
         "--model-path",
         "/GLM-5-0212-FP8",
+        "--runtime-backend",
+        "cuda",
         "--port",
         "8000",
         "--served-model-name",
@@ -329,6 +362,7 @@ fn parse_glm5_prefill_production_launch_args_as_structured_runtime_config() {
     assert_eq!(parsed.host, "0.0.0.0");
     assert_eq!(parsed.log_level.as_deref(), Some("info"));
     assert_eq!(parsed.model_path, "/GLM-5-0212-FP8");
+    assert_eq!(parsed.runtime_backend, "cuda");
     assert_eq!(parsed.port, 8000);
     assert_eq!(
         parsed.served_model_name.as_deref(),

@@ -5,6 +5,7 @@ use std::future::Future;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 
+use crate::backend::{RuntimeBackend, RuntimeCapability, validate_runtime_backend};
 use crate::cache::{CachePageAllocator, RadixCache};
 use crate::cli::ServerArgs;
 use crate::deepseek_runtime::{
@@ -124,6 +125,18 @@ impl BootstrapForwardModel {
         }
     }
 
+    fn runtime_capability(&self) -> RuntimeCapability {
+        match self {
+            Self::Space => RuntimeCapability::cpu_reference("space-reference", false),
+            Self::CpuEmbeddingLm(_) => RuntimeCapability::cpu_reference("cpu-embedding-lm", false),
+            Self::DeepSeekV4(_) => RuntimeCapability::metadata_only("deepseek-v4-metadata", false),
+            Self::GlmMoeDsa(_) => RuntimeCapability::cpu_reference("glm-moe-dsa-f32-cpu", true),
+            Self::UnsupportedLocalModelRuntime { .. } => {
+                RuntimeCapability::unsupported("unsupported-local-model")
+            }
+        }
+    }
+
     #[cfg(feature = "mooncake-link")]
     fn reserve_mooncake_kv_cache_pages(
         &mut self,
@@ -210,6 +223,31 @@ impl ForwardModel for BootstrapForwardModel {
     }
 }
 
+fn bootstrap_forward_model_from_server_args(
+    args: &ServerArgs,
+) -> Result<BootstrapForwardModel, ServerLaunchError> {
+    let model = BootstrapForwardModel::from_server_args(args)?;
+    validate_bootstrap_runtime_backend(args, &model)?;
+    Ok(model)
+}
+
+fn validate_bootstrap_runtime_backend(
+    args: &ServerArgs,
+    model: &BootstrapForwardModel,
+) -> Result<(), ServerLaunchError> {
+    let requested = RuntimeBackend::parse(&args.runtime_backend)
+        .ok_or_else(|| ServerLaunchError::InvalidRuntimeBackend(args.runtime_backend.clone()))?;
+    let capability = model.runtime_capability();
+    validate_runtime_backend(requested, &capability).map_err(|mismatch| {
+        ServerLaunchError::UnsupportedRuntimeBackend {
+            requested: mismatch.requested.to_string(),
+            actual: mismatch.actual.to_string(),
+            runtime_name: mismatch.runtime_name.to_string(),
+            reason: mismatch.reason.to_string(),
+        }
+    })
+}
+
 pub type BootstrapGrpcRouterService =
     GrpcRouterService<RuntimeTokenizer, ModelRunner<BootstrapForwardModel>>;
 pub type BootstrapHttpRouterService =
@@ -254,6 +292,13 @@ pub enum ServerLaunchError {
     UnsupportedMooncakeKvMemory {
         model_path: String,
         model_type: Option<String>,
+    },
+    InvalidRuntimeBackend(String),
+    UnsupportedRuntimeBackend {
+        requested: String,
+        actual: String,
+        runtime_name: String,
+        reason: String,
     },
     DeepSeekRuntime(DeepSeekRuntimeError),
     DeepSeekTensorShardLoad(DeepSeekV4TensorShardLoadError),
@@ -304,6 +349,28 @@ impl PartialEq for ServerLaunchError {
                     model_type: right_model_type,
                 },
             ) => left_model_path == right_model_path && left_model_type == right_model_type,
+            (Self::InvalidRuntimeBackend(left), Self::InvalidRuntimeBackend(right)) => {
+                left == right
+            }
+            (
+                Self::UnsupportedRuntimeBackend {
+                    requested: left_requested,
+                    actual: left_actual,
+                    runtime_name: left_runtime_name,
+                    reason: left_reason,
+                },
+                Self::UnsupportedRuntimeBackend {
+                    requested: right_requested,
+                    actual: right_actual,
+                    runtime_name: right_runtime_name,
+                    reason: right_reason,
+                },
+            ) => {
+                left_requested == right_requested
+                    && left_actual == right_actual
+                    && left_runtime_name == right_runtime_name
+                    && left_reason == right_reason
+            }
             (Self::DeepSeekRuntime(left), Self::DeepSeekRuntime(right)) => left == right,
             (Self::DeepSeekTensorShardLoad(left), Self::DeepSeekTensorShardLoad(right)) => {
                 left == right
@@ -358,6 +425,18 @@ impl fmt::Display for ServerLaunchError {
                 formatter,
                 "model {model_path} type {} does not expose transferable Mooncake KV memory",
                 model_type.as_deref().unwrap_or("<unknown>")
+            ),
+            Self::InvalidRuntimeBackend(value) => {
+                write!(formatter, "invalid --runtime-backend: {value}")
+            }
+            Self::UnsupportedRuntimeBackend {
+                requested,
+                actual,
+                runtime_name,
+                reason,
+            } => write!(
+                formatter,
+                "runtime backend {requested} is not supported by loaded runtime {runtime_name} ({actual}): {reason}"
             ),
             Self::DeepSeekRuntime(error) => write!(formatter, "DeepSeek runtime error: {error}"),
             Self::DeepSeekTensorShardLoad(error) => {
@@ -650,7 +729,7 @@ pub fn try_build_bootstrap_grpc_router_service(
     args: &ServerArgs,
 ) -> Result<BootstrapGrpcRouterService, ServerLaunchError> {
     validate_local_model_artifacts_if_present(args)?;
-    let scheduler = Scheduler::new(ModelRunner::new(BootstrapForwardModel::from_server_args(
+    let scheduler = Scheduler::new(ModelRunner::new(bootstrap_forward_model_from_server_args(
         args,
     )?))
     .with_max_running_requests(args.max_running_requests);
@@ -672,7 +751,7 @@ pub fn try_build_bootstrap_http_router_service(
     args: &ServerArgs,
 ) -> Result<BootstrapHttpRouterService, ServerLaunchError> {
     validate_local_model_artifacts_if_present(args)?;
-    let scheduler = Scheduler::new(ModelRunner::new(BootstrapForwardModel::from_server_args(
+    let scheduler = Scheduler::new(ModelRunner::new(bootstrap_forward_model_from_server_args(
         args,
     )?))
     .with_max_running_requests(args.max_running_requests);
@@ -700,7 +779,7 @@ pub fn try_build_bootstrap_prefill_http_router_service(
 ) -> Result<BootstrapPrefillHttpRouterService, ServerLaunchError> {
     validate_local_model_artifacts_if_present(args)?;
     let worker = KvTransferModelWorker::new(
-        ModelRunner::new(BootstrapForwardModel::from_server_args(args)?),
+        ModelRunner::new(bootstrap_forward_model_from_server_args(args)?),
         DecodeBootstrapRegistry::default(),
         FakeKvCacheTransferExecutor::default(),
     );
@@ -765,7 +844,7 @@ where
     P: DecodeBootstrapPublisher,
 {
     validate_local_model_artifacts_if_present(args)?;
-    let model = BootstrapForwardModel::from_server_args(args)?;
+    let model = bootstrap_forward_model_from_server_args(args)?;
     try_build_bootstrap_pd_http_router_service_from_model_with_decode_publisher(
         args,
         model,
@@ -970,7 +1049,7 @@ fn try_build_launch_mooncake_prefill_http_router_service(
     >,
     ServerLaunchError,
 > {
-    let model = BootstrapForwardModel::from_server_args(args)?;
+    let model = bootstrap_forward_model_from_server_args(args)?;
     let transfer_executor = MooncakeKvCacheTransferExecutor::new(
         UnlinkedMooncakeTransferEngine,
         launch_mooncake_prefill_kv_layout(&model)?,
@@ -994,7 +1073,7 @@ fn try_build_launch_mooncake_decode_http_router_service(
     >,
     ServerLaunchError,
 > {
-    let model = BootstrapForwardModel::from_server_args(args)?;
+    let model = bootstrap_forward_model_from_server_args(args)?;
     let kv_cache_layout = launch_mooncake_decode_kv_layout(&model)?;
     let transfer_executor = MooncakeKvCacheTransferExecutor::new(
         UnlinkedMooncakeTransferEngine,
@@ -1042,7 +1121,7 @@ fn try_build_launch_mooncake_prefill_grpc_router_service(
     >,
     ServerLaunchError,
 > {
-    let model = BootstrapForwardModel::from_server_args(args)?;
+    let model = bootstrap_forward_model_from_server_args(args)?;
     let transfer_executor = MooncakeKvCacheTransferExecutor::new(
         UnlinkedMooncakeTransferEngine,
         launch_mooncake_prefill_kv_layout(&model)?,
@@ -1066,7 +1145,7 @@ fn try_build_launch_mooncake_decode_grpc_router_service(
     >,
     ServerLaunchError,
 > {
-    let model = BootstrapForwardModel::from_server_args(args)?;
+    let model = bootstrap_forward_model_from_server_args(args)?;
     let kv_cache_layout = launch_mooncake_decode_kv_layout(&model)?;
     let transfer_executor = MooncakeKvCacheTransferExecutor::new(
         UnlinkedMooncakeTransferEngine,
@@ -1102,7 +1181,7 @@ fn try_build_launch_mooncake_prefill_http_router_service(
     >,
     ServerLaunchError,
 > {
-    let mut model = BootstrapForwardModel::from_server_args(args)?;
+    let mut model = bootstrap_forward_model_from_server_args(args)?;
     let engine_config = MooncakeTransferEngineConfig::from_pd_config_for_rank(
         prefill_mooncake_route_rank_ip(args),
         0,
@@ -1141,7 +1220,7 @@ fn try_build_launch_mooncake_decode_http_router_service(
     >,
     ServerLaunchError,
 > {
-    let mut model = BootstrapForwardModel::from_server_args(args)?;
+    let mut model = bootstrap_forward_model_from_server_args(args)?;
     let engine_config = MooncakeTransferEngineConfig::from_pd_config_for_rank(
         prefill_mooncake_route_rank_ip(args),
         0,
@@ -1184,7 +1263,7 @@ fn try_build_launch_mooncake_prefill_grpc_router_service(
     >,
     ServerLaunchError,
 > {
-    let mut model = BootstrapForwardModel::from_server_args(args)?;
+    let mut model = bootstrap_forward_model_from_server_args(args)?;
     let engine_config = MooncakeTransferEngineConfig::from_pd_config_for_rank(
         prefill_mooncake_route_rank_ip(args),
         0,
@@ -1223,7 +1302,7 @@ fn try_build_launch_mooncake_decode_grpc_router_service(
     >,
     ServerLaunchError,
 > {
-    let mut model = BootstrapForwardModel::from_server_args(args)?;
+    let mut model = bootstrap_forward_model_from_server_args(args)?;
     let engine_config = MooncakeTransferEngineConfig::from_pd_config_for_rank(
         prefill_mooncake_route_rank_ip(args),
         0,
@@ -1291,7 +1370,7 @@ where
     P: DecodeBootstrapPublisher,
 {
     validate_local_model_artifacts_if_present(args)?;
-    let model = BootstrapForwardModel::from_server_args(args)?;
+    let model = bootstrap_forward_model_from_server_args(args)?;
     try_build_bootstrap_pd_grpc_router_service_from_model_with_decode_publisher(
         args,
         model,
