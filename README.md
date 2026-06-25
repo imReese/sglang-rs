@@ -86,14 +86,6 @@ RoPE, and sampling/grammar helpers. The Rust runtime should depend on traits and
 typed buffers owned by `sglang-kernel`; backend-specific CUDA, CPU, Metal, ROCm,
 or MUSA details should stay behind feature-gated implementations.
 
-Runtime backend selection is an explicit launch-time contract. See
-[`docs/backend-capabilities.md`](docs/backend-capabilities.md) for the current
-production, CPU reference, and transfer backend boundaries. Backend
-implementation rules for agents live in [`AGENTS.md`](AGENTS.md), including the
-requirement to keep B200/CUDA as one backend target rather than core runtime
-logic. B200 validation is the first real GPU target and must use
-`--device cuda`; local MacBook smoke paths should use `--device cpu`.
-
 ## Current Scope
 
 This repository currently contains the first `sglang-srt` runtime crate and the
