@@ -91,7 +91,8 @@ Runtime backend selection is an explicit launch-time contract. See
 production, CPU reference, and transfer backend boundaries, and
 [`docs/backend-implementation-standards.md`](docs/backend-implementation-standards.md)
 for the implementation rules that keep B200/CUDA as one backend target rather
-than core runtime logic. B200 validation is the first real GPU target and must
+than core runtime logic. Agent-facing instructions are mirrored in
+[`AGENTS.md`](AGENTS.md). B200 validation is the first real GPU target and must
 use `--device cuda`; local MacBook smoke paths should use `--device cpu`.
 
 ## Current Scope
