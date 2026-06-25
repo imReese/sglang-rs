@@ -4,8 +4,7 @@ This project keeps compute backends, CPU reference execution, and transfer
 backends as separate launch-time capabilities. A worker must fail fast when the
 requested backend does not match the runtime that was actually loaded.
 
-Longer-term implementation rules live in
-[`backend-implementation-standards.md`](backend-implementation-standards.md).
+Agent-facing implementation rules live in [`../AGENTS.md`](../AGENTS.md).
 
 ## Runtime Backends
 
