@@ -21,7 +21,7 @@ pub struct ServerArgs {
     pub tp_size: usize,
     pub dp_size: usize,
     pub load_balance_method: String,
-    pub runtime_backend: String,
+    pub device: String,
     pub kv_cache_dtype: String,
     pub kv_cache_num_layers: Option<usize>,
     pub kv_cache_kv_heads: Option<usize>,
@@ -111,7 +111,8 @@ pub enum CliParseError {
         message: String,
     },
     InvalidLoadBalanceMethod(String),
-    InvalidRuntimeBackend(String),
+    InvalidDevice(String),
+    DeprecatedRuntimeBackendFlag,
     InvalidZmqPortRange(String),
 }
 
@@ -134,8 +135,14 @@ impl fmt::Display for CliParseError {
             Self::InvalidLoadBalanceMethod(value) => {
                 write!(formatter, "invalid --load-balance-method: {value}")
             }
-            Self::InvalidRuntimeBackend(value) => {
-                write!(formatter, "invalid --runtime-backend: {value}")
+            Self::InvalidDevice(value) => {
+                write!(formatter, "invalid --device: {value}")
+            }
+            Self::DeprecatedRuntimeBackendFlag => {
+                write!(
+                    formatter,
+                    "--runtime-backend is not a community SGLang CLI flag; use --device instead"
+                )
             }
             Self::InvalidZmqPortRange(value) => {
                 write!(formatter, "invalid --disaggregation-zmq-ports: {value}")
@@ -209,9 +216,11 @@ impl ArgParser {
                     self.parsed.load_balance_method =
                         parse_load_balance_method(self.take_value("--load-balance-method")?)?;
                 }
+                "--device" => {
+                    self.parsed.device = parse_device(self.take_value("--device")?)?;
+                }
                 "--runtime-backend" => {
-                    self.parsed.runtime_backend =
-                        parse_runtime_backend(self.take_value("--runtime-backend")?)?;
+                    return Err(CliParseError::DeprecatedRuntimeBackendFlag);
                 }
                 "--kv-cache-dtype" => {
                     self.parsed.kv_cache_dtype = self.take_value("--kv-cache-dtype")?;
@@ -476,7 +485,7 @@ impl ArgParser {
             tp_size: self.parsed.tp_size,
             dp_size: self.parsed.dp_size,
             load_balance_method,
-            runtime_backend: self.parsed.runtime_backend.clone(),
+            device: self.parsed.device.clone(),
             kv_cache_dtype: self.parsed.kv_cache_dtype.clone(),
             kv_cache_num_layers: self.parsed.kv_cache_num_layers,
             kv_cache_kv_heads: self.parsed.kv_cache_kv_heads,
@@ -588,7 +597,7 @@ struct PartialServerArgs {
     tp_size: usize,
     dp_size: usize,
     load_balance_method: String,
-    runtime_backend: String,
+    device: String,
     kv_cache_dtype: String,
     kv_cache_num_layers: Option<usize>,
     kv_cache_kv_heads: Option<usize>,
@@ -657,7 +666,7 @@ impl Default for PartialServerArgs {
             tp_size: 1,
             dp_size: 1,
             load_balance_method: "auto".to_string(),
-            runtime_backend: "auto".to_string(),
+            device: "auto".to_string(),
             kv_cache_dtype: "auto".to_string(),
             kv_cache_num_layers: None,
             kv_cache_kv_heads: None,
@@ -752,10 +761,10 @@ fn parse_load_balance_method(value: String) -> Result<String, CliParseError> {
     }
 }
 
-fn parse_runtime_backend(value: String) -> Result<String, CliParseError> {
+fn parse_device(value: String) -> Result<String, CliParseError> {
     match value.as_str() {
-        "auto" | "cpu-reference" | "cuda" | "metal" | "rocm" | "musa" => Ok(value),
-        _ => Err(CliParseError::InvalidRuntimeBackend(value)),
+        "auto" | "cpu" | "cuda" | "metal" | "rocm" | "musa" | "xpu" | "npu" | "hpu" => Ok(value),
+        _ => Err(CliParseError::InvalidDevice(value)),
     }
 }
 

@@ -235,11 +235,11 @@ fn validate_bootstrap_runtime_backend(
     args: &ServerArgs,
     model: &BootstrapForwardModel,
 ) -> Result<(), ServerLaunchError> {
-    let requested = RuntimeBackend::parse(&args.runtime_backend)
-        .ok_or_else(|| ServerLaunchError::InvalidRuntimeBackend(args.runtime_backend.clone()))?;
+    let requested = RuntimeBackend::parse(&args.device)
+        .ok_or_else(|| ServerLaunchError::InvalidDevice(args.device.clone()))?;
     let capability = model.runtime_capability();
     validate_runtime_backend(requested, &capability).map_err(|mismatch| {
-        ServerLaunchError::UnsupportedRuntimeBackend {
+        ServerLaunchError::UnsupportedDevice {
             requested: mismatch.requested.to_string(),
             actual: mismatch.actual.to_string(),
             runtime_name: mismatch.runtime_name.to_string(),
@@ -293,8 +293,8 @@ pub enum ServerLaunchError {
         model_path: String,
         model_type: Option<String>,
     },
-    InvalidRuntimeBackend(String),
-    UnsupportedRuntimeBackend {
+    InvalidDevice(String),
+    UnsupportedDevice {
         requested: String,
         actual: String,
         runtime_name: String,
@@ -349,17 +349,15 @@ impl PartialEq for ServerLaunchError {
                     model_type: right_model_type,
                 },
             ) => left_model_path == right_model_path && left_model_type == right_model_type,
-            (Self::InvalidRuntimeBackend(left), Self::InvalidRuntimeBackend(right)) => {
-                left == right
-            }
+            (Self::InvalidDevice(left), Self::InvalidDevice(right)) => left == right,
             (
-                Self::UnsupportedRuntimeBackend {
+                Self::UnsupportedDevice {
                     requested: left_requested,
                     actual: left_actual,
                     runtime_name: left_runtime_name,
                     reason: left_reason,
                 },
-                Self::UnsupportedRuntimeBackend {
+                Self::UnsupportedDevice {
                     requested: right_requested,
                     actual: right_actual,
                     runtime_name: right_runtime_name,
@@ -426,17 +424,17 @@ impl fmt::Display for ServerLaunchError {
                 "model {model_path} type {} does not expose transferable Mooncake KV memory",
                 model_type.as_deref().unwrap_or("<unknown>")
             ),
-            Self::InvalidRuntimeBackend(value) => {
-                write!(formatter, "invalid --runtime-backend: {value}")
+            Self::InvalidDevice(value) => {
+                write!(formatter, "invalid --device: {value}")
             }
-            Self::UnsupportedRuntimeBackend {
+            Self::UnsupportedDevice {
                 requested,
                 actual,
                 runtime_name,
                 reason,
             } => write!(
                 formatter,
-                "runtime backend {requested} is not supported by loaded runtime {runtime_name} ({actual}): {reason}"
+                "device {requested} is not supported by loaded runtime {runtime_name} ({actual}): {reason}"
             ),
             Self::DeepSeekRuntime(error) => write!(formatter, "DeepSeek runtime error: {error}"),
             Self::DeepSeekTensorShardLoad(error) => {

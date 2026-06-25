@@ -53,26 +53,26 @@ fn grpc_listen_addr_uses_server_host_and_port() {
 }
 
 #[test]
-fn bootstrap_cuda_runtime_rejects_space_reference_fallback() {
+fn bootstrap_cuda_device_rejects_space_reference_fallback() {
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
         "dummy",
-        "--runtime-backend",
+        "--device",
         "cuda",
         "--grpc-mode",
     ])
     .expect("args should parse");
 
     let error = match try_build_bootstrap_grpc_router_service(&args) {
-        Ok(_) => panic!("cuda runtime must not fall back to bootstrap Space reference model"),
+        Ok(_) => panic!("cuda device must not fall back to bootstrap Space reference model"),
         Err(error) => error,
     };
 
     assert!(
         matches!(
             error,
-            ServerLaunchError::UnsupportedRuntimeBackend {
+            ServerLaunchError::UnsupportedDevice {
                 ref requested,
                 ref actual,
                 ..

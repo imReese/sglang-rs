@@ -89,8 +89,8 @@ or MUSA details should stay behind feature-gated implementations.
 Runtime backend selection is an explicit launch-time contract. See
 [`docs/backend-capabilities.md`](docs/backend-capabilities.md) for the current
 production, CPU reference, and transfer backend boundaries. B200 validation is
-the first real GPU target and must use `--runtime-backend cuda`; local MacBook
-smoke paths should use `--runtime-backend cpu-reference`.
+the first real GPU target and must use `--device cuda`; local MacBook smoke
+paths should use `--device cpu`.
 
 ## Current Scope
 
@@ -107,7 +107,7 @@ This repository currently contains the first `sglang-srt` runtime crate and the
   available in CI.
 - `cli`: `sglang serve`-style argument parsing for `--model-path`/`--model`,
   `--host`, `--port`, `--tp-size`, `--dp-size`, `--grpc-mode`,
-  `--served-model-name`, `--tokenizer-path`, `--runtime-backend`, and the upstream PD
+  `--served-model-name`, `--tokenizer-path`, `--device`, and the upstream PD
   disaggregation flags, with unknown server args preserved for incremental
   upstream compatibility. The crate builds both `sglang` and `sglang-rs`
   binaries so the upstream command shape works.

@@ -5,22 +5,28 @@ use crate::transfer::TransferBackend;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeBackend {
     Auto,
-    CpuReference,
+    Cpu,
     Cuda,
     Metal,
     Rocm,
     Musa,
+    Xpu,
+    Npu,
+    Hpu,
 }
 
 impl RuntimeBackend {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "auto" => Some(Self::Auto),
-            "cpu-reference" => Some(Self::CpuReference),
+            "cpu" => Some(Self::Cpu),
             "cuda" => Some(Self::Cuda),
             "metal" => Some(Self::Metal),
             "rocm" => Some(Self::Rocm),
             "musa" => Some(Self::Musa),
+            "xpu" => Some(Self::Xpu),
+            "npu" => Some(Self::Npu),
+            "hpu" => Some(Self::Hpu),
             _ => None,
         }
     }
@@ -28,16 +34,22 @@ impl RuntimeBackend {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
-            Self::CpuReference => "cpu-reference",
+            Self::Cpu => "cpu",
             Self::Cuda => "cuda",
             Self::Metal => "metal",
             Self::Rocm => "rocm",
             Self::Musa => "musa",
+            Self::Xpu => "xpu",
+            Self::Npu => "npu",
+            Self::Hpu => "hpu",
         }
     }
 
-    pub fn is_production(self) -> bool {
-        matches!(self, Self::Cuda | Self::Metal | Self::Rocm | Self::Musa)
+    pub fn requires_production_runtime(self) -> bool {
+        matches!(
+            self,
+            Self::Cuda | Self::Metal | Self::Rocm | Self::Musa | Self::Xpu | Self::Npu | Self::Hpu
+        )
     }
 }
 
@@ -107,7 +119,7 @@ impl RuntimeCapability {
         backend: RuntimeBackend,
         supports_transferable_kv: bool,
     ) -> Self {
-        debug_assert!(backend.is_production());
+        debug_assert!(backend.requires_production_runtime());
         Self {
             runtime_name,
             class: RuntimeCapabilityClass::Production(backend),
@@ -135,7 +147,7 @@ pub fn validate_runtime_backend(
 ) -> Result<(), RuntimeBackendMismatch> {
     match requested {
         RuntimeBackend::Auto => Ok(()),
-        RuntimeBackend::CpuReference => {
+        RuntimeBackend::Cpu => {
             if capability.class == RuntimeCapabilityClass::CpuReference
                 && capability.supports_forward
             {
@@ -145,14 +157,17 @@ pub fn validate_runtime_backend(
                     requested,
                     actual: capability.backend_label(),
                     runtime_name: capability.runtime_name,
-                    reason: "requested CPU reference backend but the loaded runtime is not an executable CPU reference model",
+                    reason: "requested CPU device but the loaded runtime is not an executable CPU reference model",
                 })
             }
         }
         requested @ (RuntimeBackend::Cuda
         | RuntimeBackend::Metal
         | RuntimeBackend::Rocm
-        | RuntimeBackend::Musa) => {
+        | RuntimeBackend::Musa
+        | RuntimeBackend::Xpu
+        | RuntimeBackend::Npu
+        | RuntimeBackend::Hpu) => {
             if capability.class == RuntimeCapabilityClass::Production(requested)
                 && capability.supports_forward
             {
@@ -162,7 +177,7 @@ pub fn validate_runtime_backend(
                     requested,
                     actual: capability.backend_label(),
                     runtime_name: capability.runtime_name,
-                    reason: "requested production backend but no matching executable production runtime is registered",
+                    reason: "requested accelerator device but no matching executable production runtime is registered",
                 })
             }
         }

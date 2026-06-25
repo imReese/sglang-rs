@@ -28,7 +28,7 @@ TP_SIZE="${TP_SIZE:-8}"
 DP_SIZE="${DP_SIZE:-1}"
 PAGE_SIZE="${PAGE_SIZE:-64}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-auto}"
-RUNTIME_BACKEND="${RUNTIME_BACKEND:-cuda}"
+DEVICE="${DEVICE:-cuda}"
 TRANSFER_BACKEND="${TRANSFER_BACKEND:-mooncake}"
 NUM_RESERVED_DECODE_TOKENS="${NUM_RESERVED_DECODE_TOKENS:-512}"
 
@@ -121,7 +121,7 @@ common_worker_args=(
     --trust-remote-code
     --tp-size "$TP_SIZE"
     --dp-size "$DP_SIZE"
-    --runtime-backend "$RUNTIME_BACKEND"
+    --device "$DEVICE"
     --page-size "$PAGE_SIZE"
     --kv-cache-dtype "$KV_CACHE_DTYPE"
     --num-reserved-decode-tokens "$NUM_RESERVED_DECODE_TOKENS"
