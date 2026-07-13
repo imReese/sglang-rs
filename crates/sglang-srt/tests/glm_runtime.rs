@@ -771,6 +771,97 @@ fn glm_cached_forward_model_exposes_nonzero_mooncake_kv_memory_before_prefill() 
 }
 
 #[test]
+fn glm_cached_forward_model_groups_registered_transfer_memory_by_physical_page() {
+    let model_dir = temp_model_dir("glm-runtime-physical-mooncake-pages");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_glm_moe_dsa_attention_output_fixture(&model_dir);
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("GLM artifacts should load");
+    let runtime =
+        GlmMoeDsaRuntime::from_local_model_artifacts(&artifacts).expect("runtime should build");
+    let f32_runtime = runtime
+        .load_tensor_parallel_shards(2)
+        .expect("all TP rank shards should load")
+        .decode_f32_tensor_parallel_shards()
+        .expect("F32 cache should decode");
+    let mut model = GlmMoeDsaF32CachedForwardModel::new(f32_runtime);
+    let token_slot_size_bytes = model
+        .mooncake_kv_cache_memory()
+        .expect("initial KV memory should be available")
+        .page_size_bytes();
+
+    model
+        .reserve_transfer_slots(8, 4)
+        .expect("physical page layout should be valid");
+    let memory = model
+        .mooncake_kv_cache_memory()
+        .expect("reserved KV memory should be available");
+
+    assert_eq!(memory.page_size_bytes(), token_slot_size_bytes * 4);
+    assert_eq!(memory.regions()[0].byte_len, token_slot_size_bytes * 8);
+    assert_eq!(memory.regions()[0].byte_len / memory.page_size_bytes(), 2);
+    let registered_base_addr = memory.regions()[0].base_addr;
+
+    let batch = single_request_prefill_worker_batch(vec![0], vec![CachePageId::from(0)]);
+    model
+        .forward(&batch)
+        .expect("prefill should refresh reserved transfer memory in place");
+    let refreshed_memory = model
+        .mooncake_kv_cache_memory()
+        .expect("refreshed KV memory should be available");
+    assert_eq!(
+        refreshed_memory.regions()[0].base_addr,
+        registered_base_addr
+    );
+    assert_eq!(
+        refreshed_memory.page_size_bytes(),
+        token_slot_size_bytes * 4
+    );
+    assert_eq!(
+        refreshed_memory.regions()[0].byte_len,
+        token_slot_size_bytes * 8
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn glm_cached_forward_model_rejects_invalid_transfer_page_geometry() {
+    let model_dir = temp_model_dir("glm-runtime-invalid-mooncake-pages");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_glm_moe_dsa_attention_output_fixture(&model_dir);
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("GLM artifacts should load");
+    let runtime =
+        GlmMoeDsaRuntime::from_local_model_artifacts(&artifacts).expect("runtime should build");
+    let f32_runtime = runtime
+        .load_tensor_parallel_shards(2)
+        .expect("all TP rank shards should load")
+        .decode_f32_tensor_parallel_shards()
+        .expect("F32 cache should decode");
+    let mut model = GlmMoeDsaF32CachedForwardModel::new(f32_runtime);
+
+    let zero_page = model
+        .reserve_transfer_slots(8, 0)
+        .expect_err("zero page size should fail");
+    assert!(zero_page.to_string().contains("must be non-zero"));
+    let zero_capacity = model
+        .reserve_transfer_slots(0, 4)
+        .expect_err("zero slot capacity should fail");
+    assert!(
+        zero_capacity
+            .to_string()
+            .contains("capacity must be non-zero")
+    );
+    let unaligned = model
+        .reserve_transfer_slots(10, 4)
+        .expect_err("unaligned slot capacity should fail");
+    assert!(unaligned.to_string().contains("must be divisible"));
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
 fn glm_cached_forward_model_exposes_nonzero_mooncake_kv_memory_after_prefill() {
     let model_dir = temp_model_dir("glm-runtime-mooncake-kv-memory");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");

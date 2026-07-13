@@ -808,12 +808,12 @@ impl MooncakeDecodeBootstrapPublisher {
             dst_port: self.dst_port,
             mooncake_session_id: self.mooncake_session_id.clone(),
             dst_kv_indices: span
-                .cache_pages()
+                .page_indices()
                 .iter()
                 .map(|page| {
                     i32::try_from(page.as_usize()).map_err(|_| {
                         format!(
-                            "cache page {} cannot fit into Mooncake metadata i32 index",
+                            "physical KV page {} cannot fit into Mooncake metadata i32 index",
                             page.as_usize()
                         )
                     })

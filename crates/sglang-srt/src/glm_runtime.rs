@@ -1097,7 +1097,10 @@ pub struct GlmMoeDsaF32CachedForwardModel {
 
 #[derive(Clone, Debug, PartialEq)]
 struct GlmMoeDsaF32TransferPageStore {
+    token_slot_size_bytes: usize,
     page_size_bytes: usize,
+    slot_capacity: usize,
+    registration_locked: bool,
     pages: Vec<u8>,
 }
 
@@ -1170,27 +1173,49 @@ impl GlmMoeDsaF32CachedForwardModel {
         Ok(())
     }
 
-    #[cfg(feature = "mooncake-link")]
-    pub(crate) fn reserve_transfer_pages(
+    pub fn reserve_transfer_slots(
         &mut self,
-        page_count: usize,
+        slot_capacity: usize,
+        page_size: usize,
     ) -> Result<(), KvCacheTransferError> {
-        let page_size_bytes = self
+        if page_size == 0 {
+            return Err(KvCacheTransferError::Runtime(
+                "GLM transfer KV page size must be non-zero".to_string(),
+            ));
+        }
+        if slot_capacity == 0 {
+            return Err(KvCacheTransferError::Runtime(
+                "GLM transfer KV slot capacity must be non-zero".to_string(),
+            ));
+        }
+        if !slot_capacity.is_multiple_of(page_size) {
+            return Err(KvCacheTransferError::Runtime(format!(
+                "GLM transfer KV slot capacity {slot_capacity} must be divisible by page size {page_size}"
+            )));
+        }
+        let token_slot_size_bytes = self
             .runtime
             .zero_transfer_page_size_bytes()
             .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
-        let byte_len = page_count
-            .max(1)
-            .checked_mul(page_size_bytes)
+        let page_size_bytes = page_size
+            .checked_mul(token_slot_size_bytes)
+            .ok_or_else(|| {
+                KvCacheTransferError::Runtime(
+                    "GLM transfer physical page size overflowed".to_string(),
+                )
+            })?;
+        let byte_len = slot_capacity
+            .checked_mul(token_slot_size_bytes)
             .ok_or_else(|| {
                 KvCacheTransferError::Runtime(
                     "GLM transfer KV page backing store length overflowed".to_string(),
                 )
             })?;
+        self.transfer_pages.token_slot_size_bytes = token_slot_size_bytes;
         self.transfer_pages.page_size_bytes = page_size_bytes;
-        if self.transfer_pages.pages.len() < byte_len {
-            self.transfer_pages.pages.resize(byte_len, 0);
-        }
+        self.transfer_pages.slot_capacity = slot_capacity;
+        self.transfer_pages.registration_locked = true;
+        self.transfer_pages.pages.resize(byte_len, 0);
         Ok(())
     }
 
@@ -1202,13 +1227,13 @@ impl GlmMoeDsaF32CachedForwardModel {
         cache_pages.sort_unstable();
         cache_pages.dedup();
 
-        let Some(max_cache_page) = cache_pages.iter().copied().max() else {
-            self.transfer_pages.pages.clear();
+        let Some(max_cache_slot) = cache_pages.iter().copied().max() else {
+            self.transfer_pages.pages.fill(0);
             return Ok(());
         };
 
         let mut serialized_pages = Vec::with_capacity(cache_pages.len());
-        let mut page_size_bytes = None;
+        let token_slot_size_bytes = self.transfer_pages.token_slot_size_bytes;
         for cache_page_index in cache_pages {
             let cache_page = CachePageId::from(cache_page_index);
             let page = self.serialize_transfer_page(cache_page)?;
@@ -1217,43 +1242,49 @@ impl GlmMoeDsaF32CachedForwardModel {
                     "GLM transfer KV page serialization produced an empty page".to_string(),
                 ));
             }
-            match page_size_bytes {
-                Some(expected) if expected != page.len() => {
-                    return Err(KvCacheTransferError::Runtime(format!(
-                        "GLM transfer KV page {} serialized to {} bytes but expected {expected}",
-                        cache_page_index,
-                        page.len()
-                    )));
-                }
-                None => page_size_bytes = Some(page.len()),
-                _ => {}
+            if page.len() != token_slot_size_bytes {
+                return Err(KvCacheTransferError::Runtime(format!(
+                    "GLM transfer KV slot {} serialized to {} bytes but expected {token_slot_size_bytes}",
+                    cache_page_index,
+                    page.len()
+                )));
             }
             serialized_pages.push((cache_page, page));
         }
 
-        let page_size_bytes = page_size_bytes.unwrap_or(1);
-        let byte_len = max_cache_page
-            .checked_add(1)
-            .and_then(|page_count| page_count.checked_mul(page_size_bytes))
-            .ok_or_else(|| {
-                KvCacheTransferError::Runtime(
-                    "GLM transfer KV page backing store length overflowed".to_string(),
-                )
-            })?;
-        self.transfer_pages.page_size_bytes = page_size_bytes;
-        self.transfer_pages.pages.clear();
-        self.transfer_pages.pages.resize(byte_len, 0);
+        let required_slot_capacity = max_cache_slot.checked_add(1).ok_or_else(|| {
+            KvCacheTransferError::Runtime("GLM transfer KV slot capacity overflowed".to_string())
+        })?;
+        if required_slot_capacity > self.transfer_pages.slot_capacity {
+            if self.transfer_pages.registration_locked {
+                return Err(KvCacheTransferError::Runtime(format!(
+                    "GLM transfer KV slot {max_cache_slot} exceeds registered slot capacity {}",
+                    self.transfer_pages.slot_capacity
+                )));
+            }
+            let byte_len = required_slot_capacity
+                .checked_mul(token_slot_size_bytes)
+                .ok_or_else(|| {
+                    KvCacheTransferError::Runtime(
+                        "GLM transfer KV page backing store length overflowed".to_string(),
+                    )
+                })?;
+            self.transfer_pages.slot_capacity = required_slot_capacity;
+            self.transfer_pages.pages.resize(byte_len, 0);
+        }
+        self.transfer_pages.pages.fill(0);
 
         for (cache_page, page) in serialized_pages {
             let offset = cache_page
                 .as_usize()
-                .checked_mul(page_size_bytes)
+                .checked_mul(token_slot_size_bytes)
                 .ok_or_else(|| {
                     KvCacheTransferError::Runtime(
                         "GLM transfer KV page offset overflowed".to_string(),
                     )
                 })?;
-            self.transfer_pages.pages[offset..offset + page_size_bytes].copy_from_slice(&page);
+            self.transfer_pages.pages[offset..offset + token_slot_size_bytes]
+                .copy_from_slice(&page);
         }
 
         Ok(())
@@ -1283,12 +1314,15 @@ impl GlmMoeDsaF32CachedForwardModel {
 
 impl GlmMoeDsaF32TransferPageStore {
     fn initial_for_runtime(runtime: &GlmMoeDsaF32TensorParallelRuntime) -> Self {
-        let page_size_bytes = runtime
+        let token_slot_size_bytes = runtime
             .zero_transfer_page_size_bytes()
             .expect("GLM runtime should expose transfer page dimensions");
         Self {
-            page_size_bytes,
-            pages: vec![0; page_size_bytes],
+            token_slot_size_bytes,
+            page_size_bytes: token_slot_size_bytes,
+            slot_capacity: 1,
+            registration_locked: false,
+            pages: vec![0; token_slot_size_bytes],
         }
     }
 }

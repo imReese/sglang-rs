@@ -25,11 +25,13 @@ fn page_major_layout_matches_page_layer_tensor_token_order() {
     assert_eq!(layout.bytes_per_layer_page(), 256);
     assert_eq!(layout.bytes_per_tensor_page(), 128);
     assert_eq!(layout.total_byte_len(), 1_536);
+    assert_eq!(layout.slot_count(), 12);
     assert_eq!(layout.page_byte_range(1).unwrap(), 512..1_024);
     assert_eq!(
         layout.tensor_token_byte_range(1, 1, 1, 3).unwrap(),
         992..1_024
     );
+    assert_eq!(layout.tensor_slot_byte_range(1, 1, 7).unwrap(), 992..1_024);
 }
 
 #[test]
@@ -62,6 +64,13 @@ fn page_major_layout_rejects_out_of_range_coordinates() {
         Err(CudaKvCachePoolError::TokenOutOfRange {
             token_index: 4,
             page_size: 4,
+        })
+    );
+    assert_eq!(
+        layout.tensor_slot_byte_range(0, 0, 12),
+        Err(CudaKvCachePoolError::SlotOutOfRange {
+            slot_index: 12,
+            slot_count: 12,
         })
     );
 }

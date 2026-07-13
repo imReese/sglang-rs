@@ -2048,7 +2048,7 @@ async fn http_prefill_server_reports_router_server_info_with_kv_events() {
         "--disaggregation-zmq-ports",
         &format!("{}-{}", zmq_ports[0], zmq_ports[1]),
         "--num-reserved-decode-tokens",
-        "8",
+        "64",
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
@@ -2584,7 +2584,7 @@ async fn http_server_poll_transfers_advances_async_pd_batches() {
     assert_eq!(poll["pending_batches"], 0);
     assert_eq!(
         poll["completed_descriptor_checksums"],
-        serde_json::json!(["3a28678f92e361c8779d100ed9bf59682510b6fd5ad51f0cfc9b3b14494f491b"])
+        serde_json::json!(["e37f348404de723244ca004c09d05fccfdcad793f9013bd1f882c332d1c50b5d"])
     );
     assert_eq!(poll["pending_descriptor_checksums"], serde_json::json!([]));
 

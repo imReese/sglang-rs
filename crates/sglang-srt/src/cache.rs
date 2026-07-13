@@ -10,6 +10,16 @@ impl CachePageId {
     pub fn as_usize(&self) -> usize {
         self.0
     }
+
+    pub fn page_index(&self, page_size: usize) -> usize {
+        assert!(page_size > 0, "KV cache page size must be non-zero");
+        self.0 / page_size
+    }
+
+    pub fn slot_index_in_page(&self, page_size: usize) -> usize {
+        assert!(page_size > 0, "KV cache page size must be non-zero");
+        self.0 % page_size
+    }
 }
 
 impl From<usize> for CachePageId {
@@ -51,18 +61,38 @@ impl std::error::Error for RadixCacheError {}
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum CacheAllocationError {
-    OutOfPages { requested: usize, available: usize },
+    ZeroPageSize,
+    ZeroSlotCapacity,
+    SlotCapacityNotPageAligned {
+        slot_capacity: usize,
+        page_size: usize,
+    },
+    OutOfSlots {
+        requested: usize,
+        available: usize,
+    },
 }
 
 impl fmt::Display for CacheAllocationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::OutOfPages {
+            Self::ZeroPageSize => formatter.write_str("KV cache page size must be non-zero"),
+            Self::ZeroSlotCapacity => {
+                formatter.write_str("KV cache slot capacity must be non-zero")
+            }
+            Self::SlotCapacityNotPageAligned {
+                slot_capacity,
+                page_size,
+            } => write!(
+                formatter,
+                "KV cache slot capacity {slot_capacity} must be divisible by page size {page_size}"
+            ),
+            Self::OutOfSlots {
                 requested,
                 available,
             } => write!(
                 formatter,
-                "requested {requested} cache pages but only {available} are available"
+                "requested {requested} KV cache slots but only {available} are available"
             ),
         }
     }
@@ -309,46 +339,136 @@ struct KvBlockPrefixNode {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CachePageAllocator {
-    page_count: usize,
-    free_pages: VecDeque<CachePageId>,
+    slot_capacity: usize,
+    page_size: usize,
+    free_page_indices: VecDeque<usize>,
+    allocated_page_indices: BTreeSet<usize>,
 }
 
 impl CachePageAllocator {
-    pub fn new(page_count: usize) -> Self {
-        Self {
-            page_count,
-            free_pages: (0..page_count).map(CachePageId::from).collect(),
+    pub fn new(slot_capacity: usize) -> Self {
+        Self::with_page_size(slot_capacity, 1).expect("KV cache slot capacity must be non-zero")
+    }
+
+    pub fn with_page_size(
+        slot_capacity: usize,
+        page_size: usize,
+    ) -> Result<Self, CacheAllocationError> {
+        if page_size == 0 {
+            return Err(CacheAllocationError::ZeroPageSize);
         }
+        if slot_capacity == 0 {
+            return Err(CacheAllocationError::ZeroSlotCapacity);
+        }
+        if !slot_capacity.is_multiple_of(page_size) {
+            return Err(CacheAllocationError::SlotCapacityNotPageAligned {
+                slot_capacity,
+                page_size,
+            });
+        }
+        let page_count = slot_capacity / page_size;
+        Ok(Self {
+            slot_capacity,
+            page_size,
+            free_page_indices: (0..page_count).collect(),
+            allocated_page_indices: BTreeSet::new(),
+        })
     }
 
     pub fn available_pages(&self) -> usize {
-        self.free_pages.len()
+        self.free_page_indices.len()
+    }
+
+    pub fn available_slots(&self) -> usize {
+        self.free_page_indices.len() * self.page_size
+    }
+
+    pub fn page_size(&self) -> usize {
+        self.page_size
     }
 
     pub fn allocate(
         &mut self,
-        page_count: usize,
+        slot_count: usize,
     ) -> Result<Vec<CachePageId>, CacheAllocationError> {
-        if page_count > self.free_pages.len() {
-            return Err(CacheAllocationError::OutOfPages {
-                requested: page_count,
-                available: self.free_pages.len(),
+        self.allocate_for_sequence(&[], slot_count)
+    }
+
+    pub fn allocate_for_sequence(
+        &mut self,
+        sequence_slots: &[CachePageId],
+        slot_count: usize,
+    ) -> Result<Vec<CachePageId>, CacheAllocationError> {
+        if slot_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let reusable_tail_slots = sequence_slots
+            .last()
+            .filter(|slot| {
+                self.allocated_page_indices
+                    .contains(&slot.page_index(self.page_size))
+            })
+            .map(|slot| self.page_size - slot.slot_index_in_page(self.page_size) - 1)
+            .unwrap_or(0)
+            .min(slot_count);
+        let new_slot_count = slot_count - reusable_tail_slots;
+        let required_page_count = new_slot_count.div_ceil(self.page_size);
+        if required_page_count > self.free_page_indices.len() {
+            return Err(CacheAllocationError::OutOfSlots {
+                requested: slot_count,
+                available: reusable_tail_slots + self.available_slots(),
             });
         }
 
-        Ok((0..page_count)
-            .filter_map(|_| self.free_pages.pop_front())
-            .collect())
+        let mut slots = Vec::with_capacity(slot_count);
+        if reusable_tail_slots > 0 {
+            let first_slot = sequence_slots
+                .last()
+                .expect("reusable tail requires a sequence slot")
+                .as_usize()
+                + 1;
+            slots.extend((first_slot..first_slot + reusable_tail_slots).map(CachePageId::from));
+        }
+
+        let mut remaining_new_slots = new_slot_count;
+        for _ in 0..required_page_count {
+            let page_index = self
+                .free_page_indices
+                .pop_front()
+                .expect("page availability was checked before allocation");
+            self.allocated_page_indices.insert(page_index);
+            let slots_in_page = remaining_new_slots.min(self.page_size);
+            let first_slot = page_index * self.page_size;
+            slots.extend((first_slot..first_slot + slots_in_page).map(CachePageId::from));
+            remaining_new_slots -= slots_in_page;
+        }
+        Ok(slots)
     }
 
     pub fn release(&mut self, cache_pages: &[CachePageId]) {
-        for cache_page in cache_pages.iter().rev() {
-            self.free_pages.push_front(*cache_page);
+        let mut released_page_indices = Vec::new();
+        for slot in cache_pages {
+            // A page is owned by the allocation that contains its first slot.
+            // This keeps a failed tail-slot decode from releasing the sequence's
+            // existing physical page.
+            if slot.as_usize() >= self.slot_capacity || slot.slot_index_in_page(self.page_size) != 0
+            {
+                continue;
+            }
+            let page_index = slot.page_index(self.page_size);
+            if self.allocated_page_indices.remove(&page_index) {
+                released_page_indices.push(page_index);
+            }
+        }
+        for page_index in released_page_indices.into_iter().rev() {
+            self.free_page_indices.push_front(page_index);
         }
     }
 
     pub fn reset(&mut self) {
-        self.free_pages = (0..self.page_count).map(CachePageId::from).collect();
+        self.free_page_indices = (0..self.slot_capacity / self.page_size).collect();
+        self.allocated_page_indices.clear();
     }
 }
 
@@ -407,6 +527,16 @@ impl RadixCache {
             cache_pages,
             remaining_input_ids: input_ids[matched_token_count..].to_vec(),
         }
+    }
+
+    pub fn match_prefix_page_aligned(&self, input_ids: &[u32], page_size: usize) -> PrefixMatch {
+        assert!(page_size > 0, "KV cache page size must be non-zero");
+        let mut prefix_match = self.match_prefix(input_ids);
+        let aligned_token_count = prefix_match.matched_token_count / page_size * page_size;
+        prefix_match.matched_token_count = aligned_token_count;
+        prefix_match.cache_pages.truncate(aligned_token_count);
+        prefix_match.remaining_input_ids = input_ids[aligned_token_count..].to_vec();
+        prefix_match
     }
 }
 

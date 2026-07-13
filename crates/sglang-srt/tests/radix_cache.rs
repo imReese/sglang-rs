@@ -106,6 +106,38 @@ fn clear_removes_cached_prefix_matches() {
 }
 
 #[test]
+fn page_aligned_match_does_not_reuse_a_partial_physical_page() {
+    let mut cache = RadixCache::default();
+    cache
+        .insert(
+            &[1, 2, 3, 4, 5, 6],
+            &[
+                CachePageId::from(8),
+                CachePageId::from(9),
+                CachePageId::from(10),
+                CachePageId::from(11),
+                CachePageId::from(16),
+                CachePageId::from(17),
+            ],
+        )
+        .expect("insert should succeed");
+
+    let matched = cache.match_prefix_page_aligned(&[1, 2, 3, 4, 5, 6, 7], 4);
+
+    assert_eq!(matched.matched_token_count, 4);
+    assert_eq!(
+        matched.cache_pages,
+        vec![
+            CachePageId::from(8),
+            CachePageId::from(9),
+            CachePageId::from(10),
+            CachePageId::from(11),
+        ]
+    );
+    assert_eq!(matched.remaining_input_ids, vec![5, 6, 7]);
+}
+
+#[test]
 fn scheduler_applies_radix_cache_match_before_dispatching_to_worker() {
     let mut cache = RadixCache::default();
     cache

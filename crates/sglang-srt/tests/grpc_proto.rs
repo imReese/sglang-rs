@@ -1540,7 +1540,7 @@ async fn grpc_poll_transfers_advances_async_pd_batches() {
     assert_eq!(response.pending_batches, 0);
     assert_eq!(
         response.completed_descriptor_checksums,
-        vec!["ad7c0f474c403432d07c9165fb35d01a3f728314d9585dad67faa03d59760569".to_string()]
+        vec!["d6082ffcfe5ec89b5d6fc6bf24e3bd4671d97b4235caba245d206141e8184210".to_string()]
     );
     assert!(response.pending_descriptor_checksums.is_empty());
 }

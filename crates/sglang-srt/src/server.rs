@@ -186,13 +186,14 @@ impl BootstrapForwardModel {
     }
 
     #[cfg(feature = "mooncake-link")]
-    fn reserve_mooncake_kv_cache_pages(
+    fn reserve_mooncake_kv_cache_slots(
         &mut self,
-        page_count: usize,
+        slot_capacity: usize,
+        page_size: usize,
     ) -> Result<(), ServerLaunchError> {
         match self {
             Self::GlmMoeDsa(model) => model
-                .reserve_transfer_pages(page_count)
+                .reserve_transfer_slots(slot_capacity, page_size)
                 .map_err(|error| ServerLaunchError::KvCacheTransfer(error.to_string())),
             Self::UnsupportedLocalModelRuntime {
                 model_path,
@@ -937,6 +938,13 @@ pub fn build_bootstrap_prefill_http_router_service(
     try_build_bootstrap_prefill_http_router_service(args).expect("bootstrap tokenizer should load")
 }
 
+fn cache_page_allocator_from_server_args(
+    args: &ServerArgs,
+) -> Result<CachePageAllocator, ServerLaunchError> {
+    CachePageAllocator::with_page_size(args.num_reserved_decode_tokens, args.page_size)
+        .map_err(|error| ServerLaunchError::KvCacheTransfer(error.to_string()))
+}
+
 pub fn try_build_bootstrap_prefill_http_router_service(
     args: &ServerArgs,
 ) -> Result<BootstrapPrefillHttpRouterService, ServerLaunchError> {
@@ -945,11 +953,12 @@ pub fn try_build_bootstrap_prefill_http_router_service(
         ModelRunner::new(bootstrap_forward_model_from_server_args(args)?),
         DecodeBootstrapRegistry::default(),
         FakeKvCacheTransferExecutor::default(),
-    );
+    )
+    .with_kv_page_size(args.page_size);
     let scheduler = Scheduler::with_cache_resources(
         worker,
         RadixCache::default(),
-        CachePageAllocator::new(args.num_reserved_decode_tokens),
+        cache_page_allocator_from_server_args(args)?,
     )
     .with_max_running_requests(args.max_running_requests);
     let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
@@ -1032,14 +1041,15 @@ where
 {
     let mut worker =
         KvTransferModelWorker::new(ModelRunner::new(model), registry, transfer_executor)
-            .with_decode_bootstrap_publisher(decode_bootstrap_publisher);
+            .with_decode_bootstrap_publisher(decode_bootstrap_publisher)
+            .with_kv_page_size(args.page_size);
     if decode_side_bootstrap_only {
         worker = worker.with_decode_side_bootstrap_only();
     }
     let scheduler = Scheduler::with_cache_resources(
         worker,
         RadixCache::default(),
-        CachePageAllocator::new(args.num_reserved_decode_tokens),
+        cache_page_allocator_from_server_args(args)?,
     )
     .with_max_running_requests(args.max_running_requests);
     let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
@@ -1189,7 +1199,8 @@ fn mooncake_kv_memory_from_bootstrap_model(
 fn prepare_linked_mooncake_kv_memory(
     model: &mut BootstrapForwardModel,
     engine: &SharedLinkedMooncakeTransferEngine,
-    page_count: usize,
+    slot_capacity: usize,
+    page_size: usize,
 ) -> Result<RegisteredMooncakeKvCacheMemory<SharedLinkedMooncakeTransferEngine>, ServerLaunchError>
 {
     model
@@ -1203,7 +1214,7 @@ fn prepare_linked_mooncake_kv_memory(
             runtime_name: mismatch.runtime_name.to_string(),
             missing: mismatch.missing,
         })?;
-    model.reserve_mooncake_kv_cache_pages(page_count)?;
+    model.reserve_mooncake_kv_cache_slots(slot_capacity, page_size)?;
     let memory = mooncake_kv_memory_from_bootstrap_model(model)?;
     RegisteredMooncakeKvCacheMemory::register(engine.clone(), memory).map_err(Into::into)
 }
@@ -1360,8 +1371,12 @@ fn try_build_launch_mooncake_prefill_http_router_service(
         pd_config,
     );
     let engine = SharedLinkedMooncakeTransferEngine::new(&engine_config)?;
-    let kv_registration =
-        prepare_linked_mooncake_kv_memory(&mut model, &engine, args.num_reserved_decode_tokens)?;
+    let kv_registration = prepare_linked_mooncake_kv_memory(
+        &mut model,
+        &engine,
+        args.num_reserved_decode_tokens,
+        args.page_size,
+    )?;
     let kv_cache_layout = kv_registration.memory().prefill_layout(0);
     let target_resolver = MooncakeSessionTargetResolver::new(engine.clone(), Vec::new());
     let transfer_executor = MooncakeKvCacheTransferExecutor::with_target_resolver(
@@ -1403,8 +1418,12 @@ fn try_build_launch_mooncake_decode_http_router_service(
     );
     let engine = SharedLinkedMooncakeTransferEngine::new(&engine_config)?;
     let mooncake_session_id = engine.local_endpoint()?;
-    let kv_registration =
-        prepare_linked_mooncake_kv_memory(&mut model, &engine, args.num_reserved_decode_tokens)?;
+    let kv_registration = prepare_linked_mooncake_kv_memory(
+        &mut model,
+        &engine,
+        args.num_reserved_decode_tokens,
+        args.page_size,
+    )?;
     let target_resolver = MooncakeSessionTargetResolver::new(engine.clone(), Vec::new());
     let kv_cache_layout = kv_registration.memory().prefill_layout(0);
     let transfer_executor = MooncakeKvCacheTransferExecutor::with_target_resolver(
@@ -1447,8 +1466,12 @@ fn try_build_launch_mooncake_prefill_grpc_router_service(
         pd_config,
     );
     let engine = SharedLinkedMooncakeTransferEngine::new(&engine_config)?;
-    let kv_registration =
-        prepare_linked_mooncake_kv_memory(&mut model, &engine, args.num_reserved_decode_tokens)?;
+    let kv_registration = prepare_linked_mooncake_kv_memory(
+        &mut model,
+        &engine,
+        args.num_reserved_decode_tokens,
+        args.page_size,
+    )?;
     let kv_cache_layout = kv_registration.memory().prefill_layout(0);
     let target_resolver = MooncakeSessionTargetResolver::new(engine.clone(), Vec::new());
     let transfer_executor = MooncakeKvCacheTransferExecutor::with_target_resolver(
@@ -1490,8 +1513,12 @@ fn try_build_launch_mooncake_decode_grpc_router_service(
     );
     let engine = SharedLinkedMooncakeTransferEngine::new(&engine_config)?;
     let mooncake_session_id = engine.local_endpoint()?;
-    let kv_registration =
-        prepare_linked_mooncake_kv_memory(&mut model, &engine, args.num_reserved_decode_tokens)?;
+    let kv_registration = prepare_linked_mooncake_kv_memory(
+        &mut model,
+        &engine,
+        args.num_reserved_decode_tokens,
+        args.page_size,
+    )?;
     let target_resolver = MooncakeSessionTargetResolver::new(engine.clone(), Vec::new());
     let kv_cache_layout = kv_registration.memory().prefill_layout(0);
     let transfer_executor = MooncakeKvCacheTransferExecutor::with_target_resolver(
@@ -1577,14 +1604,15 @@ where
 {
     let mut worker =
         KvTransferModelWorker::new(ModelRunner::new(model), registry, transfer_executor)
-            .with_decode_bootstrap_publisher(decode_bootstrap_publisher);
+            .with_decode_bootstrap_publisher(decode_bootstrap_publisher)
+            .with_kv_page_size(args.page_size);
     if decode_side_bootstrap_only {
         worker = worker.with_decode_side_bootstrap_only();
     }
     let scheduler = Scheduler::with_cache_resources(
         worker,
         RadixCache::default(),
-        CachePageAllocator::new(args.num_reserved_decode_tokens),
+        cache_page_allocator_from_server_args(args)?,
     )
     .with_max_running_requests(args.max_running_requests);
     let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(

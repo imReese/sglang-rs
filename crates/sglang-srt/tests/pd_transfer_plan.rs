@@ -156,9 +156,90 @@ fn transfer_plan_uses_uncached_prefill_pages_as_pd_delta() {
     );
     assert_eq!(
         span.descriptor_checksum(),
-        "24c270a0572dbe8028f483c5744cd95bf75c80e566442e62979b8fab9c8a8763"
+        "baaefcf15fa247f929f055a6f3ed3847992d80a43f64375aba2172fa71b12913"
     );
     assert!(!span.is_noop());
+}
+
+#[test]
+fn transfer_plan_converts_page_aligned_token_slots_to_physical_pages() {
+    let mut scheduler = Scheduler::with_cache_resources(
+        FinishedWorker,
+        RadixCache::default(),
+        CachePageAllocator::with_page_size(16, 4).expect("page layout should be valid"),
+    );
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("pd-page-major"),
+            vec![1, 2, 3, 4, 5, 6],
+            SamplingParams::new(1),
+        )
+        .with_disaggregated_params(Some(disaggregated_params(78))),
+    );
+
+    let batch = scheduler
+        .next_prefill_batch(1)
+        .expect("prefill batch should be available");
+    let worker_batch = ModelWorkerBatch::from_schedule_batch(&batch);
+    let transfer_plan =
+        KvCacheTransferPlan::from_prefill_worker_batch_with_page_size(&worker_batch, 4)
+            .expect("page-aware transfer plan should build");
+
+    let span = &transfer_plan.spans()[0];
+    assert_eq!(span.page_size(), 4);
+    assert_eq!(span.page_offset(), 0);
+    assert_eq!(
+        span.cache_pages(),
+        &[
+            CachePageId::from(0),
+            CachePageId::from(1),
+            CachePageId::from(2),
+            CachePageId::from(3),
+            CachePageId::from(4),
+            CachePageId::from(5),
+        ]
+    );
+    assert_eq!(
+        span.page_indices()
+            .iter()
+            .map(|page| page.as_usize())
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+}
+
+#[test]
+fn transfer_plan_fails_fast_when_delta_prefix_is_not_page_aligned() {
+    let mut prefix_cache = RadixCache::default();
+    prefix_cache
+        .insert(&[10, 11], &[CachePageId::from(100), CachePageId::from(101)])
+        .expect("prefix cache should insert");
+    let mut scheduler =
+        Scheduler::with_cache_resources(FinishedWorker, prefix_cache, CachePageAllocator::new(4));
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("pd-unaligned"),
+            vec![10, 11, 12, 13],
+            SamplingParams::new(1),
+        )
+        .with_disaggregated_params(Some(disaggregated_params(79))),
+    );
+
+    let batch = scheduler
+        .next_prefill_batch(1)
+        .expect("prefill batch should be available");
+    let worker_batch = ModelWorkerBatch::from_schedule_batch(&batch);
+    let error = KvCacheTransferPlan::from_prefill_worker_batch_with_page_size(&worker_batch, 4)
+        .expect_err("unaligned delta must not be transferred as a full page");
+
+    assert_eq!(
+        error,
+        KvCacheTransferPlanError::UnalignedTokenOffset {
+            request_id: RequestId::from("pd-unaligned"),
+            token_offset: 2,
+            page_size: 4,
+        }
+    );
 }
 
 #[test]
@@ -469,13 +550,17 @@ fn transfer_model_worker_publishes_decode_bootstrap_metadata_from_allocated_page
         DecodeBootstrapRegistry::default(),
         RecordingTransferExecutor::default(),
     )
-    .with_decode_bootstrap_publisher(RecordingDecodeBootstrapPublisher::default());
-    let mut scheduler =
-        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(4));
+    .with_decode_bootstrap_publisher(RecordingDecodeBootstrapPublisher::default())
+    .with_kv_page_size(4);
+    let mut scheduler = Scheduler::with_cache_resources(
+        worker,
+        RadixCache::default(),
+        CachePageAllocator::with_page_size(16, 4).expect("page layout should be valid"),
+    );
     scheduler.enqueue(
         ScheduledRequest::new(
             RequestId::from("pd-decode-publish"),
-            vec![1, 2, 3],
+            vec![1, 2, 3, 4, 5, 6],
             SamplingParams::new(2),
         )
         .with_disaggregated_params(Some(DisaggregatedParams {
@@ -500,8 +585,8 @@ fn transfer_model_worker_publishes_decode_bootstrap_metadata_from_allocated_page
             bootstrap_addr: "10.0.0.8:8200".to_string(),
             bootstrap_room: 84,
             prefill_dp_rank: 3,
-            dst_kv_indices: vec![0, 1, 2],
-            decode_prefix_len: Some(3),
+            dst_kv_indices: vec![0, 1],
+            decode_prefix_len: Some(6),
         }
     );
     assert_eq!(worker.transfer_executor().seen_rooms, vec![84]);
@@ -1198,7 +1283,7 @@ fn router_runtime_poll_transfers_exposes_control_plane_counts() {
             completed_batches: 1,
             pending_batches: 0,
             completed_descriptor_checksums: vec![
-                "07d08cbaad6ac874955f90fbdf5d0394be5dd750712bf2cd43b0265ea8813f71".to_string()
+                "8040dd22fbb2db157530046ad350c52ed47fc4d3a3e6b4d46f1b245553cb1e9e".to_string()
             ],
             pending_descriptor_checksums: Vec::new(),
         }
@@ -1585,6 +1670,48 @@ fn mooncake_request_builder_maps_cache_pages_to_source_and_target_offsets() {
     assert_eq!(requests[0].length, 256);
     assert_eq!(requests[1].source as usize, 0x1000 + 256);
     assert_eq!(requests[1].target_offset, 0x8000 + 512);
+}
+
+#[test]
+fn mooncake_request_builder_transfers_each_physical_page_once() {
+    let mut scheduler = Scheduler::with_cache_resources(
+        FinishedWorker,
+        RadixCache::default(),
+        CachePageAllocator::with_page_size(16, 4).expect("page layout should be valid"),
+    );
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("pd-mooncake-pages"),
+            vec![1, 2, 3, 4, 5, 6],
+            SamplingParams::new(1),
+        )
+        .with_disaggregated_params(Some(disaggregated_params(80))),
+    );
+    let batch = scheduler
+        .next_prefill_batch(1)
+        .expect("prefill should build");
+    let worker_batch = ModelWorkerBatch::from_schedule_batch(&batch);
+    let transfer_plan =
+        KvCacheTransferPlan::from_prefill_worker_batch_with_page_size(&worker_batch, 4)
+            .expect("page-aware transfer plan should build");
+
+    let requests = build_mooncake_kv_transfer_requests(
+        &transfer_plan.spans()[0],
+        MooncakeKvCacheLayout {
+            source_base_addr: 0x1000,
+            page_size_bytes: 256,
+            target_base_offset: 0x8000,
+        },
+        MooncakeTransferTarget { target_id: 42 },
+    )
+    .expect("physical-page requests should build");
+
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].source as usize, 0x1000);
+    assert_eq!(requests[0].target_offset, 0x8000);
+    assert_eq!(requests[1].source as usize, 0x1100);
+    assert_eq!(requests[1].target_offset, 0x8100);
+    assert!(requests.iter().all(|request| request.length == 256));
 }
 
 #[test]
@@ -2219,7 +2346,7 @@ impl DecodeBootstrapPublisher for RecordingDecodeBootstrapPublisher {
                 bootstrap_room: span.bootstrap_room(),
                 prefill_dp_rank: span.data_parallel_rank(),
                 dst_kv_indices: span
-                    .cache_pages()
+                    .page_indices()
                     .iter()
                     .map(|page| page.as_usize() as i32)
                     .collect(),

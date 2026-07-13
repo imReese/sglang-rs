@@ -476,7 +476,14 @@ impl<W> Scheduler<W> {
         &mut self,
         request: &mut ScheduledRequest,
     ) -> Result<(), SchedulerError> {
-        let prefix_match = self.prefix_cache.match_prefix(request.input_ids());
+        let page_size = self
+            .cache_page_allocator
+            .as_ref()
+            .map(CachePageAllocator::page_size)
+            .unwrap_or(1);
+        let prefix_match = self
+            .prefix_cache
+            .match_prefix_page_aligned(request.input_ids(), page_size);
         let uncached_token_count = prefix_match.remaining_input_ids.len();
         let allocated_cache_pages = match self.cache_page_allocator.as_mut() {
             Some(allocator) => allocator.allocate(uncached_token_count)?,
@@ -569,7 +576,9 @@ impl<W> Scheduler<W> {
         request: &mut ScheduledRequest,
     ) -> Result<(), SchedulerError> {
         let allocated_cache_pages = match self.cache_page_allocator.as_mut() {
-            Some(allocator) => allocator.allocate(1)?,
+            Some(allocator) => {
+                allocator.allocate_for_sequence(request.sequence_cache_pages(), 1)?
+            }
             None => Vec::new(),
         };
         request.set_allocated_cache_pages(allocated_cache_pages);

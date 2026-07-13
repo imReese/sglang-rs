@@ -61,8 +61,8 @@ fn b200_cuda_backend_round_trips_page_major_device_kv_memory() {
     assert_eq!(round_trip, pattern);
 
     let tensor = kv_cache
-        .tensor_location(3, 1, 1, 15)
-        .expect("tensor coordinate should map into the pool");
+        .slot_location(1, 1, 63)
+        .expect("community-style token slot should map into the pool");
     assert_eq!(tensor.byte_offset, 522_240);
     assert_eq!(tensor.byte_len, 2_048);
     assert_eq!(

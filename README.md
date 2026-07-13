@@ -220,11 +220,12 @@ This repository currently contains the first `sglang-srt` runtime crate and the
 The implementation is intentionally small while the architecture is being
 carved out. A CUDA/cuBLAS executor now runs the weight-backed embedding LM used
 for end-to-end protocol validation; transformer attention, MoE CUDA kernels,
-and a production GLM/DeepSeek CUDA executor are not implemented yet. PD support covers the scheduler/router execution split,
-bootstrap metadata propagation, bounded transfer polling, fake/local snapshot
-transfer paths, control-plane descriptor checksums, snapshot-content checksums,
-and the Mooncake-linked transfer-engine boundary with managed memory
-registration. The CUDA KV pool owns a contiguous allocation laid out as
+and a production GLM/DeepSeek CUDA executor are not implemented yet. PD support
+covers the scheduler/router execution split, bootstrap metadata propagation,
+bounded transfer polling, fake/local snapshot transfer paths, control-plane
+descriptor checksums, snapshot-content checksums, and the Mooncake-linked
+transfer-engine boundary with managed memory registration. The CUDA KV pool
+owns a contiguous allocation laid out as
 `page -> layer -> K/V tensor -> token`, matching SGLang's page-major layout.
 The pool exposes checked tensor locations for attention kernels, while
 Mooncake registers the same physical allocation instead of transfer-owned
@@ -238,6 +239,21 @@ reference backend only when CUDA is absent. A broken CUDA installation,
 missing cuBLAS, unsupported model/backend pair, or unsupported accelerator
 fails at startup instead of falling back to CPU execution.
 
+## KV Page Contract
+
+`--page-size` follows the community SGLang CLI and means the number of token
+slots in one physical KV page. `--num-reserved-decode-tokens` is the total token
+slot capacity, so it must be nonzero and divisible by `--page-size`; invalid
+geometry fails during service construction before a server port is bound.
+
+The scheduler allocates global token slots while the radix cache only reuses
+complete physical pages. PD bootstrap metadata and Mooncake transfer requests
+carry physical page indices, so a page is transferred exactly once even though
+the model executor addresses each token slot independently. The CPU reference
+GLM backing store and the CUDA KV pool expose the same physical-page geometry.
+Fake and local snapshot transfer remain reference-only backends and are never a
+fallback for a requested Mooncake deployment.
+
 ## Development
 
 Run all checks:
@@ -247,8 +263,19 @@ cargo fmt --all --check
 cargo test --workspace
 ```
 
+On a MacBook, these tests validate allocator geometry, page-aligned prefix
+reuse, physical-page transfer planning, decode bootstrap metadata, the CPU
+reference backing store, and checked CUDA layout arithmetic without requiring a
+CUDA driver:
+
+```bash
+cargo test -p sglang-srt --test cache_allocator \
+  --test scheduler_cache_allocation --test pd_transfer_plan \
+  --test glm_runtime --test cuda_kv_cache
+```
+
 On a B200 host, validate real page-major CUDA allocation, page write/read,
-checked tensor addressing, and the transferable-memory view:
+global token-slot addressing, and the transferable-memory view:
 
 ```bash
 cargo test -p sglang-srt --test cuda_backend \
@@ -270,6 +297,12 @@ MOONCAKE_BUILD_DIR=/path/to/Mooncake/build \
   cargo test -p sglang-srt --features mooncake-link --test cuda_backend \
   b200_mooncake_registers_real_cuda_kv_memory -- --ignored --nocapture
 ```
+
+CUDA is the first production backend and B200 is the first hardware acceptance
+target; the capability interfaces do not encode a B200 product check. Metal,
+ROCm, and MUSA execution are not implemented yet. Requesting one of those
+devices fails at startup with the unavailable backend/capability instead of
+running the CPU reference model.
 
 Run a local process-level PD smoke with a tiny real safetensors model:
 

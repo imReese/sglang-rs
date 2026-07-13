@@ -22,7 +22,7 @@ use sglang_srt::server::{
     ServerLaunchError, build_bootstrap_fake_pd_grpc_router_service,
     build_bootstrap_grpc_router_service, build_bootstrap_pd_grpc_router_service, grpc_listen_addr,
     launch_grpc_server, prefill_mooncake_zmq_endpoints, register_prefill_mooncake_routes_from_args,
-    try_build_bootstrap_grpc_router_service,
+    try_build_bootstrap_grpc_router_service, try_build_bootstrap_prefill_http_router_service,
 };
 use sglang_srt::tokenizer::TokenizerError;
 use sglang_srt::transfer::{
@@ -53,6 +53,34 @@ fn grpc_listen_addr_uses_server_host_and_port() {
 
     assert_eq!(addr.ip().to_string(), "127.0.0.1");
     assert_eq!(addr.port(), 30001);
+}
+
+#[test]
+fn bootstrap_pd_service_rejects_unaligned_kv_slot_capacity_before_serving() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--page-size",
+        "4",
+        "--num-reserved-decode-tokens",
+        "10",
+    ])
+    .expect("args should parse");
+
+    let error = match try_build_bootstrap_prefill_http_router_service(&args) {
+        Ok(_) => panic!("unaligned KV slot capacity should fail during service construction"),
+        Err(error) => error,
+    };
+
+    assert!(
+        matches!(
+            &error,
+            ServerLaunchError::KvCacheTransfer(message)
+                if message.contains("slot capacity 10 must be divisible by page size 4")
+        ),
+        "unexpected error: {error:?}"
+    );
 }
 
 #[test]

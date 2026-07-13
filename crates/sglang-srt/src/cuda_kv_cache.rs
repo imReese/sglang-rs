@@ -41,6 +41,10 @@ pub enum CudaKvCachePoolError {
         token_index: usize,
         page_size: usize,
     },
+    SlotOutOfRange {
+        slot_index: usize,
+        slot_count: usize,
+    },
     PageBufferSizeMismatch {
         expected: usize,
         actual: usize,
@@ -106,6 +110,13 @@ impl fmt::Display for CudaKvCachePoolError {
                 formatter,
                 "CUDA KV cache token index {token_index} is outside page size {page_size}"
             ),
+            Self::SlotOutOfRange {
+                slot_index,
+                slot_count,
+            } => write!(
+                formatter,
+                "CUDA KV cache slot index {slot_index} is outside {slot_count} token slots"
+            ),
             Self::PageBufferSizeMismatch { expected, actual } => write!(
                 formatter,
                 "CUDA KV cache page buffer has {actual} bytes but requires exactly {expected} bytes"
@@ -148,6 +159,7 @@ pub struct CudaKvCachePoolLayout {
     bytes_per_layer_page: usize,
     bytes_per_tensor_page: usize,
     total_byte_len: usize,
+    slot_count: usize,
 }
 
 impl CudaKvCachePoolLayout {
@@ -207,6 +219,9 @@ impl CudaKvCachePoolLayout {
         let total_byte_len = page_count
             .checked_mul(runtime.page_size_bytes)
             .ok_or(CudaKvCachePoolError::SizeOverflow)?;
+        let slot_count = page_count
+            .checked_mul(runtime.page_size)
+            .ok_or(CudaKvCachePoolError::SizeOverflow)?;
 
         Ok(Self {
             runtime,
@@ -216,6 +231,7 @@ impl CudaKvCachePoolLayout {
             bytes_per_layer_page,
             bytes_per_tensor_page,
             total_byte_len,
+            slot_count,
         })
     }
 
@@ -229,6 +245,10 @@ impl CudaKvCachePoolLayout {
 
     pub fn total_byte_len(&self) -> usize {
         self.total_byte_len
+    }
+
+    pub fn slot_count(&self) -> usize {
+        self.slot_count
     }
 
     pub fn bytes_per_token_per_layer(&self) -> usize {
@@ -306,6 +326,26 @@ impl CudaKvCachePoolLayout {
             .checked_add(self.bytes_per_token_per_tensor)
             .ok_or(CudaKvCachePoolError::SizeOverflow)?;
         Ok(start..end)
+    }
+
+    pub fn tensor_slot_byte_range(
+        &self,
+        layer_index: usize,
+        tensor_index: usize,
+        slot_index: usize,
+    ) -> Result<Range<usize>, CudaKvCachePoolError> {
+        if slot_index >= self.slot_count {
+            return Err(CudaKvCachePoolError::SlotOutOfRange {
+                slot_index,
+                slot_count: self.slot_count,
+            });
+        }
+        self.tensor_token_byte_range(
+            slot_index / self.runtime.page_size,
+            layer_index,
+            tensor_index,
+            slot_index % self.runtime.page_size,
+        )
     }
 
     fn validate_page(&self, page_index: usize) -> Result<(), CudaKvCachePoolError> {
@@ -399,6 +439,23 @@ impl CudaKvCachePool {
             tensor_index,
             token_index,
         )?;
+        let device_ptr = self.allocation.device_ptr_at(range.start, range.len())?;
+        Ok(CudaKvCacheTensorLocation {
+            device_ptr,
+            byte_offset: range.start,
+            byte_len: range.len(),
+        })
+    }
+
+    pub fn slot_location(
+        &self,
+        layer_index: usize,
+        tensor_index: usize,
+        slot_index: usize,
+    ) -> Result<CudaKvCacheTensorLocation, CudaKvCachePoolError> {
+        let range = self
+            .layout
+            .tensor_slot_byte_range(layer_index, tensor_index, slot_index)?;
         let device_ptr = self.allocation.device_ptr_at(range.start, range.len())?;
         Ok(CudaKvCacheTensorLocation {
             device_ptr,

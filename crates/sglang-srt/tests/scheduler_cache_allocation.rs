@@ -184,6 +184,81 @@ fn decode_batch_allocates_output_cache_page_and_keeps_sequence_cache_pages() {
 }
 
 #[test]
+fn page_aware_decode_reuses_the_prefill_tail_slot() {
+    let mut scheduler = Scheduler::with_cache_resources(
+        UnfinishedWorker,
+        RadixCache::default(),
+        CachePageAllocator::with_page_size(8, 4).expect("page layout should be valid"),
+    );
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("req-page-tail"),
+        vec![1, 2, 3],
+        SamplingParams::new(3),
+    ));
+
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should reserve one physical page");
+    assert_eq!(scheduler.available_cache_pages(), Some(1));
+
+    let batch = scheduler
+        .next_decode_batch(1)
+        .expect("decode should reuse the prefill page tail");
+    assert_eq!(
+        batch.requests()[0].allocated_cache_pages(),
+        &[CachePageId::from(3)]
+    );
+    assert_eq!(
+        batch.requests()[0].sequence_cache_pages(),
+        &[
+            CachePageId::from(0),
+            CachePageId::from(1),
+            CachePageId::from(2),
+            CachePageId::from(3),
+        ]
+    );
+    assert_eq!(scheduler.available_cache_pages(), Some(1));
+}
+
+#[test]
+fn page_aware_scheduler_truncates_radix_hits_to_complete_pages() {
+    let mut allocator =
+        CachePageAllocator::with_page_size(16, 4).expect("page layout should be valid");
+    let cached_slots = allocator.allocate(6).expect("cached prefix should fit");
+    let mut cache = RadixCache::default();
+    cache
+        .insert(&[1, 2, 3, 4, 5, 6], &cached_slots)
+        .expect("prefix should insert");
+    let mut scheduler = Scheduler::with_cache_resources(NoopWorker, cache, allocator);
+    enqueue_request(&mut scheduler, "req-page-prefix", &[1, 2, 3, 4, 5, 6, 7]);
+
+    let batch = scheduler
+        .next_prefill_batch(1)
+        .expect("prefill should allocate after an aligned prefix");
+    let request = &batch.requests()[0];
+
+    assert_eq!(request.cached_token_count(), 4);
+    assert_eq!(
+        request.prefix_cache_pages(),
+        &[
+            CachePageId::from(0),
+            CachePageId::from(1),
+            CachePageId::from(2),
+            CachePageId::from(3),
+        ]
+    );
+    assert_eq!(request.uncached_input_ids(), &[5, 6, 7]);
+    assert_eq!(
+        request.allocated_cache_pages(),
+        &[
+            CachePageId::from(8),
+            CachePageId::from(9),
+            CachePageId::from(10),
+        ]
+    );
+}
+
+#[test]
 fn successful_prefill_dispatch_publishes_allocated_pages_to_radix_cache_for_future_prefix_hits() {
     let mut scheduler = Scheduler::with_cache_resources(
         NoopWorker,
@@ -312,7 +387,7 @@ fn allocation_failure_leaves_request_queued_and_pages_available() {
     assert_eq!(
         result,
         Err(SchedulerError::CacheAllocation(
-            CacheAllocationError::OutOfPages {
+            CacheAllocationError::OutOfSlots {
                 requested: 3,
                 available: 2
             }
@@ -337,7 +412,7 @@ fn allocation_failure_rolls_back_pages_and_preserves_queue_order_for_partial_bat
     assert_eq!(
         result,
         Err(SchedulerError::CacheAllocation(
-            CacheAllocationError::OutOfPages {
+            CacheAllocationError::OutOfSlots {
                 requested: 2,
                 available: 1
             }

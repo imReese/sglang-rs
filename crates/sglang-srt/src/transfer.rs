@@ -888,6 +888,21 @@ impl DecodeBootstrapRegistry {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KvCachePageIndex(usize);
+
+impl KvCachePageIndex {
+    pub fn as_usize(&self) -> usize {
+        self.0
+    }
+}
+
+impl From<usize> for KvCachePageIndex {
+    fn from(value: usize) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KvCacheTransferSpan {
     request_id: RequestId,
     disaggregated_params: DisaggregatedParams,
@@ -895,6 +910,8 @@ pub struct KvCacheTransferSpan {
     token_offset: usize,
     token_count: usize,
     cache_pages: Vec<CachePageId>,
+    page_size: usize,
+    page_indices: Vec<KvCachePageIndex>,
 }
 
 impl KvCacheTransferSpan {
@@ -926,9 +943,21 @@ impl KvCacheTransferSpan {
         &self.cache_pages
     }
 
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+
+    pub fn page_offset(&self) -> usize {
+        self.token_offset / self.page_size
+    }
+
+    pub fn page_indices(&self) -> &[KvCachePageIndex] {
+        &self.page_indices
+    }
+
     pub fn descriptor_checksum(&self) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(b"sglang-rs.kv-transfer-span.v1\0");
+        hasher.update(b"sglang-rs.kv-transfer-span.v2\0");
         update_len_prefixed_str(&mut hasher, self.request_id.as_str());
         update_len_prefixed_str(&mut hasher, &self.disaggregated_params.bootstrap_host);
         hasher.update(self.disaggregated_params.bootstrap_port.to_le_bytes());
@@ -936,9 +965,14 @@ impl KvCacheTransferSpan {
         hasher.update(self.data_parallel_rank.to_le_bytes());
         hasher.update((self.token_offset as u64).to_le_bytes());
         hasher.update((self.token_count as u64).to_le_bytes());
+        hasher.update((self.page_size as u64).to_le_bytes());
         hasher.update((self.cache_pages.len() as u64).to_le_bytes());
         for cache_page in &self.cache_pages {
             hasher.update((cache_page.as_usize() as u64).to_le_bytes());
+        }
+        hasher.update((self.page_indices.len() as u64).to_le_bytes());
+        for page_index in &self.page_indices {
+            hasher.update((page_index.as_usize() as u64).to_le_bytes());
         }
 
         let digest = hasher.finalize();
@@ -974,8 +1008,18 @@ impl KvCacheTransferPlan {
     pub fn from_prefill_worker_batch(
         batch: &ModelWorkerBatch,
     ) -> Result<Self, KvCacheTransferPlanError> {
+        Self::from_prefill_worker_batch_with_page_size(batch, 1)
+    }
+
+    pub fn from_prefill_worker_batch_with_page_size(
+        batch: &ModelWorkerBatch,
+        page_size: usize,
+    ) -> Result<Self, KvCacheTransferPlanError> {
         if batch.forward_mode() != ForwardMode::Prefill {
             return Err(KvCacheTransferPlanError::NonPrefillBatch);
+        }
+        if page_size == 0 {
+            return Err(KvCacheTransferPlanError::ZeroPageSize);
         }
 
         let mut spans = Vec::new();
@@ -1003,13 +1047,19 @@ impl KvCacheTransferPlan {
                 continue;
             };
 
+            let request_id = batch.request_ids()[request_index].clone();
+            let token_offset = batch.cached_token_counts()[request_index];
+            let page_indices =
+                transfer_page_indices(&request_id, token_offset, &cache_pages, page_size)?;
             spans.push(KvCacheTransferSpan {
-                request_id: batch.request_ids()[request_index].clone(),
+                request_id,
                 disaggregated_params,
                 data_parallel_rank: batch.data_parallel_ranks()[request_index],
-                token_offset: batch.cached_token_counts()[request_index],
+                token_offset,
                 token_count: input_token_count,
                 cache_pages,
+                page_size,
+                page_indices,
             });
         }
 
@@ -1036,9 +1086,53 @@ impl KvCacheTransferPlan {
     }
 }
 
+fn transfer_page_indices(
+    request_id: &RequestId,
+    token_offset: usize,
+    cache_slots: &[CachePageId],
+    page_size: usize,
+) -> Result<Vec<KvCachePageIndex>, KvCacheTransferPlanError> {
+    if cache_slots.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !token_offset.is_multiple_of(page_size) {
+        return Err(KvCacheTransferPlanError::UnalignedTokenOffset {
+            request_id: request_id.clone(),
+            token_offset,
+            page_size,
+        });
+    }
+
+    let mut page_indices = Vec::with_capacity(cache_slots.len().div_ceil(page_size));
+    for slots in cache_slots.chunks(page_size) {
+        let first_slot = slots[0].as_usize();
+        if !first_slot.is_multiple_of(page_size) {
+            return Err(KvCacheTransferPlanError::UnalignedCacheSlot {
+                request_id: request_id.clone(),
+                cache_slot: first_slot,
+                page_size,
+            });
+        }
+        for (slot_offset, slot) in slots.iter().enumerate() {
+            let expected = first_slot + slot_offset;
+            let actual = slot.as_usize();
+            if actual != expected {
+                return Err(KvCacheTransferPlanError::NonContiguousCacheSlots {
+                    request_id: request_id.clone(),
+                    expected,
+                    actual,
+                });
+            }
+        }
+        page_indices.push(KvCachePageIndex::from(first_slot / page_size));
+    }
+    Ok(page_indices)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KvCacheTransferPlanError {
     NonPrefillBatch,
+    ZeroPageSize,
     CachePageCountMismatch {
         request_id: RequestId,
         input_token_count: usize,
@@ -1048,12 +1142,28 @@ pub enum KvCacheTransferPlanError {
         consumed_cache_page_count: usize,
         cache_page_count: usize,
     },
+    UnalignedTokenOffset {
+        request_id: RequestId,
+        token_offset: usize,
+        page_size: usize,
+    },
+    UnalignedCacheSlot {
+        request_id: RequestId,
+        cache_slot: usize,
+        page_size: usize,
+    },
+    NonContiguousCacheSlots {
+        request_id: RequestId,
+        expected: usize,
+        actual: usize,
+    },
 }
 
 impl fmt::Display for KvCacheTransferPlanError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NonPrefillBatch => formatter.write_str("KV transfer plan requires prefill batch"),
+            Self::ZeroPageSize => formatter.write_str("KV transfer page size must be non-zero"),
             Self::CachePageCountMismatch {
                 request_id,
                 input_token_count,
@@ -1069,6 +1179,33 @@ impl fmt::Display for KvCacheTransferPlanError {
             } => write!(
                 formatter,
                 "KV transfer plan consumed {consumed_cache_page_count} cache pages but batch has {cache_page_count}"
+            ),
+            Self::UnalignedTokenOffset {
+                request_id,
+                token_offset,
+                page_size,
+            } => write!(
+                formatter,
+                "request {} KV delta starts at token {token_offset}, which is not aligned to page size {page_size}",
+                request_id.as_str()
+            ),
+            Self::UnalignedCacheSlot {
+                request_id,
+                cache_slot,
+                page_size,
+            } => write!(
+                formatter,
+                "request {} KV cache slot {cache_slot} does not start a page of size {page_size}",
+                request_id.as_str()
+            ),
+            Self::NonContiguousCacheSlots {
+                request_id,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "request {} KV cache page expected slot {expected} but found {actual}",
+                request_id.as_str()
             ),
         }
     }
@@ -1441,6 +1578,7 @@ pub struct KvTransferModelWorker<W, E, P = NoopDecodeBootstrapPublisher> {
     worker: W,
     registry: DecodeBootstrapRegistry,
     decode_bootstrap_publisher: P,
+    kv_page_size: usize,
     submit_prefill_transfers: bool,
     last_transfer_summary: Option<KvCacheTransferSummary>,
 }
@@ -1452,6 +1590,7 @@ impl<W, E> KvTransferModelWorker<W, E> {
             worker,
             registry,
             decode_bootstrap_publisher: NoopDecodeBootstrapPublisher,
+            kv_page_size: 1,
             submit_prefill_transfers: true,
             last_transfer_summary: None,
         }
@@ -1500,6 +1639,7 @@ impl<W, E, P> KvTransferModelWorker<W, E, P> {
             worker: self.worker,
             registry: self.registry,
             decode_bootstrap_publisher,
+            kv_page_size: self.kv_page_size,
             submit_prefill_transfers: self.submit_prefill_transfers,
             last_transfer_summary: self.last_transfer_summary,
         }
@@ -1507,6 +1647,11 @@ impl<W, E, P> KvTransferModelWorker<W, E, P> {
 
     pub fn with_decode_side_bootstrap_only(mut self) -> Self {
         self.submit_prefill_transfers = false;
+        self
+    }
+
+    pub fn with_kv_page_size(mut self, kv_page_size: usize) -> Self {
+        self.kv_page_size = kv_page_size;
         self
     }
 
@@ -1547,10 +1692,13 @@ where
     ) -> Result<BatchGeneratedTokens, WorkerExecutionError> {
         let transfer_plan = if batch.forward_mode() == ForwardMode::Prefill {
             let worker_batch = ModelWorkerBatch::from_schedule_batch(batch);
-            let transfer_plan = KvCacheTransferPlan::from_prefill_worker_batch(&worker_batch)
-                .map_err(|error| {
-                    WorkerExecutionError::Runtime(format!("KV transfer planning failed: {error}"))
-                })?;
+            let transfer_plan = KvCacheTransferPlan::from_prefill_worker_batch_with_page_size(
+                &worker_batch,
+                self.kv_page_size,
+            )
+            .map_err(|error| {
+                WorkerExecutionError::Runtime(format!("KV transfer planning failed: {error}"))
+            })?;
             self.decode_bootstrap_publisher
                 .publish_decode_bootstrap_metadata(&transfer_plan)
                 .map_err(|error| {
@@ -2203,18 +2351,19 @@ pub fn build_mooncake_kv_transfer_requests(
         return Err(MooncakeRequestBuildError::ZeroPageSize);
     }
 
-    if span.token_count() != span.cache_pages().len() {
+    let expected_page_count = span.token_count().div_ceil(span.page_size());
+    if expected_page_count != span.page_indices().len() {
         return Err(MooncakeRequestBuildError::SpanPageCountMismatch {
-            token_count: span.token_count(),
-            cache_page_count: span.cache_pages().len(),
+            expected_page_count,
+            source_page_index_count: span.page_indices().len(),
         });
     }
 
     let page_size_bytes = layout.page_size_bytes as u64;
-    let mut requests = Vec::with_capacity(span.cache_pages().len());
+    let mut requests = Vec::with_capacity(span.page_indices().len());
 
-    for (page_index, cache_page) in span.cache_pages().iter().enumerate() {
-        let source_offset = cache_page
+    for (page_index, source_page_index) in span.page_indices().iter().enumerate() {
+        let source_offset = source_page_index
             .as_usize()
             .checked_mul(layout.page_size_bytes)
             .ok_or(MooncakeRequestBuildError::AddressOverflow)?;
@@ -2222,14 +2371,14 @@ pub fn build_mooncake_kv_transfer_requests(
             .source_base_addr
             .checked_add(source_offset)
             .ok_or(MooncakeRequestBuildError::AddressOverflow)?;
-        let target_token_index = span
-            .token_offset()
+        let target_page_index = span
+            .page_offset()
             .checked_add(page_index)
             .ok_or(MooncakeRequestBuildError::OffsetOverflow)?;
         let target_offset = layout
             .target_base_offset
             .checked_add(
-                (target_token_index as u64)
+                (target_page_index as u64)
                     .checked_mul(page_size_bytes)
                     .ok_or(MooncakeRequestBuildError::OffsetOverflow)?,
             )
@@ -2265,16 +2414,17 @@ pub fn build_mooncake_remote_kv_transfer_requests(
         return Err(MooncakeRequestBuildError::MissingRemoteKvPointers);
     }
 
-    if span.token_count() != span.cache_pages().len() {
+    let expected_page_count = span.token_count().div_ceil(span.page_size());
+    if expected_page_count != span.page_indices().len() {
         return Err(MooncakeRequestBuildError::SpanPageCountMismatch {
-            token_count: span.token_count(),
-            cache_page_count: span.cache_pages().len(),
+            expected_page_count,
+            source_page_index_count: span.page_indices().len(),
         });
     }
 
-    if span.token_count() != remote_layout.dst_kv_indices.len() {
+    if span.page_indices().len() != remote_layout.dst_kv_indices.len() {
         return Err(MooncakeRequestBuildError::RemoteKvIndexCountMismatch {
-            token_count: span.token_count(),
+            source_page_count: span.page_indices().len(),
             dst_kv_index_count: remote_layout.dst_kv_indices.len(),
         });
     }
@@ -2291,9 +2441,9 @@ pub fn build_mooncake_remote_kv_transfer_requests(
     }
 
     let mut requests =
-        Vec::with_capacity(span.cache_pages().len() * remote_layout.dst_kv_ptrs.len());
+        Vec::with_capacity(span.page_indices().len() * remote_layout.dst_kv_ptrs.len());
 
-    for (page_index, cache_page) in span.cache_pages().iter().enumerate() {
+    for (page_index, source_page_index) in span.page_indices().iter().enumerate() {
         let dst_kv_index = remote_layout.dst_kv_indices[page_index];
         if dst_kv_index < 0 {
             return Err(MooncakeRequestBuildError::NegativeRemoteKvIndex(
@@ -2301,7 +2451,7 @@ pub fn build_mooncake_remote_kv_transfer_requests(
             ));
         }
 
-        let source_offset = cache_page
+        let source_offset = source_page_index
             .as_usize()
             .checked_mul(layout.page_size_bytes)
             .ok_or(MooncakeRequestBuildError::AddressOverflow)?;
@@ -2345,11 +2495,11 @@ pub enum MooncakeRequestBuildError {
     ZeroRemoteKvItemSize,
     MissingRemoteKvPointers,
     SpanPageCountMismatch {
-        token_count: usize,
-        cache_page_count: usize,
+        expected_page_count: usize,
+        source_page_index_count: usize,
     },
     RemoteKvIndexCountMismatch {
-        token_count: usize,
+        source_page_count: usize,
         dst_kv_index_count: usize,
     },
     RemoteKvItemLayoutMismatch {
@@ -2372,18 +2522,18 @@ impl fmt::Display for MooncakeRequestBuildError {
                 formatter.write_str("Mooncake remote KV pointers must not be empty")
             }
             Self::SpanPageCountMismatch {
-                token_count,
-                cache_page_count,
+                expected_page_count,
+                source_page_index_count,
             } => write!(
                 formatter,
-                "KV transfer span has {token_count} tokens but {cache_page_count} cache pages"
+                "KV transfer span requires {expected_page_count} physical pages but has {source_page_index_count} source page indices"
             ),
             Self::RemoteKvIndexCountMismatch {
-                token_count,
+                source_page_count,
                 dst_kv_index_count,
             } => write!(
                 formatter,
-                "KV transfer span has {token_count} tokens but {dst_kv_index_count} remote KV indices"
+                "KV transfer span has {source_page_count} source pages but {dst_kv_index_count} remote KV indices"
             ),
             Self::RemoteKvItemLayoutMismatch {
                 page_size_bytes,
