@@ -224,10 +224,13 @@ and a production GLM/DeepSeek CUDA executor are not implemented yet. PD support 
 bootstrap metadata propagation, bounded transfer polling, fake/local snapshot
 transfer paths, control-plane descriptor checksums, snapshot-content checksums,
 and the Mooncake-linked transfer-engine boundary with managed memory
-registration. CUDA device KV allocations can be exposed through the same
-Mooncake memory-provider contract; the current executable forward provider is
-the CPU reference GLM runtime, while the CUDA embedding LM does not have a KV
-cache and therefore fails fast if Mooncake PD is requested.
+registration. The CUDA KV pool owns a contiguous allocation laid out as
+`page -> layer -> K/V tensor -> token`, matching SGLang's page-major layout.
+The pool exposes checked tensor locations for attention kernels, while
+Mooncake registers the same physical allocation instead of transfer-owned
+staging memory. The current executable forward provider is the CPU reference
+GLM runtime; the CUDA embedding LM does not have attention or a KV cache and
+therefore fails fast if Mooncake PD is requested.
 
 `--device auto` follows the community CLI surface. It selects CUDA when a
 working NVIDIA driver and visible device are present, and selects the CPU
@@ -244,11 +247,12 @@ cargo fmt --all --check
 cargo test --workspace
 ```
 
-On a B200 host, validate the real CUDA Driver and device-KV allocation boundary:
+On a B200 host, validate real page-major CUDA allocation, page write/read,
+checked tensor addressing, and the transferable-memory view:
 
 ```bash
 cargo test -p sglang-srt --test cuda_backend \
-  b200_cuda_backend_allocates_transferable_device_kv_memory -- --ignored --nocapture
+  b200_cuda_backend_round_trips_page_major_device_kv_memory -- --ignored --nocapture
 ```
 
 Validate real safetensors weight upload, cuBLAS logits, token sampling, and the

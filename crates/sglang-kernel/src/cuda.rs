@@ -533,10 +533,10 @@ impl CudaDeviceAllocation {
 
     pub fn copy_from_host(&mut self, offset: usize, bytes: &[u8]) -> Result<(), CudaError> {
         if bytes.is_empty() {
-            self.checked_device_ptr(offset, 0)?;
+            self.device_ptr_at(offset, 0)?;
             return Ok(());
         }
-        let device_ptr = self.checked_device_ptr(offset, bytes.len())?;
+        let device_ptr = self.device_ptr_at(offset, bytes.len())?;
         self.context.with_current(|| {
             self.context.inner.driver.check(
                 unsafe {
@@ -553,10 +553,10 @@ impl CudaDeviceAllocation {
 
     pub fn copy_to_host(&self, offset: usize, bytes: &mut [u8]) -> Result<(), CudaError> {
         if bytes.is_empty() {
-            self.checked_device_ptr(offset, 0)?;
+            self.device_ptr_at(offset, 0)?;
             return Ok(());
         }
-        let device_ptr = self.checked_device_ptr(offset, bytes.len())?;
+        let device_ptr = self.device_ptr_at(offset, bytes.len())?;
         self.context.with_current(|| {
             self.context.inner.driver.check(
                 unsafe {
@@ -572,7 +572,7 @@ impl CudaDeviceAllocation {
     }
 
     pub fn fill(&mut self, value: u8) -> Result<(), CudaError> {
-        let device_ptr = self.checked_device_ptr(0, self.byte_len)?;
+        let device_ptr = self.device_ptr_at(0, self.byte_len)?;
         self.context.with_current(|| {
             self.context.inner.driver.check(
                 unsafe {
@@ -587,11 +587,7 @@ impl CudaDeviceAllocation {
         })
     }
 
-    pub(crate) fn checked_device_ptr(
-        &self,
-        offset: usize,
-        byte_len: usize,
-    ) -> Result<CuDevicePtr, CudaError> {
+    pub fn device_ptr_at(&self, offset: usize, byte_len: usize) -> Result<CuDevicePtr, CudaError> {
         if !self.active {
             return Err(CudaError::FreedAllocation);
         }
@@ -867,6 +863,12 @@ mod tests {
             .retain_primary_context(0)
             .expect("fake context should retain");
         let mut allocation = context.allocate(16).expect("allocation should succeed");
+        assert_eq!(
+            allocation
+                .device_ptr_at(4, 4)
+                .expect("checked pointer should stay within the allocation"),
+            allocation.device_ptr() + 4
+        );
 
         allocation
             .copy_from_host(4, &[1, 2, 3, 4])
@@ -889,8 +891,24 @@ mod tests {
                 allocation_byte_len: 16,
             }
         );
+        assert_eq!(
+            allocation
+                .device_ptr_at(15, 2)
+                .expect_err("out-of-bounds pointer must fail"),
+            CudaError::AllocationOutOfBounds {
+                offset: 15,
+                byte_len: 2,
+                allocation_byte_len: 16,
+            }
+        );
 
         allocation.free().expect("allocation should free");
+        assert_eq!(
+            allocation
+                .device_ptr_at(0, 1)
+                .expect_err("freed allocation must reject pointers"),
+            CudaError::FreedAllocation
+        );
         assert_eq!(
             allocation
                 .copy_to_host(0, &mut output)

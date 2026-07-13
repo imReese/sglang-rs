@@ -154,10 +154,10 @@ impl CudaBlas {
         output: &mut CudaDeviceAllocation,
     ) -> Result<(), CudaBlasError> {
         let shape = SgemvShape::new(rows, columns)?;
-        let matrix_ptr = matrix.checked_device_ptr(0, shape.matrix_byte_len)? as *const f32;
+        let matrix_ptr = matrix.device_ptr_at(0, shape.matrix_byte_len)? as *const f32;
         let vector_ptr =
-            vector.checked_device_ptr(vector_offset_bytes, shape.vector_byte_len)? as *const f32;
-        let output_ptr = output.checked_device_ptr(0, shape.output_byte_len)? as *mut f32;
+            vector.device_ptr_at(vector_offset_bytes, shape.vector_byte_len)? as *const f32;
+        let output_ptr = output.device_ptr_at(0, shape.output_byte_len)? as *mut f32;
         self.context.with_current(|| {
             launch_sgemv(
                 self.api,
