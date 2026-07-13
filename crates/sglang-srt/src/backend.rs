@@ -112,6 +112,7 @@ pub enum ComputeCapability {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeRequirements<'a> {
+    pub requires_forward: bool,
     pub dtype: Option<RuntimeDtype>,
     pub attention_backend: Option<&'a str>,
     pub tensor_parallel_size: usize,
@@ -122,6 +123,7 @@ pub struct RuntimeRequirements<'a> {
 impl Default for RuntimeRequirements<'_> {
     fn default() -> Self {
         Self {
+            requires_forward: false,
             dtype: None,
             attention_backend: None,
             tensor_parallel_size: 1,
@@ -340,6 +342,9 @@ impl RuntimeCapability {
         requirements: &RuntimeRequirements<'_>,
     ) -> Result<(), RuntimeCapabilityMismatch> {
         let mut missing = Vec::new();
+        if requirements.requires_forward && !self.supports_forward {
+            missing.push("model forward execution".to_string());
+        }
         if let Some(dtype) = requirements.dtype
             && !self.supported_dtypes.contains(&dtype)
         {

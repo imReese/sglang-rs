@@ -25,9 +25,13 @@ type CuDevicePrimaryCtxRetain = unsafe extern "C" fn(*mut CuContextHandle, CuDev
 type CuDevicePrimaryCtxRelease = unsafe extern "C" fn(CuDevice) -> c_int;
 type CuCtxPushCurrent = unsafe extern "C" fn(CuContextHandle) -> c_int;
 type CuCtxPopCurrent = unsafe extern "C" fn(*mut CuContextHandle) -> c_int;
+type CuCtxSynchronize = unsafe extern "C" fn() -> c_int;
 type CuMemAlloc = unsafe extern "C" fn(*mut CuDevicePtr, usize) -> c_int;
 type CuMemFree = unsafe extern "C" fn(CuDevicePtr) -> c_int;
 type CuMemGetInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> c_int;
+type CuMemcpyHtoD = unsafe extern "C" fn(CuDevicePtr, *const c_void, usize) -> c_int;
+type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, CuDevicePtr, usize) -> c_int;
+type CuMemsetD8 = unsafe extern "C" fn(CuDevicePtr, u8, usize) -> c_int;
 type CuGetErrorName = unsafe extern "C" fn(c_int, *mut *const c_char) -> c_int;
 type CuGetErrorString = unsafe extern "C" fn(c_int, *mut *const c_char) -> c_int;
 
@@ -94,6 +98,13 @@ pub enum CudaError {
         value: i32,
     },
     ZeroAllocation,
+    AllocationOutOfBounds {
+        offset: usize,
+        byte_len: usize,
+        allocation_byte_len: usize,
+    },
+    DeviceAddressOverflow,
+    FreedAllocation,
 }
 
 impl fmt::Display for CudaError {
@@ -142,11 +153,38 @@ impl fmt::Display for CudaError {
                 )
             }
             Self::ZeroAllocation => formatter.write_str("CUDA allocation size must be non-zero"),
+            Self::AllocationOutOfBounds {
+                offset,
+                byte_len,
+                allocation_byte_len,
+            } => write!(
+                formatter,
+                "CUDA allocation access [{offset}, {}) exceeds allocation size {allocation_byte_len}",
+                offset.saturating_add(*byte_len)
+            ),
+            Self::DeviceAddressOverflow => {
+                formatter.write_str("CUDA device pointer arithmetic overflowed")
+            }
+            Self::FreedAllocation => formatter.write_str("CUDA allocation has already been freed"),
         }
     }
 }
 
 impl std::error::Error for CudaError {}
+
+impl CudaError {
+    pub fn is_unavailable_for_auto_selection(&self) -> bool {
+        matches!(self, Self::DriverUnavailable { .. })
+            || matches!(
+                self,
+                Self::DriverCall {
+                    operation: "cuInit",
+                    code: 100,
+                    ..
+                }
+            )
+    }
+}
 
 #[derive(Clone)]
 pub struct CudaDriver {
@@ -412,15 +450,31 @@ impl CudaContext {
         })
     }
 
-    fn with_current<T>(
+    pub fn synchronize(&self) -> Result<(), CudaError> {
+        self.with_current(|| {
+            self.inner.driver.check(
+                unsafe { (self.inner.driver.inner.api.ctx_synchronize)() },
+                "cuCtxSynchronize",
+            )
+        })
+    }
+
+    pub(crate) fn with_current<T, E>(
         &self,
-        operation: impl FnOnce() -> Result<T, CudaError>,
-    ) -> Result<T, CudaError> {
+        operation: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<CudaError>,
+    {
         let driver = &self.inner.driver;
-        driver.check(
-            unsafe { (driver.inner.api.ctx_push_current)(self.inner.handle as CuContextHandle) },
-            "cuCtxPushCurrent_v2",
-        )?;
+        driver
+            .check(
+                unsafe {
+                    (driver.inner.api.ctx_push_current)(self.inner.handle as CuContextHandle)
+                },
+                "cuCtxPushCurrent_v2",
+            )
+            .map_err(E::from)?;
         let result = operation();
         let mut popped = std::ptr::null_mut();
         let pop_result = driver.check(
@@ -429,7 +483,7 @@ impl CudaContext {
         );
         match (result, pop_result) {
             (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
+            (Ok(_), Err(error)) => Err(E::from(error)),
             (Ok(value), Ok(())) => Ok(value),
         }
     }
@@ -477,6 +531,89 @@ impl CudaDeviceAllocation {
         self.context.device_ordinal()
     }
 
+    pub fn copy_from_host(&mut self, offset: usize, bytes: &[u8]) -> Result<(), CudaError> {
+        if bytes.is_empty() {
+            self.checked_device_ptr(offset, 0)?;
+            return Ok(());
+        }
+        let device_ptr = self.checked_device_ptr(offset, bytes.len())?;
+        self.context.with_current(|| {
+            self.context.inner.driver.check(
+                unsafe {
+                    (self.context.inner.driver.inner.api.memcpy_htod)(
+                        device_ptr,
+                        bytes.as_ptr().cast(),
+                        bytes.len(),
+                    )
+                },
+                "cuMemcpyHtoD_v2",
+            )
+        })
+    }
+
+    pub fn copy_to_host(&self, offset: usize, bytes: &mut [u8]) -> Result<(), CudaError> {
+        if bytes.is_empty() {
+            self.checked_device_ptr(offset, 0)?;
+            return Ok(());
+        }
+        let device_ptr = self.checked_device_ptr(offset, bytes.len())?;
+        self.context.with_current(|| {
+            self.context.inner.driver.check(
+                unsafe {
+                    (self.context.inner.driver.inner.api.memcpy_dtoh)(
+                        bytes.as_mut_ptr().cast(),
+                        device_ptr,
+                        bytes.len(),
+                    )
+                },
+                "cuMemcpyDtoH_v2",
+            )
+        })
+    }
+
+    pub fn fill(&mut self, value: u8) -> Result<(), CudaError> {
+        let device_ptr = self.checked_device_ptr(0, self.byte_len)?;
+        self.context.with_current(|| {
+            self.context.inner.driver.check(
+                unsafe {
+                    (self.context.inner.driver.inner.api.memset_d8)(
+                        device_ptr,
+                        value,
+                        self.byte_len,
+                    )
+                },
+                "cuMemsetD8_v2",
+            )
+        })
+    }
+
+    pub(crate) fn checked_device_ptr(
+        &self,
+        offset: usize,
+        byte_len: usize,
+    ) -> Result<CuDevicePtr, CudaError> {
+        if !self.active {
+            return Err(CudaError::FreedAllocation);
+        }
+        let end = offset
+            .checked_add(byte_len)
+            .ok_or(CudaError::AllocationOutOfBounds {
+                offset,
+                byte_len,
+                allocation_byte_len: self.byte_len,
+            })?;
+        if end > self.byte_len {
+            return Err(CudaError::AllocationOutOfBounds {
+                offset,
+                byte_len,
+                allocation_byte_len: self.byte_len,
+            });
+        }
+        self.device_ptr
+            .checked_add(u64::try_from(offset).map_err(|_| CudaError::DeviceAddressOverflow)?)
+            .ok_or(CudaError::DeviceAddressOverflow)
+    }
+
     pub fn free(&mut self) -> Result<(), CudaError> {
         if !self.active {
             return Ok(());
@@ -518,9 +655,13 @@ struct CudaApi {
     device_primary_ctx_release: CuDevicePrimaryCtxRelease,
     ctx_push_current: CuCtxPushCurrent,
     ctx_pop_current: CuCtxPopCurrent,
+    ctx_synchronize: CuCtxSynchronize,
     mem_alloc: CuMemAlloc,
     mem_free: CuMemFree,
     mem_get_info: CuMemGetInfo,
+    memcpy_htod: CuMemcpyHtoD,
+    memcpy_dtoh: CuMemcpyDtoH,
+    memset_d8: CuMemsetD8,
     get_error_name: CuGetErrorName,
     get_error_string: CuGetErrorString,
 }
@@ -565,9 +706,15 @@ impl CudaApi {
             ctx_pop_current: unsafe {
                 load_symbol(library, b"cuCtxPopCurrent_v2\0", "cuCtxPopCurrent_v2")?
             },
+            ctx_synchronize: unsafe {
+                load_symbol(library, b"cuCtxSynchronize\0", "cuCtxSynchronize")?
+            },
             mem_alloc: unsafe { load_symbol(library, b"cuMemAlloc_v2\0", "cuMemAlloc_v2")? },
             mem_free: unsafe { load_symbol(library, b"cuMemFree_v2\0", "cuMemFree_v2")? },
             mem_get_info: unsafe { load_symbol(library, b"cuMemGetInfo_v2\0", "cuMemGetInfo_v2")? },
+            memcpy_htod: unsafe { load_symbol(library, b"cuMemcpyHtoD_v2\0", "cuMemcpyHtoD_v2")? },
+            memcpy_dtoh: unsafe { load_symbol(library, b"cuMemcpyDtoH_v2\0", "cuMemcpyDtoH_v2")? },
+            memset_d8: unsafe { load_symbol(library, b"cuMemsetD8_v2\0", "cuMemsetD8_v2")? },
             get_error_name: unsafe { load_symbol(library, b"cuGetErrorName\0", "cuGetErrorName")? },
             get_error_string: unsafe {
                 load_symbol(library, b"cuGetErrorString\0", "cuGetErrorString")?
@@ -614,6 +761,7 @@ mod tests {
     use std::sync::Mutex;
 
     static EVENTS: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    static CUDA_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn missing_driver_reports_every_candidate() {
@@ -633,7 +781,38 @@ mod tests {
     }
 
     #[test]
+    fn auto_selection_only_treats_missing_driver_or_no_device_as_cpu_eligible() {
+        assert!(
+            CudaError::DriverUnavailable {
+                attempts: vec!["missing".to_string()]
+            }
+            .is_unavailable_for_auto_selection()
+        );
+        assert!(
+            CudaError::DriverCall {
+                operation: "cuInit",
+                code: 100,
+                name: Some("CUDA_ERROR_NO_DEVICE".to_string()),
+                description: None,
+            }
+            .is_unavailable_for_auto_selection()
+        );
+        assert!(
+            !CudaError::DriverCall {
+                operation: "cuInit",
+                code: 35,
+                name: Some("CUDA_ERROR_INSUFFICIENT_DRIVER".to_string()),
+                description: None,
+            }
+            .is_unavailable_for_auto_selection()
+        );
+    }
+
+    #[test]
     fn fake_driver_probes_b200_and_manages_allocation_lifetime() {
+        let _test_guard = CUDA_TEST_LOCK
+            .lock()
+            .expect("CUDA test lock should be held");
         EVENTS.lock().expect("events lock should be held").clear();
         let driver = fake_driver();
 
@@ -677,6 +856,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn allocation_copies_and_fills_stay_within_owned_device_memory() {
+        let _test_guard = CUDA_TEST_LOCK
+            .lock()
+            .expect("CUDA test lock should be held");
+        EVENTS.lock().expect("events lock should be held").clear();
+        let driver = fake_driver();
+        let context = driver
+            .retain_primary_context(0)
+            .expect("fake context should retain");
+        let mut allocation = context.allocate(16).expect("allocation should succeed");
+
+        allocation
+            .copy_from_host(4, &[1, 2, 3, 4])
+            .expect("host-to-device copy should succeed");
+        let mut output = [0_u8; 4];
+        allocation
+            .copy_to_host(8, &mut output)
+            .expect("device-to-host copy should succeed");
+        assert_eq!(output, [0xa5; 4]);
+        allocation.fill(0).expect("device fill should succeed");
+        context.synchronize().expect("context should synchronize");
+
+        assert_eq!(
+            allocation
+                .copy_from_host(14, &[1, 2, 3])
+                .expect_err("out-of-bounds copy must fail"),
+            CudaError::AllocationOutOfBounds {
+                offset: 14,
+                byte_len: 3,
+                allocation_byte_len: 16,
+            }
+        );
+
+        allocation.free().expect("allocation should free");
+        assert_eq!(
+            allocation
+                .copy_to_host(0, &mut output)
+                .expect_err("freed allocation must reject access"),
+            CudaError::FreedAllocation
+        );
+    }
+
     fn fake_driver() -> CudaDriver {
         CudaDriver {
             inner: Arc::new(CudaDriverInner {
@@ -693,9 +915,13 @@ mod tests {
                     device_primary_ctx_release: fake_primary_ctx_release,
                     ctx_push_current: fake_ctx_push_current,
                     ctx_pop_current: fake_ctx_pop_current,
+                    ctx_synchronize: fake_ctx_synchronize,
                     mem_alloc: fake_mem_alloc,
                     mem_free: fake_mem_free,
                     mem_get_info: fake_mem_get_info,
+                    memcpy_htod: fake_memcpy_htod,
+                    memcpy_dtoh: fake_memcpy_dtoh,
+                    memset_d8: fake_memset_d8,
                     get_error_name: fake_get_error,
                     get_error_string: fake_get_error,
                 },
@@ -791,6 +1017,14 @@ mod tests {
         CUDA_SUCCESS
     }
 
+    unsafe extern "C" fn fake_ctx_synchronize() -> c_int {
+        EVENTS
+            .lock()
+            .expect("events lock should be held")
+            .push("synchronize");
+        CUDA_SUCCESS
+    }
+
     unsafe extern "C" fn fake_mem_alloc(device_ptr: *mut CuDevicePtr, _len: usize) -> c_int {
         EVENTS
             .lock()
@@ -817,6 +1051,52 @@ mod tests {
             *free = 180 * 1024 * 1024 * 1024;
             *total = 192 * 1024 * 1024 * 1024;
         }
+        CUDA_SUCCESS
+    }
+
+    unsafe extern "C" fn fake_memcpy_htod(
+        device_ptr: CuDevicePtr,
+        source: *const c_void,
+        byte_len: usize,
+    ) -> c_int {
+        assert_eq!(device_ptr, 0x4004);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(source.cast::<u8>(), byte_len) },
+            [1, 2, 3, 4]
+        );
+        EVENTS
+            .lock()
+            .expect("events lock should be held")
+            .push("copy-htod");
+        CUDA_SUCCESS
+    }
+
+    unsafe extern "C" fn fake_memcpy_dtoh(
+        destination: *mut c_void,
+        device_ptr: CuDevicePtr,
+        byte_len: usize,
+    ) -> c_int {
+        assert_eq!(device_ptr, 0x4008);
+        unsafe { std::ptr::write_bytes(destination, 0xa5, byte_len) };
+        EVENTS
+            .lock()
+            .expect("events lock should be held")
+            .push("copy-dtoh");
+        CUDA_SUCCESS
+    }
+
+    unsafe extern "C" fn fake_memset_d8(
+        device_ptr: CuDevicePtr,
+        value: u8,
+        byte_len: usize,
+    ) -> c_int {
+        assert_eq!(device_ptr, 0x4000);
+        assert_eq!(value, 0);
+        assert_eq!(byte_len, 16);
+        EVENTS
+            .lock()
+            .expect("events lock should be held")
+            .push("memset");
         CUDA_SUCCESS
     }
 

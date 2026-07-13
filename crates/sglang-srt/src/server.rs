@@ -4,11 +4,12 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 
 use crate::backend::{
-    CapabilityStatus, RuntimeBackend, RuntimeCapability, RuntimeRequirements,
+    CapabilityStatus, CudaBackend, RuntimeBackend, RuntimeCapability, RuntimeRequirements,
     validate_runtime_backend,
 };
 use crate::cache::{CachePageAllocator, RadixCache};
 use crate::cli::ServerArgs;
+use crate::cuda_runtime::{CudaEmbeddingLmError, CudaEmbeddingLmModel};
 use crate::deepseek_runtime::{
     DeepSeekRuntimeError, DeepSeekV4LoadedTensorParallelRuntime, DeepSeekV4Runtime,
     DeepSeekV4TensorShardLoadError,
@@ -61,11 +62,12 @@ use crate::transfer::{
 };
 use crate::worker::{WorkerExecutor, WorkerWeightUpdateRequest};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub enum BootstrapForwardModel {
     #[default]
     Space,
     CpuEmbeddingLm(CpuEmbeddingLmModel),
+    CudaEmbeddingLm(Box<CudaEmbeddingLmModel>),
     DeepSeekV4(DeepSeekV4LoadedTensorParallelRuntime),
     GlmMoeDsa(GlmMoeDsaF32CachedForwardModel),
     UnsupportedLocalModelRuntime {
@@ -88,10 +90,36 @@ impl BootstrapForwardModel {
             Err(error) => return Err(error.into()),
         };
 
-        Self::from_local_model_artifacts(&artifacts, args.tp_size)
+        let requested = RuntimeBackend::parse(&args.device)
+            .ok_or_else(|| ServerLaunchError::InvalidDevice(args.device.clone()))?;
+        match requested {
+            RuntimeBackend::Cuda => {
+                let backend = CudaBackend::initialize(0)
+                    .map_err(|error| ServerLaunchError::CudaRuntime(error.to_string()))?;
+                Self::from_local_model_artifacts_cuda(&artifacts, backend)
+            }
+            RuntimeBackend::Auto => match CudaBackend::initialize(0) {
+                Ok(backend) => Self::from_local_model_artifacts_cuda(&artifacts, backend),
+                Err(error) if error.is_unavailable_for_auto_selection() => {
+                    Self::from_local_model_artifacts_cpu(&artifacts, args.tp_size)
+                }
+                Err(error) => Err(ServerLaunchError::CudaRuntime(error.to_string())),
+            },
+            RuntimeBackend::Cpu => Self::from_local_model_artifacts_cpu(&artifacts, args.tp_size),
+            backend @ (RuntimeBackend::Metal
+            | RuntimeBackend::Rocm
+            | RuntimeBackend::Musa
+            | RuntimeBackend::Xpu
+            | RuntimeBackend::Npu
+            | RuntimeBackend::Hpu) => Err(ServerLaunchError::UnsupportedModelBackend {
+                backend,
+                model_path: artifacts.model_path().display().to_string(),
+                model_type: artifacts.config().model_type.clone(),
+            }),
+        }
     }
 
-    fn from_local_model_artifacts(
+    fn from_local_model_artifacts_cpu(
         artifacts: &LocalModelArtifacts,
         tp_size: usize,
     ) -> Result<Self, ServerLaunchError> {
@@ -118,11 +146,28 @@ impl BootstrapForwardModel {
         )
     }
 
+    fn from_local_model_artifacts_cuda(
+        artifacts: &LocalModelArtifacts,
+        backend: CudaBackend,
+    ) -> Result<Self, ServerLaunchError> {
+        match CudaEmbeddingLmModel::from_local_model_artifacts(artifacts, backend)? {
+            Some(model) => Ok(Self::CudaEmbeddingLm(Box::new(model))),
+            None => Err(ServerLaunchError::UnsupportedModelBackend {
+                backend: RuntimeBackend::Cuda,
+                model_path: artifacts.model_path().display().to_string(),
+                model_type: artifacts.config().model_type.clone(),
+            }),
+        }
+    }
+
     fn reload_tp_size(&self) -> usize {
         match self {
             Self::DeepSeekV4(runtime) => runtime.rank_count(),
             Self::GlmMoeDsa(model) => model.rank_count(),
-            Self::Space | Self::CpuEmbeddingLm(_) | Self::UnsupportedLocalModelRuntime { .. } => 1,
+            Self::Space
+            | Self::CpuEmbeddingLm(_)
+            | Self::CudaEmbeddingLm(_)
+            | Self::UnsupportedLocalModelRuntime { .. } => 1,
         }
     }
 
@@ -130,6 +175,7 @@ impl BootstrapForwardModel {
         match self {
             Self::Space => RuntimeCapability::cpu_reference("space-reference", false),
             Self::CpuEmbeddingLm(_) => RuntimeCapability::cpu_reference("cpu-embedding-lm", false),
+            Self::CudaEmbeddingLm(model) => model.runtime_capability(),
             Self::DeepSeekV4(_) => RuntimeCapability::metadata_only("deepseek-v4-metadata", false),
             Self::GlmMoeDsa(_) => RuntimeCapability::cpu_reference("glm-moe-dsa-f32-cpu", true)
                 .with_tensor_parallel(CapabilityStatus::Supported),
@@ -163,6 +209,10 @@ impl BootstrapForwardModel {
                 model_path: "<bootstrap>".to_string(),
                 model_type: Some("cpu_embedding_lm".to_string()),
             }),
+            Self::CudaEmbeddingLm(_) => Err(ServerLaunchError::UnsupportedMooncakeKvMemory {
+                model_path: "<bootstrap>".to_string(),
+                model_type: Some("cuda_embedding_lm".to_string()),
+            }),
             Self::DeepSeekV4(_) => Err(ServerLaunchError::UnsupportedMooncakeKvMemory {
                 model_path: "<bootstrap>".to_string(),
                 model_type: Some("deepseek_v4".to_string()),
@@ -188,6 +238,7 @@ impl ForwardModel for BootstrapForwardModel {
                 ModelForwardOutput::new(logits)
             }
             Self::CpuEmbeddingLm(model) => model.forward(batch),
+            Self::CudaEmbeddingLm(model) => model.forward(batch),
             Self::DeepSeekV4(runtime) => {
                 let plan = runtime.forward_plan(batch);
                 Err(ModelForwardError::Runtime(format!(
@@ -218,8 +269,15 @@ impl ForwardModel for BootstrapForwardModel {
     ) -> Result<(), ModelForwardError> {
         let artifacts = LocalModelArtifacts::from_model_path(&request.model_path)
             .map_err(|error| ModelForwardError::Runtime(error.to_string()))?;
-        let next = Self::from_local_model_artifacts(&artifacts, self.reload_tp_size())
-            .map_err(|error| ModelForwardError::Runtime(error.to_string()))?;
+        let next = match self {
+            Self::CudaEmbeddingLm(model) => {
+                let backend = CudaBackend::initialize(model.device().ordinal)
+                    .map_err(|error| ModelForwardError::Runtime(error.to_string()))?;
+                Self::from_local_model_artifacts_cuda(&artifacts, backend)
+            }
+            _ => Self::from_local_model_artifacts_cpu(&artifacts, self.reload_tp_size()),
+        }
+        .map_err(|error| ModelForwardError::Runtime(error.to_string()))?;
         *self = next;
         Ok(())
     }
@@ -264,6 +322,7 @@ fn validate_bootstrap_runtime_requirements(
 ) -> Result<(), ServerLaunchError> {
     let capability = model.runtime_capability();
     let requirements = RuntimeRequirements {
+        requires_forward: true,
         attention_backend: args.attention_backend.as_deref(),
         tensor_parallel_size: args.tp_size,
         ..RuntimeRequirements::default()
@@ -331,6 +390,12 @@ pub enum ServerLaunchError {
     MissingRuntimeCapabilities {
         runtime_name: String,
         missing: Vec<String>,
+    },
+    CudaRuntime(String),
+    UnsupportedModelBackend {
+        backend: RuntimeBackend,
+        model_path: String,
+        model_type: Option<String>,
     },
     DeepSeekRuntime(DeepSeekRuntimeError),
     DeepSeekTensorShardLoad(DeepSeekV4TensorShardLoadError),
@@ -411,6 +476,23 @@ impl PartialEq for ServerLaunchError {
                     missing: right_missing,
                 },
             ) => left_runtime_name == right_runtime_name && left_missing == right_missing,
+            (Self::CudaRuntime(left), Self::CudaRuntime(right)) => left == right,
+            (
+                Self::UnsupportedModelBackend {
+                    backend: left_backend,
+                    model_path: left_model_path,
+                    model_type: left_model_type,
+                },
+                Self::UnsupportedModelBackend {
+                    backend: right_backend,
+                    model_path: right_model_path,
+                    model_type: right_model_type,
+                },
+            ) => {
+                left_backend == right_backend
+                    && left_model_path == right_model_path
+                    && left_model_type == right_model_type
+            }
             (Self::DeepSeekRuntime(left), Self::DeepSeekRuntime(right)) => left == right,
             (Self::DeepSeekTensorShardLoad(left), Self::DeepSeekTensorShardLoad(right)) => {
                 left == right
@@ -486,6 +568,18 @@ impl fmt::Display for ServerLaunchError {
                 "runtime {runtime_name} is missing required capabilities: {}",
                 missing.join(", ")
             ),
+            Self::CudaRuntime(error) => {
+                write!(formatter, "CUDA runtime initialization failed: {error}")
+            }
+            Self::UnsupportedModelBackend {
+                backend,
+                model_path,
+                model_type,
+            } => write!(
+                formatter,
+                "model {model_path} type {} has no executable {backend} runtime",
+                model_type.as_deref().unwrap_or("<unknown>")
+            ),
             Self::DeepSeekRuntime(error) => write!(formatter, "DeepSeek runtime error: {error}"),
             Self::DeepSeekTensorShardLoad(error) => {
                 write!(formatter, "DeepSeek tensor shard load error: {error}")
@@ -547,6 +641,15 @@ impl From<PdConfigError> for ServerLaunchError {
 impl From<ModelArtifactError> for ServerLaunchError {
     fn from(value: ModelArtifactError) -> Self {
         Self::ModelArtifact(value)
+    }
+}
+
+impl From<CudaEmbeddingLmError> for ServerLaunchError {
+    fn from(value: CudaEmbeddingLmError) -> Self {
+        match value {
+            CudaEmbeddingLmError::ModelArtifact(error) => Self::ModelArtifact(error),
+            error => Self::CudaRuntime(error.to_string()),
+        }
     }
 }
 
@@ -1065,6 +1168,12 @@ fn mooncake_kv_memory_from_bootstrap_model(
             Err(ServerLaunchError::UnsupportedMooncakeKvMemory {
                 model_path: "<bootstrap>".to_string(),
                 model_type: Some("cpu_embedding_lm".to_string()),
+            })
+        }
+        BootstrapForwardModel::CudaEmbeddingLm(_) => {
+            Err(ServerLaunchError::UnsupportedMooncakeKvMemory {
+                model_path: "<bootstrap>".to_string(),
+                model_type: Some("cuda_embedding_lm".to_string()),
             })
         }
         BootstrapForwardModel::DeepSeekV4(_) => {

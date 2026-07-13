@@ -209,14 +209,14 @@ pub trait ForwardModel {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct CpuEmbeddingLmModel {
+pub struct EmbeddingLmWeights {
     token_embeddings: Vec<f32>,
     lm_head: Vec<f32>,
     vocab_size: usize,
     hidden_size: usize,
 }
 
-impl CpuEmbeddingLmModel {
+impl EmbeddingLmWeights {
     pub fn from_local_model_artifacts(
         artifacts: &LocalModelArtifacts,
     ) -> Result<Option<Self>, ModelArtifactError> {
@@ -255,23 +255,54 @@ impl CpuEmbeddingLmModel {
         }))
     }
 
+    pub fn token_embeddings(&self) -> &[f32] {
+        &self.token_embeddings
+    }
+
+    pub fn lm_head(&self) -> &[f32] {
+        &self.lm_head
+    }
+
+    pub fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+
+    pub fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CpuEmbeddingLmModel {
+    weights: EmbeddingLmWeights,
+}
+
+impl CpuEmbeddingLmModel {
+    pub fn from_local_model_artifacts(
+        artifacts: &LocalModelArtifacts,
+    ) -> Result<Option<Self>, ModelArtifactError> {
+        Ok(EmbeddingLmWeights::from_local_model_artifacts(artifacts)?
+            .map(|weights| Self { weights }))
+    }
+
     fn logits_for_token(&self, token_id: u32) -> Result<Vec<f32>, ModelForwardError> {
         let token_id = usize::try_from(token_id).map_err(|_| {
             ModelForwardError::Runtime(format!("token id {token_id} does not fit usize"))
         })?;
-        if token_id >= self.vocab_size {
+        if token_id >= self.weights.vocab_size {
             return Err(ModelForwardError::Runtime(format!(
                 "token id {token_id} is outside CPU embedding LM vocabulary {}",
-                self.vocab_size
+                self.weights.vocab_size
             )));
         }
 
-        let hidden_offset = token_id * self.hidden_size;
-        let hidden = &self.token_embeddings[hidden_offset..hidden_offset + self.hidden_size];
-        let mut logits = Vec::with_capacity(self.vocab_size);
-        for output_token_id in 0..self.vocab_size {
-            let row_offset = output_token_id * self.hidden_size;
-            let row = &self.lm_head[row_offset..row_offset + self.hidden_size];
+        let hidden_offset = token_id * self.weights.hidden_size;
+        let hidden =
+            &self.weights.token_embeddings[hidden_offset..hidden_offset + self.weights.hidden_size];
+        let mut logits = Vec::with_capacity(self.weights.vocab_size);
+        for output_token_id in 0..self.weights.vocab_size {
+            let row_offset = output_token_id * self.weights.hidden_size;
+            let row = &self.weights.lm_head[row_offset..row_offset + self.weights.hidden_size];
             logits.push(dot_product(hidden, row));
         }
         Ok(logits)

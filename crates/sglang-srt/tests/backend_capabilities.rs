@@ -8,6 +8,7 @@ fn cpu_reference_reports_missing_production_requirements_together() {
     let capability = RuntimeCapability::cpu_reference("cpu-reference", false);
     let error = capability
         .validate_requirements(&RuntimeRequirements {
+            requires_forward: true,
             dtype: Some(RuntimeDtype::Bf16),
             attention_backend: Some("flashinfer"),
             tensor_parallel_size: 2,

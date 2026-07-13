@@ -98,33 +98,36 @@ fn unique_model_dir(name: &str) -> std::path::PathBuf {
     ))
 }
 
-fn write_minimal_generic_model_artifacts_with_weight_values(
-    model_dir: &std::path::Path,
-    values: &[f32],
-) {
+fn write_embedding_lm_artifacts_with_weight_values(model_dir: &std::path::Path, values: &[f32]) {
+    assert_eq!(
+        values.len(),
+        3,
+        "embedding LM fixture uses a 3-token vocabulary"
+    );
     fs::create_dir_all(model_dir).expect("model directory should be created");
     fs::write(
         model_dir.join("config.json"),
         r#"{
-  "architectures": ["TinyForCausalLM"],
-  "model_type": "tiny",
-  "vocab_size": 128,
-  "max_position_embeddings": 4096,
+  "model_type": "sglang_embedding_lm",
+  "vocab_size": 3,
+  "hidden_size": 1,
   "eos_token_id": [2, 3]
 }"#,
     )
     .expect("config should be written");
     let byte_len = values.len() * size_of::<f32>();
     let header = format!(
-        r#"{{"model.embed_tokens.weight":{{"dtype":"F32","shape":[{}],"data_offsets":[0,{}]}}}}"#,
-        values.len(),
-        byte_len
+        r#"{{"model.embed_tokens.weight":{{"dtype":"F32","shape":[3,1],"data_offsets":[0,{byte_len}]}},"lm_head.weight":{{"dtype":"F32","shape":[3,1],"data_offsets":[{byte_len},{}]}}}}"#,
+        byte_len * 2
     );
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
     bytes.extend_from_slice(header.as_bytes());
     for value in values {
         bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    for _ in values {
+        bytes.extend_from_slice(&0.0_f32.to_le_bytes());
     }
     fs::write(model_dir.join("model.safetensors"), bytes)
         .expect("safetensors shard should be written");
@@ -418,7 +421,7 @@ async fn router_update_weight_version_reaches_real_rust_srt_grpc_worker() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn router_get_weights_by_name_reaches_real_rust_srt_grpc_worker() {
     let model_dir = unique_model_dir("get-weights");
-    write_minimal_generic_model_artifacts_with_weight_values(&model_dir, &[1.5, 2.5, 3.5]);
+    write_embedding_lm_artifacts_with_weight_values(&model_dir, &[1.5, 2.5, 3.5]);
     let addr = unused_local_addr();
     let args = ServerArgs::parse_from([
         "serve",

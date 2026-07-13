@@ -85,6 +85,54 @@ fn bootstrap_cuda_device_rejects_space_reference_fallback() {
     );
 }
 
+#[test]
+fn unsupported_accelerator_fails_before_cpu_weight_materialization() {
+    let model_dir = temp_model_dir("unsupported-accelerator-fast-fail");
+    fs::create_dir_all(&model_dir).expect("temp model directory should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "model_type": "sglang_embedding_lm",
+  "vocab_size": 3,
+  "hidden_size": 2
+}"#,
+    )
+    .expect("config should be written");
+    write_safetensors_file(
+        &model_dir.join("model.safetensors"),
+        &[("unrelated.weight", "U8", &[1], [0, 1])],
+        &[0],
+    )
+    .expect("minimal safetensors file should be written");
+
+    for device in ["metal", "rocm", "musa", "xpu", "npu", "hpu"] {
+        let args = ServerArgs::parse_from([
+            "serve",
+            "--model-path",
+            model_dir.to_str().expect("temp model path should be utf-8"),
+            "--device",
+            device,
+            "--grpc-mode",
+        ])
+        .expect("server args should parse");
+        let error = match try_build_bootstrap_grpc_router_service(&args) {
+            Ok(_) => panic!("unsupported accelerator {device} must fail before serving"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(
+                error,
+                ServerLaunchError::UnsupportedModelBackend { backend, .. }
+                    if backend.as_str() == device
+            ),
+            "unexpected {device} error: {error:?}"
+        );
+    }
+
+    fs::remove_dir_all(model_dir).expect("temp model directory should be removed");
+}
+
 #[tokio::test]
 async fn launch_cpu_reference_rejects_ignored_attention_backend() {
     let args = ServerArgs::parse_from([

@@ -95,7 +95,9 @@ This repository currently contains the first `sglang-srt` runtime crate and the
   backend. The CUDA path does not require a CUDA SDK at Rust compile time; on a
   GPU host it performs real device discovery, compute-capability queries,
   primary-context management, memory accounting, and RAII `cuMemAlloc_v2` /
-  `cuMemFree_v2` device allocation.
+  `cuMemFree_v2` device allocation. Checked host/device copies and dynamically
+  loaded cuBLAS provide the first real CUDA weight-execution path without
+  requiring a CUDA SDK at Rust compile time.
 - `backend`: runtime capability contracts for compute capability, supported
   dtypes, attention implementations, tensor parallelism, KV memory
   registration, Mooncake, RDMA, and NVLink. CUDA dtype support is derived from
@@ -216,14 +218,22 @@ This repository currently contains the first `sglang-srt` runtime crate and the
 - `types`: generation request and response types.
 
 The implementation is intentionally small while the architecture is being
-carved out. The current production CUDA device/allocator boundary is real, but
-a CUDA model executor and attention kernels are not implemented yet. PD support covers the scheduler/router execution split,
+carved out. A CUDA/cuBLAS executor now runs the weight-backed embedding LM used
+for end-to-end protocol validation; transformer attention, MoE CUDA kernels,
+and a production GLM/DeepSeek CUDA executor are not implemented yet. PD support covers the scheduler/router execution split,
 bootstrap metadata propagation, bounded transfer polling, fake/local snapshot
 transfer paths, control-plane descriptor checksums, snapshot-content checksums,
 and the Mooncake-linked transfer-engine boundary with managed memory
 registration. CUDA device KV allocations can be exposed through the same
 Mooncake memory-provider contract; the current executable forward provider is
-still the CPU reference GLM runtime.
+the CPU reference GLM runtime, while the CUDA embedding LM does not have a KV
+cache and therefore fails fast if Mooncake PD is requested.
+
+`--device auto` follows the community CLI surface. It selects CUDA when a
+working NVIDIA driver and visible device are present, and selects the CPU
+reference backend only when CUDA is absent. A broken CUDA installation,
+missing cuBLAS, unsupported model/backend pair, or unsupported accelerator
+fails at startup instead of falling back to CPU execution.
 
 ## Development
 
@@ -239,6 +249,14 @@ On a B200 host, validate the real CUDA Driver and device-KV allocation boundary:
 ```bash
 cargo test -p sglang-srt --test cuda_backend \
   b200_cuda_backend_allocates_transferable_device_kv_memory -- --ignored --nocapture
+```
+
+Validate real safetensors weight upload, cuBLAS logits, token sampling, and the
+HTTP inference service on B200:
+
+```bash
+cargo test -p sglang-srt --test cuda_inference \
+  b200_auto_selects_cuda_cublas_for_weight_backed_http_inference -- --ignored --nocapture
 ```
 
 With native Mooncake built, validate CUDA KV registration and deregistration:
