@@ -7,16 +7,18 @@ use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler, Schedule
 use sglang_srt::tokenizer::ByteTokenizer;
 use sglang_srt::transfer::{
     DecodeBootstrapMetadataPublishSummary, DecodeBootstrapPublisher, DecodeBootstrapRegistry,
-    DecodeBootstrapSession, FakeKvCacheTransferExecutor, KvCacheTransferError,
-    KvCacheTransferExecutor, KvCacheTransferPlan, KvCacheTransferPlanError, KvCacheTransferSpan,
-    KvPoll, KvTransferModelWorker, LocalSnapshotTransferPdModelWorkers, MooncakeBatchId,
-    MooncakeBatchReleaser, MooncakeError, MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor,
-    MooncakeOpcode, MooncakeRemoteKvLayout, MooncakeSessionTargetResolver, MooncakeSubmittedBatch,
+    DecodeBootstrapSession, FakeKvCacheTransferExecutor, KvCacheMemoryLocation,
+    KvCacheTransferError, KvCacheTransferExecutor, KvCacheTransferPlan, KvCacheTransferPlanError,
+    KvCacheTransferSpan, KvPoll, KvTransferModelWorker, LocalSnapshotTransferPdModelWorkers,
+    MooncakeBatchId, MooncakeBatchReleaser, MooncakeError, MooncakeKvCacheLayout,
+    MooncakeKvCacheTransferExecutor, MooncakeMemoryRegistrar, MooncakeOpcode,
+    MooncakeRemoteKvLayout, MooncakeSessionTargetResolver, MooncakeSubmittedBatch,
     MooncakeTransferRequest, MooncakeTransferStatus, MooncakeTransferStatusCode,
     MooncakeTransferStatusReader, MooncakeTransferSubmitter, MooncakeTransferTarget,
-    MooncakeTransferTargetResolver, TransferableKvCacheMemory, TransferableKvCacheRegion,
-    build_mooncake_kv_transfer_requests, build_mooncake_remote_kv_transfer_requests,
-    execute_kv_cache_transfer_plan, is_decode_request_kv_ready, poll_mooncake_transfer_batches,
+    MooncakeTransferTargetResolver, RegisteredMooncakeKvCacheMemory, TransferableKvCacheMemory,
+    TransferableKvCacheRegion, build_mooncake_kv_transfer_requests,
+    build_mooncake_remote_kv_transfer_requests, execute_kv_cache_transfer_plan,
+    is_decode_request_kv_ready, poll_mooncake_transfer_batches,
 };
 use sglang_srt::types::{
     BootstrapRoom, DisaggregatedParams, RequestId, SamplingParams, TokenGenerateRequest,
@@ -25,6 +27,8 @@ use sglang_srt::worker::{
     BatchGeneratedTokens, FallibleModelWorker, GeneratedToken, ModelWorker, WorkerExecutionError,
     WorkerWeightUpdateRequest,
 };
+use std::ffi::c_void;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[derive(Default)]
@@ -1357,6 +1361,7 @@ fn transferable_kv_memory_builds_prefill_and_decode_mooncake_layouts() {
             page_size_bytes: 128,
         }],
         128,
+        KvCacheMemoryLocation::Cpu { numa_node: 0 },
     )
     .expect("memory should be valid");
 
@@ -1379,6 +1384,36 @@ fn transferable_kv_memory_builds_prefill_and_decode_mooncake_layouts() {
 }
 
 #[test]
+fn transferable_kv_memory_supports_uniform_multi_region_decode_layout() {
+    let memory = TransferableKvCacheMemory::new(
+        vec![
+            TransferableKvCacheRegion {
+                base_addr: 0x1000,
+                byte_len: 2048,
+                page_size_bytes: 64,
+            },
+            TransferableKvCacheRegion {
+                base_addr: 0x3000,
+                byte_len: 2048,
+                page_size_bytes: 64,
+            },
+        ],
+        128,
+        KvCacheMemoryLocation::Cuda { device_id: 0 },
+    )
+    .expect("uniform split KV regions should be valid");
+
+    assert_eq!(
+        memory.decode_remote_layout(&[7, 8]),
+        MooncakeRemoteKvLayout {
+            dst_kv_ptrs: vec![0x1000, 0x3000],
+            dst_kv_indices: vec![7, 8],
+            dst_kv_item_len: 64,
+        }
+    );
+}
+
+#[test]
 fn transferable_kv_memory_rejects_zero_base_address() {
     let error = TransferableKvCacheMemory::new(
         vec![TransferableKvCacheRegion {
@@ -1387,6 +1422,7 @@ fn transferable_kv_memory_rejects_zero_base_address() {
             page_size_bytes: 128,
         }],
         128,
+        KvCacheMemoryLocation::Cpu { numa_node: 0 },
     )
     .expect_err("zero address should be rejected");
 
@@ -1394,6 +1430,135 @@ fn transferable_kv_memory_rejects_zero_base_address() {
         error.to_string().contains("base address must be non-zero"),
         "{error}"
     );
+}
+
+#[test]
+fn mooncake_memory_location_uses_native_backend_prefixes_and_rejects_unknown_abis() {
+    assert_eq!(
+        KvCacheMemoryLocation::Rocm { device_id: 2 }
+            .mooncake_label()
+            .expect("ROCm has a Mooncake HIP location ABI"),
+        "hip:2"
+    );
+    assert_eq!(
+        KvCacheMemoryLocation::Musa { device_id: 4 }
+            .mooncake_label()
+            .expect("MUSA has a Mooncake location ABI"),
+        "musa:4"
+    );
+    assert_eq!(
+        KvCacheMemoryLocation::Npu { device_id: 1 }
+            .mooncake_label()
+            .expect("Ascend has a Mooncake NPU location ABI"),
+        "npu:1"
+    );
+    assert_eq!(
+        KvCacheMemoryLocation::Metal { device_id: 0 }.mooncake_label(),
+        Err(MooncakeError::UnsupportedMemoryLocation(
+            KvCacheMemoryLocation::Metal { device_id: 0 }
+        ))
+    );
+}
+
+#[test]
+fn mooncake_registration_uses_runtime_memory_location_and_unregisters_before_model_drop() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let memory = TransferableKvCacheMemory::new(
+        vec![TransferableKvCacheRegion {
+            base_addr: 0x4000,
+            byte_len: 4096,
+            page_size_bytes: 128,
+        }],
+        128,
+        KvCacheMemoryLocation::Cuda { device_id: 3 },
+    )
+    .expect("memory should be valid");
+    let registration = RegisteredMooncakeKvCacheMemory::register(
+        RecordingMemoryRegistrar::new(events.clone()),
+        memory,
+    )
+    .expect("memory registration should succeed");
+    let layout = registration.memory().prefill_layout(0);
+    let executor = MooncakeKvCacheTransferExecutor::new(
+        RecordingMooncakeSubmitter::default(),
+        layout,
+        MooncakeTransferTarget { target_id: 1 },
+    )
+    .with_local_memory_registration(registration)
+    .expect("registration should match executor layout");
+
+    let worker = KvTransferModelWorker::new(
+        DropRecordingWorker::new(events.clone()),
+        DecodeBootstrapRegistry::default(),
+        executor,
+    );
+    drop(worker);
+
+    assert_eq!(
+        *events.lock().expect("events lock should be held"),
+        [
+            "register:cuda:3:0x4000:4096",
+            "unregister:0x4000",
+            "model-drop",
+        ]
+    );
+}
+
+#[derive(Clone)]
+struct RecordingMemoryRegistrar {
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+impl RecordingMemoryRegistrar {
+    fn new(events: Arc<Mutex<Vec<String>>>) -> Self {
+        Self { events }
+    }
+}
+
+impl MooncakeMemoryRegistrar for RecordingMemoryRegistrar {
+    fn register_memory_batch(
+        &mut self,
+        buffers: &mut [sglang_srt::transfer::MooncakeBufferEntry],
+        location: &str,
+    ) -> Result<(), MooncakeError> {
+        let buffer = buffers.first().expect("test registration has one buffer");
+        self.events
+            .lock()
+            .expect("events lock should be held")
+            .push(format!(
+                "register:{location}:{:#x}:{}",
+                buffer.addr as usize, buffer.length
+            ));
+        Ok(())
+    }
+
+    fn unregister_memory_batch(&mut self, addrs: &mut [*mut c_void]) -> Result<(), MooncakeError> {
+        let addr = addrs.first().expect("test registration has one address");
+        self.events
+            .lock()
+            .expect("events lock should be held")
+            .push(format!("unregister:{:#x}", *addr as usize));
+        Ok(())
+    }
+}
+
+struct DropRecordingWorker {
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+impl DropRecordingWorker {
+    fn new(events: Arc<Mutex<Vec<String>>>) -> Self {
+        Self { events }
+    }
+}
+
+impl Drop for DropRecordingWorker {
+    fn drop(&mut self) {
+        self.events
+            .lock()
+            .expect("events lock should be held")
+            .push("model-drop".to_string());
+    }
 }
 
 #[test]

@@ -141,8 +141,9 @@ This repository currently contains the first `sglang-srt` runtime crate and the
   shares that state with `/remote_instance_transfer_engine_info`. The bootstrap
   launcher validates the requested runtime backend against the loaded model
   capability before serving, can run the decode-side PD path with the fake
-  transfer backend for local/runtime wiring tests, and explicitly rejects
-  unsupported real PD backends until Mooncake/model KV memory wiring lands.
+  transfer backend for local/runtime wiring tests, fails before binding when a
+  requested production transfer backend is unavailable, and wires linked
+  Mooncake to model-owned transferable KV memory when the runtime exposes it.
 - `engine_info_bootstrap`: lightweight HTTP bootstrap service compatible with
   SGLang's transfer-engine info registration flow. It stores per-rank
   `session_id` and `weights_info_dict` payloads via
@@ -169,8 +170,10 @@ This repository currently contains the first `sglang-srt` runtime crate and the
   control plane before decode resumes. The gRPC adapter can use the same path
   through a bounded `with_max_transfer_polls` service setting for tokenized and
   text generate RPCs. The
-  module also contains the initial Mooncake transfer-engine ABI boundary for
-  memory registration and batch transfer. Transfer backend capabilities classify
+  module also contains the Mooncake transfer-engine ABI boundary for memory
+  registration and batch transfer. Registered KV regions carry an explicit
+  device location and are owned by an RAII lease that unregisters them before
+  the model allocation is released. Transfer backend capabilities classify
   Mooncake as the production path, fake as reference-only, and NIXL/Ascend/Mori
   as planned targets until real executors are implemented.
 - `scheduler`: waiting queue, prefill/decode batch formation, request stages,
@@ -207,8 +210,10 @@ carved out. The current worker is test-driven and mockable; CUDA integration is
 not implemented yet. PD support covers the scheduler/router execution split,
 bootstrap metadata propagation, bounded transfer polling, fake/local snapshot
 transfer paths, control-plane descriptor checksums, snapshot-content checksums,
-and the Mooncake-linked transfer-engine boundary; real device KV memory wiring
-remains the next deeper integration layer.
+and the Mooncake-linked transfer-engine boundary with managed memory
+registration. A production CUDA model executor and its device KV allocations
+are still required for B200 validation; the current executable KV provider is
+the CPU reference GLM runtime.
 
 ## Development
 

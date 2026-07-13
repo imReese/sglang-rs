@@ -1,5 +1,3 @@
-#[cfg(feature = "mooncake-link")]
-use std::ffi::c_void;
 use std::fmt;
 use std::future::Future;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -55,7 +53,7 @@ use crate::transfer::{
 };
 #[cfg(feature = "mooncake-link")]
 use crate::transfer::{
-    MooncakeBufferEntry, MooncakeSessionTargetResolver, MooncakeTransferEngineConfig,
+    MooncakeSessionTargetResolver, MooncakeTransferEngineConfig, RegisteredMooncakeKvCacheMemory,
     SharedLinkedMooncakeTransferEngine,
 };
 use crate::worker::{WorkerExecutor, WorkerWeightUpdateRequest};
@@ -1019,19 +1017,11 @@ fn prepare_linked_mooncake_kv_memory(
     model: &mut BootstrapForwardModel,
     engine: &SharedLinkedMooncakeTransferEngine,
     page_count: usize,
-) -> Result<TransferableKvCacheMemory, ServerLaunchError> {
+) -> Result<RegisteredMooncakeKvCacheMemory<SharedLinkedMooncakeTransferEngine>, ServerLaunchError>
+{
     model.reserve_mooncake_kv_cache_pages(page_count)?;
     let memory = mooncake_kv_memory_from_bootstrap_model(model)?;
-    let mut buffers = memory
-        .regions()
-        .iter()
-        .map(|region| MooncakeBufferEntry {
-            addr: region.base_addr as *mut c_void,
-            length: region.byte_len,
-        })
-        .collect::<Vec<_>>();
-    engine.register_memory_batch(&mut buffers, "cpu:0")?;
-    Ok(memory)
+    RegisteredMooncakeKvCacheMemory::register(engine.clone(), memory).map_err(Into::into)
 }
 
 #[cfg(not(feature = "mooncake-link"))]
@@ -1186,14 +1176,17 @@ fn try_build_launch_mooncake_prefill_http_router_service(
         pd_config,
     );
     let engine = SharedLinkedMooncakeTransferEngine::new(&engine_config)?;
-    let kv_memory =
+    let kv_registration =
         prepare_linked_mooncake_kv_memory(&mut model, &engine, args.num_reserved_decode_tokens)?;
+    let kv_cache_layout = kv_registration.memory().prefill_layout(0);
     let target_resolver = MooncakeSessionTargetResolver::new(engine.clone(), Vec::new());
     let transfer_executor = MooncakeKvCacheTransferExecutor::with_target_resolver(
         engine,
-        kv_memory.prefill_layout(0),
+        kv_cache_layout,
         target_resolver,
-    );
+    )
+    .with_local_memory_registration(kv_registration)
+    .map_err(|error| ServerLaunchError::KvCacheTransfer(error.to_string()))?;
     try_build_bootstrap_pd_http_router_service_from_model_with_decode_publisher(
         args,
         model,
@@ -1226,15 +1219,17 @@ fn try_build_launch_mooncake_decode_http_router_service(
     );
     let engine = SharedLinkedMooncakeTransferEngine::new(&engine_config)?;
     let mooncake_session_id = engine.local_endpoint()?;
-    let kv_memory =
+    let kv_registration =
         prepare_linked_mooncake_kv_memory(&mut model, &engine, args.num_reserved_decode_tokens)?;
     let target_resolver = MooncakeSessionTargetResolver::new(engine.clone(), Vec::new());
-    let kv_cache_layout = kv_memory.prefill_layout(0);
+    let kv_cache_layout = kv_registration.memory().prefill_layout(0);
     let transfer_executor = MooncakeKvCacheTransferExecutor::with_target_resolver(
         engine,
         kv_cache_layout,
         target_resolver,
-    );
+    )
+    .with_local_memory_registration(kv_registration)
+    .map_err(|error| ServerLaunchError::KvCacheTransfer(error.to_string()))?;
     try_build_bootstrap_pd_http_router_service_from_model_with_decode_publisher(
         args,
         model,
@@ -1268,14 +1263,17 @@ fn try_build_launch_mooncake_prefill_grpc_router_service(
         pd_config,
     );
     let engine = SharedLinkedMooncakeTransferEngine::new(&engine_config)?;
-    let kv_memory =
+    let kv_registration =
         prepare_linked_mooncake_kv_memory(&mut model, &engine, args.num_reserved_decode_tokens)?;
+    let kv_cache_layout = kv_registration.memory().prefill_layout(0);
     let target_resolver = MooncakeSessionTargetResolver::new(engine.clone(), Vec::new());
     let transfer_executor = MooncakeKvCacheTransferExecutor::with_target_resolver(
         engine,
-        kv_memory.prefill_layout(0),
+        kv_cache_layout,
         target_resolver,
-    );
+    )
+    .with_local_memory_registration(kv_registration)
+    .map_err(|error| ServerLaunchError::KvCacheTransfer(error.to_string()))?;
     try_build_bootstrap_pd_grpc_router_service_from_model_with_decode_publisher(
         args,
         model,
@@ -1308,15 +1306,17 @@ fn try_build_launch_mooncake_decode_grpc_router_service(
     );
     let engine = SharedLinkedMooncakeTransferEngine::new(&engine_config)?;
     let mooncake_session_id = engine.local_endpoint()?;
-    let kv_memory =
+    let kv_registration =
         prepare_linked_mooncake_kv_memory(&mut model, &engine, args.num_reserved_decode_tokens)?;
     let target_resolver = MooncakeSessionTargetResolver::new(engine.clone(), Vec::new());
-    let kv_cache_layout = kv_memory.prefill_layout(0);
+    let kv_cache_layout = kv_registration.memory().prefill_layout(0);
     let transfer_executor = MooncakeKvCacheTransferExecutor::with_target_resolver(
         engine,
         kv_cache_layout,
         target_resolver,
-    );
+    )
+    .with_local_memory_registration(kv_registration)
+    .map_err(|error| ServerLaunchError::KvCacheTransfer(error.to_string()))?;
     try_build_bootstrap_pd_grpc_router_service_from_model_with_decode_publisher(
         args,
         model,
@@ -1445,6 +1445,24 @@ pub fn build_bootstrap_fake_pd_grpc_router_service(
     )
 }
 
+fn validate_launch_transfer_backend(pd_config: &PdConfig) -> Result<(), ServerLaunchError> {
+    if pd_config.mode == DisaggregationMode::Null {
+        return Ok(());
+    }
+
+    match pd_config.transfer_backend {
+        TransferBackend::Fake => Ok(()),
+        TransferBackend::Mooncake if cfg!(feature = "mooncake-link") => Ok(()),
+        TransferBackend::Mooncake => Err(MooncakeError::UnavailableWithoutLink.into()),
+        backend @ (TransferBackend::Nixl | TransferBackend::Ascend | TransferBackend::Mori) => {
+            Err(ServerLaunchError::UnsupportedBootstrapPdRuntime {
+                mode: pd_config.mode,
+                transfer_backend: backend,
+            })
+        }
+    }
+}
+
 pub async fn launch_grpc_server(args: ServerArgs) -> Result<(), ServerLaunchError> {
     launch_grpc_server_with_shutdown(args, std::future::pending::<()>()).await
 }
@@ -1465,6 +1483,7 @@ where
             PdConfigError::MissingMooncakeKvCacheModelLayout,
         ));
     }
+    validate_launch_transfer_backend(&pd_config)?;
     let addr = grpc_listen_addr(&args)?;
     match pd_config.mode {
         DisaggregationMode::Null => {
@@ -1543,6 +1562,7 @@ where
             PdConfigError::MissingMooncakeKvCacheModelLayout,
         ));
     }
+    validate_launch_transfer_backend(&pd_config)?;
     let addr = http_listen_addr(&args)?;
     let engine_info_addr = engine_info_bootstrap_listen_addr(&args)?;
     let engine_info_service = EngineInfoBootstrapService::default();

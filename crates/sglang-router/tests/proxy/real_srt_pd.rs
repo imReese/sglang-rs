@@ -116,7 +116,7 @@ async fn register_real_srt_workers_with_manager(
 
 #[cfg(not(feature = "mooncake-link"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_rust_srt_mooncake_workers_reject_dummy_runtime_without_transferable_kv_memory() {
+async fn real_rust_srt_mooncake_workers_reject_unlinked_transfer_backend() {
     let prefill_addr = unused_local_addr();
     let bootstrap_addr = unused_local_addr();
     let prefill_zmq_addr = unused_local_addr();
@@ -198,13 +198,13 @@ async fn real_rust_srt_mooncake_workers_reject_dummy_runtime_without_transferabl
     assert!(
         prefill_error
             .to_string()
-            .contains("does not expose transferable Mooncake KV memory"),
+            .contains("requires building sglang-srt with the mooncake-link feature"),
         "{prefill_error}"
     );
     assert!(
         decode_error
             .to_string()
-            .contains("does not expose transferable Mooncake KV memory"),
+            .contains("requires building sglang-srt with the mooncake-link feature"),
         "{decode_error}"
     );
     drop(prefill_shutdown_tx);

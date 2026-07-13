@@ -1,6 +1,8 @@
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+#[cfg(feature = "mooncake-link")]
+use std::net::SocketAddr;
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -14,12 +16,13 @@ use sglang_srt::proto::sglang::runtime::v1::sglang_service_server::SglangService
 use sglang_srt::proto::sglang::runtime::v1::{
     GetModelInfoRequest, RequestOptions, SamplingParams, TextGenerateRequest, TokenizeRequest,
 };
+#[cfg(not(feature = "mooncake-link"))]
+use sglang_srt::server::try_build_launch_mooncake_decode_http_router_service_for_test;
 use sglang_srt::server::{
     ServerLaunchError, build_bootstrap_fake_pd_grpc_router_service,
     build_bootstrap_grpc_router_service, build_bootstrap_pd_grpc_router_service, grpc_listen_addr,
     launch_grpc_server, prefill_mooncake_zmq_endpoints, register_prefill_mooncake_routes_from_args,
     try_build_bootstrap_grpc_router_service,
-    try_build_launch_mooncake_decode_http_router_service_for_test,
 };
 use sglang_srt::tokenizer::TokenizerError;
 use sglang_srt::transfer::{
@@ -1124,6 +1127,35 @@ async fn launch_grpc_server_rejects_unsupported_nixl_pd_backend() {
     );
 }
 
+#[cfg(not(feature = "mooncake-link"))]
+#[tokio::test]
+async fn launch_grpc_server_rejects_unlinked_mooncake_before_serving() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        ".",
+        "--grpc-mode",
+        "--disaggregation-mode",
+        "prefill",
+        "--disaggregation-transfer-backend",
+        "mooncake",
+    ])
+    .expect("args should parse");
+
+    let error = launch_grpc_server(args)
+        .await
+        .expect_err("unlinked Mooncake must fail before serving");
+
+    assert!(
+        matches!(
+            error,
+            ServerLaunchError::MooncakeTransfer(MooncakeError::UnavailableWithoutLink)
+        ),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[cfg(feature = "mooncake-link")]
 #[tokio::test]
 async fn launch_grpc_server_rejects_mooncake_decode_dummy_runtime_without_kv_memory() {
     let addr = unused_local_addr();
@@ -1163,6 +1195,7 @@ async fn launch_grpc_server_rejects_mooncake_decode_dummy_runtime_without_kv_mem
     );
 }
 
+#[cfg(feature = "mooncake-link")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn launch_grpc_server_rejects_mooncake_prefill_dummy_runtime_without_kv_memory() {
     let addrs = unused_distinct_local_addrs(3);
@@ -1235,6 +1268,7 @@ async fn launch_grpc_server_requires_kv_model_layout_for_mooncake_decode() {
     assert!(message.contains("--kv-cache-head-dim"));
 }
 
+#[cfg(not(feature = "mooncake-link"))]
 #[test]
 fn mooncake_decode_builder_rejects_runtime_without_transferable_kv_memory() {
     let args = ServerArgs::parse_from([
@@ -1933,6 +1967,7 @@ fn temp_model_dir(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("sglang-rs-{name}-{}", std::process::id()))
 }
 
+#[cfg(feature = "mooncake-link")]
 fn unused_local_addr() -> SocketAddr {
     TcpListener::bind("127.0.0.1:0")
         .expect("local port should bind")
@@ -1940,6 +1975,7 @@ fn unused_local_addr() -> SocketAddr {
         .expect("local port should have address")
 }
 
+#[cfg(feature = "mooncake-link")]
 fn unused_distinct_local_addrs(count: usize) -> Vec<SocketAddr> {
     let listeners = (0..count)
         .map(|_| TcpListener::bind("127.0.0.1:0").expect("local port should bind"))

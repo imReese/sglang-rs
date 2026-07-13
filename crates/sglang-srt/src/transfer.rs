@@ -646,6 +646,7 @@ impl std::error::Error for PdConfigError {}
 pub enum MooncakeError {
     InteriorNul,
     UnavailableWithoutLink,
+    UnsupportedMemoryLocation(KvCacheMemoryLocation),
     EngineCreateFailed,
     LocalEndpointQueryFailed(i32),
     LocalEndpointUtf8,
@@ -670,6 +671,10 @@ impl fmt::Display for MooncakeError {
             Self::InteriorNul => formatter.write_str("mooncake string contains interior nul byte"),
             Self::UnavailableWithoutLink => formatter.write_str(
                 "mooncake transfer engine requires building sglang-srt with the mooncake-link feature",
+            ),
+            Self::UnsupportedMemoryLocation(location) => write!(
+                formatter,
+                "mooncake transfer engine does not support KV memory location {location:?}"
             ),
             Self::EngineCreateFailed => {
                 formatter.write_str("mooncake transfer engine create failed")
@@ -1430,9 +1435,11 @@ pub fn is_decode_request_kv_ready(
 }
 
 pub struct KvTransferModelWorker<W, E, P = NoopDecodeBootstrapPublisher> {
+    // Registration leases belong to the transfer executor, so it must drop before
+    // the model releases the backing KV allocations.
+    transfer_executor: E,
     worker: W,
     registry: DecodeBootstrapRegistry,
-    transfer_executor: E,
     decode_bootstrap_publisher: P,
     submit_prefill_transfers: bool,
     last_transfer_summary: Option<KvCacheTransferSummary>,
@@ -1441,9 +1448,9 @@ pub struct KvTransferModelWorker<W, E, P = NoopDecodeBootstrapPublisher> {
 impl<W, E> KvTransferModelWorker<W, E> {
     pub fn new(worker: W, registry: DecodeBootstrapRegistry, transfer_executor: E) -> Self {
         Self {
+            transfer_executor,
             worker,
             registry,
-            transfer_executor,
             decode_bootstrap_publisher: NoopDecodeBootstrapPublisher,
             submit_prefill_transfers: true,
             last_transfer_summary: None,
@@ -1489,9 +1496,9 @@ impl<W, E, P> KvTransferModelWorker<W, E, P> {
         decode_bootstrap_publisher: NextP,
     ) -> KvTransferModelWorker<W, E, NextP> {
         KvTransferModelWorker {
+            transfer_executor: self.transfer_executor,
             worker: self.worker,
             registry: self.registry,
-            transfer_executor: self.transfer_executor,
             decode_bootstrap_publisher,
             submit_prefill_transfers: self.submit_prefill_transfers,
             last_transfer_summary: self.last_transfer_summary,
@@ -1834,16 +1841,46 @@ pub struct TransferableKvCacheRegion {
     pub page_size_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KvCacheMemoryLocation {
+    Cpu { numa_node: usize },
+    Cuda { device_id: usize },
+    Rocm { device_id: usize },
+    Metal { device_id: usize },
+    Musa { device_id: usize },
+    Xpu { device_id: usize },
+    Npu { device_id: usize },
+    Hpu { device_id: usize },
+}
+
+impl KvCacheMemoryLocation {
+    pub fn mooncake_label(self) -> Result<String, MooncakeError> {
+        let label = match self {
+            Self::Cpu { numa_node } => format!("cpu:{numa_node}"),
+            Self::Cuda { device_id } => format!("cuda:{device_id}"),
+            Self::Rocm { device_id } => format!("hip:{device_id}"),
+            Self::Musa { device_id } => format!("musa:{device_id}"),
+            Self::Npu { device_id } => format!("npu:{device_id}"),
+            location @ (Self::Metal { .. } | Self::Xpu { .. } | Self::Hpu { .. }) => {
+                return Err(MooncakeError::UnsupportedMemoryLocation(location));
+            }
+        };
+        Ok(label)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransferableKvCacheMemory {
     regions: Vec<TransferableKvCacheRegion>,
     page_size_bytes: usize,
+    location: KvCacheMemoryLocation,
 }
 
 impl TransferableKvCacheMemory {
     pub fn new(
         regions: Vec<TransferableKvCacheRegion>,
         page_size_bytes: usize,
+        location: KvCacheMemoryLocation,
     ) -> Result<Self, KvCacheTransferError> {
         if page_size_bytes == 0 {
             return Err(KvCacheTransferError::Runtime(
@@ -1861,6 +1898,7 @@ impl TransferableKvCacheMemory {
                 regions.len()
             )));
         }
+        let region_page_size_bytes = page_size_bytes / regions.len();
 
         for region in &regions {
             if region.base_addr == 0 {
@@ -1873,10 +1911,10 @@ impl TransferableKvCacheMemory {
                     "transferable KV memory region length must be non-zero".to_string(),
                 ));
             }
-            if region.page_size_bytes != page_size_bytes {
+            if region.page_size_bytes != region_page_size_bytes {
                 return Err(KvCacheTransferError::Runtime(format!(
-                    "transferable KV region page size {} does not match {page_size_bytes}",
-                    region.page_size_bytes
+                    "transferable KV region page size {} does not match per-region page size {region_page_size_bytes}",
+                    region.page_size_bytes,
                 )));
             }
             if region.byte_len % region.page_size_bytes != 0 {
@@ -1890,6 +1928,7 @@ impl TransferableKvCacheMemory {
         Ok(Self {
             regions,
             page_size_bytes,
+            location,
         })
     }
 
@@ -1899,6 +1938,10 @@ impl TransferableKvCacheMemory {
 
     pub fn page_size_bytes(&self) -> usize {
         self.page_size_bytes
+    }
+
+    pub fn location(&self) -> KvCacheMemoryLocation {
+        self.location
     }
 
     pub fn prefill_layout(&self, target_base_offset: u64) -> MooncakeKvCacheLayout {
@@ -1924,6 +1967,106 @@ impl TransferableKvCacheMemory {
 
 pub trait MooncakeKvCacheMemoryProvider {
     fn mooncake_kv_cache_memory(&self) -> Result<TransferableKvCacheMemory, KvCacheTransferError>;
+}
+
+pub trait MooncakeMemoryRegistrar: Send + 'static {
+    fn register_memory_batch(
+        &mut self,
+        buffers: &mut [MooncakeBufferEntry],
+        location: &str,
+    ) -> Result<(), MooncakeError>;
+
+    fn unregister_memory_batch(&mut self, addrs: &mut [*mut c_void]) -> Result<(), MooncakeError>;
+}
+
+pub trait MooncakeMemoryRegistrationLease: Send {
+    fn memory(&self) -> &TransferableKvCacheMemory;
+    fn unregister(&mut self) -> Result<(), MooncakeError>;
+}
+
+pub struct RegisteredMooncakeKvCacheMemory<R>
+where
+    R: MooncakeMemoryRegistrar,
+{
+    registrar: R,
+    memory: TransferableKvCacheMemory,
+    registered_addrs: Vec<usize>,
+    active: bool,
+}
+
+impl<R> RegisteredMooncakeKvCacheMemory<R>
+where
+    R: MooncakeMemoryRegistrar,
+{
+    pub fn register(
+        mut registrar: R,
+        memory: TransferableKvCacheMemory,
+    ) -> Result<Self, MooncakeError> {
+        let mut buffers = memory
+            .regions()
+            .iter()
+            .map(|region| MooncakeBufferEntry {
+                addr: region.base_addr as *mut c_void,
+                length: region.byte_len,
+            })
+            .collect::<Vec<_>>();
+        let location = memory.location().mooncake_label()?;
+        registrar.register_memory_batch(&mut buffers, &location)?;
+
+        Ok(Self {
+            registrar,
+            registered_addrs: memory
+                .regions()
+                .iter()
+                .map(|region| region.base_addr)
+                .collect(),
+            memory,
+            active: true,
+        })
+    }
+
+    pub fn memory(&self) -> &TransferableKvCacheMemory {
+        &self.memory
+    }
+
+    pub fn unregister(&mut self) -> Result<(), MooncakeError> {
+        if !self.active {
+            return Ok(());
+        }
+
+        let mut addrs = self
+            .registered_addrs
+            .iter()
+            .map(|addr| *addr as *mut c_void)
+            .collect::<Vec<_>>();
+        self.registrar.unregister_memory_batch(&mut addrs)?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl<R> MooncakeMemoryRegistrationLease for RegisteredMooncakeKvCacheMemory<R>
+where
+    R: MooncakeMemoryRegistrar,
+{
+    fn memory(&self) -> &TransferableKvCacheMemory {
+        self.memory()
+    }
+
+    fn unregister(&mut self) -> Result<(), MooncakeError> {
+        self.unregister()
+    }
+}
+
+impl<R> Drop for RegisteredMooncakeKvCacheMemory<R>
+where
+    R: MooncakeMemoryRegistrar,
+{
+    fn drop(&mut self) {
+        if let Err(error) = self.unregister() {
+            eprintln!("failed to unregister Mooncake KV cache memory: {error}");
+        }
+    }
 }
 
 pub trait MooncakeSegmentOpener {
@@ -2497,6 +2640,7 @@ where
 }
 
 pub struct MooncakeKvCacheTransferExecutor<S, R = FixedMooncakeTransferTargetResolver> {
+    local_memory_registration: Option<Box<dyn MooncakeMemoryRegistrationLease>>,
     submitter: S,
     layout: MooncakeKvCacheLayout,
     target_resolver: R,
@@ -2540,6 +2684,7 @@ impl<S, R> MooncakeKvCacheTransferExecutor<S, R> {
         target_resolver: R,
     ) -> Self {
         Self {
+            local_memory_registration: None,
             submitter,
             layout,
             target_resolver,
@@ -2564,6 +2709,7 @@ impl<S, R> MooncakeKvCacheTransferExecutor<S, R> {
         }
 
         Self {
+            local_memory_registration: None,
             submitter,
             layout,
             target_resolver,
@@ -2588,6 +2734,7 @@ impl<S, R> MooncakeKvCacheTransferExecutor<S, R> {
         }
 
         Self {
+            local_memory_registration: None,
             submitter,
             layout,
             target_resolver,
@@ -2599,6 +2746,35 @@ impl<S, R> MooncakeKvCacheTransferExecutor<S, R> {
 
     pub fn submitter(&self) -> &S {
         &self.submitter
+    }
+
+    pub fn with_local_memory_registration<L>(
+        mut self,
+        registration: L,
+    ) -> Result<Self, KvCacheTransferError>
+    where
+        L: MooncakeMemoryRegistrationLease + 'static,
+    {
+        if self.local_memory_registration.is_some() {
+            return Err(KvCacheTransferError::Runtime(
+                "Mooncake executor already owns a local memory registration".to_string(),
+            ));
+        }
+        let memory = registration.memory();
+        if memory.page_size_bytes() != self.layout.page_size_bytes
+            || memory.regions()[0].base_addr != self.layout.source_base_addr
+        {
+            return Err(KvCacheTransferError::Runtime(
+                "Mooncake memory registration does not match the executor KV layout".to_string(),
+            ));
+        }
+
+        self.local_memory_registration = Some(Box::new(registration));
+        Ok(self)
+    }
+
+    pub fn has_local_memory_registration(&self) -> bool {
+        self.local_memory_registration.is_some()
     }
 
     pub fn submitter_mut(&mut self) -> &mut S {
@@ -3075,6 +3251,21 @@ impl MooncakeBatchReleaser for SharedLinkedMooncakeTransferEngine {
             .lock()
             .expect("linked Mooncake engine lock should be held")
             .free_batch(batch_id)
+    }
+}
+
+#[cfg(feature = "mooncake-link")]
+impl MooncakeMemoryRegistrar for SharedLinkedMooncakeTransferEngine {
+    fn register_memory_batch(
+        &mut self,
+        buffers: &mut [MooncakeBufferEntry],
+        location: &str,
+    ) -> Result<(), MooncakeError> {
+        SharedLinkedMooncakeTransferEngine::register_memory_batch(self, buffers, location)
+    }
+
+    fn unregister_memory_batch(&mut self, addrs: &mut [*mut c_void]) -> Result<(), MooncakeError> {
+        SharedLinkedMooncakeTransferEngine::unregister_memory_batch(self, addrs)
     }
 }
 

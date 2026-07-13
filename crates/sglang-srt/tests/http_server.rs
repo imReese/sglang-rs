@@ -20,9 +20,10 @@ use sglang_srt::pd_bootstrap::{PrefillBootstrapService, serve_prefill_bootstrap_
 use sglang_srt::router::{RouterGetModelInfoResponse, RouterRuntime};
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::server::{
-    build_bootstrap_http_router_service, build_bootstrap_mooncake_prefill_http_router_service,
-    build_bootstrap_pd_http_router_service, build_bootstrap_prefill_http_router_service,
-    launch_http_server_with_shutdown, register_prefill_mooncake_routes_from_args,
+    ServerLaunchError, build_bootstrap_http_router_service,
+    build_bootstrap_mooncake_prefill_http_router_service, build_bootstrap_pd_http_router_service,
+    build_bootstrap_prefill_http_router_service, launch_http_server_with_shutdown,
+    register_prefill_mooncake_routes_from_args,
 };
 use sglang_srt::tokenizer::ByteTokenizer;
 use sglang_srt::transfer::{
@@ -2694,7 +2695,7 @@ async fn mooncake_prefill_http_uses_bootstrap_kv_layout_for_transfer() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn prefill_http_launch_rejects_dummy_mooncake_runtime_without_transferable_kv_memory() {
+async fn prefill_http_launch_rejects_unstartable_dummy_mooncake_runtime() {
     let http_addr = unused_local_addr();
     let bootstrap_addr = unused_local_addr();
     let args = ServerArgs::parse_from([
@@ -2717,12 +2718,7 @@ async fn prefill_http_launch_rejects_dummy_mooncake_runtime_without_transferable
     let error = launch_http_server_with_shutdown(args, async {}).await;
     let error = error.expect_err("dummy prefill worker should reject Mooncake PD startup");
 
-    assert!(
-        error
-            .to_string()
-            .contains("does not expose transferable Mooncake KV memory"),
-        "{error}"
-    );
+    assert_dummy_mooncake_startup_error(&error);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2782,7 +2778,7 @@ async fn http_launch_starts_engine_info_bootstrap_and_serves_remote_info() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn prefill_http_launch_routes_reject_dummy_mooncake_runtime_without_transferable_kv_memory() {
+async fn prefill_http_launch_routes_reject_unstartable_dummy_mooncake_runtime() {
     let http_addr = unused_local_addr();
     let bootstrap_addr = unused_local_addr();
     let args = ServerArgs::parse_from([
@@ -2809,12 +2805,7 @@ async fn prefill_http_launch_routes_reject_dummy_mooncake_runtime_without_transf
     let error = launch_http_server_with_shutdown(args, async {}).await;
     let error = error.expect_err("dummy prefill worker should reject Mooncake PD startup");
 
-    assert!(
-        error
-            .to_string()
-            .contains("does not expose transferable Mooncake KV memory"),
-        "{error}"
-    );
+    assert_dummy_mooncake_startup_error(&error);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2847,7 +2838,7 @@ async fn decode_http_launch_requires_kv_model_layout_for_mooncake() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn decode_http_launch_rejects_dummy_mooncake_runtime_without_transferable_kv_memory() {
+async fn decode_http_launch_rejects_unstartable_dummy_mooncake_runtime() {
     let http_addr = unused_local_addr();
     let args = ServerArgs::parse_from([
         "serve",
@@ -2879,6 +2870,18 @@ async fn decode_http_launch_rejects_dummy_mooncake_runtime_without_transferable_
     let error = launch_http_server_with_shutdown(args, async {}).await;
     let error = error.expect_err("dummy decode worker should reject Mooncake PD startup");
 
+    assert_dummy_mooncake_startup_error(&error);
+}
+
+fn assert_dummy_mooncake_startup_error(error: &ServerLaunchError) {
+    #[cfg(not(feature = "mooncake-link"))]
+    assert!(
+        error
+            .to_string()
+            .contains("requires building sglang-srt with the mooncake-link feature"),
+        "{error}"
+    );
+    #[cfg(feature = "mooncake-link")]
     assert!(
         error
             .to_string()

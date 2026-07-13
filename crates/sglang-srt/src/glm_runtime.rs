@@ -19,9 +19,10 @@ use crate::model_executor::{
     ForwardModel, ModelForwardError, ModelForwardOutput, ModelWorkerBatch,
 };
 use crate::transfer::{
-    KvCacheModelLayout, KvCachePageSnapshotChecksum, KvCachePageSnapshotImporter,
-    KvCachePageSnapshotProvider, KvCacheTransferError, MooncakeKvCacheMemoryProvider,
-    PdConfigError, TransferableKvCacheMemory, TransferableKvCacheRegion,
+    KvCacheMemoryLocation, KvCacheModelLayout, KvCachePageSnapshotChecksum,
+    KvCachePageSnapshotImporter, KvCachePageSnapshotProvider, KvCacheTransferError,
+    MooncakeKvCacheMemoryProvider, PdConfigError, TransferableKvCacheMemory,
+    TransferableKvCacheRegion,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1331,6 +1332,7 @@ impl MooncakeKvCacheMemoryProvider for GlmMoeDsaF32CachedForwardModel {
                 page_size_bytes: self.transfer_pages.page_size_bytes,
             }],
             self.transfer_pages.page_size_bytes,
+            KvCacheMemoryLocation::Cpu { numa_node: 0 },
         )
     }
 }

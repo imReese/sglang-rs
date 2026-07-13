@@ -146,7 +146,7 @@ async fn manager_handles_mode_changed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn manager_does_not_register_dummy_mooncake_srt_worker_without_transferable_kv_memory() {
+async fn manager_does_not_register_unstartable_dummy_mooncake_srt_worker() {
     let grpc_addr = unused_local_addr();
     let bootstrap_addr = unused_local_addr();
     let zmq_addr = unused_local_addr();
@@ -213,6 +213,14 @@ async fn manager_does_not_register_dummy_mooncake_srt_worker_without_transferabl
         .await
         .expect("gRPC server task should join")
         .expect_err("dummy Mooncake SRT worker should fail before serving");
+    #[cfg(not(feature = "mooncake-link"))]
+    assert!(
+        error
+            .to_string()
+            .contains("requires building sglang-srt with the mooncake-link feature"),
+        "{error}"
+    );
+    #[cfg(feature = "mooncake-link")]
     assert!(
         error
             .to_string()
