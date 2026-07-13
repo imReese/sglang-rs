@@ -426,6 +426,42 @@ impl CudaKvCachePool {
         Ok(())
     }
 
+    pub fn write_tensor_slot_from_device(
+        &mut self,
+        layer_index: usize,
+        tensor_index: usize,
+        slot_index: usize,
+        source: &CudaDeviceAllocation,
+        source_offset: usize,
+    ) -> Result<(), CudaKvCachePoolError> {
+        let range = self
+            .layout
+            .tensor_slot_byte_range(layer_index, tensor_index, slot_index)?;
+        self.allocation
+            .copy_from_device(range.start, source, source_offset, range.len())?;
+        Ok(())
+    }
+
+    pub fn read_tensor_slot_to_device(
+        &self,
+        layer_index: usize,
+        tensor_index: usize,
+        slot_index: usize,
+        destination: &mut CudaDeviceAllocation,
+        destination_offset: usize,
+    ) -> Result<(), CudaKvCachePoolError> {
+        let range = self
+            .layout
+            .tensor_slot_byte_range(layer_index, tensor_index, slot_index)?;
+        destination.copy_from_device(
+            destination_offset,
+            &self.allocation,
+            range.start,
+            range.len(),
+        )?;
+        Ok(())
+    }
+
     pub fn tensor_location(
         &self,
         page_index: usize,

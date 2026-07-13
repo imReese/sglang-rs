@@ -282,6 +282,15 @@ cargo test -p sglang-srt --test cuda_backend \
   b200_cuda_backend_round_trips_page_major_device_kv_memory -- --ignored --nocapture
 ```
 
+With the CUDA toolkit's NVRTC library available to the dynamic loader, validate
+runtime kernel compilation, RMSNorm, SiLU-mul, and device-to-device physical KV
+slot writes:
+
+```bash
+cargo test -p sglang-srt --test cuda_backend \
+  b200_cuda_runtime_kernels_execute_and_write_kv_slots -- --ignored --nocapture
+```
+
 Validate real safetensors weight upload, cuBLAS logits, token sampling, and the
 HTTP inference service on B200:
 

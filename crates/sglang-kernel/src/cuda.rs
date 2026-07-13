@@ -1,4 +1,4 @@
-use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
 use std::fmt;
 use std::sync::Arc;
 
@@ -13,6 +13,9 @@ const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
 type CuDevice = c_int;
 type CuContextHandle = *mut c_void;
 type CuDevicePtr = u64;
+type CuModuleHandle = *mut c_void;
+type CuFunctionHandle = *mut c_void;
+type CuStreamHandle = *mut c_void;
 
 type CuInit = unsafe extern "C" fn(c_uint) -> c_int;
 type CuDriverGetVersion = unsafe extern "C" fn(*mut c_int) -> c_int;
@@ -31,7 +34,25 @@ type CuMemFree = unsafe extern "C" fn(CuDevicePtr) -> c_int;
 type CuMemGetInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> c_int;
 type CuMemcpyHtoD = unsafe extern "C" fn(CuDevicePtr, *const c_void, usize) -> c_int;
 type CuMemcpyDtoH = unsafe extern "C" fn(*mut c_void, CuDevicePtr, usize) -> c_int;
+type CuMemcpyDtoD = unsafe extern "C" fn(CuDevicePtr, CuDevicePtr, usize) -> c_int;
 type CuMemsetD8 = unsafe extern "C" fn(CuDevicePtr, u8, usize) -> c_int;
+type CuModuleLoadData = unsafe extern "C" fn(*mut CuModuleHandle, *const c_void) -> c_int;
+type CuModuleUnload = unsafe extern "C" fn(CuModuleHandle) -> c_int;
+type CuModuleGetFunction =
+    unsafe extern "C" fn(*mut CuFunctionHandle, CuModuleHandle, *const c_char) -> c_int;
+type CuLaunchKernel = unsafe extern "C" fn(
+    CuFunctionHandle,
+    c_uint,
+    c_uint,
+    c_uint,
+    c_uint,
+    c_uint,
+    c_uint,
+    c_uint,
+    CuStreamHandle,
+    *mut *mut c_void,
+    *mut *mut c_void,
+) -> c_int;
 type CuGetErrorName = unsafe extern "C" fn(c_int, *mut *const c_char) -> c_int;
 type CuGetErrorString = unsafe extern "C" fn(c_int, *mut *const c_char) -> c_int;
 
@@ -104,7 +125,17 @@ pub enum CudaError {
         allocation_byte_len: usize,
     },
     DeviceAddressOverflow,
+    DeviceMismatch {
+        source_ordinal: usize,
+        destination_ordinal: usize,
+    },
     FreedAllocation,
+    EmptyModuleImage,
+    ModuleImageContainsInteriorNul,
+    ModuleLoadReturnedNull,
+    InvalidKernelName(String),
+    KernelLookupReturnedNull(String),
+    ZeroLaunchDimension(&'static str),
 }
 
 impl fmt::Display for CudaError {
@@ -165,7 +196,36 @@ impl fmt::Display for CudaError {
             Self::DeviceAddressOverflow => {
                 formatter.write_str("CUDA device pointer arithmetic overflowed")
             }
+            Self::DeviceMismatch {
+                source_ordinal,
+                destination_ordinal,
+            } => write!(
+                formatter,
+                "CUDA device-to-device copy requires one device, got source {source_ordinal} and destination {destination_ordinal}"
+            ),
             Self::FreedAllocation => formatter.write_str("CUDA allocation has already been freed"),
+            Self::EmptyModuleImage => formatter.write_str("CUDA module image must not be empty"),
+            Self::ModuleImageContainsInteriorNul => {
+                formatter.write_str("CUDA module image contains an interior NUL byte")
+            }
+            Self::ModuleLoadReturnedNull => {
+                formatter.write_str("cuModuleLoadData returned a null module")
+            }
+            Self::InvalidKernelName(name) => {
+                write!(
+                    formatter,
+                    "CUDA kernel name contains an interior NUL: {name:?}"
+                )
+            }
+            Self::KernelLookupReturnedNull(name) => {
+                write!(
+                    formatter,
+                    "cuModuleGetFunction returned null for kernel {name}"
+                )
+            }
+            Self::ZeroLaunchDimension(dimension) => {
+                write!(formatter, "CUDA kernel launch {dimension} must be non-zero")
+            }
         }
     }
 }
@@ -459,6 +519,43 @@ impl CudaContext {
         })
     }
 
+    pub fn load_module(&self, image: &[u8]) -> Result<CudaModule, CudaError> {
+        if image.is_empty() {
+            return Err(CudaError::EmptyModuleImage);
+        }
+        let content = image.strip_suffix(&[0]).unwrap_or(image);
+        if content.contains(&0) {
+            return Err(CudaError::ModuleImageContainsInteriorNul);
+        }
+        let mut terminated_image = Vec::with_capacity(image.len() + 1);
+        terminated_image.extend_from_slice(image);
+        if terminated_image.last() != Some(&0) {
+            terminated_image.push(0);
+        }
+
+        let mut handle = std::ptr::null_mut();
+        self.with_current(|| {
+            self.inner.driver.check(
+                unsafe {
+                    (self.inner.driver.inner.api.module_load_data)(
+                        &mut handle,
+                        terminated_image.as_ptr().cast(),
+                    )
+                },
+                "cuModuleLoadData",
+            )
+        })?;
+        if handle.is_null() {
+            return Err(CudaError::ModuleLoadReturnedNull);
+        }
+        Ok(CudaModule {
+            inner: Arc::new(CudaModuleInner {
+                context: self.clone(),
+                handle: handle as usize,
+            }),
+        })
+    }
+
     pub(crate) fn with_current<T, E>(
         &self,
         operation: impl FnOnce() -> Result<T, E>,
@@ -518,6 +615,162 @@ pub struct CudaDeviceAllocation {
     active: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CudaLaunchDimensions {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+}
+
+impl CudaLaunchDimensions {
+    pub const fn new(x: u32, y: u32, z: u32) -> Self {
+        Self { x, y, z }
+    }
+
+    fn validate(self, kind: &'static str) -> Result<Self, CudaError> {
+        if self.x == 0 || self.y == 0 || self.z == 0 {
+            return Err(CudaError::ZeroLaunchDimension(kind));
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Clone)]
+pub struct CudaModule {
+    inner: Arc<CudaModuleInner>,
+}
+
+impl fmt::Debug for CudaModule {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CudaModule")
+            .field("device_ordinal", &self.inner.context.device_ordinal())
+            .field("handle", &self.inner.handle)
+            .finish()
+    }
+}
+
+impl CudaModule {
+    pub fn get_function(&self, name: &str) -> Result<CudaFunction, CudaError> {
+        let name_c =
+            CString::new(name).map_err(|_| CudaError::InvalidKernelName(name.to_string()))?;
+        let mut handle = std::ptr::null_mut();
+        self.inner.context.with_current(|| {
+            self.inner.context.inner.driver.check(
+                unsafe {
+                    (self
+                        .inner
+                        .context
+                        .inner
+                        .driver
+                        .inner
+                        .api
+                        .module_get_function)(
+                        &mut handle,
+                        self.inner.handle as CuModuleHandle,
+                        name_c.as_ptr(),
+                    )
+                },
+                "cuModuleGetFunction",
+            )
+        })?;
+        if handle.is_null() {
+            return Err(CudaError::KernelLookupReturnedNull(name.to_string()));
+        }
+        Ok(CudaFunction {
+            module: Arc::clone(&self.inner),
+            handle: handle as usize,
+            name: name.to_string(),
+        })
+    }
+}
+
+struct CudaModuleInner {
+    context: CudaContext,
+    handle: usize,
+}
+
+impl Drop for CudaModuleInner {
+    fn drop(&mut self) {
+        let result = self.context.with_current(|| {
+            self.context.inner.driver.check(
+                unsafe {
+                    (self.context.inner.driver.inner.api.module_unload)(
+                        self.handle as CuModuleHandle,
+                    )
+                },
+                "cuModuleUnload",
+            )
+        });
+        if let Err(error) = result {
+            eprintln!("failed to unload CUDA module: {error}");
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct CudaFunction {
+    module: Arc<CudaModuleInner>,
+    handle: usize,
+    name: String,
+}
+
+impl fmt::Debug for CudaFunction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CudaFunction")
+            .field("device_ordinal", &self.module.context.device_ordinal())
+            .field("name", &self.name)
+            .field("handle", &self.handle)
+            .finish()
+    }
+}
+
+impl CudaFunction {
+    pub fn device_ordinal(&self) -> usize {
+        self.module.context.device_ordinal()
+    }
+
+    /// Launches the function on CUDA's default stream.
+    ///
+    /// # Safety
+    ///
+    /// Every entry in `arguments` must point to a live host value whose bytes
+    /// match the corresponding kernel parameter ABI for the duration of this
+    /// call. Device pointers embedded in those values must be valid for this
+    /// function's CUDA context.
+    pub unsafe fn launch(
+        &self,
+        grid: CudaLaunchDimensions,
+        block: CudaLaunchDimensions,
+        shared_memory_bytes: u32,
+        arguments: &mut [*mut c_void],
+    ) -> Result<(), CudaError> {
+        let grid = grid.validate("grid dimension")?;
+        let block = block.validate("block dimension")?;
+        self.module.context.with_current(|| {
+            self.module.context.inner.driver.check(
+                unsafe {
+                    (self.module.context.inner.driver.inner.api.launch_kernel)(
+                        self.handle as CuFunctionHandle,
+                        grid.x,
+                        grid.y,
+                        grid.z,
+                        block.x,
+                        block.y,
+                        block.z,
+                        shared_memory_bytes,
+                        std::ptr::null_mut(),
+                        arguments.as_mut_ptr(),
+                        std::ptr::null_mut(),
+                    )
+                },
+                "cuLaunchKernel",
+            )
+        })
+    }
+}
+
 impl CudaDeviceAllocation {
     pub fn device_ptr(&self) -> u64 {
         self.device_ptr
@@ -567,6 +820,38 @@ impl CudaDeviceAllocation {
                     )
                 },
                 "cuMemcpyDtoH_v2",
+            )
+        })
+    }
+
+    pub fn copy_from_device(
+        &mut self,
+        destination_offset: usize,
+        source: &CudaDeviceAllocation,
+        source_offset: usize,
+        byte_len: usize,
+    ) -> Result<(), CudaError> {
+        if self.device_ordinal() != source.device_ordinal() {
+            return Err(CudaError::DeviceMismatch {
+                source_ordinal: source.device_ordinal(),
+                destination_ordinal: self.device_ordinal(),
+            });
+        }
+        let destination_ptr = self.device_ptr_at(destination_offset, byte_len)?;
+        let source_ptr = source.device_ptr_at(source_offset, byte_len)?;
+        if byte_len == 0 {
+            return Ok(());
+        }
+        self.context.with_current(|| {
+            self.context.inner.driver.check(
+                unsafe {
+                    (self.context.inner.driver.inner.api.memcpy_dtod)(
+                        destination_ptr,
+                        source_ptr,
+                        byte_len,
+                    )
+                },
+                "cuMemcpyDtoD_v2",
             )
         })
     }
@@ -657,7 +942,12 @@ struct CudaApi {
     mem_get_info: CuMemGetInfo,
     memcpy_htod: CuMemcpyHtoD,
     memcpy_dtoh: CuMemcpyDtoH,
+    memcpy_dtod: CuMemcpyDtoD,
     memset_d8: CuMemsetD8,
+    module_load_data: CuModuleLoadData,
+    module_unload: CuModuleUnload,
+    module_get_function: CuModuleGetFunction,
+    launch_kernel: CuLaunchKernel,
     get_error_name: CuGetErrorName,
     get_error_string: CuGetErrorString,
 }
@@ -710,7 +1000,16 @@ impl CudaApi {
             mem_get_info: unsafe { load_symbol(library, b"cuMemGetInfo_v2\0", "cuMemGetInfo_v2")? },
             memcpy_htod: unsafe { load_symbol(library, b"cuMemcpyHtoD_v2\0", "cuMemcpyHtoD_v2")? },
             memcpy_dtoh: unsafe { load_symbol(library, b"cuMemcpyDtoH_v2\0", "cuMemcpyDtoH_v2")? },
+            memcpy_dtod: unsafe { load_symbol(library, b"cuMemcpyDtoD_v2\0", "cuMemcpyDtoD_v2")? },
             memset_d8: unsafe { load_symbol(library, b"cuMemsetD8_v2\0", "cuMemsetD8_v2")? },
+            module_load_data: unsafe {
+                load_symbol(library, b"cuModuleLoadData\0", "cuModuleLoadData")?
+            },
+            module_unload: unsafe { load_symbol(library, b"cuModuleUnload\0", "cuModuleUnload")? },
+            module_get_function: unsafe {
+                load_symbol(library, b"cuModuleGetFunction\0", "cuModuleGetFunction")?
+            },
+            launch_kernel: unsafe { load_symbol(library, b"cuLaunchKernel\0", "cuLaunchKernel")? },
             get_error_name: unsafe { load_symbol(library, b"cuGetErrorName\0", "cuGetErrorName")? },
             get_error_string: unsafe {
                 load_symbol(library, b"cuGetErrorString\0", "cuGetErrorString")?
@@ -917,6 +1216,94 @@ mod tests {
         );
     }
 
+    #[test]
+    fn device_copy_and_kernel_launch_keep_context_owned_resources_alive() {
+        let _test_guard = CUDA_TEST_LOCK
+            .lock()
+            .expect("CUDA test lock should be held");
+        EVENTS.lock().expect("events lock should be held").clear();
+        let driver = fake_driver();
+        let context = driver
+            .retain_primary_context(0)
+            .expect("fake context should retain");
+        let source = context.allocate(16).expect("source should allocate");
+        let mut destination = context.allocate(16).expect("destination should allocate");
+
+        destination
+            .copy_from_device(8, &source, 4, 4)
+            .expect("device-to-device copy should succeed");
+        let module = context
+            .load_module(b".version 8.0")
+            .expect("PTX module should load");
+        let function = module
+            .get_function("test_kernel")
+            .expect("kernel should resolve");
+        drop(module);
+        assert!(
+            !EVENTS
+                .lock()
+                .expect("events lock should be held")
+                .contains(&"module-unload"),
+            "function must retain its module"
+        );
+
+        let mut device_ptr = source.device_ptr();
+        let mut arguments = [(&mut device_ptr as *mut u64).cast::<c_void>()];
+        unsafe {
+            function
+                .launch(
+                    CudaLaunchDimensions::new(2, 1, 1),
+                    CudaLaunchDimensions::new(32, 1, 1),
+                    128,
+                    &mut arguments,
+                )
+                .expect("kernel should launch");
+        }
+        drop(function);
+
+        let events = EVENTS.lock().expect("events lock should be held");
+        assert!(events.contains(&"copy-dtod"));
+        assert!(events.contains(&"module-load"));
+        assert!(events.contains(&"function-lookup"));
+        assert!(events.contains(&"launch"));
+        assert!(events.contains(&"module-unload"));
+    }
+
+    #[test]
+    fn module_and_launch_validation_fail_before_calling_cuda() {
+        let _test_guard = CUDA_TEST_LOCK
+            .lock()
+            .expect("CUDA test lock should be held");
+        let driver = fake_driver();
+        let context = driver
+            .retain_primary_context(0)
+            .expect("fake context should retain");
+        assert_eq!(
+            context
+                .load_module(b"ptx\0trailing")
+                .expect_err("interior NUL must fail"),
+            CudaError::ModuleImageContainsInteriorNul
+        );
+        let module = context
+            .load_module(b".version 8.0")
+            .expect("PTX module should load");
+        let function = module
+            .get_function("test_kernel")
+            .expect("kernel should resolve");
+        assert_eq!(
+            unsafe {
+                function.launch(
+                    CudaLaunchDimensions::new(0, 1, 1),
+                    CudaLaunchDimensions::new(1, 1, 1),
+                    0,
+                    &mut [],
+                )
+            }
+            .expect_err("zero grid must fail"),
+            CudaError::ZeroLaunchDimension("grid dimension")
+        );
+    }
+
     fn fake_driver() -> CudaDriver {
         CudaDriver {
             inner: Arc::new(CudaDriverInner {
@@ -939,7 +1326,12 @@ mod tests {
                     mem_get_info: fake_mem_get_info,
                     memcpy_htod: fake_memcpy_htod,
                     memcpy_dtoh: fake_memcpy_dtoh,
+                    memcpy_dtod: fake_memcpy_dtod,
                     memset_d8: fake_memset_d8,
+                    module_load_data: fake_module_load_data,
+                    module_unload: fake_module_unload,
+                    module_get_function: fake_module_get_function,
+                    launch_kernel: fake_launch_kernel,
                     get_error_name: fake_get_error,
                     get_error_string: fake_get_error,
                 },
@@ -1103,6 +1495,21 @@ mod tests {
         CUDA_SUCCESS
     }
 
+    unsafe extern "C" fn fake_memcpy_dtod(
+        destination: CuDevicePtr,
+        source: CuDevicePtr,
+        byte_len: usize,
+    ) -> c_int {
+        assert_eq!(destination, 0x4008);
+        assert_eq!(source, 0x4004);
+        assert_eq!(byte_len, 4);
+        EVENTS
+            .lock()
+            .expect("events lock should be held")
+            .push("copy-dtod");
+        CUDA_SUCCESS
+    }
+
     unsafe extern "C" fn fake_memset_d8(
         device_ptr: CuDevicePtr,
         value: u8,
@@ -1115,6 +1522,76 @@ mod tests {
             .lock()
             .expect("events lock should be held")
             .push("memset");
+        CUDA_SUCCESS
+    }
+
+    unsafe extern "C" fn fake_module_load_data(
+        module: *mut CuModuleHandle,
+        image: *const c_void,
+    ) -> c_int {
+        assert_eq!(
+            unsafe { CStr::from_ptr(image.cast()) }.to_bytes(),
+            b".version 8.0"
+        );
+        EVENTS
+            .lock()
+            .expect("events lock should be held")
+            .push("module-load");
+        unsafe { *module = 0x5000usize as CuModuleHandle };
+        CUDA_SUCCESS
+    }
+
+    unsafe extern "C" fn fake_module_unload(module: CuModuleHandle) -> c_int {
+        assert_eq!(module as usize, 0x5000);
+        EVENTS
+            .lock()
+            .expect("events lock should be held")
+            .push("module-unload");
+        CUDA_SUCCESS
+    }
+
+    unsafe extern "C" fn fake_module_get_function(
+        function: *mut CuFunctionHandle,
+        module: CuModuleHandle,
+        name: *const c_char,
+    ) -> c_int {
+        assert_eq!(module as usize, 0x5000);
+        assert_eq!(unsafe { CStr::from_ptr(name) }.to_bytes(), b"test_kernel");
+        EVENTS
+            .lock()
+            .expect("events lock should be held")
+            .push("function-lookup");
+        unsafe { *function = 0x6000usize as CuFunctionHandle };
+        CUDA_SUCCESS
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe extern "C" fn fake_launch_kernel(
+        function: CuFunctionHandle,
+        grid_x: c_uint,
+        grid_y: c_uint,
+        grid_z: c_uint,
+        block_x: c_uint,
+        block_y: c_uint,
+        block_z: c_uint,
+        shared_memory_bytes: c_uint,
+        stream: CuStreamHandle,
+        kernel_parameters: *mut *mut c_void,
+        extra: *mut *mut c_void,
+    ) -> c_int {
+        assert_eq!(function as usize, 0x6000);
+        assert_eq!((grid_x, grid_y, grid_z), (2, 1, 1));
+        assert_eq!((block_x, block_y, block_z), (32, 1, 1));
+        assert_eq!(shared_memory_bytes, 128);
+        assert!(stream.is_null());
+        assert!(extra.is_null());
+        assert!(!kernel_parameters.is_null());
+        let first_argument = unsafe { *kernel_parameters };
+        assert_eq!(unsafe { *first_argument.cast::<u64>() }, 0x4000);
+        EVENTS
+            .lock()
+            .expect("events lock should be held")
+            .push("launch");
         CUDA_SUCCESS
     }
 

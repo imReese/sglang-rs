@@ -9,6 +9,8 @@ use std::fmt;
 pub mod cpu;
 pub mod cublas;
 pub mod cuda;
+pub mod cuda_kernels;
+pub mod nvrtc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendKind {
