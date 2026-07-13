@@ -91,6 +91,16 @@ or MUSA details should stay behind feature-gated implementations.
 This repository currently contains the first `sglang-srt` runtime crate and the
 `sglang-router` package used to exercise the gateway/router boundary:
 
+- `sglang-kernel`: CPU reference kernels plus a dynamically loaded CUDA Driver
+  backend. The CUDA path does not require a CUDA SDK at Rust compile time; on a
+  GPU host it performs real device discovery, compute-capability queries,
+  primary-context management, memory accounting, and RAII `cuMemAlloc_v2` /
+  `cuMemFree_v2` device allocation.
+- `backend`: runtime capability contracts for compute capability, supported
+  dtypes, attention implementations, tensor parallelism, KV memory
+  registration, Mooncake, RDMA, and NVLink. CUDA dtype support is derived from
+  SM capability rather than product names, while unavailable execution or
+  transport capabilities remain explicit instead of silently falling back.
 - `proto`: the initial `sglang.runtime.v1.SglangService` contract for the
   native Rust gRPC path in the community roadmap, including typed
   text/tokenized generation, embedding, classification, tokenization,
@@ -206,14 +216,14 @@ This repository currently contains the first `sglang-srt` runtime crate and the
 - `types`: generation request and response types.
 
 The implementation is intentionally small while the architecture is being
-carved out. The current worker is test-driven and mockable; CUDA integration is
-not implemented yet. PD support covers the scheduler/router execution split,
+carved out. The current production CUDA device/allocator boundary is real, but
+a CUDA model executor and attention kernels are not implemented yet. PD support covers the scheduler/router execution split,
 bootstrap metadata propagation, bounded transfer polling, fake/local snapshot
 transfer paths, control-plane descriptor checksums, snapshot-content checksums,
 and the Mooncake-linked transfer-engine boundary with managed memory
-registration. A production CUDA model executor and its device KV allocations
-are still required for B200 validation; the current executable KV provider is
-the CPU reference GLM runtime.
+registration. CUDA device KV allocations can be exposed through the same
+Mooncake memory-provider contract; the current executable forward provider is
+still the CPU reference GLM runtime.
 
 ## Development
 
@@ -222,6 +232,21 @@ Run all checks:
 ```bash
 cargo fmt --all --check
 cargo test --workspace
+```
+
+On a B200 host, validate the real CUDA Driver and device-KV allocation boundary:
+
+```bash
+cargo test -p sglang-srt --test cuda_backend \
+  b200_cuda_backend_allocates_transferable_device_kv_memory -- --ignored --nocapture
+```
+
+With native Mooncake built, validate CUDA KV registration and deregistration:
+
+```bash
+MOONCAKE_BUILD_DIR=/path/to/Mooncake/build \
+  cargo test -p sglang-srt --features mooncake-link --test cuda_backend \
+  b200_mooncake_registers_real_cuda_kv_memory -- --ignored --nocapture
 ```
 
 Run a local process-level PD smoke with a tiny real safetensors model:

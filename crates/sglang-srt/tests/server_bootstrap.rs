@@ -86,6 +86,58 @@ fn bootstrap_cuda_device_rejects_space_reference_fallback() {
 }
 
 #[tokio::test]
+async fn launch_cpu_reference_rejects_ignored_attention_backend() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--device",
+        "cpu",
+        "--attention-backend",
+        "flashinfer",
+    ])
+    .expect("args should parse");
+
+    let error = launch_grpc_server(args)
+        .await
+        .expect_err("CPU reference must not silently ignore an attention backend");
+
+    assert_eq!(
+        error,
+        ServerLaunchError::MissingRuntimeCapabilities {
+            runtime_name: "space-reference".to_string(),
+            missing: vec!["attention backend flashinfer".to_string()],
+        }
+    );
+}
+
+#[tokio::test]
+async fn launch_cpu_reference_rejects_ignored_tensor_parallel_size() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--device",
+        "cpu",
+        "--tp-size",
+        "2",
+    ])
+    .expect("args should parse");
+
+    let error = launch_grpc_server(args)
+        .await
+        .expect_err("CPU reference must not silently ignore tensor parallelism");
+
+    assert_eq!(
+        error,
+        ServerLaunchError::MissingRuntimeCapabilities {
+            runtime_name: "space-reference".to_string(),
+            missing: vec!["tensor parallel size 2".to_string()],
+        }
+    );
+}
+
+#[tokio::test]
 async fn bootstrap_grpc_router_service_carries_model_metadata() {
     let args = ServerArgs::parse_from([
         "serve",

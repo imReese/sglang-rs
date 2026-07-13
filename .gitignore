@@ -25,3 +25,6 @@ target
 # Local superpowers planning notes
 docs/superpowers/
 superpowers/specs/
+
+# Local coding-agent instructions
+/AGENTS.md

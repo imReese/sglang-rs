@@ -7,6 +7,7 @@
 use std::fmt;
 
 pub mod cpu;
+pub mod cuda;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendKind {

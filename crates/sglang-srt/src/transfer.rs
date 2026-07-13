@@ -8,6 +8,7 @@ use std::path::Path;
 #[cfg(feature = "mooncake-link")]
 use std::sync::{Arc, Mutex};
 
+use sglang_kernel::cuda::{CudaContext, CudaDeviceAllocation};
 use sha2::{Digest, Sha256};
 
 use crate::cache::CachePageId;
@@ -1874,6 +1875,103 @@ pub struct TransferableKvCacheMemory {
     regions: Vec<TransferableKvCacheRegion>,
     page_size_bytes: usize,
     location: KvCacheMemoryLocation,
+}
+
+pub struct CudaKvCacheMemory {
+    allocations: Vec<CudaDeviceAllocation>,
+    transferable: TransferableKvCacheMemory,
+}
+
+impl CudaKvCacheMemory {
+    pub fn allocate(
+        context: &CudaContext,
+        region_count: usize,
+        region_byte_len: usize,
+        region_page_size_bytes: usize,
+    ) -> Result<Self, KvCacheTransferError> {
+        if region_count == 0 {
+            return Err(KvCacheTransferError::Runtime(
+                "CUDA KV cache must allocate at least one region".to_string(),
+            ));
+        }
+
+        let mut allocations = Vec::with_capacity(region_count);
+        for _ in 0..region_count {
+            allocations.push(
+                context
+                    .allocate(region_byte_len)
+                    .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?,
+            );
+        }
+        Self::from_allocations(allocations, region_page_size_bytes)
+    }
+
+    pub fn from_allocations(
+        allocations: Vec<CudaDeviceAllocation>,
+        region_page_size_bytes: usize,
+    ) -> Result<Self, KvCacheTransferError> {
+        let Some(first) = allocations.first() else {
+            return Err(KvCacheTransferError::Runtime(
+                "CUDA KV cache must own at least one allocation".to_string(),
+            ));
+        };
+        let device_id = first.device_ordinal();
+        if allocations
+            .iter()
+            .any(|allocation| allocation.device_ordinal() != device_id)
+        {
+            return Err(KvCacheTransferError::Runtime(
+                "CUDA KV cache allocations must belong to the same device".to_string(),
+            ));
+        }
+
+        let page_size_bytes = region_page_size_bytes
+            .checked_mul(allocations.len())
+            .ok_or_else(|| {
+                KvCacheTransferError::Runtime(
+                    "CUDA KV cache logical page size overflow".to_string(),
+                )
+            })?;
+        let regions = allocations
+            .iter()
+            .map(|allocation| {
+                let base_addr = usize::try_from(allocation.device_ptr()).map_err(|_| {
+                    KvCacheTransferError::Runtime(
+                        "CUDA device pointer does not fit the host address width".to_string(),
+                    )
+                })?;
+                Ok(TransferableKvCacheRegion {
+                    base_addr,
+                    byte_len: allocation.byte_len(),
+                    page_size_bytes: region_page_size_bytes,
+                })
+            })
+            .collect::<Result<Vec<_>, KvCacheTransferError>>()?;
+        let transferable = TransferableKvCacheMemory::new(
+            regions,
+            page_size_bytes,
+            KvCacheMemoryLocation::Cuda { device_id },
+        )?;
+
+        Ok(Self {
+            allocations,
+            transferable,
+        })
+    }
+
+    pub fn allocations(&self) -> &[CudaDeviceAllocation] {
+        &self.allocations
+    }
+
+    pub fn transferable_memory(&self) -> &TransferableKvCacheMemory {
+        &self.transferable
+    }
+}
+
+impl MooncakeKvCacheMemoryProvider for CudaKvCacheMemory {
+    fn mooncake_kv_cache_memory(&self) -> Result<TransferableKvCacheMemory, KvCacheTransferError> {
+        Ok(self.transferable.clone())
+    }
 }
 
 impl TransferableKvCacheMemory {

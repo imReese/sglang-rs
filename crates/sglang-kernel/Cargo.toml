@@ -8,3 +8,6 @@ repository.workspace = true
 [lib]
 name = "sglang_kernel"
 path = "src/lib.rs"
+
+[dependencies]
+libloading = "0.9.0"
