@@ -1,6 +1,7 @@
 use std::fmt;
 
 use crate::backend::{InitializedRuntimeBackend, RuntimeBackend, RuntimeCapability, RuntimeDtype};
+use crate::cpu_hybrid::CpuReferenceHybridDecoder;
 use crate::cpu_reference::CpuReferenceDenseDecoder;
 use crate::cuda_runtime::CudaEmbeddingLmModel;
 use crate::model_artifacts::LocalModelArtifacts;
@@ -42,6 +43,16 @@ impl ModelExecutor for CpuReferenceDenseDecoder {
 
     fn execution_dtype(&self) -> RuntimeDtype {
         CpuReferenceDenseDecoder::execution_dtype(self)
+    }
+}
+
+impl ModelExecutor for CpuReferenceHybridDecoder {
+    fn runtime_capability(&self) -> RuntimeCapability {
+        CpuReferenceHybridDecoder::runtime_capability(self)
+    }
+
+    fn execution_dtype(&self) -> RuntimeDtype {
+        CpuReferenceHybridDecoder::execution_dtype(self)
     }
 }
 
@@ -102,6 +113,10 @@ impl ForwardModel for LoadedModelRuntime {
         self.executor.forward(batch)
     }
 
+    fn complete_request(&mut self, request_id: &crate::types::RequestId) {
+        self.executor.complete_request(request_id);
+    }
+
     fn update_weights_from_disk(
         &mut self,
         request: &WorkerWeightUpdateRequest,
@@ -151,15 +166,17 @@ pub(crate) fn validate_runtime_support(
     } = definition.execution()
     {
         let has_cpu_reference_executor = matches!(backend, InitializedRuntimeBackend::CpuReference)
-            && definition.dense_decoder().is_some()
             && matches!(
-                attention,
-                crate::models::AttentionArchitecture::MultiHead { .. }
+                (attention, feed_forward),
+                (
+                    crate::models::AttentionArchitecture::MultiHead { .. },
+                    crate::models::FeedForwardArchitecture::Dense { .. }
+                ) | (
+                    crate::models::AttentionArchitecture::Hybrid { .. },
+                    crate::models::FeedForwardArchitecture::Dense { .. }
+                )
             )
-            && matches!(
-                feed_forward,
-                crate::models::FeedForwardArchitecture::Dense { .. }
-            );
+            && (definition.dense_decoder().is_some() || definition.hybrid_decoder().is_some());
         if !has_cpu_reference_executor {
             missing.push(format!(
                 "{} {} decoder executor for {} backend",
@@ -189,6 +206,11 @@ fn load_executor(
             attention,
             feed_forward,
         } => match backend {
+            InitializedRuntimeBackend::CpuReference if definition.hybrid_decoder().is_some() => {
+                CpuReferenceHybridDecoder::load(definition, artifacts)
+                    .map(|model| Box::new(model) as Box<dyn ModelExecutor>)
+                    .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))
+            }
             InitializedRuntimeBackend::CpuReference if definition.dense_decoder().is_some() => {
                 CpuReferenceDenseDecoder::load(definition, artifacts)
                     .map(|model| Box::new(model) as Box<dyn ModelExecutor>)

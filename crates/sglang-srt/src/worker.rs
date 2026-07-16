@@ -149,6 +149,10 @@ pub trait FallibleModelWorker {
 
     fn complete_request(&mut self, _request: &ScheduledRequest) {}
 
+    fn fail_request(&mut self, request: &ScheduledRequest) {
+        self.complete_request(request);
+    }
+
     fn update_weights_from_disk(
         &mut self,
         _request: &WorkerWeightUpdateRequest,
@@ -173,6 +177,8 @@ pub trait WorkerExecutor {
     fn poll_transfers(&mut self) -> Result<MooncakeTransferPollSummary, KvCacheTransferError>;
 
     fn complete_request(&mut self, request: &ScheduledRequest);
+
+    fn fail_request(&mut self, request: &ScheduledRequest);
 
     fn update_weights_from_disk(
         &mut self,
@@ -216,6 +222,10 @@ where
 
     fn complete_request(&mut self, request: &ScheduledRequest) {
         FallibleModelWorker::complete_request(self, request)
+    }
+
+    fn fail_request(&mut self, request: &ScheduledRequest) {
+        FallibleModelWorker::fail_request(self, request)
     }
 
     fn update_weights_from_disk(

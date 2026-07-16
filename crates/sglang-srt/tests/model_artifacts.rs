@@ -31,6 +31,64 @@ fn hf_model_config_parses_attention_bias() {
 }
 
 #[test]
+fn hf_model_config_reads_language_execution_fields_from_nested_text_config() {
+    let model_dir = temp_model_dir("nested-qwen35-config");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "architectures": ["Qwen3_5ForConditionalGeneration"],
+  "model_type": "qwen3_5",
+  "tie_word_embeddings": false,
+  "text_config": {
+    "model_type": "qwen3_5_text",
+    "vocab_size": 248320,
+    "hidden_size": 1024,
+    "num_hidden_layers": 2,
+    "tie_word_embeddings": true,
+    "layer_types": ["linear_attention", "full_attention"],
+    "linear_conv_kernel_dim": 4,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 16,
+    "rope_parameters": {
+      "rope_type": "default",
+      "rope_theta": 10000000,
+      "partial_rotary_factor": 0.25
+    }
+  },
+  "vision_config": {
+    "hidden_size": 768,
+    "model_type": "qwen3_5"
+  }
+}"#,
+    )
+    .expect("config should be written");
+
+    let config = HfModelConfig::from_model_path(&model_dir).expect("nested config should parse");
+
+    assert_eq!(config.model_type.as_deref(), Some("qwen3_5"));
+    assert_eq!(config.text_model_type.as_deref(), Some("qwen3_5_text"));
+    assert_eq!(config.hidden_size, Some(1024));
+    assert_eq!(config.tie_word_embeddings, Some(true));
+    assert_eq!(
+        config.layer_types,
+        vec!["linear_attention", "full_attention"]
+    );
+    assert_eq!(
+        config.rope_theta.map(|value| value.get()),
+        Some(10_000_000.0)
+    );
+    assert_eq!(
+        config.partial_rotary_factor.map(|value| value.get()),
+        Some(0.25)
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
 fn local_model_artifacts_loads_deepseek_v4_config_and_indexed_safetensors() {
     let model_dir = temp_model_dir("indexed-safetensors");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");

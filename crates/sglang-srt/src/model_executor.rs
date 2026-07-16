@@ -200,6 +200,8 @@ pub trait ForwardModel {
         batch: &ModelWorkerBatch,
     ) -> Result<ModelForwardOutput, ModelForwardError>;
 
+    fn complete_request(&mut self, _request_id: &RequestId) {}
+
     fn update_weights_from_disk(
         &mut self,
         _request: &WorkerWeightUpdateRequest,
@@ -973,6 +975,10 @@ where
                 })
                 .collect(),
         )?)
+    }
+
+    fn complete_request(&mut self, request: &ScheduledRequest) {
+        self.model.complete_request(request.request_id());
     }
 
     fn update_weights_from_disk(

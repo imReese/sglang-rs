@@ -1781,6 +1781,23 @@ where
         self.worker.complete_request(request)
     }
 
+    fn fail_request(&mut self, request: &ScheduledRequest) {
+        if let Some(disaggregated_params) = request.disaggregated_params() {
+            let transfer_failed = self
+                .registry
+                .get(disaggregated_params.bootstrap_room)
+                .is_some_and(|session| session.status() == KvPoll::Failed);
+            if !transfer_failed {
+                self.registry.remove(disaggregated_params.bootstrap_room);
+                let _ = self
+                    .transfer_executor
+                    .cancel_transfer_room(disaggregated_params.bootstrap_room);
+            }
+        }
+
+        self.worker.fail_request(request)
+    }
+
     fn update_weights_from_disk(
         &mut self,
         request: &WorkerWeightUpdateRequest,

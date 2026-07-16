@@ -2,6 +2,7 @@ mod deepseek;
 mod embedding;
 mod glm;
 mod qwen;
+mod qwen3_5;
 
 use std::fmt;
 use std::path::Path;
@@ -14,6 +15,7 @@ pub(crate) use deepseek::DEEPSEEK_V4_ADAPTER;
 pub(crate) use embedding::EMBEDDING_LM_ADAPTER;
 pub(crate) use glm::GLM_MOE_DSA_ADAPTER;
 pub(crate) use qwen::{QWEN2_ADAPTER, QWEN3_ADAPTER};
+pub(crate) use qwen3_5::QWEN3_5_ADAPTER;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttentionArchitecture {
@@ -29,6 +31,15 @@ pub enum AttentionArchitecture {
         qk_rope_head_dim: usize,
         value_head_dim: usize,
     },
+    Hybrid {
+        num_attention_heads: usize,
+        num_key_value_heads: usize,
+        attention_head_dim: usize,
+        linear_num_key_heads: usize,
+        linear_num_value_heads: usize,
+        linear_key_head_dim: usize,
+        linear_value_head_dim: usize,
+    },
 }
 
 impl AttentionArchitecture {
@@ -37,21 +48,36 @@ impl AttentionArchitecture {
             Self::None => AttentionFamily::None,
             Self::MultiHead { .. } => AttentionFamily::MultiHead,
             Self::MultiLatent { .. } => AttentionFamily::MultiLatent,
+            Self::Hybrid { .. } => AttentionFamily::Hybrid,
         }
     }
 
     fn validate_tensor_parallel(self, tensor_parallel_size: usize) -> Result<(), String> {
-        let (num_attention_heads, num_key_value_heads) = match self {
+        let (num_attention_heads, head_counts) = match self {
             Self::None => return Ok(()),
             Self::MultiHead {
                 num_attention_heads,
                 num_key_value_heads,
                 ..
-            } => (num_attention_heads, Some(num_key_value_heads)),
+            } => (num_attention_heads, vec![("KV", num_key_value_heads)]),
             Self::MultiLatent {
                 num_attention_heads,
                 ..
-            } => (num_attention_heads, None),
+            } => (num_attention_heads, Vec::new()),
+            Self::Hybrid {
+                num_attention_heads,
+                num_key_value_heads,
+                linear_num_key_heads,
+                linear_num_value_heads,
+                ..
+            } => (
+                num_attention_heads,
+                vec![
+                    ("KV", num_key_value_heads),
+                    ("linear key", linear_num_key_heads),
+                    ("linear value", linear_num_value_heads),
+                ],
+            ),
         };
 
         if !num_attention_heads.is_multiple_of(tensor_parallel_size) {
@@ -60,15 +86,15 @@ impl AttentionArchitecture {
             ));
         }
 
-        if let Some(num_key_value_heads) = num_key_value_heads {
-            let valid = if num_key_value_heads >= tensor_parallel_size {
-                num_key_value_heads.is_multiple_of(tensor_parallel_size)
+        for (name, head_count) in head_counts {
+            let valid = if head_count >= tensor_parallel_size {
+                head_count.is_multiple_of(tensor_parallel_size)
             } else {
-                tensor_parallel_size.is_multiple_of(num_key_value_heads)
+                tensor_parallel_size.is_multiple_of(head_count)
             };
             if !valid {
                 return Err(format!(
-                    "KV head count {num_key_value_heads} must shard across or replicate evenly over tensor parallel size {tensor_parallel_size}"
+                    "{name} head count {head_count} must shard across or replicate evenly over tensor parallel size {tensor_parallel_size}"
                 ));
             }
         }
@@ -82,6 +108,7 @@ pub enum AttentionFamily {
     None,
     MultiHead,
     MultiLatent,
+    Hybrid,
 }
 
 impl fmt::Display for AttentionFamily {
@@ -90,6 +117,7 @@ impl fmt::Display for AttentionFamily {
             Self::None => "none",
             Self::MultiHead => "multi-head attention",
             Self::MultiLatent => "multi-latent attention",
+            Self::Hybrid => "hybrid full and linear attention",
         })
     }
 }
@@ -168,6 +196,106 @@ pub(crate) struct DenseDecoderExecutionPlan {
     pub(crate) weights: DenseDecoderWeightNames,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DenseFeedForwardWeightNames {
+    pub(crate) gate_weight: String,
+    pub(crate) up_weight: String,
+    pub(crate) down_weight: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HybridFullAttentionWeightNames {
+    pub(crate) query_weight: String,
+    pub(crate) query_norm: String,
+    pub(crate) key_weight: String,
+    pub(crate) key_norm: String,
+    pub(crate) value_weight: String,
+    pub(crate) output_weight: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GatedDeltaNetWeightNames {
+    pub(crate) a_log: String,
+    pub(crate) conv1d_weight: String,
+    pub(crate) dt_bias: String,
+    pub(crate) in_proj_a_weight: String,
+    pub(crate) in_proj_b_weight: String,
+    pub(crate) in_proj_qkv_weight: String,
+    pub(crate) in_proj_z_weight: String,
+    pub(crate) norm_weight: String,
+    pub(crate) output_weight: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HybridDecoderLayerKind {
+    FullAttention {
+        cache_layer_index: usize,
+        weights: HybridFullAttentionWeightNames,
+    },
+    GatedDeltaNet {
+        state_layer_index: usize,
+        weights: GatedDeltaNetWeightNames,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HybridDecoderLayerWeightNames {
+    pub(crate) input_norm: String,
+    pub(crate) mixer: HybridDecoderLayerKind,
+    pub(crate) post_attention_norm: String,
+    pub(crate) feed_forward: DenseFeedForwardWeightNames,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HybridDecoderWeightNames {
+    pub(crate) token_embeddings: String,
+    pub(crate) final_norm: String,
+    pub(crate) lm_head: Option<String>,
+    pub(crate) layers: Vec<HybridDecoderLayerWeightNames>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct HybridDecoderExecutionPlan {
+    pub(crate) vocab_size: usize,
+    pub(crate) hidden_size: usize,
+    pub(crate) intermediate_size: usize,
+    pub(crate) max_position_embeddings: usize,
+    pub(crate) rms_norm_eps: f32,
+    pub(crate) rope_theta: f32,
+    pub(crate) rotary_dim: usize,
+    pub(crate) attention_output_gate: bool,
+    pub(crate) num_attention_heads: usize,
+    pub(crate) num_key_value_heads: usize,
+    pub(crate) attention_head_dim: usize,
+    pub(crate) linear_conv_kernel_dim: usize,
+    pub(crate) linear_key_head_dim: usize,
+    pub(crate) linear_value_head_dim: usize,
+    pub(crate) linear_num_key_heads: usize,
+    pub(crate) linear_num_value_heads: usize,
+    pub(crate) activation: DenseDecoderActivation,
+    pub(crate) weights: HybridDecoderWeightNames,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelCacheArchitecture {
+    None,
+    PagedKv,
+    HybridState {
+        full_attention_layer_count: usize,
+        recurrent_state_layer_count: usize,
+    },
+}
+
+impl ModelCacheArchitecture {
+    pub fn supports_radix_prefix_cache(self) -> bool {
+        matches!(self, Self::PagedKv)
+    }
+
+    pub fn supports_kv_only_transfer(self) -> bool {
+        !matches!(self, Self::HybridState { .. })
+    }
+}
+
 impl fmt::Display for FeedForwardFamily {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -222,7 +350,9 @@ pub struct ModelDefinition {
     execution: ModelExecutionArchitecture,
     supported_dtypes: Vec<RuntimeDtype>,
     kv_cache_layout: Option<KvCacheModelLayout>,
+    cache_architecture: ModelCacheArchitecture,
     dense_decoder: Option<DenseDecoderExecutionPlan>,
+    hybrid_decoder: Option<HybridDecoderExecutionPlan>,
 }
 
 impl ModelDefinition {
@@ -240,12 +370,34 @@ impl ModelDefinition {
             execution,
             supported_dtypes,
             kv_cache_layout,
+            cache_architecture: if kv_cache_layout.is_some() {
+                ModelCacheArchitecture::PagedKv
+            } else {
+                ModelCacheArchitecture::None
+            },
             dense_decoder: None,
+            hybrid_decoder: None,
         }
     }
 
     pub(crate) fn with_dense_decoder(mut self, plan: DenseDecoderExecutionPlan) -> Self {
         self.dense_decoder = Some(plan);
+        self
+    }
+
+    pub(crate) fn with_hybrid_decoder(mut self, plan: HybridDecoderExecutionPlan) -> Self {
+        let full_attention_layer_count = plan
+            .weights
+            .layers
+            .iter()
+            .filter(|layer| matches!(layer.mixer, HybridDecoderLayerKind::FullAttention { .. }))
+            .count();
+        let recurrent_state_layer_count = plan.weights.layers.len() - full_attention_layer_count;
+        self.cache_architecture = ModelCacheArchitecture::HybridState {
+            full_attention_layer_count,
+            recurrent_state_layer_count,
+        };
+        self.hybrid_decoder = Some(plan);
         self
     }
 
@@ -269,8 +421,16 @@ impl ModelDefinition {
         self.kv_cache_layout
     }
 
+    pub fn cache_architecture(&self) -> ModelCacheArchitecture {
+        self.cache_architecture
+    }
+
     pub(crate) fn dense_decoder(&self) -> Option<&DenseDecoderExecutionPlan> {
         self.dense_decoder.as_ref()
+    }
+
+    pub(crate) fn hybrid_decoder(&self) -> Option<&HybridDecoderExecutionPlan> {
+        self.hybrid_decoder.as_ref()
     }
 
     pub(crate) fn validate_dense_decoder_checkpoint(
@@ -361,6 +521,172 @@ impl ModelDefinition {
                 &layer.down_weight,
                 &[plan.hidden_size, intermediate_size],
             )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_hybrid_decoder_checkpoint(
+        &self,
+        artifacts: &LocalModelArtifacts,
+    ) -> Result<(), ModelArtifactError> {
+        let Some(plan) = self.hybrid_decoder() else {
+            return Err(invalid_dense_decoder_checkpoint(
+                artifacts,
+                "model definition does not include a hybrid decoder execution plan",
+            ));
+        };
+        if plan.weights.layers.is_empty() {
+            return Err(invalid_dense_decoder_checkpoint(
+                artifacts,
+                "hybrid decoder weight map has no layers",
+            ));
+        }
+
+        let query_size = plan
+            .num_attention_heads
+            .checked_mul(plan.attention_head_dim)
+            .ok_or_else(|| {
+                invalid_dense_decoder_checkpoint(artifacts, "query projection size overflowed")
+            })?;
+        let projected_query_size = query_size
+            .checked_mul(if plan.attention_output_gate { 2 } else { 1 })
+            .ok_or_else(|| {
+                invalid_dense_decoder_checkpoint(
+                    artifacts,
+                    "gated query projection size overflowed",
+                )
+            })?;
+        let kv_size = plan
+            .num_key_value_heads
+            .checked_mul(plan.attention_head_dim)
+            .ok_or_else(|| {
+                invalid_dense_decoder_checkpoint(artifacts, "KV projection size overflowed")
+            })?;
+        let linear_key_size = plan
+            .linear_num_key_heads
+            .checked_mul(plan.linear_key_head_dim)
+            .ok_or_else(|| {
+                invalid_dense_decoder_checkpoint(artifacts, "linear key size overflowed")
+            })?;
+        let linear_value_size = plan
+            .linear_num_value_heads
+            .checked_mul(plan.linear_value_head_dim)
+            .ok_or_else(|| {
+                invalid_dense_decoder_checkpoint(artifacts, "linear value size overflowed")
+            })?;
+        let conv_dim = linear_key_size
+            .checked_mul(2)
+            .and_then(|size| size.checked_add(linear_value_size))
+            .ok_or_else(|| {
+                invalid_dense_decoder_checkpoint(artifacts, "linear convolution size overflowed")
+            })?;
+
+        require_tensor_shape(
+            artifacts,
+            &plan.weights.token_embeddings,
+            &[plan.vocab_size, plan.hidden_size],
+        )?;
+        require_tensor_shape(artifacts, &plan.weights.final_norm, &[plan.hidden_size])?;
+        if let Some(lm_head) = &plan.weights.lm_head {
+            require_tensor_shape(artifacts, lm_head, &[plan.vocab_size, plan.hidden_size])?;
+        }
+
+        for layer in &plan.weights.layers {
+            require_tensor_shape(artifacts, &layer.input_norm, &[plan.hidden_size])?;
+            require_tensor_shape(artifacts, &layer.post_attention_norm, &[plan.hidden_size])?;
+            require_tensor_shape(
+                artifacts,
+                &layer.feed_forward.gate_weight,
+                &[plan.intermediate_size, plan.hidden_size],
+            )?;
+            require_tensor_shape(
+                artifacts,
+                &layer.feed_forward.up_weight,
+                &[plan.intermediate_size, plan.hidden_size],
+            )?;
+            require_tensor_shape(
+                artifacts,
+                &layer.feed_forward.down_weight,
+                &[plan.hidden_size, plan.intermediate_size],
+            )?;
+
+            match &layer.mixer {
+                HybridDecoderLayerKind::FullAttention { weights, .. } => {
+                    require_tensor_shape(
+                        artifacts,
+                        &weights.query_weight,
+                        &[projected_query_size, plan.hidden_size],
+                    )?;
+                    require_tensor_shape(
+                        artifacts,
+                        &weights.query_norm,
+                        &[plan.attention_head_dim],
+                    )?;
+                    require_tensor_shape(
+                        artifacts,
+                        &weights.key_weight,
+                        &[kv_size, plan.hidden_size],
+                    )?;
+                    require_tensor_shape(artifacts, &weights.key_norm, &[plan.attention_head_dim])?;
+                    require_tensor_shape(
+                        artifacts,
+                        &weights.value_weight,
+                        &[kv_size, plan.hidden_size],
+                    )?;
+                    require_tensor_shape(
+                        artifacts,
+                        &weights.output_weight,
+                        &[plan.hidden_size, query_size],
+                    )?;
+                }
+                HybridDecoderLayerKind::GatedDeltaNet { weights, .. } => {
+                    require_tensor_shape(
+                        artifacts,
+                        &weights.a_log,
+                        &[plan.linear_num_value_heads],
+                    )?;
+                    require_tensor_shape(
+                        artifacts,
+                        &weights.conv1d_weight,
+                        &[conv_dim, 1, plan.linear_conv_kernel_dim],
+                    )?;
+                    require_tensor_shape(
+                        artifacts,
+                        &weights.dt_bias,
+                        &[plan.linear_num_value_heads],
+                    )?;
+                    require_tensor_shape(
+                        artifacts,
+                        &weights.in_proj_a_weight,
+                        &[plan.linear_num_value_heads, plan.hidden_size],
+                    )?;
+                    require_tensor_shape(
+                        artifacts,
+                        &weights.in_proj_b_weight,
+                        &[plan.linear_num_value_heads, plan.hidden_size],
+                    )?;
+                    require_tensor_shape(
+                        artifacts,
+                        &weights.in_proj_qkv_weight,
+                        &[conv_dim, plan.hidden_size],
+                    )?;
+                    require_tensor_shape(
+                        artifacts,
+                        &weights.in_proj_z_weight,
+                        &[linear_value_size, plan.hidden_size],
+                    )?;
+                    require_tensor_shape(
+                        artifacts,
+                        &weights.norm_weight,
+                        &[plan.linear_value_head_dim],
+                    )?;
+                    require_tensor_shape(
+                        artifacts,
+                        &weights.output_weight,
+                        &[plan.hidden_size, linear_value_size],
+                    )?;
+                }
+            }
         }
         Ok(())
     }

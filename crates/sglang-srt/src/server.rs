@@ -28,7 +28,7 @@ use crate::pd_bootstrap::{
     serve_mooncake_bootstrap_zmq_endpoints_with_shutdown, serve_prefill_bootstrap_with_shutdown,
 };
 use crate::router::{RouterGetModelInfoResponse, RouterRuntime};
-use crate::scheduler::Scheduler;
+use crate::scheduler::{PrefixCachePolicy, Scheduler};
 use crate::tokenizer::{RuntimeTokenizer, Tokenizer, TokenizerError};
 #[cfg(not(feature = "mooncake-link"))]
 use crate::transfer::MooncakeTransferTarget;
@@ -278,6 +278,27 @@ fn bootstrap_forward_model_for_launch(
 fn bootstrap_model_runner(model: BootstrapForwardModel) -> ModelRunner<BootstrapForwardModel> {
     let kv_cache_layout = model.kv_cache_layout();
     ModelRunner::new_with_kv_cache_layout(model, kv_cache_layout)
+}
+
+fn model_prefix_cache_policy(model: &BootstrapForwardModel) -> PrefixCachePolicy {
+    if model.cache_architecture().supports_radix_prefix_cache() {
+        PrefixCachePolicy::Enabled
+    } else {
+        PrefixCachePolicy::Disabled
+    }
+}
+
+fn validate_kv_only_transfer_model(model: &BootstrapForwardModel) -> Result<(), ServerLaunchError> {
+    if model.cache_architecture().supports_kv_only_transfer() {
+        return Ok(());
+    }
+    Err(ServerLaunchError::MissingRuntimeCapabilities {
+        runtime_name: model.runtime_capability().runtime_name.to_string(),
+        missing: vec![
+            "hybrid recurrent state memory registration and transfer; KV-only transfer is insufficient"
+                .to_string(),
+        ],
+    })
 }
 
 fn validate_bootstrap_runtime_backend(
@@ -775,10 +796,12 @@ fn try_build_bootstrap_grpc_router_service_from_model(
     args: &ServerArgs,
     model: BootstrapForwardModel,
 ) -> Result<BootstrapGrpcRouterService, ServerLaunchError> {
-    let scheduler = Scheduler::with_cache_resources(
+    let prefix_cache_policy = model_prefix_cache_policy(&model);
+    let scheduler = Scheduler::with_cache_resources_and_policy(
         bootstrap_model_runner(model),
         RadixCache::default(),
         cache_page_allocator_from_server_args(args)?,
+        prefix_cache_policy,
     )
     .with_max_running_requests(args.max_running_requests);
     let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
@@ -807,10 +830,12 @@ fn try_build_bootstrap_http_router_service_from_model(
     args: &ServerArgs,
     model: BootstrapForwardModel,
 ) -> Result<BootstrapHttpRouterService, ServerLaunchError> {
-    let scheduler = Scheduler::with_cache_resources(
+    let prefix_cache_policy = model_prefix_cache_policy(&model);
+    let scheduler = Scheduler::with_cache_resources_and_policy(
         bootstrap_model_runner(model),
         RadixCache::default(),
         cache_page_allocator_from_server_args(args)?,
+        prefix_cache_policy,
     )
     .with_max_running_requests(args.max_running_requests);
     let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
@@ -843,8 +868,10 @@ pub fn try_build_bootstrap_prefill_http_router_service(
     args: &ServerArgs,
 ) -> Result<BootstrapPrefillHttpRouterService, ServerLaunchError> {
     validate_local_model_artifacts_if_present(args)?;
+    let model = bootstrap_forward_model_from_server_args(args)?;
+    validate_kv_only_transfer_model(&model)?;
     let worker = KvTransferModelWorker::new(
-        ModelRunner::new(bootstrap_forward_model_from_server_args(args)?),
+        ModelRunner::new(model),
         DecodeBootstrapRegistry::default(),
         FakeKvCacheTransferExecutor::default(),
     )
@@ -933,6 +960,7 @@ where
     E: KvCacheTransferExecutor,
     P: DecodeBootstrapPublisher,
 {
+    validate_kv_only_transfer_model(&model)?;
     try_build_bootstrap_pd_http_router_service_from_runner_with_decode_publisher(
         args,
         bootstrap_model_runner(model),
@@ -1061,6 +1089,7 @@ where
 fn launch_mooncake_prefill_kv_layout(
     model_runner: &ModelRunner<BootstrapForwardModel>,
 ) -> Result<MooncakeKvCacheLayout, ServerLaunchError> {
+    validate_kv_only_transfer_model(model_runner.model())?;
     Ok(mooncake_kv_memory_from_model_runner(model_runner)?.prefill_layout(0))
 }
 
@@ -1068,6 +1097,7 @@ fn launch_mooncake_prefill_kv_layout(
 fn launch_mooncake_decode_kv_layout(
     model_runner: &ModelRunner<BootstrapForwardModel>,
 ) -> Result<MooncakeKvCacheLayout, ServerLaunchError> {
+    validate_kv_only_transfer_model(model_runner.model())?;
     Ok(mooncake_kv_memory_from_model_runner(model_runner)?.prefill_layout(0))
 }
 
@@ -1087,6 +1117,7 @@ fn prepare_linked_mooncake_kv_memory(
     page_size: usize,
 ) -> Result<RegisteredMooncakeKvCacheMemory<SharedLinkedMooncakeTransferEngine>, ServerLaunchError>
 {
+    validate_kv_only_transfer_model(model_runner.model())?;
     model_runner
         .model()
         .runtime_capability()
@@ -1482,6 +1513,7 @@ where
     E: KvCacheTransferExecutor,
     P: DecodeBootstrapPublisher,
 {
+    validate_kv_only_transfer_model(&model)?;
     try_build_bootstrap_pd_grpc_router_service_from_runner_with_decode_publisher(
         args,
         bootstrap_model_runner(model),

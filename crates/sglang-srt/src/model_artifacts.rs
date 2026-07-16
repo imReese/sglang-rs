@@ -1053,6 +1053,7 @@ impl Eq for HfConfigFloat {}
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct HfModelConfig {
     pub model_type: Option<String>,
+    pub text_model_type: Option<String>,
     pub architectures: Vec<String>,
     pub eos_token_ids: Vec<u32>,
     pub vocab_size: Option<usize>,
@@ -1086,6 +1087,17 @@ pub struct HfModelConfig {
     pub qk_nope_head_dim: Option<usize>,
     pub qk_rope_head_dim: Option<usize>,
     pub v_head_dim: Option<usize>,
+    pub layer_types: Vec<String>,
+    pub full_attention_interval: Option<usize>,
+    pub attn_output_gate: Option<bool>,
+    pub partial_rotary_factor: Option<HfConfigFloat>,
+    pub linear_conv_kernel_dim: Option<usize>,
+    pub linear_key_head_dim: Option<usize>,
+    pub linear_value_head_dim: Option<usize>,
+    pub linear_num_key_heads: Option<usize>,
+    pub linear_num_value_heads: Option<usize>,
+    pub output_gate_type: Option<String>,
+    pub mamba_ssm_dtype: Option<String>,
 }
 
 impl HfModelConfig {
@@ -1128,62 +1140,87 @@ impl HfModelConfig {
                 message: error.to_string(),
             })?;
 
-        let rope_parameters = value
-            .get("rope_parameters")
-            .filter(|value| !value.is_null());
-        let rope_theta = read_f64_field(&value, "rope_theta", config_path)?.or(rope_parameters
+        let text = value
+            .get("text_config")
+            .filter(|value| value.is_object())
+            .unwrap_or(&value);
+
+        let rope_parameters = text.get("rope_parameters").filter(|value| !value.is_null());
+        let rope_theta = read_f64_field(text, "rope_theta", config_path)?.or(rope_parameters
             .map(|parameters| read_f64_field(parameters, "rope_theta", config_path))
             .transpose()?
             .flatten());
-        let rope_scaling = value
+        let rope_scaling = text
             .get("rope_scaling")
             .filter(|value| !value.is_null())
             .or(rope_parameters)
             .cloned();
+        let partial_rotary_factor =
+            read_f64_field(text, "partial_rotary_factor", config_path)?.or(rope_parameters
+                .map(|parameters| read_f64_field(parameters, "partial_rotary_factor", config_path))
+                .transpose()?
+                .flatten());
 
         Ok(Self {
             model_type: read_string_field(&value, "model_type"),
+            text_model_type: read_string_field(text, "model_type"),
             architectures: read_string_array_field(&value, "architectures"),
-            eos_token_ids: read_u32_or_array_field(&value, "eos_token_id", config_path)?,
-            vocab_size: read_usize_field(&value, "vocab_size", config_path)?,
+            eos_token_ids: read_u32_or_array_field(text, "eos_token_id", config_path)?,
+            vocab_size: read_usize_field(text, "vocab_size", config_path)?,
             max_position_embeddings: read_usize_field(
-                &value,
+                text,
                 "max_position_embeddings",
                 config_path,
             )?,
-            num_hidden_layers: read_usize_field(&value, "num_hidden_layers", config_path)?,
-            hidden_size: read_usize_field(&value, "hidden_size", config_path)?,
-            intermediate_size: read_usize_field(&value, "intermediate_size", config_path)?,
-            moe_intermediate_size: read_usize_field(&value, "moe_intermediate_size", config_path)?,
-            n_routed_experts: read_usize_field(&value, "n_routed_experts", config_path)?,
-            n_shared_experts: read_usize_field(&value, "n_shared_experts", config_path)?,
-            num_experts_per_tok: read_usize_field(&value, "num_experts_per_tok", config_path)?,
-            norm_topk_prob: read_bool_field(&value, "norm_topk_prob", config_path)?,
-            routed_scaling_factor: read_f64_field(&value, "routed_scaling_factor", config_path)?,
-            first_k_dense_replace: read_usize_field(&value, "first_k_dense_replace", config_path)?,
-            moe_layer_freq: read_usize_field(&value, "moe_layer_freq", config_path)?,
-            hc_mult: read_usize_field(&value, "hc_mult", config_path)?,
-            hc_sinkhorn_iters: read_usize_field(&value, "hc_sinkhorn_iters", config_path)?,
-            hidden_act: read_string_field(&value, "hidden_act"),
-            attention_bias: read_bool_field(&value, "attention_bias", config_path)?,
-            rms_norm_eps: read_f64_field(&value, "rms_norm_eps", config_path)?,
+            num_hidden_layers: read_usize_field(text, "num_hidden_layers", config_path)?,
+            hidden_size: read_usize_field(text, "hidden_size", config_path)?,
+            intermediate_size: read_usize_field(text, "intermediate_size", config_path)?,
+            moe_intermediate_size: read_usize_field(text, "moe_intermediate_size", config_path)?,
+            n_routed_experts: read_usize_field(text, "n_routed_experts", config_path)?,
+            n_shared_experts: read_usize_field(text, "n_shared_experts", config_path)?,
+            num_experts_per_tok: read_usize_field(text, "num_experts_per_tok", config_path)?,
+            norm_topk_prob: read_bool_field(text, "norm_topk_prob", config_path)?,
+            routed_scaling_factor: read_f64_field(text, "routed_scaling_factor", config_path)?,
+            first_k_dense_replace: read_usize_field(text, "first_k_dense_replace", config_path)?,
+            moe_layer_freq: read_usize_field(text, "moe_layer_freq", config_path)?,
+            hc_mult: read_usize_field(text, "hc_mult", config_path)?,
+            hc_sinkhorn_iters: read_usize_field(text, "hc_sinkhorn_iters", config_path)?,
+            hidden_act: read_string_field(text, "hidden_act"),
+            attention_bias: read_bool_field(text, "attention_bias", config_path)?,
+            rms_norm_eps: read_f64_field(text, "rms_norm_eps", config_path)?,
             rope_theta,
             rope_scaling,
-            use_sliding_window: read_bool_field(&value, "use_sliding_window", config_path)?,
-            sliding_window: read_usize_field(&value, "sliding_window", config_path)?,
-            hc_eps: read_f64_field(&value, "hc_eps", config_path)?,
-            tie_word_embeddings: read_bool_field(&value, "tie_word_embeddings", config_path)?,
-            num_attention_heads: read_usize_field(&value, "num_attention_heads", config_path)?,
+            use_sliding_window: read_bool_field(text, "use_sliding_window", config_path)?,
+            sliding_window: read_usize_field(text, "sliding_window", config_path)?,
+            hc_eps: read_f64_field(text, "hc_eps", config_path)?,
+            tie_word_embeddings: read_bool_field(text, "tie_word_embeddings", config_path)?
+                .or(read_bool_field(&value, "tie_word_embeddings", config_path)?),
+            num_attention_heads: read_usize_field(text, "num_attention_heads", config_path)?,
             original_num_attention_heads: read_usize_field(
-                &value,
+                text,
                 "original_num_attention_heads",
                 config_path,
             )?,
-            num_key_value_heads: read_usize_field(&value, "num_key_value_heads", config_path)?,
-            head_dim: read_usize_field(&value, "head_dim", config_path)?,
-            qk_nope_head_dim: read_usize_field(&value, "qk_nope_head_dim", config_path)?,
-            qk_rope_head_dim: read_usize_field(&value, "qk_rope_head_dim", config_path)?,
-            v_head_dim: read_usize_field(&value, "v_head_dim", config_path)?,
+            num_key_value_heads: read_usize_field(text, "num_key_value_heads", config_path)?,
+            head_dim: read_usize_field(text, "head_dim", config_path)?,
+            qk_nope_head_dim: read_usize_field(text, "qk_nope_head_dim", config_path)?,
+            qk_rope_head_dim: read_usize_field(text, "qk_rope_head_dim", config_path)?,
+            v_head_dim: read_usize_field(text, "v_head_dim", config_path)?,
+            layer_types: read_string_array_field(text, "layer_types"),
+            full_attention_interval: read_usize_field(
+                text,
+                "full_attention_interval",
+                config_path,
+            )?,
+            attn_output_gate: read_bool_field(text, "attn_output_gate", config_path)?,
+            partial_rotary_factor,
+            linear_conv_kernel_dim: read_usize_field(text, "linear_conv_kernel_dim", config_path)?,
+            linear_key_head_dim: read_usize_field(text, "linear_key_head_dim", config_path)?,
+            linear_value_head_dim: read_usize_field(text, "linear_value_head_dim", config_path)?,
+            linear_num_key_heads: read_usize_field(text, "linear_num_key_heads", config_path)?,
+            linear_num_value_heads: read_usize_field(text, "linear_num_value_heads", config_path)?,
+            output_gate_type: read_string_field(text, "output_gate_type"),
+            mamba_ssm_dtype: read_string_field(text, "mamba_ssm_dtype"),
         })
     }
 

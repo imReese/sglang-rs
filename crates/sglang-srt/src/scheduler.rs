@@ -23,6 +23,12 @@ pub enum ForwardMode {
     Decode,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrefixCachePolicy {
+    Enabled,
+    Disabled,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScheduledRequest {
     request_id: RequestId,
@@ -249,6 +255,7 @@ pub struct Scheduler<W> {
     waiting_queue: VecDeque<ScheduledRequest>,
     decode_queue: VecDeque<ScheduledRequest>,
     prefix_cache: RadixCache,
+    prefix_cache_policy: PrefixCachePolicy,
     pending_prefix_cache_inserts: Vec<ScheduledRequest>,
     cache_page_allocator: Option<CachePageAllocator>,
     max_running_requests: Option<usize>,
@@ -310,6 +317,7 @@ impl<W> Scheduler<W> {
             waiting_queue: VecDeque::new(),
             decode_queue: VecDeque::new(),
             prefix_cache,
+            prefix_cache_policy: PrefixCachePolicy::Enabled,
             pending_prefix_cache_inserts: Vec::new(),
             cache_page_allocator: None,
             max_running_requests: None,
@@ -326,6 +334,25 @@ impl<W> Scheduler<W> {
             waiting_queue: VecDeque::new(),
             decode_queue: VecDeque::new(),
             prefix_cache,
+            prefix_cache_policy: PrefixCachePolicy::Enabled,
+            pending_prefix_cache_inserts: Vec::new(),
+            cache_page_allocator: Some(cache_page_allocator),
+            max_running_requests: None,
+            worker,
+        }
+    }
+
+    pub fn with_cache_resources_and_policy(
+        worker: W,
+        prefix_cache: RadixCache,
+        cache_page_allocator: CachePageAllocator,
+        prefix_cache_policy: PrefixCachePolicy,
+    ) -> Self {
+        Self {
+            waiting_queue: VecDeque::new(),
+            decode_queue: VecDeque::new(),
+            prefix_cache,
+            prefix_cache_policy,
             pending_prefix_cache_inserts: Vec::new(),
             cache_page_allocator: Some(cache_page_allocator),
             max_running_requests: None,
@@ -365,12 +392,14 @@ impl<W> Scheduler<W> {
         W: WorkerExecutor,
     {
         if let Some(request) = remove_request_from_queue(&mut self.waiting_queue, request_id) {
+            self.release_request_cache_pages(&request);
             self.worker.complete_request(&request);
             return true;
         }
 
         if let Some(request) = remove_request_from_queue(&mut self.decode_queue, request_id) {
             self.release_pending_prefix_cache_insert(request_id);
+            self.release_request_cache_pages(&request);
             self.worker.complete_request(&request);
             return true;
         }
@@ -384,11 +413,13 @@ impl<W> Scheduler<W> {
     {
         let mut aborted = 0;
         while let Some(request) = self.waiting_queue.pop_front() {
+            self.release_request_cache_pages(&request);
             self.worker.complete_request(&request);
             aborted += 1;
         }
         while let Some(request) = self.decode_queue.pop_front() {
             self.release_pending_prefix_cache_insert(request.request_id());
+            self.release_request_cache_pages(&request);
             self.worker.complete_request(&request);
             aborted += 1;
         }
@@ -502,9 +533,16 @@ impl<W> Scheduler<W> {
             .as_ref()
             .map(CachePageAllocator::page_size)
             .unwrap_or(1);
-        let mut prefix_match = self
-            .prefix_cache
-            .match_prefix_page_aligned(request.input_ids(), page_size);
+        let mut prefix_match = match self.prefix_cache_policy {
+            PrefixCachePolicy::Enabled => self
+                .prefix_cache
+                .match_prefix_page_aligned(request.input_ids(), page_size),
+            PrefixCachePolicy::Disabled => PrefixMatch {
+                matched_token_count: 0,
+                cache_pages: Vec::new(),
+                remaining_input_ids: request.input_ids().to_vec(),
+            },
+        };
         let cache_hit_token_count = prefix_match.matched_token_count;
         let replay_cache_page = if request.disaggregated_params().is_none()
             && !request.input_ids().is_empty()
@@ -778,6 +816,7 @@ where
 
             if finished {
                 request.set_stage(RequestStage::Finished);
+                self.release_request_cache_pages(&request);
                 self.worker.complete_request(&request);
             } else {
                 request.set_stage(RequestStage::DecodeWaiting);
@@ -791,12 +830,13 @@ where
     }
 
     fn release_failed_batch_cache_pages(&mut self, batch: &ScheduleBatch) {
-        let Some(allocator) = self.cache_page_allocator.as_mut() else {
-            return;
-        };
-
+        if let Some(allocator) = self.cache_page_allocator.as_mut() {
+            for request in batch.requests() {
+                allocator.release(request.allocated_cache_pages());
+            }
+        }
         for request in batch.requests() {
-            allocator.release(request.allocated_cache_pages());
+            self.worker.fail_request(request);
         }
     }
 
@@ -804,7 +844,10 @@ where
         &mut self,
         request: &ScheduledRequest,
     ) -> Result<(), SchedulerError> {
-        if request.allocated_cache_pages().is_empty() || request.skips_radix_cache_insert() {
+        if self.prefix_cache_policy == PrefixCachePolicy::Disabled
+            || request.allocated_cache_pages().is_empty()
+            || request.skips_radix_cache_insert()
+        {
             return Ok(());
         }
 
@@ -905,6 +948,20 @@ where
         if let Some(allocator) = self.cache_page_allocator.as_mut() {
             allocator.release(request.allocated_cache_pages());
         }
+    }
+
+    fn release_request_cache_pages(&mut self, request: &ScheduledRequest) {
+        let Some(allocator) = self.cache_page_allocator.as_mut() else {
+            return;
+        };
+        let owned_slots = match self.prefix_cache_policy {
+            PrefixCachePolicy::Disabled => request.sequence_cache_pages(),
+            PrefixCachePolicy::Enabled => request
+                .sequence_cache_pages()
+                .get(request.input_ids().len()..)
+                .unwrap_or_default(),
+        };
+        allocator.release(owned_slots);
     }
 }
 

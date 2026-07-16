@@ -1,7 +1,7 @@
 use sglang_srt::cache::{CacheAllocationError, CachePageAllocator, CachePageId, RadixCache};
 use sglang_srt::model_executor::ModelWorkerBatch;
 use sglang_srt::scheduler::{
-    ForwardMode, ScheduleBatch, ScheduledRequest, Scheduler, SchedulerError,
+    ForwardMode, PrefixCachePolicy, ScheduleBatch, ScheduledRequest, Scheduler, SchedulerError,
 };
 use sglang_srt::types::{DisaggregatedParams, FAKE_BOOTSTRAP_HOST, RequestId, SamplingParams};
 use sglang_srt::worker::{
@@ -289,6 +289,32 @@ fn successful_prefill_dispatch_publishes_allocated_pages_to_radix_cache_for_futu
         batch.requests()[0].allocated_cache_pages(),
         &[CachePageId::from(3)]
     );
+}
+
+#[test]
+fn disabled_prefix_cache_replays_full_prompts_and_releases_request_owned_pages() {
+    let mut scheduler = Scheduler::with_cache_resources_and_policy(
+        NoopWorker,
+        RadixCache::default(),
+        CachePageAllocator::new(8),
+        PrefixCachePolicy::Disabled,
+    );
+    enqueue_request(&mut scheduler, "req-hybrid-a", &[1, 2, 3]);
+
+    let first = scheduler
+        .dispatch_prefill_batch(1)
+        .expect("first hybrid prefill should dispatch");
+
+    assert_eq!(first[0].cached_tokens, 0);
+    assert_eq!(scheduler.available_cache_pages(), Some(8));
+
+    enqueue_request(&mut scheduler, "req-hybrid-b", &[1, 2, 3]);
+    let second = scheduler
+        .dispatch_prefill_batch(1)
+        .expect("repeated hybrid prefill should replay the full prompt");
+
+    assert_eq!(second[0].cached_tokens, 0);
+    assert_eq!(scheduler.available_cache_pages(), Some(8));
 }
 
 #[test]

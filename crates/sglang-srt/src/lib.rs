@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod cache;
 pub mod cli;
+mod cpu_hybrid;
 mod cpu_reference;
 pub mod cuda_attention;
 pub mod cuda_kv_cache;

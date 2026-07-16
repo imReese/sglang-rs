@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::fmt;
 
 use sglang_kernel::cpu::{
-    GroupedQueryAttentionShape, apply_neox_rope_inplace, grouped_query_attention, linear, rms_norm,
-    silu_and_mul,
+    GroupedQueryAttentionShape, apply_partial_neox_rope_inplace, gemma_rms_norm,
+    grouped_query_attention, linear, rms_norm, silu_and_mul,
 };
 
 use crate::backend::{RuntimeCapability, RuntimeDtype};
@@ -256,61 +256,27 @@ fn forward_layer(
         rms_norm_eps,
     )
     .map_err(kernel_error)?;
-    let mut query = layer.query.project(&normalized, 1)?;
-    let mut key = layer.key.project(&normalized, 1)?;
-    let value = layer.value.project(&normalized, 1)?;
-    if let Some(weight) = &layer.query_norm {
-        query = rms_norm(
-            &query,
-            weight,
-            shape.query_head_count,
-            shape.head_dim,
+    let attention_output = forward_full_attention(
+        &layer.attention,
+        kv_cache,
+        &normalized,
+        FullAttentionForwardContext {
+            cache_layer_index: layer_index,
+            position,
+            output_slot,
+            sequence_slots,
+            shape: FullAttentionShape {
+                query_head_count: shape.query_head_count,
+                kv_head_count: shape.kv_head_count,
+                head_dim: shape.head_dim,
+                rotary_dim: shape.head_dim,
+                output_gate: false,
+            },
             rms_norm_eps,
-        )
-        .map_err(kernel_error)?;
-    }
-    if let Some(weight) = &layer.key_norm {
-        key = rms_norm(
-            &key,
-            weight,
-            shape.kv_head_count,
-            shape.head_dim,
-            rms_norm_eps,
-        )
-        .map_err(kernel_error)?;
-    }
-    apply_neox_rope_inplace(
-        &mut query,
-        shape.query_head_count,
-        shape.head_dim,
-        position,
-        rope_theta,
-    )
-    .map_err(kernel_error)?;
-    apply_neox_rope_inplace(
-        &mut key,
-        shape.kv_head_count,
-        shape.head_dim,
-        position,
-        rope_theta,
-    )
-    .map_err(kernel_error)?;
-    kv_cache.write(layer_index, output_slot, key, value)?;
-    let (keys, values) = kv_cache.gather(layer_index, sequence_slots)?;
-    let attention = grouped_query_attention(
-        &query,
-        &keys,
-        &values,
-        GroupedQueryAttentionShape {
-            token_count: sequence_slots.len(),
-            query_head_count: shape.query_head_count,
-            kv_head_count: shape.kv_head_count,
-            head_dim: shape.head_dim,
-            scale: (shape.head_dim as f32).sqrt().recip(),
+            rope_theta,
+            qk_normalization: CpuNormalization::Standard,
         },
-    )
-    .map_err(kernel_error)?;
-    let attention_output = layer.output.project(&attention, 1)?;
+    )?;
     let after_attention = add_residual(hidden, &attention_output)?;
 
     let normalized = rms_norm(
@@ -321,23 +287,16 @@ fn forward_layer(
         rms_norm_eps,
     )
     .map_err(kernel_error)?;
-    let gate = layer.gate.project(&normalized, 1)?;
-    let up = layer.up.project(&normalized, 1)?;
-    let activated = match activation {
-        DenseDecoderActivation::Silu => silu_and_mul(&gate, &up).map_err(kernel_error)?,
-    };
-    if activated.len() != shape.intermediate_size {
-        return Err(CpuReferenceDenseDecoderError::Execution(format!(
-            "dense activation width {} does not match intermediate size {}",
-            activated.len(),
-            shape.intermediate_size
-        )));
-    }
-    let feed_forward = layer.down.project(&activated, 1)?;
+    let feed_forward =
+        layer
+            .feed_forward
+            .forward(&normalized, shape.intermediate_size, activation)?;
     add_residual(&after_attention, &feed_forward)
 }
 
-fn validate_batch(batch: &ModelWorkerBatch) -> Result<(), CpuReferenceDenseDecoderError> {
+pub(crate) fn validate_batch(
+    batch: &ModelWorkerBatch,
+) -> Result<(), CpuReferenceDenseDecoderError> {
     let request_count = batch.request_ids().len();
     for (name, actual) in [
         ("request_offsets", batch.request_offsets().len()),
@@ -391,19 +350,278 @@ fn validate_batch(batch: &ModelWorkerBatch) -> Result<(), CpuReferenceDenseDecod
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CpuNormalization {
+    Standard,
+    Gemma,
+}
+
+pub(crate) fn apply_normalization(
+    input: &[f32],
+    weight: &[f32],
+    rows: usize,
+    cols: usize,
+    eps: f32,
+    normalization: CpuNormalization,
+) -> Result<Vec<f32>, CpuReferenceDenseDecoderError> {
+    match normalization {
+        CpuNormalization::Standard => rms_norm(input, weight, rows, cols, eps),
+        CpuNormalization::Gemma => gemma_rms_norm(input, weight, rows, cols, eps),
+    }
+    .map_err(kernel_error)
+}
+
+pub(crate) struct FullAttentionWeightNamesRef<'a> {
+    pub(crate) query_weight: &'a str,
+    pub(crate) query_bias: Option<&'a str>,
+    pub(crate) query_norm: Option<&'a str>,
+    pub(crate) key_weight: &'a str,
+    pub(crate) key_bias: Option<&'a str>,
+    pub(crate) key_norm: Option<&'a str>,
+    pub(crate) value_weight: &'a str,
+    pub(crate) value_bias: Option<&'a str>,
+    pub(crate) output_weight: &'a str,
+    pub(crate) output_bias: Option<&'a str>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FullAttentionShape {
+    pub(crate) query_head_count: usize,
+    pub(crate) kv_head_count: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) rotary_dim: usize,
+    pub(crate) output_gate: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FullAttentionForwardContext<'a> {
+    pub(crate) cache_layer_index: usize,
+    pub(crate) position: usize,
+    pub(crate) output_slot: CachePageId,
+    pub(crate) sequence_slots: &'a [CachePageId],
+    pub(crate) shape: FullAttentionShape,
+    pub(crate) rms_norm_eps: f32,
+    pub(crate) rope_theta: f32,
+    pub(crate) qk_normalization: CpuNormalization,
+}
+
 #[derive(Debug)]
-struct DenseDecoderLayerWeights {
-    input_norm: Vec<f32>,
+pub(crate) struct FullAttentionWeights {
     query: FloatMatrix,
     query_norm: Option<Vec<f32>>,
     key: FloatMatrix,
     key_norm: Option<Vec<f32>>,
     value: FloatMatrix,
     output: FloatMatrix,
-    post_attention_norm: Vec<f32>,
+}
+
+impl FullAttentionWeights {
+    pub(crate) fn load(
+        artifacts: &LocalModelArtifacts,
+        names: FullAttentionWeightNamesRef<'_>,
+        hidden_size: usize,
+        projected_query_size: usize,
+        query_size: usize,
+        kv_size: usize,
+        head_dim: usize,
+    ) -> Result<Self, CpuReferenceDenseDecoderError> {
+        Ok(Self {
+            query: FloatMatrix::load_with_bias(
+                artifacts,
+                names.query_weight,
+                names.query_bias,
+                projected_query_size,
+                hidden_size,
+            )?,
+            query_norm: names
+                .query_norm
+                .map(|name| load_vector(artifacts, name, head_dim))
+                .transpose()?,
+            key: FloatMatrix::load_with_bias(
+                artifacts,
+                names.key_weight,
+                names.key_bias,
+                kv_size,
+                hidden_size,
+            )?,
+            key_norm: names
+                .key_norm
+                .map(|name| load_vector(artifacts, name, head_dim))
+                .transpose()?,
+            value: FloatMatrix::load_with_bias(
+                artifacts,
+                names.value_weight,
+                names.value_bias,
+                kv_size,
+                hidden_size,
+            )?,
+            output: FloatMatrix::load_with_bias(
+                artifacts,
+                names.output_weight,
+                names.output_bias,
+                hidden_size,
+                query_size,
+            )?,
+        })
+    }
+}
+
+pub(crate) fn forward_full_attention(
+    weights: &FullAttentionWeights,
+    kv_cache: &mut CpuReferenceKvCache,
+    hidden: &[f32],
+    context: FullAttentionForwardContext<'_>,
+) -> Result<Vec<f32>, CpuReferenceDenseDecoderError> {
+    let FullAttentionForwardContext {
+        cache_layer_index,
+        position,
+        output_slot,
+        sequence_slots,
+        shape,
+        rms_norm_eps,
+        rope_theta,
+        qk_normalization,
+    } = context;
+    let projected_query = weights.query.project(hidden, 1)?;
+    let query_size = checked_product(
+        shape.query_head_count,
+        shape.head_dim,
+        "full attention query",
+    )?;
+    let (mut query, output_gate) = if shape.output_gate {
+        if projected_query.len() != query_size * 2 {
+            return Err(CpuReferenceDenseDecoderError::Execution(format!(
+                "gated query width {} does not match expected {}",
+                projected_query.len(),
+                query_size * 2
+            )));
+        }
+        let mut query = Vec::with_capacity(query_size);
+        let mut gate = Vec::with_capacity(query_size);
+        for head in 0..shape.query_head_count {
+            let offset = head * shape.head_dim * 2;
+            query.extend_from_slice(&projected_query[offset..offset + shape.head_dim]);
+            gate.extend_from_slice(
+                &projected_query[offset + shape.head_dim..offset + shape.head_dim * 2],
+            );
+        }
+        (query, Some(gate))
+    } else {
+        (projected_query, None)
+    };
+    let mut key = weights.key.project(hidden, 1)?;
+    let value = weights.value.project(hidden, 1)?;
+    if let Some(weight) = &weights.query_norm {
+        query = apply_normalization(
+            &query,
+            weight,
+            shape.query_head_count,
+            shape.head_dim,
+            rms_norm_eps,
+            qk_normalization,
+        )?;
+    }
+    if let Some(weight) = &weights.key_norm {
+        key = apply_normalization(
+            &key,
+            weight,
+            shape.kv_head_count,
+            shape.head_dim,
+            rms_norm_eps,
+            qk_normalization,
+        )?;
+    }
+    apply_partial_neox_rope_inplace(
+        &mut query,
+        shape.query_head_count,
+        shape.head_dim,
+        shape.rotary_dim,
+        position,
+        rope_theta,
+    )
+    .map_err(kernel_error)?;
+    apply_partial_neox_rope_inplace(
+        &mut key,
+        shape.kv_head_count,
+        shape.head_dim,
+        shape.rotary_dim,
+        position,
+        rope_theta,
+    )
+    .map_err(kernel_error)?;
+    kv_cache.write(cache_layer_index, output_slot, key, value)?;
+    let (keys, values) = kv_cache.gather(cache_layer_index, sequence_slots)?;
+    let mut attention = grouped_query_attention(
+        &query,
+        &keys,
+        &values,
+        GroupedQueryAttentionShape {
+            token_count: sequence_slots.len(),
+            query_head_count: shape.query_head_count,
+            kv_head_count: shape.kv_head_count,
+            head_dim: shape.head_dim,
+            scale: (shape.head_dim as f32).sqrt().recip(),
+        },
+    )
+    .map_err(kernel_error)?;
+    if let Some(gate) = output_gate {
+        for (value, gate) in attention.iter_mut().zip(gate) {
+            *value *= 1.0 / (1.0 + (-gate).exp());
+        }
+    }
+    weights.output.project(&attention, 1)
+}
+
+#[derive(Debug)]
+pub(crate) struct DenseFeedForwardWeights {
     gate: FloatMatrix,
     up: FloatMatrix,
     down: FloatMatrix,
+}
+
+impl DenseFeedForwardWeights {
+    pub(crate) fn load(
+        artifacts: &LocalModelArtifacts,
+        gate_weight: &str,
+        up_weight: &str,
+        down_weight: &str,
+        hidden_size: usize,
+        intermediate_size: usize,
+    ) -> Result<Self, CpuReferenceDenseDecoderError> {
+        Ok(Self {
+            gate: FloatMatrix::load(artifacts, gate_weight, intermediate_size, hidden_size)?,
+            up: FloatMatrix::load(artifacts, up_weight, intermediate_size, hidden_size)?,
+            down: FloatMatrix::load(artifacts, down_weight, hidden_size, intermediate_size)?,
+        })
+    }
+
+    pub(crate) fn forward(
+        &self,
+        input: &[f32],
+        intermediate_size: usize,
+        activation: DenseDecoderActivation,
+    ) -> Result<Vec<f32>, CpuReferenceDenseDecoderError> {
+        let gate = self.gate.project(input, 1)?;
+        let up = self.up.project(input, 1)?;
+        let activated = match activation {
+            DenseDecoderActivation::Silu => silu_and_mul(&gate, &up).map_err(kernel_error)?,
+        };
+        if activated.len() != intermediate_size {
+            return Err(CpuReferenceDenseDecoderError::Execution(format!(
+                "dense activation width {} does not match intermediate size {intermediate_size}",
+                activated.len()
+            )));
+        }
+        self.down.project(&activated, 1)
+    }
+}
+
+#[derive(Debug)]
+struct DenseDecoderLayerWeights {
+    input_norm: Vec<f32>,
+    attention: FullAttentionWeights,
+    post_attention_norm: Vec<f32>,
+    feed_forward: DenseFeedForwardWeights,
 }
 
 impl DenseDecoderLayerWeights {
@@ -418,54 +636,31 @@ impl DenseDecoderLayerWeights {
     ) -> Result<Self, CpuReferenceDenseDecoderError> {
         Ok(Self {
             input_norm: load_vector(artifacts, &names.input_norm, hidden_size)?,
-            query: FloatMatrix::load_with_bias(
+            attention: FullAttentionWeights::load(
                 artifacts,
-                &names.query_weight,
-                names.query_bias.as_deref(),
-                query_size,
-                hidden_size,
-            )?,
-            query_norm: names
-                .query_norm
-                .as_deref()
-                .map(|name| load_vector(artifacts, name, head_dim))
-                .transpose()?,
-            key: FloatMatrix::load_with_bias(
-                artifacts,
-                &names.key_weight,
-                names.key_bias.as_deref(),
-                kv_size,
-                hidden_size,
-            )?,
-            key_norm: names
-                .key_norm
-                .as_deref()
-                .map(|name| load_vector(artifacts, name, head_dim))
-                .transpose()?,
-            value: FloatMatrix::load_with_bias(
-                artifacts,
-                &names.value_weight,
-                names.value_bias.as_deref(),
-                kv_size,
-                hidden_size,
-            )?,
-            output: FloatMatrix::load_with_bias(
-                artifacts,
-                &names.output_weight,
-                names.output_bias.as_deref(),
+                FullAttentionWeightNamesRef {
+                    query_weight: &names.query_weight,
+                    query_bias: names.query_bias.as_deref(),
+                    query_norm: names.query_norm.as_deref(),
+                    key_weight: &names.key_weight,
+                    key_bias: names.key_bias.as_deref(),
+                    key_norm: names.key_norm.as_deref(),
+                    value_weight: &names.value_weight,
+                    value_bias: names.value_bias.as_deref(),
+                    output_weight: &names.output_weight,
+                    output_bias: names.output_bias.as_deref(),
+                },
                 hidden_size,
                 query_size,
+                query_size,
+                kv_size,
+                head_dim,
             )?,
             post_attention_norm: load_vector(artifacts, &names.post_attention_norm, hidden_size)?,
-            gate: FloatMatrix::load(
+            feed_forward: DenseFeedForwardWeights::load(
                 artifacts,
                 &names.gate_weight,
-                intermediate_size,
-                hidden_size,
-            )?,
-            up: FloatMatrix::load(artifacts, &names.up_weight, intermediate_size, hidden_size)?,
-            down: FloatMatrix::load(
-                artifacts,
+                &names.up_weight,
                 &names.down_weight,
                 hidden_size,
                 intermediate_size,
@@ -475,7 +670,7 @@ impl DenseDecoderLayerWeights {
 }
 
 #[derive(Debug)]
-struct FloatMatrix {
+pub(crate) struct FloatMatrix {
     rows: usize,
     columns: usize,
     values: Vec<f32>,
@@ -483,7 +678,7 @@ struct FloatMatrix {
 }
 
 impl FloatMatrix {
-    fn load(
+    pub(crate) fn load(
         artifacts: &LocalModelArtifacts,
         tensor_name: &str,
         rows: usize,
@@ -492,7 +687,7 @@ impl FloatMatrix {
         Self::load_with_bias(artifacts, tensor_name, None, rows, columns)
     }
 
-    fn load_with_bias(
+    pub(crate) fn load_with_bias(
         artifacts: &LocalModelArtifacts,
         tensor_name: &str,
         bias_name: Option<&str>,
@@ -511,7 +706,7 @@ impl FloatMatrix {
         })
     }
 
-    fn project(
+    pub(crate) fn project(
         &self,
         input: &[f32],
         input_rows: usize,
@@ -527,7 +722,7 @@ impl FloatMatrix {
         .map_err(kernel_error)
     }
 
-    fn row(&self, row: u32) -> Result<Vec<f32>, CpuReferenceDenseDecoderError> {
+    pub(crate) fn row(&self, row: u32) -> Result<Vec<f32>, CpuReferenceDenseDecoderError> {
         let row = usize::try_from(row).map_err(|_| {
             CpuReferenceDenseDecoderError::Execution(format!("token id {row} does not fit usize"))
         })?;
@@ -542,20 +737,20 @@ impl FloatMatrix {
 }
 
 #[derive(Debug)]
-struct CpuReferenceKvCache {
+pub(crate) struct CpuReferenceKvCache {
     layers: Vec<HashMap<usize, KvSlot>>,
     kv_width: usize,
 }
 
 impl CpuReferenceKvCache {
-    fn new(layer_count: usize, kv_width: usize) -> Self {
+    pub(crate) fn new(layer_count: usize, kv_width: usize) -> Self {
         Self {
             layers: (0..layer_count).map(|_| HashMap::new()).collect(),
             kv_width,
         }
     }
 
-    fn write(
+    pub(crate) fn write(
         &mut self,
         layer_index: usize,
         slot: CachePageId,
@@ -579,7 +774,7 @@ impl CpuReferenceKvCache {
         Ok(())
     }
 
-    fn gather(
+    pub(crate) fn gather(
         &self,
         layer_index: usize,
         slots: &[CachePageId],
@@ -614,7 +809,7 @@ struct KvSlot {
     value: Vec<f32>,
 }
 
-fn load_vector(
+pub(crate) fn load_vector(
     artifacts: &LocalModelArtifacts,
     tensor_name: &str,
     length: usize,
@@ -622,7 +817,7 @@ fn load_vector(
     load_tensor(artifacts, tensor_name, &[length])
 }
 
-fn load_tensor(
+pub(crate) fn load_tensor(
     artifacts: &LocalModelArtifacts,
     tensor_name: &str,
     expected_shape: &[usize],
@@ -655,7 +850,7 @@ fn load_tensor(
     })
 }
 
-fn add_residual(
+pub(crate) fn add_residual(
     residual: &[f32],
     update: &[f32],
 ) -> Result<Vec<f32>, CpuReferenceDenseDecoderError> {
@@ -673,7 +868,7 @@ fn add_residual(
         .collect())
 }
 
-fn checked_product(
+pub(crate) fn checked_product(
     left: usize,
     right: usize,
     name: &str,
@@ -683,11 +878,11 @@ fn checked_product(
     })
 }
 
-fn kernel_error(error: impl fmt::Display) -> CpuReferenceDenseDecoderError {
+pub(crate) fn kernel_error(error: impl fmt::Display) -> CpuReferenceDenseDecoderError {
     CpuReferenceDenseDecoderError::Execution(error.to_string())
 }
 
-fn model_forward_error(error: CpuReferenceDenseDecoderError) -> ModelForwardError {
+pub(crate) fn model_forward_error(error: CpuReferenceDenseDecoderError) -> ModelForwardError {
     ModelForwardError::Runtime(error.to_string())
 }
 

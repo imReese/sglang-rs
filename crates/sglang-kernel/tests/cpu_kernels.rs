@@ -1,6 +1,8 @@
 use sglang_kernel::cpu::{
-    GroupedQueryAttentionShape, apply_neox_rope_inplace, apply_token_bitmask_inplace,
-    grouped_query_attention, linear, rms_norm, silu_and_mul, top_k_renorm_probs,
+    GatedDeltaRuleShape, GroupedQueryAttentionShape, apply_neox_rope_inplace,
+    apply_partial_neox_rope_inplace, apply_token_bitmask_inplace, causal_depthwise_conv1d_step,
+    gated_delta_rule_step, gemma_rms_norm, grouped_query_attention, linear, rms_norm, silu_and_mul,
+    top_k_renorm_probs,
 };
 use sglang_kernel::{KernelError, TopK};
 
@@ -19,6 +21,15 @@ fn cpu_rms_norm_matches_reference_values() {
     ];
 
     assert_close(&output, &expected);
+}
+
+#[test]
+fn cpu_gemma_rms_norm_applies_checkpoint_weight_as_one_plus_weight() {
+    let output =
+        gemma_rms_norm(&[3.0, 4.0], &[0.0, 1.0], 1, 2, 0.0).expect("Gemma RMS norm should run");
+    let scale = ((9.0_f32 + 16.0) / 2.0).sqrt();
+
+    assert_close(&output, &[3.0 / scale, 4.0 / scale * 2.0]);
 }
 
 #[test]
@@ -46,6 +57,73 @@ fn cpu_neox_rope_rotates_half_split_dimensions() {
     assert!((values[1] - (2.0 * cos - 4.0 * sin)).abs() < 1e-6);
     assert!((values[2] - (3.0 * cos + 1.0 * sin)).abs() < 1e-6);
     assert!((values[3] - (4.0 * cos + 2.0 * sin)).abs() < 1e-6);
+}
+
+#[test]
+fn cpu_partial_neox_rope_leaves_non_rotary_dimensions_unchanged() {
+    let mut values = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    apply_partial_neox_rope_inplace(&mut values, 1, 6, 4, 1, 1.0).expect("valid partial RoPE");
+    let (cos, sin) = (1.0_f32.cos(), 1.0_f32.sin());
+
+    assert_close(
+        &values,
+        &[
+            1.0 * cos - 3.0 * sin,
+            2.0 * cos - 4.0 * sin,
+            3.0 * cos + 1.0 * sin,
+            4.0 * cos + 2.0 * sin,
+            5.0,
+            6.0,
+        ],
+    );
+}
+
+#[test]
+fn cpu_causal_depthwise_conv_updates_history_in_time_order() {
+    let mut state = vec![0.0, 0.0];
+    let first = causal_depthwise_conv1d_step(&[2.0], &[1.0, 10.0, 100.0], &mut state, 1, 3)
+        .expect("first convolution step");
+    let second = causal_depthwise_conv1d_step(&[3.0], &[1.0, 10.0, 100.0], &mut state, 1, 3)
+        .expect("second convolution step");
+
+    assert_eq!(first, vec![200.0]);
+    assert_eq!(second, vec![320.0]);
+    assert_eq!(state, vec![2.0, 3.0]);
+}
+
+#[test]
+fn cpu_gated_delta_rule_updates_state_before_readout() {
+    let shape = GatedDeltaRuleShape {
+        key_head_count: 1,
+        value_head_count: 1,
+        key_head_dim: 2,
+        value_head_dim: 2,
+    };
+    let mut state = vec![0.0; 4];
+    let first = gated_delta_rule_step(
+        &[1.0, 0.0],
+        &[1.0, 0.0],
+        &[2.0, 3.0],
+        &[0.5],
+        &[0.5],
+        &mut state,
+        shape,
+    )
+    .expect("first delta update");
+    let second = gated_delta_rule_step(
+        &[0.0, 1.0],
+        &[0.0, 1.0],
+        &[4.0, 6.0],
+        &[0.5],
+        &[1.0],
+        &mut state,
+        shape,
+    )
+    .expect("second delta update");
+
+    assert_close(&first, &[1.0, 1.5]);
+    assert_close(&second, &[4.0, 6.0]);
+    assert_close(&state, &[0.5, 0.75, 4.0, 6.0]);
 }
 
 #[test]

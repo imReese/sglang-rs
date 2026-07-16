@@ -24,7 +24,7 @@ use sglang_srt::server::test_support::{
 use sglang_srt::server::{
     ServerLaunchError, build_bootstrap_grpc_router_service, grpc_listen_addr, launch_grpc_server,
     prefill_mooncake_zmq_endpoints, register_prefill_mooncake_routes_from_args,
-    try_build_bootstrap_grpc_router_service,
+    try_build_bootstrap_grpc_router_service, try_build_bootstrap_prefill_http_router_service,
 };
 use sglang_srt::tokenizer::TokenizerError;
 use sglang_srt::transfer::{
@@ -476,6 +476,45 @@ async fn bootstrap_runs_qwen3_centralized_prefill_and_decode_without_transfer() 
     write_complete_qwen3_checkpoint(&model_dir);
     assert_centralized_qwen_generation(&model_dir, "centralized-qwen3").await;
 
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[tokio::test]
+async fn bootstrap_runs_qwen3_5_hybrid_centralized_prefill_and_decode_without_transfer() {
+    let model_dir = temp_model_dir("server-qwen35-runtime-forward");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_complete_qwen3_5_checkpoint(&model_dir);
+    assert_centralized_qwen_generation(&model_dir, "centralized-qwen35").await;
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn qwen3_5_pd_startup_rejects_kv_only_transfer_before_serving() {
+    let model_dir = temp_model_dir("server-qwen35-pd-fail-fast");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_complete_qwen3_5_checkpoint(&model_dir);
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_dir.to_str().expect("temp model dir should be utf-8"),
+        "--device",
+        "cpu",
+        "--num-reserved-decode-tokens",
+        "16",
+    ])
+    .expect("args should parse");
+
+    let error = match try_build_bootstrap_prefill_http_router_service(&args) {
+        Ok(_) => panic!("hybrid state must not start with KV-only transfer"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        ServerLaunchError::MissingRuntimeCapabilities { ref missing, .. }
+            if missing.iter().any(|item| item.contains("hybrid recurrent state") && item.contains("KV-only"))
+    ));
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
 
@@ -1763,6 +1802,191 @@ fn write_complete_qwen3_checkpoint(model_dir: &std::path::Path) {
     }
     write_safetensors_file(&model_dir.join("model.safetensors"), &tensors, &payload)
         .expect("Qwen3 checkpoint should be written");
+}
+
+fn write_complete_qwen3_5_checkpoint(model_dir: &std::path::Path) {
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "architectures": ["Qwen3_5ForConditionalGeneration"],
+  "model_type": "qwen3_5",
+  "text_config": {
+    "model_type": "qwen3_5_text",
+    "vocab_size": 3,
+    "num_hidden_layers": 2,
+    "hidden_size": 2,
+    "intermediate_size": 2,
+    "num_attention_heads": 1,
+    "num_key_value_heads": 1,
+    "head_dim": 2,
+    "hidden_act": "silu",
+    "attention_bias": false,
+    "attn_output_gate": true,
+    "rms_norm_eps": 0.000001,
+    "max_position_embeddings": 32,
+    "tie_word_embeddings": false,
+    "layer_types": ["linear_attention", "full_attention"],
+    "linear_conv_kernel_dim": 2,
+    "linear_key_head_dim": 2,
+    "linear_value_head_dim": 2,
+    "linear_num_key_heads": 1,
+    "linear_num_value_heads": 1,
+    "mamba_ssm_dtype": "float32",
+    "rope_parameters": {
+      "rope_type": "default",
+      "rope_theta": 1000000.0,
+      "partial_rotary_factor": 1.0
+    }
+  },
+  "tie_word_embeddings": false
+}"#,
+    )
+    .expect("config should be written");
+    fs::write(
+        model_dir.join("tokenizer.json"),
+        word_level_tokenizer_json(),
+    )
+    .expect("Qwen3.5 tokenizer should be written");
+
+    let mut descriptors: Vec<(String, Vec<usize>, Vec<f32>)> = vec![
+        (
+            "model.language_model.embed_tokens.weight".to_string(),
+            vec![3, 2],
+            vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
+        ),
+        (
+            "model.language_model.norm.weight".to_string(),
+            vec![2],
+            vec![0.0; 2],
+        ),
+        (
+            "lm_head.weight".to_string(),
+            vec![3, 2],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0],
+        ),
+    ];
+    for layer_id in 0..2 {
+        let prefix = format!("model.language_model.layers.{layer_id}");
+        descriptors.extend([
+            (
+                format!("{prefix}.input_layernorm.weight"),
+                vec![2],
+                vec![0.0; 2],
+            ),
+            (
+                format!("{prefix}.post_attention_layernorm.weight"),
+                vec![2],
+                vec![0.0; 2],
+            ),
+            (
+                format!("{prefix}.mlp.gate_proj.weight"),
+                vec![2, 2],
+                vec![0.0; 4],
+            ),
+            (
+                format!("{prefix}.mlp.up_proj.weight"),
+                vec![2, 2],
+                vec![0.0; 4],
+            ),
+            (
+                format!("{prefix}.mlp.down_proj.weight"),
+                vec![2, 2],
+                vec![0.0; 4],
+            ),
+        ]);
+    }
+    descriptors.extend([
+        (
+            "model.language_model.layers.0.linear_attn.A_log".to_string(),
+            vec![1],
+            vec![0.0],
+        ),
+        (
+            "model.language_model.layers.0.linear_attn.conv1d.weight".to_string(),
+            vec![6, 1, 2],
+            vec![0.0; 12],
+        ),
+        (
+            "model.language_model.layers.0.linear_attn.dt_bias".to_string(),
+            vec![1],
+            vec![0.0],
+        ),
+        (
+            "model.language_model.layers.0.linear_attn.in_proj_a.weight".to_string(),
+            vec![1, 2],
+            vec![0.0; 2],
+        ),
+        (
+            "model.language_model.layers.0.linear_attn.in_proj_b.weight".to_string(),
+            vec![1, 2],
+            vec![0.0; 2],
+        ),
+        (
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight".to_string(),
+            vec![6, 2],
+            vec![0.0; 12],
+        ),
+        (
+            "model.language_model.layers.0.linear_attn.in_proj_z.weight".to_string(),
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.language_model.layers.0.linear_attn.norm.weight".to_string(),
+            vec![2],
+            vec![1.0; 2],
+        ),
+        (
+            "model.language_model.layers.0.linear_attn.out_proj.weight".to_string(),
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.language_model.layers.1.self_attn.q_proj.weight".to_string(),
+            vec![4, 2],
+            vec![0.0; 8],
+        ),
+        (
+            "model.language_model.layers.1.self_attn.q_norm.weight".to_string(),
+            vec![2],
+            vec![0.0; 2],
+        ),
+        (
+            "model.language_model.layers.1.self_attn.k_proj.weight".to_string(),
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.language_model.layers.1.self_attn.k_norm.weight".to_string(),
+            vec![2],
+            vec![0.0; 2],
+        ),
+        (
+            "model.language_model.layers.1.self_attn.v_proj.weight".to_string(),
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.language_model.layers.1.self_attn.o_proj.weight".to_string(),
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+    ]);
+
+    let mut payload = Vec::new();
+    let mut tensors = Vec::new();
+    for (name, shape, values) in &descriptors {
+        let start = payload.len();
+        payload.extend(values.iter().flat_map(|value| value.to_le_bytes()));
+        tensors.push((
+            name.as_str(),
+            "F32",
+            shape.as_slice(),
+            [start, payload.len()],
+        ));
+    }
+    write_safetensors_file(&model_dir.join("model.safetensors"), &tensors, &payload)
+        .expect("Qwen3.5 checkpoint should be written");
 }
 
 fn write_complete_glm_moe_dsa_forward_checkpoint(model_dir: &std::path::Path) {

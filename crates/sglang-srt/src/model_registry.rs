@@ -12,17 +12,18 @@ use crate::model_executor::{
 use crate::model_runtime::{LoadedModelRuntime, ModelRuntimeLoadError, validate_runtime_support};
 use crate::models::{
     DEEPSEEK_V4_ADAPTER, EMBEDDING_LM_ADAPTER, GLM_MOE_DSA_ADAPTER, ModelAdapter,
-    ModelAdapterError, ModelDefinition, QWEN2_ADAPTER, QWEN3_ADAPTER,
+    ModelAdapterError, ModelDefinition, QWEN2_ADAPTER, QWEN3_5_ADAPTER, QWEN3_ADAPTER,
 };
 use crate::transfer::KvCacheModelLayout;
 use crate::worker::WorkerWeightUpdateRequest;
 
-static MODEL_ADAPTERS: [&'static dyn ModelAdapter; 5] = [
+static MODEL_ADAPTERS: [&'static dyn ModelAdapter; 6] = [
     &EMBEDDING_LM_ADAPTER,
     &DEEPSEEK_V4_ADAPTER,
     &GLM_MOE_DSA_ADAPTER,
     &QWEN2_ADAPTER,
     &QWEN3_ADAPTER,
+    &QWEN3_5_ADAPTER,
 ];
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -242,6 +243,10 @@ impl BootstrapForwardModel {
         self.registered.definition.kv_cache_layout()
     }
 
+    pub fn cache_architecture(&self) -> crate::models::ModelCacheArchitecture {
+        self.registered.definition.cache_architecture()
+    }
+
     fn reload_backend(&self) -> RuntimeBackend {
         self.registered.runtime_backend()
     }
@@ -257,6 +262,10 @@ impl ForwardModel for BootstrapForwardModel {
         batch: &ModelWorkerBatch,
     ) -> Result<ModelForwardOutput, ModelForwardError> {
         self.registered.runtime.forward(batch)
+    }
+
+    fn complete_request(&mut self, request_id: &crate::types::RequestId) {
+        self.registered.runtime.complete_request(request_id);
     }
 
     fn update_weights_from_disk(
@@ -474,6 +483,42 @@ mod tests {
         }
     }
 
+    fn qwen3_5_config() -> HfModelConfig {
+        HfModelConfig {
+            model_type: Some("qwen3_5".to_string()),
+            text_model_type: Some("qwen3_5_text".to_string()),
+            architectures: vec!["Qwen3_5ForConditionalGeneration".to_string()],
+            vocab_size: Some(248_320),
+            max_position_embeddings: Some(262_144),
+            num_hidden_layers: Some(4),
+            hidden_size: Some(1024),
+            intermediate_size: Some(3584),
+            num_attention_heads: Some(8),
+            num_key_value_heads: Some(2),
+            head_dim: Some(256),
+            hidden_act: Some("silu".to_string()),
+            attention_bias: Some(false),
+            rms_norm_eps: Some(HfConfigFloat::new(1e-6)),
+            rope_theta: Some(HfConfigFloat::new(10_000_000.0)),
+            partial_rotary_factor: Some(HfConfigFloat::new(0.25)),
+            attn_output_gate: Some(true),
+            linear_conv_kernel_dim: Some(4),
+            linear_key_head_dim: Some(128),
+            linear_value_head_dim: Some(128),
+            linear_num_key_heads: Some(16),
+            linear_num_value_heads: Some(16),
+            layer_types: vec![
+                "linear_attention".to_string(),
+                "linear_attention".to_string(),
+                "linear_attention".to_string(),
+                "full_attention".to_string(),
+            ],
+            mamba_ssm_dtype: Some("float32".to_string()),
+            tie_word_embeddings: Some(true),
+            ..HfModelConfig::default()
+        }
+    }
+
     #[test]
     fn glm_and_deepseek_share_mla_moe_execution_components() {
         let glm = ModelRegistry
@@ -548,6 +593,51 @@ mod tests {
         qwen3
             .validate_tensor_parallel(8)
             .expect("Qwen3 attention heads should shard over TP");
+    }
+
+    #[test]
+    fn qwen3_5_uses_shared_hybrid_execution_without_changing_qwen3_dense_boundary() {
+        let qwen3 = ModelRegistry
+            .definition(Path::new("/models/qwen3"), &qwen3_config())
+            .expect("Qwen3 dense definition");
+        let qwen3_5 = ModelRegistry
+            .definition(Path::new("/models/qwen3.5"), &qwen3_5_config())
+            .expect("Qwen3.5 hybrid definition");
+
+        assert!(matches!(
+            qwen3.execution(),
+            ModelExecutionArchitecture::Transformer {
+                attention: AttentionArchitecture::MultiHead { .. },
+                feed_forward: FeedForwardArchitecture::Dense { .. },
+            }
+        ));
+        assert!(matches!(
+            qwen3_5.execution(),
+            ModelExecutionArchitecture::Transformer {
+                attention: AttentionArchitecture::Hybrid { .. },
+                feed_forward: FeedForwardArchitecture::Dense { .. },
+            }
+        ));
+        assert_eq!(
+            qwen3_5.cache_architecture(),
+            crate::models::ModelCacheArchitecture::HybridState {
+                full_attention_layer_count: 1,
+                recurrent_state_layer_count: 3,
+            }
+        );
+        assert_eq!(
+            qwen3_5
+                .kv_cache_layout()
+                .expect("full-attention KV layout")
+                .num_layers,
+            1
+        );
+        validate_runtime_support(&qwen3_5, &InitializedRuntimeBackend::CpuReference, 1)
+            .expect("CPU reference backend should execute a shared hybrid decoder plan");
+        qwen3_5
+            .validate_tensor_parallel(8)
+            .expect("all hybrid head families should support TP 8");
+        assert!(qwen3_5.validate_tensor_parallel(3).is_err());
     }
 
     #[test]
