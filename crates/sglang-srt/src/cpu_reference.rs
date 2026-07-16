@@ -88,6 +88,7 @@ impl CpuReferenceDenseDecoder {
                     plan.hidden_size,
                     query_size,
                     kv_size,
+                    head_dim,
                     intermediate_size,
                 )
             })
@@ -258,6 +259,26 @@ fn forward_layer(
     let mut query = layer.query.project(&normalized, 1)?;
     let mut key = layer.key.project(&normalized, 1)?;
     let value = layer.value.project(&normalized, 1)?;
+    if let Some(weight) = &layer.query_norm {
+        query = rms_norm(
+            &query,
+            weight,
+            shape.query_head_count,
+            shape.head_dim,
+            rms_norm_eps,
+        )
+        .map_err(kernel_error)?;
+    }
+    if let Some(weight) = &layer.key_norm {
+        key = rms_norm(
+            &key,
+            weight,
+            shape.kv_head_count,
+            shape.head_dim,
+            rms_norm_eps,
+        )
+        .map_err(kernel_error)?;
+    }
     apply_neox_rope_inplace(
         &mut query,
         shape.query_head_count,
@@ -374,7 +395,9 @@ fn validate_batch(batch: &ModelWorkerBatch) -> Result<(), CpuReferenceDenseDecod
 struct DenseDecoderLayerWeights {
     input_norm: Vec<f32>,
     query: FloatMatrix,
+    query_norm: Option<Vec<f32>>,
     key: FloatMatrix,
+    key_norm: Option<Vec<f32>>,
     value: FloatMatrix,
     output: FloatMatrix,
     post_attention_norm: Vec<f32>,
@@ -390,6 +413,7 @@ impl DenseDecoderLayerWeights {
         hidden_size: usize,
         query_size: usize,
         kv_size: usize,
+        head_dim: usize,
         intermediate_size: usize,
     ) -> Result<Self, CpuReferenceDenseDecoderError> {
         Ok(Self {
@@ -401,6 +425,11 @@ impl DenseDecoderLayerWeights {
                 query_size,
                 hidden_size,
             )?,
+            query_norm: names
+                .query_norm
+                .as_deref()
+                .map(|name| load_vector(artifacts, name, head_dim))
+                .transpose()?,
             key: FloatMatrix::load_with_bias(
                 artifacts,
                 &names.key_weight,
@@ -408,6 +437,11 @@ impl DenseDecoderLayerWeights {
                 kv_size,
                 hidden_size,
             )?,
+            key_norm: names
+                .key_norm
+                .as_deref()
+                .map(|name| load_vector(artifacts, name, head_dim))
+                .transpose()?,
             value: FloatMatrix::load_with_bias(
                 artifacts,
                 &names.value_weight,
@@ -415,7 +449,13 @@ impl DenseDecoderLayerWeights {
                 kv_size,
                 hidden_size,
             )?,
-            output: FloatMatrix::load(artifacts, &names.output_weight, hidden_size, query_size)?,
+            output: FloatMatrix::load_with_bias(
+                artifacts,
+                &names.output_weight,
+                names.output_bias.as_deref(),
+                hidden_size,
+                query_size,
+            )?,
             post_attention_norm: load_vector(artifacts, &names.post_attention_norm, hidden_size)?,
             gate: FloatMatrix::load(
                 artifacts,

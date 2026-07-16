@@ -12,16 +12,17 @@ use crate::model_executor::{
 use crate::model_runtime::{LoadedModelRuntime, ModelRuntimeLoadError, validate_runtime_support};
 use crate::models::{
     DEEPSEEK_V4_ADAPTER, EMBEDDING_LM_ADAPTER, GLM_MOE_DSA_ADAPTER, ModelAdapter,
-    ModelAdapterError, ModelDefinition, QWEN2_ADAPTER,
+    ModelAdapterError, ModelDefinition, QWEN2_ADAPTER, QWEN3_ADAPTER,
 };
 use crate::transfer::KvCacheModelLayout;
 use crate::worker::WorkerWeightUpdateRequest;
 
-static MODEL_ADAPTERS: [&'static dyn ModelAdapter; 4] = [
+static MODEL_ADAPTERS: [&'static dyn ModelAdapter; 5] = [
     &EMBEDDING_LM_ADAPTER,
     &DEEPSEEK_V4_ADAPTER,
     &GLM_MOE_DSA_ADAPTER,
     &QWEN2_ADAPTER,
+    &QWEN3_ADAPTER,
 ];
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -452,6 +453,27 @@ mod tests {
         }
     }
 
+    fn qwen3_config() -> HfModelConfig {
+        HfModelConfig {
+            model_type: Some("qwen3".to_string()),
+            architectures: vec!["Qwen3ForCausalLM".to_string()],
+            vocab_size: Some(151_936),
+            max_position_embeddings: Some(40_960),
+            num_hidden_layers: Some(28),
+            hidden_size: Some(1024),
+            intermediate_size: Some(3072),
+            num_attention_heads: Some(16),
+            num_key_value_heads: Some(8),
+            head_dim: Some(128),
+            hidden_act: Some("silu".to_string()),
+            attention_bias: Some(false),
+            rms_norm_eps: Some(HfConfigFloat::new(1e-6)),
+            rope_theta: Some(HfConfigFloat::new(1_000_000.0)),
+            tie_word_embeddings: Some(true),
+            ..HfModelConfig::default()
+        }
+    }
+
     #[test]
     fn glm_and_deepseek_share_mla_moe_execution_components() {
         let glm = ModelRegistry
@@ -500,6 +522,32 @@ mod tests {
         qwen.validate_tensor_parallel(4)
             .expect("Qwen attention heads should shard over TP");
         assert!(qwen.validate_tensor_parallel(3).is_err());
+    }
+
+    #[test]
+    fn qwen2_and_qwen3_share_dense_execution_and_kv_boundaries() {
+        let qwen2 = ModelRegistry
+            .definition(Path::new("/models/qwen2"), &qwen_config())
+            .expect("Qwen2 adapter should build a model definition");
+        let qwen3 = ModelRegistry
+            .definition(Path::new("/models/qwen3"), &qwen3_config())
+            .expect("Qwen3 adapter should build a model definition");
+
+        assert_eq!(
+            qwen2.execution().attention_family(),
+            qwen3.execution().attention_family()
+        );
+        assert_eq!(
+            qwen2.execution().feed_forward_family(),
+            qwen3.execution().feed_forward_family()
+        );
+        assert_eq!(
+            qwen3.kv_cache_layout().expect("Qwen3 KV layout").kv_heads,
+            8
+        );
+        qwen3
+            .validate_tensor_parallel(8)
+            .expect("Qwen3 attention heads should shard over TP");
     }
 
     #[test]

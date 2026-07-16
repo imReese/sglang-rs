@@ -29,7 +29,9 @@ pub struct ScheduledRequest {
     input_ids: Vec<u32>,
     output_ids: Vec<u32>,
     allocated_cache_pages: Vec<CachePageId>,
+    forward_cache_pages: Vec<CachePageId>,
     sequence_cache_pages: Vec<CachePageId>,
+    cache_hit_token_count: usize,
     sampling: SamplingParams,
     disaggregated_params: Option<DisaggregatedParams>,
     data_parallel_rank: i32,
@@ -45,7 +47,9 @@ impl ScheduledRequest {
             input_ids,
             output_ids: Vec::new(),
             allocated_cache_pages: Vec::new(),
+            forward_cache_pages: Vec::new(),
             sequence_cache_pages: Vec::new(),
+            cache_hit_token_count: 0,
             sampling,
             disaggregated_params: None,
             data_parallel_rank: 0,
@@ -121,11 +125,19 @@ impl ScheduledRequest {
         &self.allocated_cache_pages
     }
 
+    pub fn forward_cache_pages(&self) -> &[CachePageId] {
+        &self.forward_cache_pages
+    }
+
     pub fn sequence_cache_pages(&self) -> &[CachePageId] {
         &self.sequence_cache_pages
     }
 
     pub fn cached_token_count(&self) -> usize {
+        self.cache_hit_token_count
+    }
+
+    pub fn forward_prefix_token_count(&self) -> usize {
         self.prefix_match.matched_token_count
     }
 
@@ -139,6 +151,14 @@ impl ScheduledRequest {
 
     fn set_allocated_cache_pages(&mut self, cache_pages: Vec<CachePageId>) {
         self.allocated_cache_pages = cache_pages;
+    }
+
+    fn set_forward_cache_pages(&mut self, cache_pages: Vec<CachePageId>) {
+        self.forward_cache_pages = cache_pages;
+    }
+
+    fn set_cache_hit_token_count(&mut self, token_count: usize) {
+        self.cache_hit_token_count = token_count;
     }
 
     fn set_sequence_cache_pages(&mut self, cache_pages: Vec<CachePageId>) {
@@ -159,6 +179,7 @@ impl ScheduledRequest {
             );
         }
         self.allocated_cache_pages.clear();
+        self.forward_cache_pages.clear();
     }
 
     fn append_output_ids(&mut self, output_ids: &[u32]) {
@@ -481,18 +502,50 @@ impl<W> Scheduler<W> {
             .as_ref()
             .map(CachePageAllocator::page_size)
             .unwrap_or(1);
-        let prefix_match = self
+        let mut prefix_match = self
             .prefix_cache
             .match_prefix_page_aligned(request.input_ids(), page_size);
-        let uncached_token_count = prefix_match.remaining_input_ids.len();
+        let cache_hit_token_count = prefix_match.matched_token_count;
+        let replay_cache_page = if request.disaggregated_params().is_none()
+            && !request.input_ids().is_empty()
+            && prefix_match.remaining_input_ids.is_empty()
+        {
+            prefix_match.matched_token_count -= 1;
+            prefix_match
+                .remaining_input_ids
+                .push(*request.input_ids().last().expect("input is not empty"));
+            Some(
+                prefix_match
+                    .cache_pages
+                    .pop()
+                    .expect("fully matched prefix must have a cache page"),
+            )
+        } else {
+            None
+        };
+        let uncached_token_count = if replay_cache_page.is_some() {
+            0
+        } else {
+            prefix_match.remaining_input_ids.len()
+        };
         let allocated_cache_pages = match self.cache_page_allocator.as_mut() {
             Some(allocator) => allocator.allocate(uncached_token_count)?,
             None => Vec::new(),
         };
-        let mut sequence_cache_pages =
-            Vec::with_capacity(prefix_match.cache_pages.len() + allocated_cache_pages.len());
+        let mut sequence_cache_pages = Vec::with_capacity(
+            prefix_match.cache_pages.len()
+                + usize::from(replay_cache_page.is_some())
+                + allocated_cache_pages.len(),
+        );
         sequence_cache_pages.extend_from_slice(&prefix_match.cache_pages);
+        if let Some(replay_cache_page) = replay_cache_page {
+            sequence_cache_pages.push(replay_cache_page);
+            request.set_forward_cache_pages(vec![replay_cache_page]);
+        } else {
+            request.set_forward_cache_pages(allocated_cache_pages.clone());
+        }
         sequence_cache_pages.extend_from_slice(&allocated_cache_pages);
+        request.set_cache_hit_token_count(cache_hit_token_count);
         request.apply_prefix_match(prefix_match);
         request.set_allocated_cache_pages(allocated_cache_pages);
         request.set_sequence_cache_pages(sequence_cache_pages);
@@ -514,6 +567,7 @@ impl<W> Scheduler<W> {
         self.waiting_queue.push_front(failed_request);
         for mut request in prepared_requests.into_iter().rev() {
             request.set_allocated_cache_pages(Vec::new());
+            request.set_forward_cache_pages(Vec::new());
             request.set_sequence_cache_pages(Vec::new());
             request.set_stage(RequestStage::PrefillWaiting);
             self.waiting_queue.push_front(request);
@@ -581,6 +635,7 @@ impl<W> Scheduler<W> {
             }
             None => Vec::new(),
         };
+        request.set_forward_cache_pages(allocated_cache_pages.clone());
         request.set_allocated_cache_pages(allocated_cache_pages);
         let allocated_cache_pages = request.allocated_cache_pages().to_vec();
         request.append_sequence_cache_pages(&allocated_cache_pages);

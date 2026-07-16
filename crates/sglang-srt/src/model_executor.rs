@@ -138,7 +138,8 @@ impl ModelWorkerBatch {
     fn push_request(&mut self, forward_mode: ForwardMode, request: &ScheduledRequest) {
         self.request_ids.push(request.request_id().clone());
         self.request_offsets.push(self.input_ids.len());
-        self.cached_token_counts.push(request.cached_token_count());
+        self.cached_token_counts
+            .push(request.forward_prefix_token_count());
         self.prefix_cache_pages
             .push(request.prefix_cache_pages().to_vec());
         self.disaggregated_params
@@ -164,7 +165,7 @@ impl ModelWorkerBatch {
         self.input_ids.extend_from_slice(uncached_input_ids);
         self.input_token_counts.push(uncached_input_ids.len());
         self.out_cache_pages
-            .extend_from_slice(request.allocated_cache_pages());
+            .extend_from_slice(request.forward_cache_pages());
         self.positions
             .extend(prefix_len..prefix_len + uncached_input_ids.len());
         self.sequence_lengths.push(request.input_ids().len());
@@ -185,7 +186,7 @@ impl ModelWorkerBatch {
         self.input_ids.push(decode_token);
         self.input_token_counts.push(1);
         self.out_cache_pages
-            .extend_from_slice(request.allocated_cache_pages());
+            .extend_from_slice(request.forward_cache_pages());
         self.positions
             .push(request.input_ids().len() + request.output_ids().len() - 1);
         self.sequence_lengths

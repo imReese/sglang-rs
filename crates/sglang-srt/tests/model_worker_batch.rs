@@ -493,7 +493,7 @@ fn model_forward_output_rejects_flattened_logits_with_wrong_token_count() {
 }
 
 #[test]
-fn model_forward_output_rejects_flattened_logits_for_request_without_input_tokens() {
+fn model_forward_output_uses_replayed_last_token_for_fully_cached_request() {
     let mut cache = RadixCache::default();
     cache
         .insert(&[10, 11], &[CachePageId::from(100), CachePageId::from(101)])
@@ -505,13 +505,12 @@ fn model_forward_output_rejects_flattened_logits_for_request_without_input_token
         .expect("batch should be available");
     let worker_batch = ModelWorkerBatch::from_schedule_batch(&batch);
 
-    let error = ModelForwardOutput::from_token_logits(&worker_batch, Vec::new())
-        .expect_err("fully cached requests should not index missing token logits");
-
-    assert_eq!(
-        error,
-        ModelForwardError::MissingRequestTokenLogits { request_index: 0 }
-    );
+    assert_eq!(worker_batch.input_ids(), &[11]);
+    assert_eq!(worker_batch.cached_token_counts(), &[1]);
+    assert_eq!(worker_batch.out_cache_pages(), &[CachePageId::from(101)]);
+    let output = ModelForwardOutput::from_token_logits(&worker_batch, vec![vec![0.1, 9.0]])
+        .expect("the replayed token should provide request logits");
+    assert_eq!(output.logits(), &[vec![0.1, 9.0]]);
 }
 
 #[derive(Default)]

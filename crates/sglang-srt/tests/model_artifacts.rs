@@ -18,6 +18,19 @@ use sglang_srt::model_registry::{ModelRegistry, ModelRegistryError};
 static HF_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
+fn hf_model_config_parses_attention_bias() {
+    let model_dir = temp_model_dir("attention-bias-config");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(model_dir.join("config.json"), r#"{"attention_bias":true}"#)
+        .expect("config should be written");
+
+    let config = HfModelConfig::from_model_path(&model_dir).expect("config should parse");
+    assert_eq!(config.attention_bias, Some(true));
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
 fn local_model_artifacts_loads_deepseek_v4_config_and_indexed_safetensors() {
     let model_dir = temp_model_dir("indexed-safetensors");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");

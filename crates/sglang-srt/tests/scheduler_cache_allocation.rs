@@ -292,6 +292,42 @@ fn successful_prefill_dispatch_publishes_allocated_pages_to_radix_cache_for_futu
 }
 
 #[test]
+fn centralized_full_prefix_hit_replays_last_token_without_allocating_cache() {
+    let mut scheduler = Scheduler::with_cache_resources(
+        NoopWorker,
+        RadixCache::default(),
+        CachePageAllocator::new(8),
+    );
+    enqueue_request(&mut scheduler, "req-seed", &[1, 2, 3]);
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("seed prefill should populate the radix cache");
+    let available_slots = scheduler.available_cache_pages();
+
+    enqueue_request(&mut scheduler, "req-replay", &[1, 2, 3]);
+    let batch = scheduler
+        .next_prefill_batch(1)
+        .expect("fully cached prefill should replay its last token");
+    let request = &batch.requests()[0];
+    let worker_batch = ModelWorkerBatch::from_schedule_batch(&batch);
+
+    assert_eq!(request.cached_token_count(), 3);
+    assert_eq!(request.uncached_input_ids(), &[3]);
+    assert!(request.allocated_cache_pages().is_empty());
+    assert_eq!(
+        request.sequence_cache_pages(),
+        &[
+            CachePageId::from(0),
+            CachePageId::from(1),
+            CachePageId::from(2)
+        ]
+    );
+    assert_eq!(worker_batch.out_cache_pages(), &[CachePageId::from(2)]);
+    assert_eq!(worker_batch.cached_token_counts(), &[2]);
+    assert_eq!(scheduler.available_cache_pages(), available_slots);
+}
+
+#[test]
 fn fake_bootstrap_prefill_dispatch_does_not_publish_pages_to_radix_cache() {
     let mut scheduler = Scheduler::with_cache_resources(
         NoopWorker,

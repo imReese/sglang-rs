@@ -13,7 +13,7 @@ use crate::transfer::KvCacheModelLayout;
 pub(crate) use deepseek::DEEPSEEK_V4_ADAPTER;
 pub(crate) use embedding::EMBEDDING_LM_ADAPTER;
 pub(crate) use glm::GLM_MOE_DSA_ADAPTER;
-pub(crate) use qwen::QWEN2_ADAPTER;
+pub(crate) use qwen::{QWEN2_ADAPTER, QWEN3_ADAPTER};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttentionArchitecture {
@@ -135,11 +135,14 @@ pub(crate) struct DenseDecoderLayerWeightNames {
     pub(crate) input_norm: String,
     pub(crate) query_weight: String,
     pub(crate) query_bias: Option<String>,
+    pub(crate) query_norm: Option<String>,
     pub(crate) key_weight: String,
     pub(crate) key_bias: Option<String>,
+    pub(crate) key_norm: Option<String>,
     pub(crate) value_weight: String,
     pub(crate) value_bias: Option<String>,
     pub(crate) output_weight: String,
+    pub(crate) output_bias: Option<String>,
     pub(crate) post_attention_norm: String,
     pub(crate) gate_weight: String,
     pub(crate) up_weight: String,
@@ -326,14 +329,21 @@ impl ModelDefinition {
                 &[query_size, plan.hidden_size],
             )?;
             require_optional_tensor_shape(artifacts, layer.query_bias.as_deref(), &[query_size])?;
+            require_optional_tensor_shape(artifacts, layer.query_norm.as_deref(), &[head_dim])?;
             require_tensor_shape(artifacts, &layer.key_weight, &[kv_size, plan.hidden_size])?;
             require_optional_tensor_shape(artifacts, layer.key_bias.as_deref(), &[kv_size])?;
+            require_optional_tensor_shape(artifacts, layer.key_norm.as_deref(), &[head_dim])?;
             require_tensor_shape(artifacts, &layer.value_weight, &[kv_size, plan.hidden_size])?;
             require_optional_tensor_shape(artifacts, layer.value_bias.as_deref(), &[kv_size])?;
             require_tensor_shape(
                 artifacts,
                 &layer.output_weight,
                 &[plan.hidden_size, query_size],
+            )?;
+            require_optional_tensor_shape(
+                artifacts,
+                layer.output_bias.as_deref(),
+                &[plan.hidden_size],
             )?;
             require_tensor_shape(artifacts, &layer.post_attention_norm, &[plan.hidden_size])?;
             require_tensor_shape(

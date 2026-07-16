@@ -11,9 +11,12 @@ use super::{
 };
 
 pub(crate) const QWEN2_ARCHITECTURE: &str = "Qwen2ForCausalLM";
+pub(crate) const QWEN3_ARCHITECTURE: &str = "Qwen3ForCausalLM";
 pub(crate) static QWEN2_ADAPTER: Qwen2Adapter = Qwen2Adapter;
+pub(crate) static QWEN3_ADAPTER: Qwen3Adapter = Qwen3Adapter;
 
 pub(crate) struct Qwen2Adapter;
+pub(crate) struct Qwen3Adapter;
 
 impl ModelAdapter for Qwen2Adapter {
     fn architectures(&self) -> &'static [&'static str] {
@@ -42,28 +45,63 @@ impl ModelAdapter for Qwen2Adapter {
     }
 }
 
+impl ModelAdapter for Qwen3Adapter {
+    fn architectures(&self) -> &'static [&'static str] {
+        &[QWEN3_ARCHITECTURE]
+    }
+
+    fn build_definition(
+        &self,
+        _model_path: &Path,
+        config: &HfModelConfig,
+    ) -> Result<ModelDefinition, ModelAdapterError> {
+        build_qwen3_definition(config)
+    }
+
+    fn validate_checkpoint(
+        &self,
+        artifacts: &LocalModelArtifacts,
+    ) -> Result<(), ModelArtifactError> {
+        let definition = build_qwen3_definition(artifacts.config()).map_err(|error| {
+            ModelArtifactError::InvalidSafetensorsData {
+                path: artifacts.model_path().to_path_buf(),
+                message: error.to_string(),
+            }
+        })?;
+        definition.validate_dense_decoder_checkpoint(artifacts)
+    }
+}
+
 fn build_qwen2_definition(config: &HfModelConfig) -> Result<ModelDefinition, ModelAdapterError> {
-    let vocab_size = required_usize(QWEN2_ARCHITECTURE, "vocab_size", config.vocab_size)?;
-    let num_layers = required_usize(
-        QWEN2_ARCHITECTURE,
-        "num_hidden_layers",
-        config.num_hidden_layers,
-    )?;
-    let hidden_size = required_usize(QWEN2_ARCHITECTURE, "hidden_size", config.hidden_size)?;
-    let intermediate_size = required_usize(
-        QWEN2_ARCHITECTURE,
-        "intermediate_size",
-        config.intermediate_size,
-    )?;
+    build_qwen_definition(config, QWEN2_ARCHITECTURE, qwen2_weight_names)
+}
+
+fn build_qwen3_definition(config: &HfModelConfig) -> Result<ModelDefinition, ModelAdapterError> {
+    let attention_bias = config.attention_bias.unwrap_or(false);
+    build_qwen_definition(config, QWEN3_ARCHITECTURE, |num_layers, tied_embeddings| {
+        qwen3_weight_names(num_layers, tied_embeddings, attention_bias)
+    })
+}
+
+fn build_qwen_definition(
+    config: &HfModelConfig,
+    architecture: &'static str,
+    weight_names: impl FnOnce(usize, bool) -> DenseDecoderWeightNames,
+) -> Result<ModelDefinition, ModelAdapterError> {
+    let vocab_size = required_usize(architecture, "vocab_size", config.vocab_size)?;
+    let num_layers = required_usize(architecture, "num_hidden_layers", config.num_hidden_layers)?;
+    let hidden_size = required_usize(architecture, "hidden_size", config.hidden_size)?;
+    let intermediate_size =
+        required_usize(architecture, "intermediate_size", config.intermediate_size)?;
     let num_attention_heads = required_usize(
-        QWEN2_ARCHITECTURE,
+        architecture,
         "num_attention_heads",
         config.num_attention_heads,
     )?;
     let num_key_value_heads = config.num_key_value_heads.unwrap_or(num_attention_heads);
     if num_key_value_heads == 0 || !num_attention_heads.is_multiple_of(num_key_value_heads) {
         return Err(ModelAdapterError::invalid(
-            QWEN2_ARCHITECTURE,
+            architecture,
             format!(
                 "num_attention_heads ({num_attention_heads}) must be divisible by non-zero num_key_value_heads ({num_key_value_heads})"
             ),
@@ -78,7 +116,7 @@ fn build_qwen2_definition(config: &HfModelConfig) -> Result<ModelDefinition, Mod
         }
         (Some(_), _) | (None, None) => {
             return Err(ModelAdapterError::invalid(
-                QWEN2_ARCHITECTURE,
+                architecture,
                 format!(
                     "hidden_size ({hidden_size}) must be divisible by attention head divisor ({head_divisor})"
                 ),
@@ -87,14 +125,14 @@ fn build_qwen2_definition(config: &HfModelConfig) -> Result<ModelDefinition, Mod
         (None, Some(head_dim)) if head_dim > 0 => head_dim,
         (None, Some(_)) => {
             return Err(ModelAdapterError::invalid(
-                QWEN2_ARCHITECTURE,
+                architecture,
                 "head_dim must be non-zero",
             ));
         }
     };
     if !head_dim.is_multiple_of(2) {
         return Err(ModelAdapterError::invalid(
-            QWEN2_ARCHITECTURE,
+            architecture,
             format!("NeoX RoPE requires an even head_dim, found {head_dim}"),
         ));
     }
@@ -103,35 +141,32 @@ fn build_qwen2_definition(config: &HfModelConfig) -> Result<ModelDefinition, Mod
         Some("silu") => {}
         Some(hidden_act) => {
             return Err(ModelAdapterError::invalid(
-                QWEN2_ARCHITECTURE,
+                architecture,
                 format!("unsupported hidden_act {hidden_act}; shared dense decoder requires silu"),
             ));
         }
         None => {
-            return Err(ModelAdapterError::missing_field(
-                QWEN2_ARCHITECTURE,
-                "hidden_act",
-            ));
+            return Err(ModelAdapterError::missing_field(architecture, "hidden_act"));
         }
     }
     if config.use_sliding_window == Some(true) {
         return Err(ModelAdapterError::invalid(
-            QWEN2_ARCHITECTURE,
+            architecture,
             format!(
                 "sliding-window attention is not implemented (sliding_window={:?})",
                 config.sliding_window
             ),
         ));
     }
-    validate_default_rope(config)?;
+    validate_default_rope(architecture, config)?;
 
     let rms_norm_eps = config
         .rms_norm_eps
-        .ok_or_else(|| ModelAdapterError::missing_field(QWEN2_ARCHITECTURE, "rms_norm_eps"))?
+        .ok_or_else(|| ModelAdapterError::missing_field(architecture, "rms_norm_eps"))?
         .get() as f32;
     if !rms_norm_eps.is_finite() || rms_norm_eps < 0.0 {
         return Err(ModelAdapterError::invalid(
-            QWEN2_ARCHITECTURE,
+            architecture,
             "rms_norm_eps must be finite and non-negative",
         ));
     }
@@ -141,14 +176,14 @@ fn build_qwen2_definition(config: &HfModelConfig) -> Result<ModelDefinition, Mod
         .unwrap_or(1_000_000.0) as f32;
     if !rope_theta.is_finite() || rope_theta <= 0.0 {
         return Err(ModelAdapterError::invalid(
-            QWEN2_ARCHITECTURE,
+            architecture,
             "rope_theta must be finite and positive",
         ));
     }
     let max_position_embeddings = config.max_position_embeddings.unwrap_or(32_768);
     if max_position_embeddings == 0 {
         return Err(ModelAdapterError::invalid(
-            QWEN2_ARCHITECTURE,
+            architecture,
             "max_position_embeddings must be non-zero",
         ));
     }
@@ -168,11 +203,11 @@ fn build_qwen2_definition(config: &HfModelConfig) -> Result<ModelDefinition, Mod
         rms_norm_eps,
         rope_theta,
         activation: DenseDecoderActivation::Silu,
-        weights: qwen2_weight_names(num_layers, config.tie_word_embeddings == Some(true)),
+        weights: weight_names(num_layers, config.tie_word_embeddings == Some(true)),
     };
 
     Ok(ModelDefinition::new(
-        QWEN2_ARCHITECTURE,
+        architecture,
         config,
         execution,
         vec![RuntimeDtype::F32, RuntimeDtype::Fp16, RuntimeDtype::Bf16],
@@ -186,13 +221,16 @@ fn build_qwen2_definition(config: &HfModelConfig) -> Result<ModelDefinition, Mod
     .with_dense_decoder(plan))
 }
 
-fn validate_default_rope(config: &HfModelConfig) -> Result<(), ModelAdapterError> {
+fn validate_default_rope(
+    architecture: &'static str,
+    config: &HfModelConfig,
+) -> Result<(), ModelAdapterError> {
     let Some(rope_scaling) = config.rope_scaling.as_ref() else {
         return Ok(());
     };
     let Some(parameters) = rope_scaling.as_object() else {
         return Err(ModelAdapterError::invalid(
-            QWEN2_ARCHITECTURE,
+            architecture,
             "rope_scaling/rope_parameters must be an object",
         ));
     };
@@ -209,7 +247,7 @@ fn validate_default_rope(config: &HfModelConfig) -> Result<(), ModelAdapterError
             == Some(true)
     {
         return Err(ModelAdapterError::invalid(
-            QWEN2_ARCHITECTURE,
+            architecture,
             format!("RoPE variant {rope_type} is not implemented by the dense decoder backend"),
         ));
     }
@@ -228,11 +266,48 @@ fn qwen2_weight_names(num_layers: usize, tied_embeddings: bool) -> DenseDecoderW
                     input_norm: format!("{prefix}.input_layernorm.weight"),
                     query_weight: format!("{prefix}.self_attn.q_proj.weight"),
                     query_bias: Some(format!("{prefix}.self_attn.q_proj.bias")),
+                    query_norm: None,
                     key_weight: format!("{prefix}.self_attn.k_proj.weight"),
                     key_bias: Some(format!("{prefix}.self_attn.k_proj.bias")),
+                    key_norm: None,
                     value_weight: format!("{prefix}.self_attn.v_proj.weight"),
                     value_bias: Some(format!("{prefix}.self_attn.v_proj.bias")),
                     output_weight: format!("{prefix}.self_attn.o_proj.weight"),
+                    output_bias: None,
+                    post_attention_norm: format!("{prefix}.post_attention_layernorm.weight"),
+                    gate_weight: format!("{prefix}.mlp.gate_proj.weight"),
+                    up_weight: format!("{prefix}.mlp.up_proj.weight"),
+                    down_weight: format!("{prefix}.mlp.down_proj.weight"),
+                }
+            })
+            .collect(),
+    }
+}
+
+fn qwen3_weight_names(
+    num_layers: usize,
+    tied_embeddings: bool,
+    attention_bias: bool,
+) -> DenseDecoderWeightNames {
+    DenseDecoderWeightNames {
+        token_embeddings: "model.embed_tokens.weight".to_string(),
+        final_norm: "model.norm.weight".to_string(),
+        lm_head: (!tied_embeddings).then(|| "lm_head.weight".to_string()),
+        layers: (0..num_layers)
+            .map(|layer_id| {
+                let prefix = format!("model.layers.{layer_id}");
+                DenseDecoderLayerWeightNames {
+                    input_norm: format!("{prefix}.input_layernorm.weight"),
+                    query_weight: format!("{prefix}.self_attn.q_proj.weight"),
+                    query_bias: attention_bias.then(|| format!("{prefix}.self_attn.q_proj.bias")),
+                    query_norm: Some(format!("{prefix}.self_attn.q_norm.weight")),
+                    key_weight: format!("{prefix}.self_attn.k_proj.weight"),
+                    key_bias: attention_bias.then(|| format!("{prefix}.self_attn.k_proj.bias")),
+                    key_norm: Some(format!("{prefix}.self_attn.k_norm.weight")),
+                    value_weight: format!("{prefix}.self_attn.v_proj.weight"),
+                    value_bias: attention_bias.then(|| format!("{prefix}.self_attn.v_proj.bias")),
+                    output_weight: format!("{prefix}.self_attn.o_proj.weight"),
+                    output_bias: attention_bias.then(|| format!("{prefix}.self_attn.o_proj.bias")),
                     post_attention_norm: format!("{prefix}.post_attention_layernorm.weight"),
                     gate_weight: format!("{prefix}.mlp.gate_proj.weight"),
                     up_weight: format!("{prefix}.mlp.up_proj.weight"),

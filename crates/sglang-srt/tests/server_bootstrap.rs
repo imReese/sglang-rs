@@ -464,6 +464,22 @@ async fn bootstrap_runs_qwen_centralized_prefill_and_decode_without_transfer() {
     let model_dir = temp_model_dir("server-qwen-runtime-forward");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");
     write_complete_qwen2_checkpoint(&model_dir);
+    assert_centralized_qwen_generation(&model_dir, "centralized-qwen").await;
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[tokio::test]
+async fn bootstrap_runs_qwen3_centralized_prefill_and_decode_without_transfer() {
+    let model_dir = temp_model_dir("server-qwen3-runtime-forward");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_complete_qwen3_checkpoint(&model_dir);
+    assert_centralized_qwen_generation(&model_dir, "centralized-qwen3").await;
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+async fn assert_centralized_qwen_generation(model_dir: &std::path::Path, request_id: &str) {
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
@@ -486,7 +502,7 @@ async fn bootstrap_runs_qwen_centralized_prefill_and_decode_without_transfer() {
                 ..Default::default()
             }),
             options: Some(RequestOptions {
-                request_id: Some("centralized-qwen".to_string()),
+                request_id: Some(request_id.to_string()),
                 stream: true,
                 data_parallel_rank: 0,
                 trace_headers: Default::default(),
@@ -506,9 +522,9 @@ async fn bootstrap_runs_qwen_centralized_prefill_and_decode_without_transfer() {
         .expect("decode response")
         .expect("decode response should succeed");
 
-    assert_eq!(first.request_id, "centralized-qwen");
+    assert_eq!(first.request_id, request_id);
     assert!(matches!(first.body, Some(Body::Chunk(_))));
-    assert_eq!(second.request_id, "centralized-qwen");
+    assert_eq!(second.request_id, request_id);
     assert!(
         matches!(
             second.body,
@@ -526,8 +542,6 @@ async fn bootstrap_runs_qwen_centralized_prefill_and_decode_without_transfer() {
             .await
             .is_none()
     );
-
-    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
 
 #[tokio::test]
@@ -1641,6 +1655,114 @@ fn write_complete_qwen2_checkpoint(model_dir: &std::path::Path) {
     }
     write_safetensors_file(&model_dir.join("model.safetensors"), &tensors, &payload)
         .expect("Qwen checkpoint should be written");
+}
+
+fn write_complete_qwen3_checkpoint(model_dir: &std::path::Path) {
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "architectures": ["Qwen3ForCausalLM"],
+  "model_type": "qwen3",
+  "vocab_size": 3,
+  "num_hidden_layers": 1,
+  "hidden_size": 2,
+  "intermediate_size": 2,
+  "num_attention_heads": 1,
+  "num_key_value_heads": 1,
+  "head_dim": 2,
+  "hidden_act": "silu",
+  "attention_bias": false,
+  "rms_norm_eps": 0.000001,
+  "rope_theta": 1000000.0,
+  "max_position_embeddings": 32,
+  "tie_word_embeddings": false
+}"#,
+    )
+    .expect("config should be written");
+
+    fs::write(
+        model_dir.join("tokenizer.json"),
+        word_level_tokenizer_json(),
+    )
+    .expect("Qwen3 tokenizer should be written");
+
+    let descriptors: Vec<(&str, Vec<usize>, Vec<f32>)> = vec![
+        (
+            "model.embed_tokens.weight",
+            vec![3, 2],
+            vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
+        ),
+        ("model.norm.weight", vec![2], vec![1.0, 1.0]),
+        (
+            "lm_head.weight",
+            vec![3, 2],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0],
+        ),
+        (
+            "model.layers.0.self_attn.q_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.self_attn.q_norm.weight",
+            vec![2],
+            vec![1.0; 2],
+        ),
+        (
+            "model.layers.0.self_attn.k_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.self_attn.k_norm.weight",
+            vec![2],
+            vec![1.0; 2],
+        ),
+        (
+            "model.layers.0.self_attn.v_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.self_attn.o_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.input_layernorm.weight",
+            vec![2],
+            vec![1.0; 2],
+        ),
+        (
+            "model.layers.0.post_attention_layernorm.weight",
+            vec![2],
+            vec![1.0; 2],
+        ),
+        (
+            "model.layers.0.mlp.gate_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.mlp.up_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.mlp.down_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+    ];
+    let mut payload = Vec::new();
+    let mut tensors = Vec::new();
+    for (name, shape, values) in &descriptors {
+        let start = payload.len();
+        payload.extend(values.iter().flat_map(|value| value.to_le_bytes()));
+        tensors.push((*name, "F32", shape.as_slice(), [start, payload.len()]));
+    }
+    write_safetensors_file(&model_dir.join("model.safetensors"), &tensors, &payload)
+        .expect("Qwen3 checkpoint should be written");
 }
 
 fn write_complete_glm_moe_dsa_forward_checkpoint(model_dir: &std::path::Path) {
