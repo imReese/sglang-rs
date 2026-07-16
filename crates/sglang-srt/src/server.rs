@@ -14,6 +14,7 @@ use crate::engine_info_bootstrap::{
     serve_engine_info_bootstrap_with_shutdown,
 };
 use crate::grpc::{GrpcRouterService, GrpcServeError, serve_grpc_router_with_shutdown};
+use crate::grpc_sidecar::serve_grpc_http_sidecar_with_shutdown;
 use crate::http::{
     HttpKvCacheInfo, HttpKvEventsInfo, HttpRouterService, HttpServeError, HttpServerInfo,
     serve_http_router_with_shutdown,
@@ -366,6 +367,9 @@ pub enum ServerLaunchError {
         host: String,
         port: u16,
     },
+    InvalidGrpcSidecarPort {
+        grpc_port: u16,
+    },
     PdConfig(PdConfigError),
     UnsupportedBootstrapPdRuntime {
         mode: DisaggregationMode,
@@ -415,6 +419,14 @@ impl PartialEq for ServerLaunchError {
                     port: right_port,
                 },
             ) => left_host == right_host && left_port == right_port,
+            (
+                Self::InvalidGrpcSidecarPort {
+                    grpc_port: left_port,
+                },
+                Self::InvalidGrpcSidecarPort {
+                    grpc_port: right_port,
+                },
+            ) => left_port == right_port,
             (Self::PdConfig(left), Self::PdConfig(right)) => left == right,
             (
                 Self::UnsupportedBootstrapPdRuntime {
@@ -494,6 +506,10 @@ impl fmt::Display for ServerLaunchError {
             Self::NoSocketAddress { host, port } => {
                 write!(formatter, "listen address {host}:{port} did not resolve")
             }
+            Self::InvalidGrpcSidecarPort { grpc_port } => write!(
+                formatter,
+                "gRPC HTTP sidecar defaults to --port + 1, but gRPC port {grpc_port} has no successor; set --smg-http-sidecar-port explicitly"
+            ),
             Self::PdConfig(error) => write!(formatter, "PD config error: {error}"),
             Self::UnsupportedBootstrapPdRuntime {
                 mode,
@@ -619,6 +635,27 @@ pub fn grpc_listen_addr(args: &ServerArgs) -> Result<SocketAddr, ServerLaunchErr
 
 pub fn http_listen_addr(args: &ServerArgs) -> Result<SocketAddr, ServerLaunchError> {
     grpc_listen_addr(args)
+}
+
+pub fn grpc_http_sidecar_listen_addr(args: &ServerArgs) -> Result<SocketAddr, ServerLaunchError> {
+    let port = match args.smg_http_sidecar_port {
+        Some(port) => port,
+        None => args
+            .port
+            .checked_add(1)
+            .ok_or(ServerLaunchError::InvalidGrpcSidecarPort {
+                grpc_port: args.port,
+            })?,
+    };
+    let mut addresses = (args.host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(ServerLaunchError::AddressResolve)?;
+    addresses
+        .next()
+        .ok_or_else(|| ServerLaunchError::NoSocketAddress {
+            host: args.host.clone(),
+            port,
+        })
 }
 
 pub fn prefill_bootstrap_listen_addr(args: &ServerArgs) -> Result<SocketAddr, ServerLaunchError> {
@@ -1685,18 +1722,22 @@ where
     }
     validate_launch_transfer_backend(&pd_config)?;
     let addr = grpc_listen_addr(&args)?;
+    let sidecar_addr = grpc_http_sidecar_listen_addr(&args)?;
     match pd_config.mode {
         DisaggregationMode::Null => {
             let service = try_build_launch_grpc_router_service(&args)?;
-            serve_grpc_router_with_shutdown(addr, service, true, shutdown).await?;
+            serve_grpc_and_sidecar(addr, service, sidecar_addr, args.enable_metrics, shutdown)
+                .await?;
         }
         DisaggregationMode::Prefill if pd_config.transfer_backend == TransferBackend::Fake => {
             let service = try_build_launch_fake_pd_grpc_router_service(&args, false)?;
-            serve_grpc_router_with_shutdown(addr, service, true, shutdown).await?;
+            serve_grpc_and_sidecar(addr, service, sidecar_addr, args.enable_metrics, shutdown)
+                .await?;
         }
         DisaggregationMode::Decode if pd_config.transfer_backend == TransferBackend::Fake => {
             let service = try_build_launch_fake_pd_grpc_router_service(&args, true)?;
-            serve_grpc_router_with_shutdown(addr, service, true, shutdown).await?;
+            serve_grpc_and_sidecar(addr, service, sidecar_addr, args.enable_metrics, shutdown)
+                .await?;
         }
         DisaggregationMode::Prefill if pd_config.transfer_backend == TransferBackend::Mooncake => {
             let bootstrap_addr = prefill_bootstrap_listen_addr(&args)?;
@@ -1711,16 +1752,21 @@ where
             serve_prefill_grpc_and_bootstrap(
                 addr,
                 service,
-                bootstrap_addr,
-                bootstrap_service,
-                zmq_endpoints,
+                PrefillGrpcBootstrapServices {
+                    sidecar_addr,
+                    enable_metrics: args.enable_metrics,
+                    prefill_addr: bootstrap_addr,
+                    prefill_service: bootstrap_service,
+                    zmq_endpoints,
+                },
                 shutdown,
             )
             .await?;
         }
         DisaggregationMode::Decode if pd_config.transfer_backend == TransferBackend::Mooncake => {
             let service = try_build_launch_mooncake_decode_grpc_router_service(&args, &pd_config)?;
-            serve_grpc_router_with_shutdown(addr, service, true, shutdown).await?;
+            serve_grpc_and_sidecar(addr, service, sidecar_addr, args.enable_metrics, shutdown)
+                .await?;
         }
         _ => {
             return Err(ServerLaunchError::UnsupportedBootstrapPdRuntime {
@@ -1974,12 +2020,11 @@ where
     }
 }
 
-async fn serve_prefill_grpc_and_bootstrap<T, W, F>(
+async fn serve_grpc_and_sidecar<T, W, F>(
     grpc_addr: SocketAddr,
     grpc_service: GrpcRouterService<T, W>,
-    bootstrap_addr: SocketAddr,
-    bootstrap_service: PrefillBootstrapService,
-    zmq_endpoints: Vec<String>,
+    sidecar_addr: SocketAddr,
+    enable_metrics: bool,
     shutdown: F,
 ) -> Result<(), ServerLaunchError>
 where
@@ -1988,22 +2033,85 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let sidecar_service = grpc_service.clone();
     let mut grpc_task = tokio::spawn(serve_grpc_router_with_shutdown(
         grpc_addr,
         grpc_service,
         true,
         watch_shutdown(shutdown_rx.clone()),
     ));
-    let mut bootstrap_tasks = tokio::task::JoinSet::new();
-    bootstrap_tasks.spawn(serve_prefill_bootstrap_with_shutdown(
-        bootstrap_addr,
-        bootstrap_service.clone(),
+    let mut sidecar_task = tokio::spawn(serve_grpc_http_sidecar_with_shutdown(
+        sidecar_addr,
+        sidecar_service,
+        enable_metrics,
+        watch_shutdown(shutdown_rx),
+    ));
+
+    tokio::select! {
+        _ = shutdown => {
+            let _ = shutdown_tx.send(true);
+            join_grpc_task(grpc_task).await?;
+            join_http_task(sidecar_task).await?;
+            Ok(())
+        }
+        result = &mut grpc_task => {
+            let _ = shutdown_tx.send(true);
+            join_http_task(sidecar_task).await?;
+            result.map_err(|error| ServerLaunchError::ServerTaskJoin(error.to_string()))??;
+            Ok(())
+        }
+        result = &mut sidecar_task => {
+            let _ = shutdown_tx.send(true);
+            join_grpc_task(grpc_task).await?;
+            result.map_err(|error| ServerLaunchError::ServerTaskJoin(error.to_string()))??;
+            Ok(())
+        }
+    }
+}
+
+struct PrefillGrpcBootstrapServices {
+    sidecar_addr: SocketAddr,
+    enable_metrics: bool,
+    prefill_addr: SocketAddr,
+    prefill_service: PrefillBootstrapService,
+    zmq_endpoints: Vec<String>,
+}
+
+async fn serve_prefill_grpc_and_bootstrap<T, W, F>(
+    grpc_addr: SocketAddr,
+    grpc_service: GrpcRouterService<T, W>,
+    bootstrap: PrefillGrpcBootstrapServices,
+    shutdown: F,
+) -> Result<(), ServerLaunchError>
+where
+    T: Tokenizer + Send + 'static,
+    W: WorkerExecutor + Send + 'static,
+    F: Future<Output = ()> + Send + 'static,
+{
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let sidecar_service = grpc_service.clone();
+    let mut grpc_task = tokio::spawn(serve_grpc_router_with_shutdown(
+        grpc_addr,
+        grpc_service,
+        true,
         watch_shutdown(shutdown_rx.clone()),
     ));
-    if !zmq_endpoints.is_empty() {
+    let mut sidecar_task = tokio::spawn(serve_grpc_http_sidecar_with_shutdown(
+        bootstrap.sidecar_addr,
+        sidecar_service,
+        bootstrap.enable_metrics,
+        watch_shutdown(shutdown_rx.clone()),
+    ));
+    let mut bootstrap_tasks = tokio::task::JoinSet::new();
+    bootstrap_tasks.spawn(serve_prefill_bootstrap_with_shutdown(
+        bootstrap.prefill_addr,
+        bootstrap.prefill_service.clone(),
+        watch_shutdown(shutdown_rx.clone()),
+    ));
+    if !bootstrap.zmq_endpoints.is_empty() {
         bootstrap_tasks.spawn(serve_mooncake_bootstrap_zmq_endpoints_with_shutdown(
-            zmq_endpoints,
-            bootstrap_service,
+            bootstrap.zmq_endpoints,
+            bootstrap.prefill_service,
             watch_shutdown(shutdown_rx),
         ));
     }
@@ -2012,11 +2120,20 @@ where
         _ = shutdown => {
             let _ = shutdown_tx.send(true);
             join_grpc_task(grpc_task).await?;
+            join_http_task(sidecar_task).await?;
             join_bootstrap_tasks(bootstrap_tasks).await?;
             Ok(())
         }
         result = &mut grpc_task => {
             let _ = shutdown_tx.send(true);
+            join_http_task(sidecar_task).await?;
+            join_bootstrap_tasks(bootstrap_tasks).await?;
+            result.map_err(|error| ServerLaunchError::ServerTaskJoin(error.to_string()))??;
+            Ok(())
+        }
+        result = &mut sidecar_task => {
+            let _ = shutdown_tx.send(true);
+            join_grpc_task(grpc_task).await?;
             join_bootstrap_tasks(bootstrap_tasks).await?;
             result.map_err(|error| ServerLaunchError::ServerTaskJoin(error.to_string()))??;
             Ok(())
@@ -2024,6 +2141,7 @@ where
         result = bootstrap_tasks.join_next() => {
             let _ = shutdown_tx.send(true);
             join_grpc_task(grpc_task).await?;
+            join_http_task(sidecar_task).await?;
             match result {
                 Some(Ok(Ok(()))) => {
                     join_bootstrap_tasks(bootstrap_tasks).await?;

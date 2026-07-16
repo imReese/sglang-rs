@@ -4,16 +4,21 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use tokio::io::{AsyncReadExt as TokioAsyncReadExt, AsyncWriteExt as TokioAsyncWriteExt};
+use tokio::sync::oneshot;
 use tonic::Request;
+use tonic::transport::Channel;
 
 use sglang_srt::cli::ServerArgs;
 use sglang_srt::model_artifacts::ModelArtifactError;
 use sglang_srt::model_registry::ModelRegistryError;
 use sglang_srt::pd_bootstrap::PrefillBootstrapService;
 use sglang_srt::proto::sglang::runtime::v1::generate_response::Body;
+use sglang_srt::proto::sglang::runtime::v1::sglang_service_client::SglangServiceClient;
 use sglang_srt::proto::sglang::runtime::v1::sglang_service_server::SglangService;
 use sglang_srt::proto::sglang::runtime::v1::{
-    GetModelInfoRequest, RequestOptions, SamplingParams, TextGenerateRequest, TokenizeRequest,
+    GetModelInfoRequest, HealthCheckRequest, RequestOptions, SamplingParams, TextGenerateRequest,
+    TokenizeRequest,
 };
 use sglang_srt::router::RouterGetModelInfoResponse;
 use sglang_srt::server::test_support::{
@@ -22,7 +27,8 @@ use sglang_srt::server::test_support::{
     try_build_reference_prefill_http_router_service,
 };
 use sglang_srt::server::{
-    ServerLaunchError, build_bootstrap_grpc_router_service, grpc_listen_addr, launch_grpc_server,
+    ServerLaunchError, build_bootstrap_grpc_router_service, grpc_http_sidecar_listen_addr,
+    grpc_listen_addr, launch_grpc_server, launch_grpc_server_with_shutdown,
     prefill_mooncake_zmq_endpoints, register_prefill_mooncake_routes_from_args,
     try_build_bootstrap_grpc_router_service, try_build_bootstrap_prefill_http_router_service,
 };
@@ -55,6 +61,143 @@ fn grpc_listen_addr_uses_server_host_and_port() {
 
     assert_eq!(addr.ip().to_string(), "127.0.0.1");
     assert_eq!(addr.port(), 30001);
+}
+
+#[test]
+fn grpc_http_sidecar_address_matches_community_defaults_and_override() {
+    let default_args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "30001",
+        "--smg-grpc-mode",
+    ])
+    .expect("args should parse");
+    let default_addr = grpc_http_sidecar_listen_addr(&default_args)
+        .expect("default sidecar address should resolve");
+    assert_eq!(default_addr.port(), 30002);
+
+    let explicit_args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--port",
+        "65535",
+        "--smg-http-sidecar-port",
+        "30100",
+    ])
+    .expect("args should parse");
+    let explicit_addr = grpc_http_sidecar_listen_addr(&explicit_args)
+        .expect("explicit sidecar address should resolve");
+    assert_eq!(explicit_addr.port(), 30100);
+
+    let overflow_args =
+        ServerArgs::parse_from(["serve", "--model-path", "dummy", "--port", "65535"])
+            .expect("args should parse");
+    assert_eq!(
+        grpc_http_sidecar_listen_addr(&overflow_args),
+        Err(ServerLaunchError::InvalidGrpcSidecarPort { grpc_port: 65535 })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_grpc_launch_starts_and_stops_community_http_sidecar() {
+    let model_dir = temp_model_dir("grpc-launch-sidecar");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_complete_qwen2_checkpoint(&model_dir);
+    let grpc_addr = unused_local_addr();
+    let sidecar_addr = unused_local_addr();
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_dir.to_str().expect("model dir should be UTF-8"),
+        "--device",
+        "cpu",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &grpc_addr.port().to_string(),
+        "--smg-grpc-mode",
+        "--smg-http-sidecar-port",
+        &sidecar_addr.port().to_string(),
+        "--enable-metrics",
+    ])
+    .expect("args should parse");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(launch_grpc_server_with_shutdown(args, async move {
+        let _ = shutdown_rx.await;
+    }));
+
+    let mut client = connect_grpc_with_retry(grpc_addr).await;
+    let health = client
+        .health_check(HealthCheckRequest {})
+        .await
+        .expect("gRPC health check should execute")
+        .into_inner();
+    assert!(health.healthy);
+    let metrics = request_sidecar_with_retry(sidecar_addr, "/metrics").await;
+    assert!(metrics.starts_with("HTTP/1.1 200"), "{metrics}");
+    assert!(metrics.contains("sglang_requests_total 0\n"), "{metrics}");
+
+    shutdown_tx
+        .send(())
+        .expect("production gRPC server should still run");
+    server
+        .await
+        .expect("production gRPC task should join")
+        .expect("production gRPC and sidecar should stop cleanly");
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_grpc_launch_fails_when_http_sidecar_port_is_occupied() {
+    let model_dir = temp_model_dir("grpc-launch-sidecar-conflict");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_complete_qwen2_checkpoint(&model_dir);
+    let grpc_addr = unused_local_addr();
+    let occupied_sidecar =
+        TcpListener::bind(("127.0.0.1", 0)).expect("sidecar conflict listener should bind");
+    let sidecar_addr = occupied_sidecar
+        .local_addr()
+        .expect("sidecar conflict address should resolve");
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_dir.to_str().expect("model dir should be UTF-8"),
+        "--device",
+        "cpu",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &grpc_addr.port().to_string(),
+        "--smg-grpc-mode",
+        "--smg-http-sidecar-port",
+        &sidecar_addr.port().to_string(),
+        "--enable-metrics",
+    ])
+    .expect("args should parse");
+
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        launch_grpc_server_with_shutdown(args, std::future::pending::<()>()),
+    )
+    .await
+    .expect("sidecar bind failure should return promptly")
+    .expect_err("occupied sidecar port must fail production launch");
+    assert!(
+        matches!(
+            error,
+            ServerLaunchError::Http(sglang_srt::http::HttpServeError::Io(ref io_error))
+                if io_error.kind() == std::io::ErrorKind::AddrInUse
+        ),
+        "unexpected error: {error:?}"
+    );
+
+    drop(occupied_sidecar);
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
 
 #[test]
@@ -2304,6 +2447,59 @@ fn glm_moe_dsa_config_json() -> &'static str {
   "num_key_value_heads": 64,
   "head_dim": 64
 }"#
+}
+
+async fn connect_grpc_with_retry(addr: std::net::SocketAddr) -> SglangServiceClient<Channel> {
+    let endpoint = format!("http://{addr}");
+    let mut last_error = None;
+    for _ in 0..100 {
+        match SglangServiceClient::connect(endpoint.clone()).await {
+            Ok(client) => return client,
+            Err(error) => last_error = Some(error),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!(
+        "gRPC client should connect to production server: {}",
+        last_error.expect("at least one connection attempt should run")
+    );
+}
+
+async fn request_sidecar_with_retry(addr: std::net::SocketAddr, path: &str) -> String {
+    let mut last_error = None;
+    for _ in 0..100 {
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(mut stream) => {
+                let request =
+                    format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+                if let Err(error) = stream.write_all(request.as_bytes()).await {
+                    last_error = Some(error);
+                } else {
+                    let mut response = Vec::new();
+                    match stream.read_to_end(&mut response).await {
+                        Ok(_) => {
+                            return String::from_utf8(response)
+                                .expect("sidecar response should be UTF-8");
+                        }
+                        Err(error) => last_error = Some(error),
+                    }
+                }
+            }
+            Err(error) => last_error = Some(error),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!(
+        "HTTP client should connect to production gRPC sidecar: {}",
+        last_error.expect("at least one connection attempt should run")
+    );
+}
+
+fn unused_local_addr() -> std::net::SocketAddr {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral port should bind");
+    listener
+        .local_addr()
+        .expect("ephemeral listener should have local addr")
 }
 
 fn temp_model_dir(name: &str) -> PathBuf {

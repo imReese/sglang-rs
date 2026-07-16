@@ -139,6 +139,26 @@ fn runtime_tokenizer_rejects_local_model_without_tokenizer() {
 }
 
 #[test]
+fn runtime_tokenizer_keeps_explicit_missing_paths_local() {
+    let missing = format!("./target/missing-tokenizer-path-{}", std::process::id());
+    let model_error = RuntimeTokenizer::from_model_or_tokenizer_path(&missing, None)
+        .expect_err("an explicit model path must not be treated as a Hub repo id");
+    assert!(
+        model_error
+            .to_string()
+            .contains("tokenizer.json was not found")
+    );
+
+    let tokenizer_error = RuntimeTokenizer::from_model_or_tokenizer_path("dummy", Some(&missing))
+        .expect_err("an explicit tokenizer path must not be treated as a Hub repo id");
+    assert!(
+        tokenizer_error
+            .to_string()
+            .contains("tokenizer.json was not found")
+    );
+}
+
+#[test]
 fn runtime_tokenizer_downloads_repo_id_tokenizer_when_cache_is_missing() {
     let _env_guard = HF_ENV_LOCK
         .lock()

@@ -3,9 +3,8 @@ use std::convert::Infallible;
 use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Query, State};
@@ -33,6 +32,10 @@ use crate::router::{
     RouterGenerateResponse, RouterGenerateResponseBody, RouterGetModelInfoResponse,
     RouterProtocolError, RouterRuntime, RouterRuntimeError, RouterSamplingParams, RouterStatusCode,
     RouterTextGenerateRequest, RouterTokenizedInput,
+};
+use crate::serving_metrics::{
+    RequestObservation, ServingMetrics as HttpMetrics,
+    observe_responses as observe_router_responses,
 };
 use crate::tokenizer::{ChatTemplateInput, Tokenizer};
 use crate::types::BootstrapRoom;
@@ -259,138 +262,6 @@ where
             router
         };
         router.with_state(self)
-    }
-}
-
-#[derive(Default)]
-struct HttpMetrics {
-    requests_total: AtomicU64,
-    requests_failed_total: AtomicU64,
-    requests_in_flight: AtomicU64,
-    prompt_tokens_total: AtomicU64,
-    generation_tokens_total: AtomicU64,
-    cached_tokens_total: AtomicU64,
-    time_to_first_token_micros_total: AtomicU64,
-    time_to_first_token_count: AtomicU64,
-    request_duration_micros_total: AtomicU64,
-    request_duration_count: AtomicU64,
-}
-
-impl HttpMetrics {
-    fn render(&self) -> String {
-        let seconds = |micros: u64| micros as f64 / 1_000_000.0;
-        format!(
-            concat!(
-                "# TYPE sglang_requests_total counter\nsglang_requests_total {}\n",
-                "# TYPE sglang_requests_failed_total counter\nsglang_requests_failed_total {}\n",
-                "# TYPE sglang_requests_in_flight gauge\nsglang_requests_in_flight {}\n",
-                "# TYPE sglang_prompt_tokens_total counter\nsglang_prompt_tokens_total {}\n",
-                "# TYPE sglang_generation_tokens_total counter\nsglang_generation_tokens_total {}\n",
-                "# TYPE sglang_cached_tokens_total counter\nsglang_cached_tokens_total {}\n",
-                "# TYPE sglang_time_to_first_token_seconds summary\n",
-                "sglang_time_to_first_token_seconds_sum {}\n",
-                "sglang_time_to_first_token_seconds_count {}\n",
-                "# TYPE sglang_request_duration_seconds summary\n",
-                "sglang_request_duration_seconds_sum {}\n",
-                "sglang_request_duration_seconds_count {}\n"
-            ),
-            self.requests_total.load(Ordering::Relaxed),
-            self.requests_failed_total.load(Ordering::Relaxed),
-            self.requests_in_flight.load(Ordering::Relaxed),
-            self.prompt_tokens_total.load(Ordering::Relaxed),
-            self.generation_tokens_total.load(Ordering::Relaxed),
-            self.cached_tokens_total.load(Ordering::Relaxed),
-            seconds(
-                self.time_to_first_token_micros_total
-                    .load(Ordering::Relaxed)
-            ),
-            self.time_to_first_token_count.load(Ordering::Relaxed),
-            seconds(self.request_duration_micros_total.load(Ordering::Relaxed)),
-            self.request_duration_count.load(Ordering::Relaxed),
-        )
-    }
-}
-
-struct RequestObservation {
-    metrics: Arc<HttpMetrics>,
-    started: Instant,
-    first_output_observed: bool,
-    finished: bool,
-}
-
-impl RequestObservation {
-    fn new(metrics: Arc<HttpMetrics>) -> Self {
-        metrics.requests_total.fetch_add(1, Ordering::Relaxed);
-        metrics.requests_in_flight.fetch_add(1, Ordering::Relaxed);
-        Self {
-            metrics,
-            started: Instant::now(),
-            first_output_observed: false,
-            finished: false,
-        }
-    }
-
-    fn observe(&mut self, response: &RouterGenerateResponse) {
-        if !self.first_output_observed {
-            self.first_output_observed = true;
-            self.metrics
-                .time_to_first_token_micros_total
-                .fetch_add(elapsed_micros(self.started), Ordering::Relaxed);
-            self.metrics
-                .time_to_first_token_count
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        if let RouterGenerateResponseBody::Complete(complete) = &response.body {
-            self.metrics
-                .prompt_tokens_total
-                .fetch_add(complete.prompt_tokens.max(0) as u64, Ordering::Relaxed);
-            self.metrics
-                .generation_tokens_total
-                .fetch_add(complete.completion_tokens.max(0) as u64, Ordering::Relaxed);
-            self.metrics
-                .cached_tokens_total
-                .fetch_add(complete.cached_tokens.max(0) as u64, Ordering::Relaxed);
-        }
-    }
-
-    fn finish(&mut self, success: bool) {
-        if self.finished {
-            return;
-        }
-        self.finished = true;
-        self.metrics
-            .requests_in_flight
-            .fetch_sub(1, Ordering::Relaxed);
-        if !success {
-            self.metrics
-                .requests_failed_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        self.metrics
-            .request_duration_micros_total
-            .fetch_add(elapsed_micros(self.started), Ordering::Relaxed);
-        self.metrics
-            .request_duration_count
-            .fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-impl Drop for RequestObservation {
-    fn drop(&mut self) {
-        self.finish(false);
-    }
-}
-
-fn elapsed_micros(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
-}
-
-fn observe_router_responses(
-    observation: &mut RequestObservation,
-    responses: &[RouterGenerateResponse],
-) {
-    for response in responses {
-        observation.observe(response);
     }
 }
 

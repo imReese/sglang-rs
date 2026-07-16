@@ -80,6 +80,28 @@ fn parse_accepts_equals_style_sglang_args() {
 }
 
 #[test]
+fn parse_accepts_community_grpc_sidecar_args() {
+    let parsed = ServerArgs::parse_from([
+        "serve",
+        "--model-path=Qwen/Qwen3-0.6B",
+        "--smg-grpc-mode",
+        "--smg-http-sidecar-port=30100",
+    ])
+    .expect("community gRPC sidecar args should parse");
+    assert!(parsed.grpc_mode);
+    assert_eq!(parsed.smg_http_sidecar_port, Some(30100));
+
+    let alias = ServerArgs::parse_from([
+        "serve",
+        "--model-path=Qwen/Qwen3-0.6B",
+        "--grpc-http-sidecar-port",
+        "30200",
+    ])
+    .expect("gRPC sidecar alias should parse");
+    assert_eq!(alias.smg_http_sidecar_port, Some(30200));
+}
+
+#[test]
 fn parse_preserves_unknown_server_args_for_future_compatibility() {
     let parsed = ServerArgs::parse_from([
         "serve",

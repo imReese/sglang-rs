@@ -48,6 +48,12 @@ use crate::router::{
     RouterGetModelInfoResponse, RouterProtocolError, RouterRuntime, RouterRuntimeError,
     RouterSamplingParams, RouterStatusCode, RouterTextGenerateRequest,
 };
+use crate::serving_metrics::{
+    RequestObservation as GrpcRequestObservation, ServingMetrics as GrpcMetrics,
+    finish_observation as finish_grpc_observation,
+    observe_optional_responses as observe_grpc_responses,
+    observe_response as observe_grpc_response,
+};
 use crate::tokenizer::Tokenizer;
 use crate::transfer::PdConfig;
 use crate::weight_update::{get_weights_by_name_from_disk, update_model_info_from_disk};
@@ -97,13 +103,28 @@ enum GrpcCompletionResponse {
 pub const SGLANG_RUNTIME_FILE_DESCRIPTOR_SET: &[u8] =
     tonic::include_file_descriptor_set!("sglang_runtime_descriptor");
 
-#[derive(Clone)]
 pub struct GrpcRouterService<T, W> {
     runtime: Arc<Mutex<RouterRuntime<T, W>>>,
     model_info: Arc<Mutex<Option<RouterGetModelInfoResponse>>>,
     max_transfer_polls: usize,
     server_info_attributes: HashMap<String, String>,
     profile: Arc<Mutex<Option<ProfileSession>>>,
+    metrics: Arc<GrpcMetrics>,
+    metrics_enabled: bool,
+}
+
+impl<T, W> Clone for GrpcRouterService<T, W> {
+    fn clone(&self) -> Self {
+        Self {
+            runtime: Arc::clone(&self.runtime),
+            model_info: Arc::clone(&self.model_info),
+            max_transfer_polls: self.max_transfer_polls,
+            server_info_attributes: self.server_info_attributes.clone(),
+            profile: Arc::clone(&self.profile),
+            metrics: Arc::clone(&self.metrics),
+            metrics_enabled: self.metrics_enabled,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -143,6 +164,8 @@ impl<T, W> GrpcRouterService<T, W> {
             max_transfer_polls: 0,
             server_info_attributes: default_server_info_attributes(),
             profile: Arc::new(Mutex::new(None)),
+            metrics: Arc::new(GrpcMetrics::default()),
+            metrics_enabled: false,
         }
     }
 
@@ -156,6 +179,8 @@ impl<T, W> GrpcRouterService<T, W> {
             max_transfer_polls: 0,
             server_info_attributes: default_server_info_attributes(),
             profile: Arc::new(Mutex::new(None)),
+            metrics: Arc::new(GrpcMetrics::default()),
+            metrics_enabled: false,
         }
     }
 
@@ -167,10 +192,16 @@ impl<T, W> GrpcRouterService<T, W> {
     pub fn with_server_args(runtime: RouterRuntime<T, W>, args: &ServerArgs) -> Self {
         Self::with_model_info(runtime, RouterGetModelInfoResponse::from_server_args(args))
             .with_server_info_attributes(server_info_attributes_from_args(args))
+            .with_metrics(args.enable_metrics)
     }
 
     pub fn with_server_info_attributes(mut self, attributes: HashMap<String, String>) -> Self {
         self.server_info_attributes = attributes;
+        self
+    }
+
+    fn with_metrics(mut self, enabled: bool) -> Self {
+        self.metrics_enabled = enabled;
         self
     }
 
@@ -187,6 +218,15 @@ impl<T, W> GrpcRouterService<T, W> {
 
     pub fn runtime(&self) -> &Arc<Mutex<RouterRuntime<T, W>>> {
         &self.runtime
+    }
+
+    pub(crate) fn metrics_render(&self) -> String {
+        self.metrics.render()
+    }
+
+    fn request_observation(&self) -> Option<GrpcRequestObservation> {
+        self.metrics_enabled
+            .then(|| GrpcRequestObservation::new(Arc::clone(&self.metrics)))
     }
 
     fn model_info(&self) -> Result<RouterGetModelInfoResponse, Status> {
@@ -959,17 +999,22 @@ where
             let (sender, receiver) = tokio::sync::mpsc::channel(16);
             let runtime = Arc::clone(&self.runtime);
             let max_transfer_polls = self.max_transfer_polls;
+            let mut observation = self.request_observation();
             tokio::task::spawn_blocking(move || {
+                let mut connected = true;
                 let result = match runtime.lock() {
                     Ok(mut runtime) => runtime.generate_text_stream_with_transfer_polling_sink(
                         request,
                         max_transfer_polls,
                         |response| {
-                            sender
+                            observe_grpc_response(&mut observation, &response);
+                            let sent = sender
                                 .blocking_send(Ok(router_generate_response_to_proto_response(
                                     response,
                                 )))
-                                .is_ok()
+                                .is_ok();
+                            connected &= sent;
+                            sent
                         },
                     ),
                     Err(_) => {
@@ -978,22 +1023,34 @@ where
                         return;
                     }
                 };
+                let success = result.is_ok() && connected;
                 if let Err(error) = result {
                     let _ = sender.blocking_send(Err(router_runtime_error_to_status(error)));
                 }
+                finish_grpc_observation(&mut observation, success);
             });
             return Ok(Response::new(start_grpc_stream(receiver).await?));
         }
-        let responses = self
+        let mut observation = self.request_observation();
+        let result = self
             .runtime
             .lock()
             .map_err(|_| Status::internal("router runtime mutex poisoned"))?
-            .generate_text_stream_with_transfer_polling(request, self.max_transfer_polls)
-            .map_err(router_runtime_error_to_status)?
+            .generate_text_stream_with_transfer_polling(request, self.max_transfer_polls);
+        let responses = match result {
+            Ok(responses) => responses,
+            Err(error) => {
+                finish_grpc_observation(&mut observation, false);
+                return Err(router_runtime_error_to_status(error));
+            }
+        };
+        observe_grpc_responses(&mut observation, &responses);
+        let responses = responses
             .into_iter()
             .map(router_generate_response_to_proto_response)
             .map(Ok)
             .collect::<Vec<_>>();
+        finish_grpc_observation(&mut observation, true);
 
         Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
             responses,
@@ -1009,17 +1066,22 @@ where
             let (sender, receiver) = tokio::sync::mpsc::channel(16);
             let runtime = Arc::clone(&self.runtime);
             let max_transfer_polls = self.max_transfer_polls;
+            let mut observation = self.request_observation();
             tokio::task::spawn_blocking(move || {
+                let mut connected = true;
                 let result = match runtime.lock() {
                     Ok(mut runtime) => runtime.generate_stream_with_transfer_polling_sink(
                         request,
                         max_transfer_polls,
                         |response| {
-                            sender
+                            observe_grpc_response(&mut observation, &response);
+                            let sent = sender
                                 .blocking_send(Ok(router_generate_response_to_proto_response(
                                     response,
                                 )))
-                                .is_ok()
+                                .is_ok();
+                            connected &= sent;
+                            sent
                         },
                     ),
                     Err(_) => {
@@ -1028,22 +1090,34 @@ where
                         return;
                     }
                 };
+                let success = result.is_ok() && connected;
                 if let Err(error) = result {
                     let _ = sender.blocking_send(Err(router_runtime_error_to_status(error)));
                 }
+                finish_grpc_observation(&mut observation, success);
             });
             return Ok(Response::new(start_grpc_stream(receiver).await?));
         }
-        let responses = self
+        let mut observation = self.request_observation();
+        let result = self
             .runtime
             .lock()
             .map_err(|_| Status::internal("router runtime mutex poisoned"))?
-            .generate_stream_with_transfer_polling(request, self.max_transfer_polls)
-            .map_err(router_runtime_error_to_status)?
+            .generate_stream_with_transfer_polling(request, self.max_transfer_polls);
+        let responses = match result {
+            Ok(responses) => responses,
+            Err(error) => {
+                finish_grpc_observation(&mut observation, false);
+                return Err(router_runtime_error_to_status(error));
+            }
+        };
+        observe_grpc_responses(&mut observation, &responses);
+        let responses = responses
             .into_iter()
             .map(router_generate_response_to_proto_response)
             .map(Ok)
             .collect::<Vec<_>>();
+        finish_grpc_observation(&mut observation, true);
 
         Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
             responses,
@@ -1336,17 +1410,21 @@ where
             let (sender, receiver) = tokio::sync::mpsc::channel(16);
             let runtime = Arc::clone(&self.runtime);
             let max_transfer_polls = self.max_transfer_polls;
+            let mut observation = self.request_observation();
             tokio::task::spawn_blocking(move || {
+                let mut connected = true;
                 let result = match runtime.lock() {
                     Ok(mut runtime) => runtime.generate_text_stream_with_transfer_polling_sink(
                         request,
                         max_transfer_polls,
                         |response| {
-                            sender
-                                .blocking_send(openai_chat_stream_response_from_router_response(
-                                    response, &model,
-                                ))
-                                .is_ok()
+                            observe_grpc_response(&mut observation, &response);
+                            let frame =
+                                openai_chat_stream_response_from_router_response(response, &model);
+                            let valid = frame.is_ok();
+                            let sent = sender.blocking_send(frame).is_ok();
+                            connected &= sent && valid;
+                            sent && valid
                         },
                     ),
                     Err(_) => {
@@ -1355,13 +1433,16 @@ where
                         return;
                     }
                 };
+                let success = result.is_ok() && connected;
                 if let Err(error) = result {
                     let _ = sender.blocking_send(Err(router_runtime_error_to_status(error)));
                 }
+                finish_grpc_observation(&mut observation, success);
             });
             return Ok(Response::new(start_grpc_stream(receiver).await?));
         }
 
+        let mut observation = self.request_observation();
         let mut runtime = self
             .runtime
             .lock()
@@ -1385,22 +1466,30 @@ where
             }
         }
         .map_err(router_runtime_error_to_status)?;
-
-        match response {
+        match &response {
             GrpcChatResponse::Single(responses) => {
-                let response = openai_chat_response_from_router_responses(responses, &model)?;
-                Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
-                    [Ok(response)],
-                ))))
+                observe_grpc_responses(&mut observation, responses);
             }
             GrpcChatResponse::Batch(batch_responses) => {
-                let response =
-                    openai_chat_batch_response_from_router_responses(batch_responses, &model)?;
-                Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
-                    [Ok(response)],
-                ))))
+                for responses in batch_responses {
+                    observe_grpc_responses(&mut observation, responses);
+                }
             }
         }
+        drop(runtime);
+
+        let response = match response {
+            GrpcChatResponse::Single(responses) => {
+                openai_chat_response_from_router_responses(responses, &model)
+            }
+            GrpcChatResponse::Batch(batch_responses) => {
+                openai_chat_batch_response_from_router_responses(batch_responses, &model)
+            }
+        }?;
+        finish_grpc_observation(&mut observation, true);
+        Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
+            [Ok(response)],
+        ))))
     }
 
     async fn complete(
@@ -1438,19 +1527,22 @@ where
             let (sender, receiver) = tokio::sync::mpsc::channel(16);
             let runtime = Arc::clone(&self.runtime);
             let max_transfer_polls = self.max_transfer_polls;
+            let mut observation = self.request_observation();
             tokio::task::spawn_blocking(move || {
+                let mut connected = true;
                 let result = match runtime.lock() {
                     Ok(mut runtime) => runtime.generate_text_stream_with_transfer_polling_sink(
                         request,
                         max_transfer_polls,
                         |response| {
-                            sender
-                                .blocking_send(
-                                    openai_completion_stream_response_from_router_response(
-                                        response, &model,
-                                    ),
-                                )
-                                .is_ok()
+                            observe_grpc_response(&mut observation, &response);
+                            let frame = openai_completion_stream_response_from_router_response(
+                                response, &model,
+                            );
+                            let valid = frame.is_ok();
+                            let sent = sender.blocking_send(frame).is_ok();
+                            connected &= sent && valid;
+                            sent && valid
                         },
                     ),
                     Err(_) => {
@@ -1459,13 +1551,16 @@ where
                         return;
                     }
                 };
+                let success = result.is_ok() && connected;
                 if let Err(error) = result {
                     let _ = sender.blocking_send(Err(router_runtime_error_to_status(error)));
                 }
+                finish_grpc_observation(&mut observation, success);
             });
             return Ok(Response::new(start_grpc_stream(receiver).await?));
         }
 
+        let mut observation = self.request_observation();
         let mut runtime = self
             .runtime
             .lock()
@@ -1489,24 +1584,30 @@ where
             }
         }
         .map_err(router_runtime_error_to_status)?;
-
-        match response {
+        match &response {
             GrpcCompletionResponse::Single(responses) => {
-                let response = openai_completion_response_from_router_responses(responses, &model)?;
-                Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
-                    [Ok(response)],
-                ))))
+                observe_grpc_responses(&mut observation, responses);
             }
             GrpcCompletionResponse::Batch(batch_responses) => {
-                let response = openai_completion_batch_response_from_router_responses(
-                    batch_responses,
-                    &model,
-                )?;
-                Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
-                    [Ok(response)],
-                ))))
+                for responses in batch_responses {
+                    observe_grpc_responses(&mut observation, responses);
+                }
             }
         }
+        drop(runtime);
+
+        let response = match response {
+            GrpcCompletionResponse::Single(responses) => {
+                openai_completion_response_from_router_responses(responses, &model)
+            }
+            GrpcCompletionResponse::Batch(batch_responses) => {
+                openai_completion_batch_response_from_router_responses(batch_responses, &model)
+            }
+        }?;
+        finish_grpc_observation(&mut observation, true);
+        Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
+            [Ok(response)],
+        ))))
     }
 
     async fn responses(
@@ -1529,13 +1630,16 @@ where
             let runtime = Arc::clone(&self.runtime);
             let max_transfer_polls = self.max_transfer_polls;
             let router_request = request.request;
+            let mut observation = self.request_observation();
             tokio::task::spawn_blocking(move || {
                 let mut stream_state = GrpcResponsesStreamState::default();
+                let mut connected = true;
                 let result = match runtime.lock() {
                     Ok(mut runtime) => runtime.generate_text_stream_with_transfer_polling_sink(
                         router_request,
                         max_transfer_polls,
                         |response| {
+                            observe_grpc_response(&mut observation, &response);
                             let events = match openai_responses_stream_from_router_responses(
                                 vec![response],
                                 &response_model,
@@ -1544,12 +1648,15 @@ where
                                 Ok(events) => events,
                                 Err(error) => {
                                     let _ = sender.blocking_send(Err(error));
+                                    connected = false;
                                     return false;
                                 }
                             };
-                            events
+                            let sent = events
                                 .into_iter()
-                                .all(|event| sender.blocking_send(Ok(event)).is_ok())
+                                .all(|event| sender.blocking_send(Ok(event)).is_ok());
+                            connected &= sent;
+                            sent
                         },
                     ),
                     Err(_) => {
@@ -1558,21 +1665,26 @@ where
                         return;
                     }
                 };
+                let success = result.is_ok() && connected;
                 if let Err(error) = result {
                     let _ = sender.blocking_send(Err(router_runtime_error_to_status(error)));
                 }
+                finish_grpc_observation(&mut observation, success);
             });
             return Ok(Response::new(start_grpc_stream(receiver).await?));
         }
 
+        let mut observation = self.request_observation();
         let responses = self
             .runtime
             .lock()
             .map_err(|_| Status::internal("router runtime mutex poisoned"))?
             .generate_text_stream_with_transfer_polling(request.request, self.max_transfer_polls)
             .map_err(router_runtime_error_to_status)?;
+        observe_grpc_responses(&mut observation, &responses);
 
         let response = openai_responses_response_from_router_responses(responses, &response_model)?;
+        finish_grpc_observation(&mut observation, true);
         Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
             [Ok(response)],
         ))))

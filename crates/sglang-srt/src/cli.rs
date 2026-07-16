@@ -43,6 +43,7 @@ pub struct ServerArgs {
     pub max_prefill_tokens: Option<usize>,
     pub max_total_tokens: Option<usize>,
     pub grpc_mode: bool,
+    pub smg_http_sidecar_port: Option<u16>,
     pub served_model_name: Option<String>,
     pub tokenizer_path: Option<String>,
     pub disaggregation_mode: String,
@@ -310,8 +311,16 @@ impl ArgParser {
                         self.take_value("--max-total-tokens")?,
                     )?);
                 }
-                "--grpc-mode" => {
+                "--grpc-mode" | "--smg-grpc-mode" => {
                     self.parsed.grpc_mode = true;
+                }
+                "--smg-http-sidecar-port" | "--grpc-http-sidecar-port" => {
+                    let value = self.take_value("--smg-http-sidecar-port")?;
+                    self.parsed.smg_http_sidecar_port = Some(
+                        value
+                            .parse::<u16>()
+                            .map_err(|_| CliParseError::InvalidPort(value))?,
+                    );
                 }
                 "--served-model-name" => {
                     self.parsed.served_model_name = Some(self.take_value("--served-model-name")?);
@@ -507,6 +516,7 @@ impl ArgParser {
             max_prefill_tokens: self.parsed.max_prefill_tokens,
             max_total_tokens: self.parsed.max_total_tokens,
             grpc_mode: self.parsed.grpc_mode,
+            smg_http_sidecar_port: self.parsed.smg_http_sidecar_port,
             served_model_name: self.parsed.served_model_name.clone(),
             tokenizer_path: self.parsed.tokenizer_path.clone(),
             disaggregation_mode: self.parsed.disaggregation_mode.clone(),
@@ -619,6 +629,7 @@ struct PartialServerArgs {
     max_prefill_tokens: Option<usize>,
     max_total_tokens: Option<usize>,
     grpc_mode: bool,
+    smg_http_sidecar_port: Option<u16>,
     served_model_name: Option<String>,
     tokenizer_path: Option<String>,
     disaggregation_mode: String,
@@ -688,6 +699,7 @@ impl Default for PartialServerArgs {
             max_prefill_tokens: None,
             max_total_tokens: None,
             grpc_mode: false,
+            smg_http_sidecar_port: None,
             served_model_name: None,
             tokenizer_path: None,
             disaggregation_mode: "null".to_string(),

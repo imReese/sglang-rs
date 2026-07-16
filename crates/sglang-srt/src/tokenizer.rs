@@ -325,25 +325,34 @@ impl RuntimeTokenizer {
             )?)));
         }
 
-        if resolved_model_path.exists() || is_local_tokenizer_path(Path::new(model_path)) {
+        if resolved_model_path.exists() || is_explicit_local_tokenizer_path(Path::new(model_path)) {
             return Err(TokenizerError::TokenizerFileNotFound {
                 path: resolved_model_path,
             });
         }
 
-        if !looks_like_hf_model_id(model_path) {
-            return Ok(Self::Byte(ByteTokenizer));
+        if looks_like_hf_model_id(model_path) {
+            let tokenizer_json = download_hf_tokenizer_json(model_path)?;
+            return Ok(Self::Hf(Box::new(HfTokenizer::from_tokenizer_path(
+                tokenizer_json,
+            )?)));
         }
 
-        let tokenizer_json = download_hf_tokenizer_json(model_path)?;
-        Ok(Self::Hf(Box::new(HfTokenizer::from_tokenizer_path(
-            tokenizer_json,
-        )?)))
+        if is_local_tokenizer_path(Path::new(model_path)) {
+            return Err(TokenizerError::TokenizerFileNotFound {
+                path: resolved_model_path,
+            });
+        }
+
+        Ok(Self::Byte(ByteTokenizer))
     }
 
     fn from_tokenizer_source(tokenizer_path: &str) -> Result<Self, TokenizerError> {
         let path = Path::new(tokenizer_path);
         if resolve_tokenizer_json(path).is_some() {
+            return Ok(Self::Hf(Box::new(HfTokenizer::from_tokenizer_path(path)?)));
+        }
+        if is_explicit_local_tokenizer_path(path) {
             return Ok(Self::Hf(Box::new(HfTokenizer::from_tokenizer_path(path)?)));
         }
         if is_local_tokenizer_path(path) && !looks_like_hf_model_id(tokenizer_path) {
@@ -492,6 +501,17 @@ fn resolve_tokenizer_json(path: &Path) -> Option<PathBuf> {
 fn is_local_tokenizer_path(path: &Path) -> bool {
     path.is_absolute()
         || path.components().count() > 1
+        || matches!(
+            path.components().next(),
+            Some(std::path::Component::CurDir | std::path::Component::ParentDir)
+        )
+        || path
+            .file_name()
+            .is_some_and(|file_name| file_name == "tokenizer.json")
+}
+
+fn is_explicit_local_tokenizer_path(path: &Path) -> bool {
+    path.is_absolute()
         || matches!(
             path.components().next(),
             Some(std::path::Component::CurDir | std::path::Component::ParentDir)
