@@ -48,7 +48,9 @@ __pycache__/
 /AGENTS.md
 /CLAUDE.md
 /.agents/
+/.claude/
 /.codex/
+/.gitnexus/
 /.superpowers/
 /docs/superpowers/
 /superpowers/
