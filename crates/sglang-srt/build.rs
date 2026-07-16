@@ -20,11 +20,15 @@ fn compile_proto() {
     let sglang_proto = proto_root.join("sglang/runtime/v1/sglang.proto");
     let descriptor_path = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set"))
         .join("sglang_runtime_descriptor.bin");
+    let protoc = protoc_bin_vendored::protoc_bin_path()
+        .expect("vendored protoc binary should support the build host");
+    let mut prost_config = tonic_prost_build::Config::new();
+    prost_config.protoc_executable(protoc);
 
     println!("cargo:rerun-if-changed={}", sglang_proto.display());
     tonic_prost_build::configure()
         .file_descriptor_set_path(descriptor_path)
-        .compile_protos(&[sglang_proto], &[proto_root])
+        .compile_with_config(prost_config, &[sglang_proto], &[proto_root])
         .expect("sglang runtime proto should compile");
 }
 

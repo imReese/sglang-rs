@@ -30,4 +30,5 @@ hf-hub = { version = "0.4.3", default-features = false, features = ["ureq", "rus
 sglang-kernel = { version = "0.1.0", path = "../sglang-kernel" }
 
 [build-dependencies]
+protoc-bin-vendored = "3.2.0"
 tonic-prost-build = "0.14.6"
