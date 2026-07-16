@@ -12,6 +12,7 @@ pub mod grpc;
 pub mod http;
 pub mod model_artifacts;
 pub mod model_executor;
+pub mod model_registry;
 mod openai_classify;
 mod openai_embedding;
 mod openai_id;

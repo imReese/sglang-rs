@@ -69,6 +69,7 @@ fn write_embedding_lm_artifacts(model_dir: &Path) {
     fs::write(
         model_dir.join("config.json"),
         r#"{
+  "architectures": ["SglangEmbeddingLmForCausalLM"],
   "model_type": "sglang_embedding_lm",
   "vocab_size": 3,
   "hidden_size": 2

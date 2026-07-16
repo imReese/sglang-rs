@@ -145,6 +145,51 @@ pub struct CudaBackend {
     device: CudaDeviceInfo,
 }
 
+pub(crate) enum InitializedRuntimeBackend {
+    CpuReference,
+    Cuda(CudaBackend),
+    Unavailable(RuntimeBackend),
+}
+
+impl InitializedRuntimeBackend {
+    pub(crate) fn initialize(
+        requested: RuntimeBackend,
+    ) -> Result<Self, RuntimeBackendInitializationError> {
+        match requested {
+            RuntimeBackend::Cpu => Ok(Self::CpuReference),
+            RuntimeBackend::Cuda => CudaBackend::initialize(0).map(Self::Cuda).map_err(|error| {
+                RuntimeBackendInitializationError {
+                    requested,
+                    message: error.to_string(),
+                }
+            }),
+            RuntimeBackend::Auto => CudaBackend::initialize(0).map(Self::Cuda).map_err(|error| {
+                RuntimeBackendInitializationError {
+                    requested,
+                    message: format!(
+                        "no executable production backend was detected; CUDA initialization failed: {error}; auto never falls back to the CPU reference backend"
+                    ),
+                }
+            }),
+            backend => Ok(Self::Unavailable(backend)),
+        }
+    }
+
+    pub(crate) fn runtime_backend(&self) -> RuntimeBackend {
+        match self {
+            Self::CpuReference => RuntimeBackend::Cpu,
+            Self::Cuda(_) => RuntimeBackend::Cuda,
+            Self::Unavailable(backend) => *backend,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeBackendInitializationError {
+    pub(crate) requested: RuntimeBackend,
+    pub(crate) message: String,
+}
+
 impl CudaBackend {
     pub fn initialize(device_ordinal: usize) -> Result<Self, CudaError> {
         let driver = CudaDriver::load()?;

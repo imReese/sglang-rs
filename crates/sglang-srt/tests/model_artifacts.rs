@@ -13,6 +13,7 @@ use sglang_srt::model_artifacts::{
     SafetensorsRoutedExpertWeightSpan, SafetensorsTensorData, SafetensorsTensorMetadata,
     SafetensorsTensorSpan,
 };
+use sglang_srt::model_registry::{ModelRegistry, ModelRegistryError};
 
 static HF_ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -406,12 +407,13 @@ fn local_model_artifacts_builds_checkpoint_catalog_for_layer_and_routed_weights(
 }
 
 #[test]
-fn local_model_artifacts_dispatches_checkpoint_validation_by_model_type() {
+fn model_registry_dispatches_checkpoint_validation_by_architecture() {
     let deepseek_dir = temp_model_dir("deepseek-v4-dispatch-validation");
     fs::create_dir_all(&deepseek_dir).expect("temp model dir should be created");
     fs::write(
         deepseek_dir.join("config.json"),
         r#"{
+  "architectures": ["DeepseekV4ForCausalLM"],
   "model_type": "deepseek_v4",
   "num_hidden_layers": 0
 }"#,
@@ -429,14 +431,17 @@ fn local_model_artifacts_dispatches_checkpoint_validation_by_model_type() {
     let deepseek_artifacts = LocalModelArtifacts::from_model_path(&deepseek_dir)
         .expect("DeepSeek local artifacts should load");
 
-    let error = deepseek_artifacts
-        .validate_checkpoint_for_supported_model()
+    let error = ModelRegistry
+        .validate_checkpoint(&deepseek_artifacts)
         .expect_err("DeepSeek V4 dispatch should enforce DeepSeek checkpoint structure");
 
     assert!(
         matches!(
             error,
-            ModelArtifactError::InvalidSafetensorsData { ref path, ref message }
+            ModelRegistryError::ModelArtifact(ModelArtifactError::InvalidSafetensorsData {
+                ref path,
+                ref message,
+            })
                 if path == &deepseek_dir
                     && message.contains("missing DeepSeek model tensor")
                     && message.contains("lm_head.weight")
@@ -444,33 +449,12 @@ fn local_model_artifacts_dispatches_checkpoint_validation_by_model_type() {
         "unexpected error: {error:?}"
     );
 
-    let generic_dir = temp_model_dir("generic-dispatch-validation");
-    fs::create_dir_all(&generic_dir).expect("temp model dir should be created");
-    fs::write(
-        generic_dir.join("config.json"),
-        r#"{
-  "model_type": "llama"
-}"#,
-    )
-    .expect("config should be written");
-    write_safetensors_file(
-        &generic_dir.join("model.safetensors"),
-        &[("model.embed_tokens.weight", "U8", &[1], [0, 1])],
-        &[7],
-    )
-    .expect("shard should be written");
-    let generic_artifacts = LocalModelArtifacts::from_model_path(&generic_dir)
-        .expect("generic local artifacts should load");
-
-    generic_artifacts
-        .validate_checkpoint_for_supported_model()
-        .expect("unknown model dispatch should keep generic artifact validation");
-
     let glm_dir = temp_model_dir("glm-moe-dsa-dispatch-validation");
     fs::create_dir_all(&glm_dir).expect("temp model dir should be created");
     fs::write(
         glm_dir.join("config.json"),
         r#"{
+  "architectures": ["GlmMoeDsaForCausalLM"],
   "model_type": "glm_moe_dsa",
   "num_hidden_layers": 0
 }"#,
@@ -488,14 +472,17 @@ fn local_model_artifacts_dispatches_checkpoint_validation_by_model_type() {
     let glm_artifacts =
         LocalModelArtifacts::from_model_path(&glm_dir).expect("GLM local artifacts should load");
 
-    let error = glm_artifacts
-        .validate_checkpoint_for_supported_model()
+    let error = ModelRegistry
+        .validate_checkpoint(&glm_artifacts)
         .expect_err("GLM-DSA dispatch should enforce CausalLM checkpoint roots");
 
     assert!(
         matches!(
             error,
-            ModelArtifactError::InvalidSafetensorsData { ref path, ref message }
+            ModelRegistryError::ModelArtifact(ModelArtifactError::InvalidSafetensorsData {
+                ref path,
+                ref message,
+            })
                 if path == &glm_dir
                     && message.contains("missing GLM-DSA model tensor")
                     && message.contains("lm_head.weight")
@@ -504,7 +491,6 @@ fn local_model_artifacts_dispatches_checkpoint_validation_by_model_type() {
     );
 
     fs::remove_dir_all(deepseek_dir).expect("temp model dir should be removed");
-    fs::remove_dir_all(generic_dir).expect("temp model dir should be removed");
     fs::remove_dir_all(glm_dir).expect("temp model dir should be removed");
 }
 

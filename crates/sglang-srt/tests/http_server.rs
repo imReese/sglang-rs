@@ -1322,12 +1322,12 @@ async fn http_server_update_weights_from_disk_validates_artifacts_and_updates_mo
     let model_path = model_dir.to_string_lossy().to_string();
     assert_eq!(model_info["model_path"], model_path);
     assert_eq!(model_info["tokenizer_path"], model_path);
-    assert_eq!(model_info["model_type"], "tiny");
+    assert_eq!(model_info["model_type"], "sglang_embedding_lm");
     assert_eq!(
         model_info["architectures"],
-        serde_json::json!(["TinyForCausalLM"])
+        serde_json::json!(["SglangEmbeddingLmForCausalLM"])
     );
-    assert_eq!(model_info["vocab_size"], 128);
+    assert_eq!(model_info["vocab_size"], 1);
     assert_eq!(model_info["max_context_length"], 4096);
     assert!(
         model_info["weight_version"]
@@ -1549,6 +1549,8 @@ async fn http_server_get_weights_by_name_reads_safetensors_parameter() {
         "serve",
         "--model-path",
         model_dir.to_str().expect("temp model dir should be utf-8"),
+        "--device",
+        "cpu",
         "--served-model-name",
         "tiny-http",
         "--host",
@@ -2731,6 +2733,8 @@ async fn http_launch_starts_engine_info_bootstrap_and_serves_remote_info() {
         "serve",
         "--model-path",
         model_dir.to_str().expect("temp model dir should be utf-8"),
+        "--device",
+        "cpu",
         "--served-model-name",
         "tiny-http",
         "--host",
@@ -3032,9 +3036,10 @@ fn write_minimal_generic_model_artifacts(model_dir: &Path) {
     fs::write(
         model_dir.join("config.json"),
         r#"{
-  "architectures": ["TinyForCausalLM"],
-  "model_type": "tiny",
-  "vocab_size": 128,
+  "architectures": ["SglangEmbeddingLmForCausalLM"],
+  "model_type": "sglang_embedding_lm",
+  "vocab_size": 1,
+  "hidden_size": 1,
   "max_position_embeddings": 4096,
   "eos_token_id": [2, 3]
 }"#,
@@ -3050,6 +3055,7 @@ fn write_minimal_embedding_lm_artifacts(model_dir: &Path) {
         model_dir.join("config.json"),
         format!(
             r#"{{
+  "architectures": ["SglangEmbeddingLmForCausalLM"],
   "model_type": "sglang_embedding_lm",
   "vocab_size": {VOCAB_SIZE},
   "hidden_size": 1
@@ -3074,24 +3080,28 @@ fn write_minimal_generic_model_artifacts_with_weight_values(model_dir: &Path, va
     fs::create_dir_all(model_dir).expect("temp model dir should be created");
     fs::write(
         model_dir.join("config.json"),
-        r#"{
-  "architectures": ["TinyForCausalLM"],
-  "model_type": "tiny",
-  "vocab_size": 128,
+        format!(
+            r#"{{
+  "architectures": ["SglangEmbeddingLmForCausalLM"],
+  "model_type": "sglang_embedding_lm",
+  "vocab_size": {},
+  "hidden_size": 1,
   "max_position_embeddings": 4096,
   "eos_token_id": [2, 3]
-}"#,
+}}"#,
+            values.len()
+        ),
     )
     .expect("config should be written");
     write_safetensors_weight_values(&model_dir.join("model.safetensors"), values);
 }
 
 fn write_minimal_safetensors_file(path: &Path) {
-    let header =
-        br#"{"model.embed_tokens.weight":{"dtype":"F32","shape":[1,1],"data_offsets":[0,4]}}"#;
+    let header = br#"{"model.embed_tokens.weight":{"dtype":"F32","shape":[1,1],"data_offsets":[0,4]},"lm_head.weight":{"dtype":"F32","shape":[1,1],"data_offsets":[4,8]}}"#;
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
     bytes.extend_from_slice(header);
+    bytes.extend_from_slice(&0.0f32.to_le_bytes());
     bytes.extend_from_slice(&0.0f32.to_le_bytes());
     fs::write(path, bytes).expect("safetensors shard should be written");
 }
@@ -3099,9 +3109,12 @@ fn write_minimal_safetensors_file(path: &Path) {
 fn write_safetensors_weight_values(path: &Path, values: &[f32]) {
     let byte_len = std::mem::size_of_val(values);
     let header = format!(
-        r#"{{"model.embed_tokens.weight":{{"dtype":"F32","shape":[{}],"data_offsets":[0,{}]}}}}"#,
+        r#"{{"model.embed_tokens.weight":{{"dtype":"F32","shape":[{},1],"data_offsets":[0,{}]}},"lm_head.weight":{{"dtype":"F32","shape":[{},1],"data_offsets":[{},{}]}}}}"#,
         values.len(),
-        byte_len
+        byte_len,
+        values.len(),
+        byte_len,
+        byte_len * 2
     );
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
@@ -3109,6 +3122,7 @@ fn write_safetensors_weight_values(path: &Path, values: &[f32]) {
     for value in values {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
+    bytes.resize(bytes.len() + byte_len, 0);
     fs::write(path, bytes).expect("safetensors shard should be written");
 }
 

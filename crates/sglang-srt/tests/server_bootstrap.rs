@@ -7,13 +7,14 @@ use std::sync::Mutex;
 use tonic::Request;
 
 use sglang_srt::cli::ServerArgs;
-use sglang_srt::model_artifacts::ModelArtifactError;
+use sglang_srt::model_registry::ModelRegistryError;
 use sglang_srt::pd_bootstrap::PrefillBootstrapService;
 use sglang_srt::proto::sglang::runtime::v1::generate_response::Body;
 use sglang_srt::proto::sglang::runtime::v1::sglang_service_server::SglangService;
 use sglang_srt::proto::sglang::runtime::v1::{
     GetModelInfoRequest, RequestOptions, SamplingParams, TextGenerateRequest, TokenizeRequest,
 };
+use sglang_srt::router::RouterGetModelInfoResponse;
 use sglang_srt::server::{
     ServerLaunchError, build_bootstrap_fake_pd_grpc_router_service,
     build_bootstrap_grpc_router_service, build_bootstrap_pd_grpc_router_service, grpc_listen_addr,
@@ -116,6 +117,7 @@ fn unsupported_accelerator_fails_before_cpu_weight_materialization() {
     fs::write(
         model_dir.join("config.json"),
         r#"{
+  "architectures": ["SglangEmbeddingLmForCausalLM"],
   "model_type": "sglang_embedding_lm",
   "vocab_size": 3,
   "hidden_size": 2
@@ -147,7 +149,10 @@ fn unsupported_accelerator_fails_before_cpu_weight_materialization() {
         assert!(
             matches!(
                 error,
-                ServerLaunchError::UnsupportedModelBackend { backend, .. }
+                ServerLaunchError::ModelRegistry(ModelRegistryError::MissingCapabilities {
+                    backend,
+                    ..
+                })
                     if backend.as_str() == device
             ),
             "unexpected {device} error: {error:?}"
@@ -233,8 +238,8 @@ async fn bootstrap_grpc_router_service_reports_local_model_config_metadata() {
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
 
-#[tokio::test]
-async fn bootstrap_grpc_router_service_reports_local_moe_checkpoint_coverage() {
+#[test]
+fn bootstrap_grpc_router_service_reports_local_moe_checkpoint_coverage() {
     let model_dir = temp_model_dir("server-moe-checkpoint-coverage");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");
     fs::write(
@@ -364,13 +369,7 @@ async fn bootstrap_grpc_router_service_reports_local_moe_checkpoint_coverage() {
         "--grpc-mode",
     ])
     .expect("args should parse");
-    let service = build_bootstrap_grpc_router_service(&args);
-
-    let response = service
-        .get_model_info(Request::new(GetModelInfoRequest {}))
-        .await
-        .expect("model info should execute")
-        .into_inner();
+    let response = RouterGetModelInfoResponse::from_server_args(&args);
 
     assert_eq!(response.routed_expert_expected_group_count, 1);
     assert_eq!(response.routed_expert_actual_group_count, 1);
@@ -380,8 +379,8 @@ async fn bootstrap_grpc_router_service_reports_local_moe_checkpoint_coverage() {
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
 
-#[tokio::test]
-async fn bootstrap_grpc_router_service_rejects_generation_for_unsupported_local_model_runtime() {
+#[test]
+fn bootstrap_grpc_router_service_rejects_generation_for_unsupported_local_model_runtime() {
     let model_dir = temp_model_dir("server-unsupported-local-forward");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");
     write_complete_deepseek_v4_checkpoint(&model_dir);
@@ -389,152 +388,60 @@ async fn bootstrap_grpc_router_service_rejects_generation_for_unsupported_local_
         "serve",
         "--model-path",
         model_dir.to_str().expect("temp model dir should be utf-8"),
+        "--device",
+        "cpu",
         "--grpc-mode",
     ])
     .expect("args should parse");
-    let service = build_bootstrap_grpc_router_service(&args);
-
-    let error = match service
-        .text_generate(Request::new(TextGenerateRequest {
-            text: "hello".to_string(),
-            sampling_params: Some(SamplingParams {
-                max_new_tokens: Some(1),
-                ..Default::default()
-            }),
-            options: Some(RequestOptions {
-                request_id: Some("unsupported-local-forward".to_string()),
-                stream: true,
-                data_parallel_rank: 0,
-                trace_headers: Default::default(),
-            }),
-            disaggregated_params: None,
-        }))
-        .await
-    {
-        Ok(_) => panic!("unsupported local model runtime should not generate fake output"),
-        Err(error) => error,
-    };
-
-    assert_eq!(error.code(), tonic::Code::Internal);
-    assert!(
-        error
-            .message()
-            .contains("DeepSeek V4 Rust forward kernels are not implemented"),
-        "unexpected error: {error:?}"
-    );
-    assert!(
-        error.message().contains("loaded 1 tensor-parallel rank(s)"),
-        "unexpected error: {error:?}"
-    );
-
-    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
-}
-
-#[tokio::test]
-async fn bootstrap_grpc_router_service_routes_glm_moe_dsa_through_runtime_loader() {
-    let model_dir = temp_model_dir("server-glm-runtime-forward");
-    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
-    write_complete_glm_moe_dsa_forward_checkpoint(&model_dir);
-    fs::write(
-        model_dir.join("tokenizer.json"),
-        word_level_tokenizer_json(),
-    )
-    .expect("tokenizer should be written");
-    let args = ServerArgs::parse_from([
-        "serve",
-        "--model-path",
-        model_dir.to_str().expect("temp model dir should be utf-8"),
-        "--grpc-mode",
-    ])
-    .expect("args should parse");
-    let service = build_bootstrap_grpc_router_service(&args);
-
-    let mut stream = service
-        .text_generate(Request::new(TextGenerateRequest {
-            text: "hello".to_string(),
-            sampling_params: Some(SamplingParams {
-                max_new_tokens: Some(1),
-                ..Default::default()
-            }),
-            options: Some(RequestOptions {
-                request_id: Some("glm-runtime-forward".to_string()),
-                stream: true,
-                data_parallel_rank: 0,
-                trace_headers: Default::default(),
-            }),
-            disaggregated_params: None,
-        }))
-        .await
-        .expect("GLM f32 runtime should execute")
-        .into_inner();
-
-    let response = tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
-        .await
-        .expect("one response")
-        .expect("response should be ok");
-
-    assert_eq!(response.request_id, "glm-runtime-forward");
-    assert_eq!(
-        response.body,
-        Some(Body::Complete(
-            sglang_srt::proto::sglang::runtime::v1::GenerateComplete {
-                output_ids: vec![2],
-                text: "world".to_string(),
-                finish_reason: "stop".to_string(),
-                prompt_tokens: 1,
-                completion_tokens: 1,
-                cached_tokens: 0,
-                index: 0,
-            }
-        ))
-    );
-
-    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
-}
-
-#[test]
-fn bootstrap_grpc_router_service_rejects_missing_deepseek_v4_model_root_tensor() {
-    let model_dir = temp_model_dir("server-missing-deepseek-root");
-    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
-    fs::write(
-        model_dir.join("config.json"),
-        r#"{
-  "model_type": "deepseek_v4",
-  "num_hidden_layers": 0
-}"#,
-    )
-    .expect("config should be written");
-    write_safetensors_file(
-        &model_dir.join("model.safetensors"),
-        &[
-            ("model.embed_tokens.weight", "U8", &[1], [0, 1]),
-            ("model.norm.weight", "U8", &[1], [1, 2]),
-        ],
-        &[1, 2],
-    )
-    .expect("shard should be written");
-    let args = ServerArgs::parse_from([
-        "serve",
-        "--model-path",
-        model_dir.to_str().expect("temp model dir should be utf-8"),
-        "--grpc-mode",
-    ])
-    .expect("args should parse");
-
     let error = match try_build_bootstrap_grpc_router_service(&args) {
-        Ok(_) => panic!("missing DeepSeek V4 model root tensor should fail bootstrap"),
+        Ok(_) => panic!("DeepSeek without a forward executor must fail during startup"),
         Err(error) => error,
     };
 
     assert!(
         matches!(
             error,
-            ServerLaunchError::ModelArtifact(ModelArtifactError::InvalidSafetensorsData {
-                ref path,
-                ref message,
-            }) if path == &model_dir
-                && message.contains("missing DeepSeek model tensor")
-                && message.contains("lm_head.weight")
+            ServerLaunchError::ModelRegistry(ModelRegistryError::MissingCapabilities {
+                architecture: "DeepseekV4ForCausalLM",
+                backend: sglang_srt::backend::RuntimeBackend::Cpu,
+                ref missing,
+                ..
+            }) if missing == &["registered model forward executor"]
+        ),
+        "unexpected error: {error:?}"
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn bootstrap_rejects_glm_legacy_executor_before_service_construction() {
+    let model_dir = temp_model_dir("server-glm-runtime-forward");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_complete_glm_moe_dsa_forward_checkpoint(&model_dir);
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_dir.to_str().expect("temp model dir should be utf-8"),
+        "--device",
+        "cpu",
+        "--grpc-mode",
+    ])
+    .expect("args should parse");
+    let error = match try_build_bootstrap_grpc_router_service(&args) {
+        Ok(_) => panic!("GLM legacy executor must not enter the generic serving path"),
+        Err(error) => error,
+    };
+
+    assert!(
+        matches!(
+            error,
+            ServerLaunchError::ModelRegistry(ModelRegistryError::MissingCapabilities {
+                architecture: "GlmMoeDsaForCausalLM",
+                backend: sglang_srt::backend::RuntimeBackend::Cpu,
+                ref missing,
+                ..
+            }) if missing == &["registered model forward executor"]
         ),
         "unexpected error: {error:?}"
     );
@@ -602,6 +509,7 @@ async fn bootstrap_grpc_router_service_generates_from_local_fp8_safetensors_weig
     fs::write(
         model_dir.join("config.json"),
         r#"{
+  "architectures": ["SglangEmbeddingLmForCausalLM"],
   "model_type": "sglang_embedding_lm",
   "vocab_size": 3,
   "hidden_size": 2
@@ -638,6 +546,8 @@ async fn bootstrap_grpc_router_service_generates_from_local_fp8_safetensors_weig
         "serve",
         "--model-path",
         model_dir.to_str().expect("temp model dir should be utf-8"),
+        "--device",
+        "cpu",
         "--grpc-mode",
     ])
     .expect("args should parse");
@@ -902,134 +812,6 @@ fn bootstrap_grpc_router_service_rejects_missing_explicit_tokenizer_path() {
             path: tokenizer_dir
         })
     );
-}
-
-#[test]
-fn bootstrap_grpc_router_service_rejects_incomplete_local_moe_checkpoint() {
-    let model_dir = temp_model_dir("server-incomplete-moe-checkpoint");
-    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
-    fs::write(
-        model_dir.join("config.json"),
-        r#"{
-  "model_type": "deepseek_v4",
-  "num_hidden_layers": 2,
-  "n_routed_experts": 2,
-  "first_k_dense_replace": 0,
-  "moe_layer_freq": 1
-}"#,
-    )
-    .expect("config should be written");
-    fs::write(
-        model_dir.join("model.safetensors.index.json"),
-        r#"{
-  "weight_map": {
-    "model.layers.0.ffn.experts.0.w1.weight": "model.safetensors",
-    "model.layers.0.ffn.experts.0.w2.weight": "model.safetensors",
-    "model.layers.0.ffn.experts.0.w3.weight": "model.safetensors"
-  }
-}"#,
-    )
-    .expect("index should be written");
-    write_safetensors_file(
-        &model_dir.join("model.safetensors"),
-        &[
-            ("model.layers.0.ffn.experts.0.w1.weight", "U8", &[1], [0, 1]),
-            ("model.layers.0.ffn.experts.0.w2.weight", "U8", &[1], [1, 2]),
-            ("model.layers.0.ffn.experts.0.w3.weight", "U8", &[1], [2, 3]),
-        ],
-        &[1, 2, 3],
-    )
-    .expect("shard should be written");
-    let args = ServerArgs::parse_from([
-        "serve",
-        "--model-path",
-        model_dir.to_str().expect("temp model dir should be utf-8"),
-        "--grpc-mode",
-    ])
-    .expect("args should parse");
-
-    let error = match try_build_bootstrap_grpc_router_service(&args) {
-        Ok(_) => panic!("incomplete local MoE checkpoint should fail bootstrap"),
-        Err(error) => error,
-    };
-
-    assert!(
-        matches!(
-            error,
-            ServerLaunchError::ModelArtifact(ModelArtifactError::InvalidSafetensorsData {
-                ref path,
-                ref message,
-            }) if path == &model_dir
-                && message.contains("expected 4 routed expert groups")
-                && message.contains("found 1")
-        ),
-        "unexpected error: {error:?}"
-    );
-
-    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
-}
-
-#[test]
-fn bootstrap_grpc_router_service_rejects_duplicate_local_layer_tensors() {
-    let model_dir = temp_model_dir("server-duplicate-layer-tensors");
-    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
-    fs::write(
-        model_dir.join("config.json"),
-        deepseek_v4_model_config_json(),
-    )
-    .expect("config should be written");
-    let first_shard = model_dir.join("model-00001.safetensors");
-    write_safetensors_file(
-        &first_shard,
-        &[(
-            "model.layers.0.self_attn.q_a_proj.weight",
-            "U8",
-            &[1],
-            [0, 1],
-        )],
-        &[1],
-    )
-    .expect("first shard should be written");
-    let second_shard = model_dir.join("model-00002.safetensors");
-    write_safetensors_file(
-        &second_shard,
-        &[(
-            "model.layers.0.self_attn.q_a_proj.weight",
-            "U8",
-            &[1],
-            [0, 1],
-        )],
-        &[2],
-    )
-    .expect("second shard should be written");
-    let args = ServerArgs::parse_from([
-        "serve",
-        "--model-path",
-        model_dir.to_str().expect("temp model dir should be utf-8"),
-        "--grpc-mode",
-    ])
-    .expect("args should parse");
-
-    let error = match try_build_bootstrap_grpc_router_service(&args) {
-        Ok(_) => panic!("duplicate local layer tensor should fail bootstrap"),
-        Err(error) => error,
-    };
-
-    assert!(
-        matches!(
-            error,
-            ServerLaunchError::ModelArtifact(ModelArtifactError::InvalidSafetensorsData {
-                ref path,
-                ref message,
-            }) if path == &second_shard
-                && message.contains("duplicate layer tensor suffix")
-                && message.contains("layer 0")
-                && message.contains("self_attn.q_a_proj.weight")
-        ),
-        "unexpected error: {error:?}"
-    );
-
-    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
 
 #[tokio::test]
@@ -1546,6 +1328,7 @@ fn write_complete_deepseek_v4_checkpoint(model_dir: &std::path::Path) {
     fs::write(
         model_dir.join("config.json"),
         r#"{
+  "architectures": ["DeepseekV4ForCausalLM"],
   "model_type": "deepseek_v4",
   "num_hidden_layers": 1,
   "hidden_size": 1,
@@ -1669,6 +1452,7 @@ fn write_complete_glm_moe_dsa_forward_checkpoint(model_dir: &std::path::Path) {
     fs::write(
         model_dir.join("config.json"),
         r#"{
+  "architectures": ["GlmMoeDsaForCausalLM"],
   "model_type": "glm_moe_dsa",
   "vocab_size": 3,
   "num_hidden_layers": 1,

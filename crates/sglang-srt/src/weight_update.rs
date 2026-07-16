@@ -1,6 +1,7 @@
 use sha2::{Digest, Sha256};
 
 use crate::model_artifacts::LocalModelArtifacts;
+use crate::model_registry::ModelRegistry;
 use crate::router::RouterGetModelInfoResponse;
 use crate::worker::WorkerWeightUpdateRequest;
 
@@ -26,8 +27,8 @@ pub(crate) fn update_model_info_from_disk(
 
     let artifacts = LocalModelArtifacts::from_model_path(model_path)
         .map_err(|error| format!("invalid local model artifacts: {error}"))?;
-    artifacts
-        .validate_checkpoint_for_supported_model()
+    ModelRegistry
+        .validate_checkpoint(&artifacts)
         .map_err(|error| format!("unsupported local model checkpoint: {error}"))?;
 
     let weight_version = safetensors_weight_version(&artifacts, load_format)?;

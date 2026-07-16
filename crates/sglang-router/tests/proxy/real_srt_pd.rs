@@ -371,6 +371,8 @@ async fn spawn_prefill_worker(
         "serve",
         "--model-path",
         model_path.to_str().expect("model path should be UTF-8"),
+        "--device",
+        "cpu",
         "--served-model-name",
         "tiny",
         "--host",
@@ -406,6 +408,8 @@ async fn spawn_decode_worker(
         "serve",
         "--model-path",
         model_path.to_str().expect("model path should be UTF-8"),
+        "--device",
+        "cpu",
         "--served-model-name",
         "tiny",
         "--host",
@@ -438,6 +442,8 @@ async fn spawn_fake_prefill_worker(
         "serve",
         "--model-path",
         model_path.to_str().expect("model path should be UTF-8"),
+        "--device",
+        "cpu",
         "--served-model-name",
         "tiny",
         "--host",
@@ -471,6 +477,8 @@ async fn spawn_fake_decode_worker(
         "serve",
         "--model-path",
         model_path.to_str().expect("model path should be UTF-8"),
+        "--device",
+        "cpu",
         "--served-model-name",
         "tiny",
         "--host",
@@ -541,6 +549,7 @@ fn write_cpu_embedding_lm_fixture(model_dir: &Path) {
     fs::write(
         model_dir.join("config.json"),
         r#"{
+  "architectures": ["SglangEmbeddingLmForCausalLM"],
   "model_type": "sglang_embedding_lm",
   "vocab_size": 3,
   "hidden_size": 2,
@@ -605,6 +614,7 @@ fn write_glm_moe_dsa_attention_output_fixture(model_dir: &Path) {
     fs::write(
         model_dir.join("config.json"),
         r#"{
+  "architectures": ["GlmMoeDsaForCausalLM"],
   "model_type": "glm_moe_dsa",
   "vocab_size": 2,
   "num_hidden_layers": 1,

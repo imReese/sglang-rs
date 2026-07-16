@@ -109,9 +109,10 @@ fn write_minimal_generic_model_artifacts(model_dir: &Path) {
     fs::write(
         model_dir.join("config.json"),
         r#"{
-  "architectures": ["TinyForCausalLM"],
-  "model_type": "tiny",
-  "vocab_size": 128,
+  "architectures": ["SglangEmbeddingLmForCausalLM"],
+  "model_type": "sglang_embedding_lm",
+  "vocab_size": 1,
+  "hidden_size": 1,
   "max_position_embeddings": 4096,
   "eos_token_id": [2, 3]
 }"#,
@@ -137,11 +138,11 @@ fn write_minimal_generic_model_artifacts_with_weight_values(model_dir: &Path, va
 }
 
 fn write_minimal_safetensors_file(path: &Path) {
-    let header =
-        br#"{"model.embed_tokens.weight":{"dtype":"F32","shape":[1,1],"data_offsets":[0,4]}}"#;
+    let header = br#"{"model.embed_tokens.weight":{"dtype":"F32","shape":[1,1],"data_offsets":[0,4]},"lm_head.weight":{"dtype":"F32","shape":[1,1],"data_offsets":[4,8]}}"#;
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
     bytes.extend_from_slice(header);
+    bytes.extend_from_slice(&0.0f32.to_le_bytes());
     bytes.extend_from_slice(&0.0f32.to_le_bytes());
     fs::write(path, bytes).expect("safetensors shard should be written");
 }
@@ -1652,9 +1653,9 @@ async fn grpc_update_weights_from_disk_validates_artifacts_and_updates_model_inf
     assert_eq!(model_info.model_path, model_dir.to_string_lossy());
     assert_eq!(model_info.tokenizer_path, model_dir.to_string_lossy());
     assert_eq!(model_info.served_model_name, "tiny");
-    assert_eq!(model_info.model_type, "tiny");
+    assert_eq!(model_info.model_type, "sglang_embedding_lm");
     assert_eq!(model_info.eos_token_ids, vec![2, 3]);
-    assert_eq!(model_info.vocab_size, 128);
+    assert_eq!(model_info.vocab_size, 1);
     assert_eq!(model_info.max_context_length, 4096);
     assert!(model_info.weight_version.starts_with("safetensors-sha256:"));
 

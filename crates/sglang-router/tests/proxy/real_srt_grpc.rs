@@ -113,6 +113,7 @@ fn write_embedding_lm_artifacts_with_weight_values(model_dir: &std::path::Path, 
     fs::write(
         model_dir.join("config.json"),
         r#"{
+  "architectures": ["SglangEmbeddingLmForCausalLM"],
   "model_type": "sglang_embedding_lm",
   "vocab_size": 3,
   "hidden_size": 1,
@@ -446,6 +447,8 @@ async fn router_get_weights_by_name_reaches_real_rust_srt_grpc_worker() {
         "serve",
         "--model-path",
         model_dir.to_str().expect("model dir should be utf-8"),
+        "--device",
+        "cpu",
         "--served-model-name",
         "tiny",
         "--host",
