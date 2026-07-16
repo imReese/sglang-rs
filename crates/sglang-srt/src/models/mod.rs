@@ -125,6 +125,46 @@ pub enum FeedForwardFamily {
     MixtureOfExperts,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DenseDecoderActivation {
+    Silu,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DenseDecoderLayerWeightNames {
+    pub(crate) input_norm: String,
+    pub(crate) query_weight: String,
+    pub(crate) query_bias: Option<String>,
+    pub(crate) key_weight: String,
+    pub(crate) key_bias: Option<String>,
+    pub(crate) value_weight: String,
+    pub(crate) value_bias: Option<String>,
+    pub(crate) output_weight: String,
+    pub(crate) post_attention_norm: String,
+    pub(crate) gate_weight: String,
+    pub(crate) up_weight: String,
+    pub(crate) down_weight: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DenseDecoderWeightNames {
+    pub(crate) token_embeddings: String,
+    pub(crate) final_norm: String,
+    pub(crate) lm_head: Option<String>,
+    pub(crate) layers: Vec<DenseDecoderLayerWeightNames>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DenseDecoderExecutionPlan {
+    pub(crate) vocab_size: usize,
+    pub(crate) hidden_size: usize,
+    pub(crate) max_position_embeddings: usize,
+    pub(crate) rms_norm_eps: f32,
+    pub(crate) rope_theta: f32,
+    pub(crate) activation: DenseDecoderActivation,
+    pub(crate) weights: DenseDecoderWeightNames,
+}
+
 impl fmt::Display for FeedForwardFamily {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -172,13 +212,14 @@ impl ModelExecutionArchitecture {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ModelDefinition {
     architecture: &'static str,
     model_type: Option<String>,
     execution: ModelExecutionArchitecture,
-    dtype: RuntimeDtype,
+    supported_dtypes: Vec<RuntimeDtype>,
     kv_cache_layout: Option<KvCacheModelLayout>,
+    dense_decoder: Option<DenseDecoderExecutionPlan>,
 }
 
 impl ModelDefinition {
@@ -186,16 +227,23 @@ impl ModelDefinition {
         architecture: &'static str,
         config: &HfModelConfig,
         execution: ModelExecutionArchitecture,
-        dtype: RuntimeDtype,
+        supported_dtypes: Vec<RuntimeDtype>,
         kv_cache_layout: Option<KvCacheModelLayout>,
     ) -> Self {
+        debug_assert!(!supported_dtypes.is_empty());
         Self {
             architecture,
             model_type: config.model_type.clone(),
             execution,
-            dtype,
+            supported_dtypes,
             kv_cache_layout,
+            dense_decoder: None,
         }
+    }
+
+    pub(crate) fn with_dense_decoder(mut self, plan: DenseDecoderExecutionPlan) -> Self {
+        self.dense_decoder = Some(plan);
+        self
     }
 
     pub fn architecture(&self) -> &'static str {
@@ -210,22 +258,112 @@ impl ModelDefinition {
         self.execution
     }
 
-    pub fn dtype(&self) -> RuntimeDtype {
-        self.dtype
+    pub fn supported_dtypes(&self) -> &[RuntimeDtype] {
+        &self.supported_dtypes
     }
 
     pub fn kv_cache_layout(&self) -> Option<KvCacheModelLayout> {
         self.kv_cache_layout
     }
 
+    pub(crate) fn dense_decoder(&self) -> Option<&DenseDecoderExecutionPlan> {
+        self.dense_decoder.as_ref()
+    }
+
+    pub(crate) fn validate_dense_decoder_checkpoint(
+        &self,
+        artifacts: &LocalModelArtifacts,
+    ) -> Result<(), ModelArtifactError> {
+        let Some(plan) = self.dense_decoder() else {
+            return Err(invalid_dense_decoder_checkpoint(
+                artifacts,
+                "model definition does not include a dense decoder execution plan",
+            ));
+        };
+        let ModelExecutionArchitecture::Transformer {
+            attention:
+                AttentionArchitecture::MultiHead {
+                    num_attention_heads,
+                    num_key_value_heads,
+                    head_dim,
+                },
+            feed_forward: FeedForwardArchitecture::Dense { intermediate_size },
+        } = self.execution
+        else {
+            return Err(invalid_dense_decoder_checkpoint(
+                artifacts,
+                "dense decoder plan requires multi-head attention and dense feed-forward components",
+            ));
+        };
+        let query_size = num_attention_heads.checked_mul(head_dim).ok_or_else(|| {
+            invalid_dense_decoder_checkpoint(artifacts, "query projection size overflowed")
+        })?;
+        let kv_size = num_key_value_heads.checked_mul(head_dim).ok_or_else(|| {
+            invalid_dense_decoder_checkpoint(artifacts, "KV projection size overflowed")
+        })?;
+
+        require_tensor_shape(
+            artifacts,
+            &plan.weights.token_embeddings,
+            &[plan.vocab_size, plan.hidden_size],
+        )?;
+        require_tensor_shape(artifacts, &plan.weights.final_norm, &[plan.hidden_size])?;
+        if let Some(lm_head) = &plan.weights.lm_head {
+            require_tensor_shape(artifacts, lm_head, &[plan.vocab_size, plan.hidden_size])?;
+        }
+        if plan.weights.layers.is_empty() {
+            return Err(invalid_dense_decoder_checkpoint(
+                artifacts,
+                "dense decoder weight map has no layers",
+            ));
+        }
+
+        for layer in &plan.weights.layers {
+            require_tensor_shape(artifacts, &layer.input_norm, &[plan.hidden_size])?;
+            require_tensor_shape(
+                artifacts,
+                &layer.query_weight,
+                &[query_size, plan.hidden_size],
+            )?;
+            require_optional_tensor_shape(artifacts, layer.query_bias.as_deref(), &[query_size])?;
+            require_tensor_shape(artifacts, &layer.key_weight, &[kv_size, plan.hidden_size])?;
+            require_optional_tensor_shape(artifacts, layer.key_bias.as_deref(), &[kv_size])?;
+            require_tensor_shape(artifacts, &layer.value_weight, &[kv_size, plan.hidden_size])?;
+            require_optional_tensor_shape(artifacts, layer.value_bias.as_deref(), &[kv_size])?;
+            require_tensor_shape(
+                artifacts,
+                &layer.output_weight,
+                &[plan.hidden_size, query_size],
+            )?;
+            require_tensor_shape(artifacts, &layer.post_attention_norm, &[plan.hidden_size])?;
+            require_tensor_shape(
+                artifacts,
+                &layer.gate_weight,
+                &[intermediate_size, plan.hidden_size],
+            )?;
+            require_tensor_shape(
+                artifacts,
+                &layer.up_weight,
+                &[intermediate_size, plan.hidden_size],
+            )?;
+            require_tensor_shape(
+                artifacts,
+                &layer.down_weight,
+                &[plan.hidden_size, intermediate_size],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn runtime_requirements<'a>(
         &self,
+        execution_dtype: RuntimeDtype,
         tensor_parallel_size: usize,
         requested_attention_backend: Option<&'a str>,
     ) -> RuntimeRequirements<'a> {
         RuntimeRequirements {
             requires_forward: true,
-            dtype: Some(self.dtype),
+            dtype: Some(execution_dtype),
             attention_backend: requested_attention_backend,
             tensor_parallel_size,
             requires_kv_cache_registration: false,
@@ -239,6 +377,53 @@ impl ModelDefinition {
         }
         self.execution
             .validate_tensor_parallel(tensor_parallel_size)
+    }
+}
+
+fn require_optional_tensor_shape(
+    artifacts: &LocalModelArtifacts,
+    tensor_name: Option<&str>,
+    expected_shape: &[usize],
+) -> Result<(), ModelArtifactError> {
+    match tensor_name {
+        Some(tensor_name) => require_tensor_shape(artifacts, tensor_name, expected_shape),
+        None => Ok(()),
+    }
+}
+
+fn require_tensor_shape(
+    artifacts: &LocalModelArtifacts,
+    tensor_name: &str,
+    expected_shape: &[usize],
+) -> Result<(), ModelArtifactError> {
+    let metadata = artifacts
+        .safetensors()
+        .tensor_metadata(tensor_name)?
+        .ok_or_else(|| {
+            invalid_dense_decoder_checkpoint(
+                artifacts,
+                format!("missing dense decoder checkpoint tensor {tensor_name}"),
+            )
+        })?;
+    if metadata.shape != expected_shape {
+        return Err(invalid_dense_decoder_checkpoint(
+            artifacts,
+            format!(
+                "dense decoder tensor {tensor_name} shape {:?} does not match expected {expected_shape:?}",
+                metadata.shape
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_dense_decoder_checkpoint(
+    artifacts: &LocalModelArtifacts,
+    message: impl Into<String>,
+) -> ModelArtifactError {
+    ModelArtifactError::InvalidSafetensorsData {
+        path: artifacts.model_path().to_path_buf(),
+        message: message.into(),
     }
 }
 

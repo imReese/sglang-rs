@@ -1,8 +1,7 @@
 use std::fmt;
 
-use crate::backend::{
-    InitializedRuntimeBackend, RuntimeBackend, RuntimeCapability, RuntimeRequirements,
-};
+use crate::backend::{InitializedRuntimeBackend, RuntimeBackend, RuntimeCapability, RuntimeDtype};
+use crate::cpu_reference::CpuReferenceDenseDecoder;
 use crate::cuda_runtime::CudaEmbeddingLmModel;
 use crate::model_artifacts::LocalModelArtifacts;
 use crate::model_executor::{
@@ -13,17 +12,36 @@ use crate::worker::WorkerWeightUpdateRequest;
 
 pub(crate) trait ModelExecutor: ForwardModel + fmt::Debug + Send {
     fn runtime_capability(&self) -> RuntimeCapability;
+    fn execution_dtype(&self) -> RuntimeDtype;
 }
 
 impl ModelExecutor for CpuEmbeddingLmModel {
     fn runtime_capability(&self) -> RuntimeCapability {
         RuntimeCapability::cpu_reference("cpu-embedding-lm", false)
     }
+
+    fn execution_dtype(&self) -> RuntimeDtype {
+        RuntimeDtype::F32
+    }
 }
 
 impl ModelExecutor for CudaEmbeddingLmModel {
     fn runtime_capability(&self) -> RuntimeCapability {
         CudaEmbeddingLmModel::runtime_capability(self)
+    }
+
+    fn execution_dtype(&self) -> RuntimeDtype {
+        RuntimeDtype::F32
+    }
+}
+
+impl ModelExecutor for CpuReferenceDenseDecoder {
+    fn runtime_capability(&self) -> RuntimeCapability {
+        CpuReferenceDenseDecoder::runtime_capability(self)
+    }
+
+    fn execution_dtype(&self) -> RuntimeDtype {
+        CpuReferenceDenseDecoder::execution_dtype(self)
     }
 }
 
@@ -44,8 +62,18 @@ impl LoadedModelRuntime {
         let runtime_backend = backend.runtime_backend();
         let executor = load_executor(definition, artifacts, backend)?;
         let capability = executor.runtime_capability();
+        let execution_dtype = executor.execution_dtype();
+        if !definition.supported_dtypes().contains(&execution_dtype) {
+            return Err(ModelRuntimeLoadError::MissingCapabilities(vec![format!(
+                "model execution dtype {execution_dtype}"
+            )]));
+        }
         capability
-            .validate_requirements(&definition.runtime_requirements(tensor_parallel_size, None))
+            .validate_requirements(&definition.runtime_requirements(
+                execution_dtype,
+                tensor_parallel_size,
+                None,
+            ))
             .map_err(|mismatch| ModelRuntimeLoadError::MissingCapabilities(mismatch.missing))?;
         Ok(Self {
             runtime_backend,
@@ -59,6 +87,10 @@ impl LoadedModelRuntime {
 
     pub(crate) fn runtime_capability(&self) -> RuntimeCapability {
         self.executor.runtime_capability()
+    }
+
+    pub(crate) fn execution_dtype(&self) -> RuntimeDtype {
+        self.executor.execution_dtype()
     }
 }
 
@@ -94,29 +126,49 @@ pub(crate) fn validate_runtime_support(
         .validate_tensor_parallel(tensor_parallel_size)
         .map_err(|message| ModelRuntimeLoadError::MissingCapabilities(vec![message]))?;
 
-    let requirements = RuntimeRequirements {
-        requires_forward: false,
-        dtype: Some(definition.dtype()),
-        attention_backend: None,
-        tensor_parallel_size,
-        requires_kv_cache_registration: false,
-        requires_mooncake: false,
-    };
-    let mut missing = backend
-        .capabilities()
-        .validate_requirements(&requirements)
-        .err()
-        .map(|mismatch| mismatch.missing)
-        .unwrap_or_default();
+    let backend_capabilities = backend.capabilities();
+    let execution_dtype = definition
+        .supported_dtypes()
+        .iter()
+        .copied()
+        .find(|dtype| backend_capabilities.supported_dtypes.contains(dtype));
+    let mut missing = execution_dtype
+        .is_none()
+        .then(|| {
+            format!(
+                "execution dtype supported by both model ({}) and {} backend ({})",
+                format_dtypes(definition.supported_dtypes()),
+                backend.runtime_backend(),
+                format_dtypes(&backend_capabilities.supported_dtypes)
+            )
+        })
+        .into_iter()
+        .collect::<Vec<_>>();
 
     if let ModelExecutionArchitecture::Transformer {
         attention,
         feed_forward,
     } = definition.execution()
     {
-        missing.push(format!("{} decoder execution", attention.family()));
-        missing.push(format!("{} kernels", feed_forward.family()));
-        missing.push("runtime-owned KV cache allocation".to_string());
+        let has_cpu_reference_executor = matches!(backend, InitializedRuntimeBackend::CpuReference)
+            && definition.dense_decoder().is_some()
+            && matches!(
+                attention,
+                crate::models::AttentionArchitecture::MultiHead { .. }
+            )
+            && matches!(
+                feed_forward,
+                crate::models::FeedForwardArchitecture::Dense { .. }
+            );
+        if !has_cpu_reference_executor {
+            missing.push(format!(
+                "{} {} decoder executor for {} backend",
+                attention.family(),
+                feed_forward.family(),
+                backend.runtime_backend()
+            ));
+            missing.push("runtime-owned KV cache allocation".to_string());
+        }
     }
 
     if missing.is_empty() {
@@ -136,11 +188,45 @@ fn load_executor(
         ModelExecutionArchitecture::Transformer {
             attention,
             feed_forward,
-        } => Err(ModelRuntimeLoadError::MissingCapabilities(vec![
-            format!("{} decoder execution", attention.family()),
-            format!("{} kernels", feed_forward.family()),
-            "runtime-owned KV cache allocation".to_string(),
-        ])),
+        } => match backend {
+            InitializedRuntimeBackend::CpuReference if definition.dense_decoder().is_some() => {
+                CpuReferenceDenseDecoder::load(definition, artifacts)
+                    .map(|model| Box::new(model) as Box<dyn ModelExecutor>)
+                    .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))
+            }
+            InitializedRuntimeBackend::CpuReference => {
+                Err(ModelRuntimeLoadError::MissingCapabilities(vec![format!(
+                    "{} {} decoder executor for cpu backend",
+                    attention.family(),
+                    feed_forward.family()
+                )]))
+            }
+            InitializedRuntimeBackend::Cuda(_) => {
+                Err(ModelRuntimeLoadError::MissingCapabilities(vec![format!(
+                    "{} {} decoder executor for cuda backend",
+                    attention.family(),
+                    feed_forward.family()
+                )]))
+            }
+            InitializedRuntimeBackend::Unavailable(runtime_backend) => {
+                Err(ModelRuntimeLoadError::MissingCapabilities(vec![format!(
+                    "{} runtime backend implementation",
+                    runtime_backend.as_str()
+                )]))
+            }
+        },
+    }
+}
+
+fn format_dtypes(dtypes: &[RuntimeDtype]) -> String {
+    if dtypes.is_empty() {
+        "none".to_string()
+    } else {
+        dtypes
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 

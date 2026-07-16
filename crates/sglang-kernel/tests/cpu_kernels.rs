@@ -1,4 +1,7 @@
-use sglang_kernel::cpu::{apply_token_bitmask_inplace, rms_norm, top_k_renorm_probs};
+use sglang_kernel::cpu::{
+    GroupedQueryAttentionShape, apply_neox_rope_inplace, apply_token_bitmask_inplace,
+    grouped_query_attention, linear, rms_norm, silu_and_mul, top_k_renorm_probs,
+};
 use sglang_kernel::{KernelError, TopK};
 
 #[test]
@@ -16,6 +19,59 @@ fn cpu_rms_norm_matches_reference_values() {
     ];
 
     assert_close(&output, &expected);
+}
+
+#[test]
+fn cpu_linear_uses_row_major_out_in_weights_and_bias() {
+    let output = linear(
+        &[1.0, 2.0, 3.0, 4.0],
+        &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+        Some(&[0.5, -0.5, 1.0]),
+        2,
+        2,
+        3,
+    )
+    .expect("valid linear projection");
+
+    assert_eq!(output, vec![1.5, 1.5, 4.0, 3.5, 3.5, 8.0]);
+}
+
+#[test]
+fn cpu_neox_rope_rotates_half_split_dimensions() {
+    let mut values = vec![1.0, 2.0, 3.0, 4.0];
+    apply_neox_rope_inplace(&mut values, 1, 4, 1, 1.0).expect("valid RoPE");
+    let (cos, sin) = (1.0_f32.cos(), 1.0_f32.sin());
+
+    assert!((values[0] - (1.0 * cos - 3.0 * sin)).abs() < 1e-6);
+    assert!((values[1] - (2.0 * cos - 4.0 * sin)).abs() < 1e-6);
+    assert!((values[2] - (3.0 * cos + 1.0 * sin)).abs() < 1e-6);
+    assert!((values[3] - (4.0 * cos + 2.0 * sin)).abs() < 1e-6);
+}
+
+#[test]
+fn cpu_grouped_query_attention_maps_query_heads_to_kv_groups() {
+    let output = grouped_query_attention(
+        &[1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0],
+        &[1.0, 0.0, 0.0, 1.0],
+        &[2.0, 3.0, 5.0, 7.0],
+        GroupedQueryAttentionShape {
+            token_count: 1,
+            query_head_count: 4,
+            kv_head_count: 2,
+            head_dim: 2,
+            scale: 1.0,
+        },
+    )
+    .expect("valid GQA");
+
+    assert_eq!(output, vec![2.0, 3.0, 2.0, 3.0, 5.0, 7.0, 5.0, 7.0]);
+}
+
+#[test]
+fn cpu_silu_and_mul_matches_reference_formula() {
+    let output = silu_and_mul(&[0.0, 1.0], &[2.0, 3.0]).expect("valid SwiGLU");
+    assert_eq!(output[0], 0.0);
+    assert!((output[1] - 3.0 / (1.0 + (-1.0_f32).exp())).abs() < 1e-6);
 }
 
 #[test]

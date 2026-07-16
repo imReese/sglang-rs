@@ -5,8 +5,9 @@ use crate::model_artifacts::{HfModelConfig, LocalModelArtifacts, ModelArtifactEr
 use crate::transfer::KvCacheModelLayout;
 
 use super::{
-    AttentionArchitecture, FeedForwardArchitecture, ModelAdapter, ModelAdapterError,
-    ModelDefinition, ModelExecutionArchitecture, required_usize,
+    AttentionArchitecture, DenseDecoderActivation, DenseDecoderExecutionPlan,
+    DenseDecoderLayerWeightNames, DenseDecoderWeightNames, FeedForwardArchitecture, ModelAdapter,
+    ModelAdapterError, ModelDefinition, ModelExecutionArchitecture, required_usize,
 };
 
 pub(crate) const QWEN2_ARCHITECTURE: &str = "Qwen2ForCausalLM";
@@ -24,131 +25,221 @@ impl ModelAdapter for Qwen2Adapter {
         _model_path: &Path,
         config: &HfModelConfig,
     ) -> Result<ModelDefinition, ModelAdapterError> {
-        let num_layers = required_usize(
-            QWEN2_ARCHITECTURE,
-            "num_hidden_layers",
-            config.num_hidden_layers,
-        )?;
-        let hidden_size = required_usize(QWEN2_ARCHITECTURE, "hidden_size", config.hidden_size)?;
-        let intermediate_size = required_usize(
-            QWEN2_ARCHITECTURE,
-            "intermediate_size",
-            config.intermediate_size,
-        )?;
-        let num_attention_heads = required_usize(
-            QWEN2_ARCHITECTURE,
-            "num_attention_heads",
-            config.num_attention_heads,
-        )?;
-        let num_key_value_heads = config.num_key_value_heads.unwrap_or(num_attention_heads);
-        if num_key_value_heads == 0 {
-            return Err(ModelAdapterError::invalid(
-                QWEN2_ARCHITECTURE,
-                "num_key_value_heads must be non-zero",
-            ));
-        }
-        let head_dim = match config.head_dim {
-            Some(head_dim) if head_dim > 0 => head_dim,
-            Some(_) => {
-                return Err(ModelAdapterError::invalid(
-                    QWEN2_ARCHITECTURE,
-                    "head_dim must be non-zero",
-                ));
-            }
-            None if hidden_size.is_multiple_of(num_attention_heads) => {
-                hidden_size / num_attention_heads
-            }
-            None => {
-                return Err(ModelAdapterError::invalid(
-                    QWEN2_ARCHITECTURE,
-                    format!(
-                        "hidden_size ({hidden_size}) must be divisible by num_attention_heads ({num_attention_heads})"
-                    ),
-                ));
-            }
-        };
-
-        Ok(ModelDefinition::new(
-            QWEN2_ARCHITECTURE,
-            config,
-            ModelExecutionArchitecture::Transformer {
-                attention: AttentionArchitecture::MultiHead {
-                    num_attention_heads,
-                    num_key_value_heads,
-                    head_dim,
-                },
-                feed_forward: FeedForwardArchitecture::Dense { intermediate_size },
-            },
-            RuntimeDtype::Bf16,
-            Some(KvCacheModelLayout::multi_tensor(
-                num_layers,
-                num_key_value_heads,
-                head_dim,
-                2,
-            )),
-        ))
+        build_qwen2_definition(config)
     }
 
     fn validate_checkpoint(
         &self,
         artifacts: &LocalModelArtifacts,
     ) -> Result<(), ModelArtifactError> {
-        let config = artifacts.config();
-        let num_layers = config.num_hidden_layers.ok_or_else(|| {
-            invalid_checkpoint(artifacts, "Qwen2 config is missing num_hidden_layers")
-        })?;
-        let mut required = vec!["model.embed_tokens.weight", "model.norm.weight"];
-        if config.tie_word_embeddings != Some(true) {
-            required.push("lm_head.weight");
-        }
-        for tensor_name in required {
-            require_tensor(artifacts, tensor_name)?;
-        }
-
-        const LAYER_TENSORS: &[&str] = &[
-            "self_attn.q_proj.weight",
-            "self_attn.k_proj.weight",
-            "self_attn.v_proj.weight",
-            "self_attn.o_proj.weight",
-            "input_layernorm.weight",
-            "post_attention_layernorm.weight",
-            "mlp.gate_proj.weight",
-            "mlp.up_proj.weight",
-            "mlp.down_proj.weight",
-        ];
-        for layer_id in 0..num_layers {
-            for suffix in LAYER_TENSORS {
-                require_tensor(artifacts, &format!("model.layers.{layer_id}.{suffix}"))?;
+        let definition = build_qwen2_definition(artifacts.config()).map_err(|error| {
+            ModelArtifactError::InvalidSafetensorsData {
+                path: artifacts.model_path().to_path_buf(),
+                message: error.to_string(),
             }
-        }
-        Ok(())
+        })?;
+        definition.validate_dense_decoder_checkpoint(artifacts)
     }
 }
 
-fn require_tensor(
-    artifacts: &LocalModelArtifacts,
-    tensor_name: &str,
-) -> Result<(), ModelArtifactError> {
-    if artifacts
-        .safetensors()
-        .tensor_metadata(tensor_name)?
-        .is_none()
+fn build_qwen2_definition(config: &HfModelConfig) -> Result<ModelDefinition, ModelAdapterError> {
+    let vocab_size = required_usize(QWEN2_ARCHITECTURE, "vocab_size", config.vocab_size)?;
+    let num_layers = required_usize(
+        QWEN2_ARCHITECTURE,
+        "num_hidden_layers",
+        config.num_hidden_layers,
+    )?;
+    let hidden_size = required_usize(QWEN2_ARCHITECTURE, "hidden_size", config.hidden_size)?;
+    let intermediate_size = required_usize(
+        QWEN2_ARCHITECTURE,
+        "intermediate_size",
+        config.intermediate_size,
+    )?;
+    let num_attention_heads = required_usize(
+        QWEN2_ARCHITECTURE,
+        "num_attention_heads",
+        config.num_attention_heads,
+    )?;
+    let num_key_value_heads = config.num_key_value_heads.unwrap_or(num_attention_heads);
+    if num_key_value_heads == 0 || !num_attention_heads.is_multiple_of(num_key_value_heads) {
+        return Err(ModelAdapterError::invalid(
+            QWEN2_ARCHITECTURE,
+            format!(
+                "num_attention_heads ({num_attention_heads}) must be divisible by non-zero num_key_value_heads ({num_key_value_heads})"
+            ),
+        ));
+    }
+    let head_divisor = config
+        .original_num_attention_heads
+        .unwrap_or(num_attention_heads);
+    let head_dim = match (config.original_num_attention_heads, config.head_dim) {
+        (Some(_), _) | (None, None) if hidden_size.is_multiple_of(head_divisor) => {
+            hidden_size / head_divisor
+        }
+        (Some(_), _) | (None, None) => {
+            return Err(ModelAdapterError::invalid(
+                QWEN2_ARCHITECTURE,
+                format!(
+                    "hidden_size ({hidden_size}) must be divisible by attention head divisor ({head_divisor})"
+                ),
+            ));
+        }
+        (None, Some(head_dim)) if head_dim > 0 => head_dim,
+        (None, Some(_)) => {
+            return Err(ModelAdapterError::invalid(
+                QWEN2_ARCHITECTURE,
+                "head_dim must be non-zero",
+            ));
+        }
+    };
+    if !head_dim.is_multiple_of(2) {
+        return Err(ModelAdapterError::invalid(
+            QWEN2_ARCHITECTURE,
+            format!("NeoX RoPE requires an even head_dim, found {head_dim}"),
+        ));
+    }
+
+    match config.hidden_act.as_deref() {
+        Some("silu") => {}
+        Some(hidden_act) => {
+            return Err(ModelAdapterError::invalid(
+                QWEN2_ARCHITECTURE,
+                format!("unsupported hidden_act {hidden_act}; shared dense decoder requires silu"),
+            ));
+        }
+        None => {
+            return Err(ModelAdapterError::missing_field(
+                QWEN2_ARCHITECTURE,
+                "hidden_act",
+            ));
+        }
+    }
+    if config.use_sliding_window == Some(true) {
+        return Err(ModelAdapterError::invalid(
+            QWEN2_ARCHITECTURE,
+            format!(
+                "sliding-window attention is not implemented (sliding_window={:?})",
+                config.sliding_window
+            ),
+        ));
+    }
+    validate_default_rope(config)?;
+
+    let rms_norm_eps = config
+        .rms_norm_eps
+        .ok_or_else(|| ModelAdapterError::missing_field(QWEN2_ARCHITECTURE, "rms_norm_eps"))?
+        .get() as f32;
+    if !rms_norm_eps.is_finite() || rms_norm_eps < 0.0 {
+        return Err(ModelAdapterError::invalid(
+            QWEN2_ARCHITECTURE,
+            "rms_norm_eps must be finite and non-negative",
+        ));
+    }
+    let rope_theta = config
+        .rope_theta
+        .map(|theta| theta.get())
+        .unwrap_or(1_000_000.0) as f32;
+    if !rope_theta.is_finite() || rope_theta <= 0.0 {
+        return Err(ModelAdapterError::invalid(
+            QWEN2_ARCHITECTURE,
+            "rope_theta must be finite and positive",
+        ));
+    }
+    let max_position_embeddings = config.max_position_embeddings.unwrap_or(32_768);
+    if max_position_embeddings == 0 {
+        return Err(ModelAdapterError::invalid(
+            QWEN2_ARCHITECTURE,
+            "max_position_embeddings must be non-zero",
+        ));
+    }
+
+    let execution = ModelExecutionArchitecture::Transformer {
+        attention: AttentionArchitecture::MultiHead {
+            num_attention_heads,
+            num_key_value_heads,
+            head_dim,
+        },
+        feed_forward: FeedForwardArchitecture::Dense { intermediate_size },
+    };
+    let plan = DenseDecoderExecutionPlan {
+        vocab_size,
+        hidden_size,
+        max_position_embeddings,
+        rms_norm_eps,
+        rope_theta,
+        activation: DenseDecoderActivation::Silu,
+        weights: qwen2_weight_names(num_layers, config.tie_word_embeddings == Some(true)),
+    };
+
+    Ok(ModelDefinition::new(
+        QWEN2_ARCHITECTURE,
+        config,
+        execution,
+        vec![RuntimeDtype::F32, RuntimeDtype::Fp16, RuntimeDtype::Bf16],
+        Some(KvCacheModelLayout::multi_tensor(
+            num_layers,
+            num_key_value_heads,
+            head_dim,
+            2,
+        )),
+    )
+    .with_dense_decoder(plan))
+}
+
+fn validate_default_rope(config: &HfModelConfig) -> Result<(), ModelAdapterError> {
+    let Some(rope_scaling) = config.rope_scaling.as_ref() else {
+        return Ok(());
+    };
+    let Some(parameters) = rope_scaling.as_object() else {
+        return Err(ModelAdapterError::invalid(
+            QWEN2_ARCHITECTURE,
+            "rope_scaling/rope_parameters must be an object",
+        ));
+    };
+    let rope_type = parameters
+        .get("rope_type")
+        .or_else(|| parameters.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("default");
+    if rope_type != "default"
+        || parameters.contains_key("mrope_section")
+        || parameters
+            .get("use_fope")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
     {
-        return Err(invalid_checkpoint(
-            artifacts,
-            format!("missing Qwen2 checkpoint tensor {tensor_name}"),
+        return Err(ModelAdapterError::invalid(
+            QWEN2_ARCHITECTURE,
+            format!("RoPE variant {rope_type} is not implemented by the dense decoder backend"),
         ));
     }
     Ok(())
 }
 
-fn invalid_checkpoint(
-    artifacts: &LocalModelArtifacts,
-    message: impl Into<String>,
-) -> ModelArtifactError {
-    ModelArtifactError::InvalidSafetensorsData {
-        path: artifacts.model_path().to_path_buf(),
-        message: message.into(),
+fn qwen2_weight_names(num_layers: usize, tied_embeddings: bool) -> DenseDecoderWeightNames {
+    DenseDecoderWeightNames {
+        token_embeddings: "model.embed_tokens.weight".to_string(),
+        final_norm: "model.norm.weight".to_string(),
+        lm_head: (!tied_embeddings).then(|| "lm_head.weight".to_string()),
+        layers: (0..num_layers)
+            .map(|layer_id| {
+                let prefix = format!("model.layers.{layer_id}");
+                DenseDecoderLayerWeightNames {
+                    input_norm: format!("{prefix}.input_layernorm.weight"),
+                    query_weight: format!("{prefix}.self_attn.q_proj.weight"),
+                    query_bias: Some(format!("{prefix}.self_attn.q_proj.bias")),
+                    key_weight: format!("{prefix}.self_attn.k_proj.weight"),
+                    key_bias: Some(format!("{prefix}.self_attn.k_proj.bias")),
+                    value_weight: format!("{prefix}.self_attn.v_proj.weight"),
+                    value_bias: Some(format!("{prefix}.self_attn.v_proj.bias")),
+                    output_weight: format!("{prefix}.self_attn.o_proj.weight"),
+                    post_attention_norm: format!("{prefix}.post_attention_layernorm.weight"),
+                    gate_weight: format!("{prefix}.mlp.gate_proj.weight"),
+                    up_weight: format!("{prefix}.mlp.up_proj.weight"),
+                    down_weight: format!("{prefix}.mlp.down_proj.weight"),
+                }
+            })
+            .collect(),
     }
 }
 
@@ -163,7 +254,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn qwen_adapter_validates_real_dense_decoder_weight_names() {
+    fn qwen_adapter_validates_dense_decoder_weight_names_and_shapes() {
         let model_dir = temp_model_dir("qwen-complete-checkpoint");
         write_qwen_checkpoint(&model_dir, None);
         let artifacts =
@@ -198,52 +289,61 @@ mod tests {
             r#"{
   "architectures": ["Qwen2ForCausalLM"],
   "model_type": "qwen2",
-  "vocab_size": 2,
+  "vocab_size": 8,
   "num_hidden_layers": 1,
-  "hidden_size": 2,
-  "intermediate_size": 4,
+  "hidden_size": 4,
+  "intermediate_size": 8,
   "num_attention_heads": 2,
   "num_key_value_heads": 1,
+  "hidden_act": "silu",
+  "rms_norm_eps": 0.000001,
+  "rope_theta": 1000000.0,
+  "max_position_embeddings": 32,
   "tie_word_embeddings": false
 }"#,
         )
         .expect("config should be written");
 
-        let tensor_names = [
-            "model.embed_tokens.weight",
-            "model.norm.weight",
-            "lm_head.weight",
-            "model.layers.0.self_attn.q_proj.weight",
-            "model.layers.0.self_attn.k_proj.weight",
-            "model.layers.0.self_attn.v_proj.weight",
-            "model.layers.0.self_attn.o_proj.weight",
-            "model.layers.0.input_layernorm.weight",
-            "model.layers.0.post_attention_layernorm.weight",
-            "model.layers.0.mlp.gate_proj.weight",
-            "model.layers.0.mlp.up_proj.weight",
-            "model.layers.0.mlp.down_proj.weight",
+        let tensors = [
+            ("model.embed_tokens.weight", vec![8, 4]),
+            ("model.norm.weight", vec![4]),
+            ("lm_head.weight", vec![8, 4]),
+            ("model.layers.0.self_attn.q_proj.weight", vec![4, 4]),
+            ("model.layers.0.self_attn.q_proj.bias", vec![4]),
+            ("model.layers.0.self_attn.k_proj.weight", vec![2, 4]),
+            ("model.layers.0.self_attn.k_proj.bias", vec![2]),
+            ("model.layers.0.self_attn.v_proj.weight", vec![2, 4]),
+            ("model.layers.0.self_attn.v_proj.bias", vec![2]),
+            ("model.layers.0.self_attn.o_proj.weight", vec![4, 4]),
+            ("model.layers.0.input_layernorm.weight", vec![4]),
+            ("model.layers.0.post_attention_layernorm.weight", vec![4]),
+            ("model.layers.0.mlp.gate_proj.weight", vec![8, 4]),
+            ("model.layers.0.mlp.up_proj.weight", vec![8, 4]),
+            ("model.layers.0.mlp.down_proj.weight", vec![4, 8]),
         ];
-        let included = tensor_names
+        let included = tensors
             .into_iter()
-            .filter(|name| Some(*name) != omitted_tensor)
+            .filter(|(name, _)| Some(*name) != omitted_tensor)
             .collect::<Vec<_>>();
         let mut header = BTreeMap::new();
-        for (index, tensor_name) in included.iter().enumerate() {
-            let start = index * std::mem::size_of::<f32>();
+        let mut offset = 0;
+        for (tensor_name, shape) in &included {
+            let byte_len = shape.iter().product::<usize>() * std::mem::size_of::<f32>();
             header.insert(
                 *tensor_name,
                 json!({
                     "dtype": "F32",
-                    "shape": [1],
-                    "data_offsets": [start, start + std::mem::size_of::<f32>()]
+                    "shape": shape,
+                    "data_offsets": [offset, offset + byte_len]
                 }),
             );
+            offset += byte_len;
         }
         let header = serde_json::to_vec(&header).expect("safetensors header should serialize");
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
         bytes.extend_from_slice(&header);
-        bytes.resize(bytes.len() + included.len() * std::mem::size_of::<f32>(), 0);
+        bytes.resize(bytes.len() + offset, 0);
         fs::write(model_dir.join("model.safetensors"), bytes)
             .expect("safetensors should be written");
     }

@@ -412,8 +412,8 @@ fn bootstrap_grpc_router_service_rejects_generation_for_unsupported_local_model_
                 backend: sglang_srt::backend::RuntimeBackend::Cpu,
                 ref missing,
                 ..
-            }) if missing.iter().any(|capability| capability == "multi-latent attention decoder execution")
-                && missing.iter().any(|capability| capability == "mixture-of-experts kernels")
+            }) if missing.iter().any(|capability| capability.contains("bfloat16") && capability.contains("float32"))
+                && missing.iter().any(|capability| capability.contains("multi-latent attention") && capability.contains("mixture-of-experts"))
                 && missing.iter().any(|capability| capability == "runtime-owned KV cache allocation")
         ),
         "unexpected error: {error:?}"
@@ -449,8 +449,8 @@ fn bootstrap_rejects_glm_through_the_shared_mla_moe_runtime_preflight() {
                 backend: sglang_srt::backend::RuntimeBackend::Cpu,
                 ref missing,
                 ..
-            }) if missing.iter().any(|capability| capability == "multi-latent attention decoder execution")
-                && missing.iter().any(|capability| capability == "mixture-of-experts kernels")
+            }) if missing.iter().any(|capability| capability.contains("bfloat16") && capability.contains("float32"))
+                && missing.iter().any(|capability| capability.contains("multi-latent attention") && capability.contains("mixture-of-experts"))
                 && missing.iter().any(|capability| capability == "runtime-owned KV cache allocation")
         ),
         "unexpected error: {error:?}"
@@ -459,8 +459,8 @@ fn bootstrap_rejects_glm_through_the_shared_mla_moe_runtime_preflight() {
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
 
-#[test]
-fn bootstrap_rejects_qwen_through_the_same_generic_runtime_preflight() {
+#[tokio::test]
+async fn bootstrap_runs_qwen_centralized_prefill_and_decode_without_transfer() {
     let model_dir = temp_model_dir("server-qwen-runtime-forward");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");
     write_complete_qwen2_checkpoint(&model_dir);
@@ -471,26 +471,60 @@ fn bootstrap_rejects_qwen_through_the_same_generic_runtime_preflight() {
         "--device",
         "cpu",
         "--grpc-mode",
+        "--num-reserved-decode-tokens",
+        "16",
     ])
     .expect("args should parse");
-    let error = match try_build_bootstrap_grpc_router_service(&args) {
-        Ok(_) => panic!("Qwen must not bypass the generic runtime capability preflight"),
-        Err(error) => error,
-    };
+    let service = try_build_bootstrap_grpc_router_service(&args)
+        .expect("Qwen should start on the CPU reference backend");
+    let mut stream = service
+        .text_generate(Request::new(TextGenerateRequest {
+            text: "hello".to_string(),
+            sampling_params: Some(SamplingParams {
+                max_new_tokens: Some(2),
+                top_k: Some(1),
+                ..Default::default()
+            }),
+            options: Some(RequestOptions {
+                request_id: Some("centralized-qwen".to_string()),
+                stream: true,
+                data_parallel_rank: 0,
+                trace_headers: Default::default(),
+            }),
+            disaggregated_params: None,
+        }))
+        .await
+        .expect("centralized Qwen generation should execute")
+        .into_inner();
 
+    let first = tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
+        .await
+        .expect("prefill response")
+        .expect("prefill response should succeed");
+    let second = tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
+        .await
+        .expect("decode response")
+        .expect("decode response should succeed");
+
+    assert_eq!(first.request_id, "centralized-qwen");
+    assert!(matches!(first.body, Some(Body::Chunk(_))));
+    assert_eq!(second.request_id, "centralized-qwen");
     assert!(
         matches!(
-            error,
-            ServerLaunchError::ModelRegistry(ModelRegistryError::MissingCapabilities {
-                architecture: "Qwen2ForCausalLM",
-                backend: sglang_srt::backend::RuntimeBackend::Cpu,
-                ref missing,
-                ..
-            }) if missing.iter().any(|capability| capability == "multi-head attention decoder execution")
-                && missing.iter().any(|capability| capability == "dense feed-forward kernels")
-                && missing.iter().any(|capability| capability == "runtime-owned KV cache allocation")
+            second.body,
+            Some(Body::Complete(ref complete))
+                if complete.output_ids == [2, 1]
+                    && complete.prompt_tokens == 1
+                    && complete.completion_tokens == 2
+                    && complete.cached_tokens == 0
+                    && complete.finish_reason == "stop"
         ),
-        "unexpected error: {error:?}"
+        "unexpected decode response: {second:?}"
+    );
+    assert!(
+        tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
+            .await
+            .is_none()
     );
 
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
@@ -1504,37 +1538,108 @@ fn write_complete_qwen2_checkpoint(model_dir: &std::path::Path) {
         r#"{
   "architectures": ["Qwen2ForCausalLM"],
   "model_type": "qwen2",
-  "vocab_size": 2,
+  "vocab_size": 3,
   "num_hidden_layers": 1,
   "hidden_size": 2,
-  "intermediate_size": 4,
-  "num_attention_heads": 2,
+  "intermediate_size": 2,
+  "num_attention_heads": 1,
   "num_key_value_heads": 1,
+  "hidden_act": "silu",
+  "rms_norm_eps": 0.000001,
+  "rope_theta": 1000000.0,
+  "max_position_embeddings": 32,
   "tie_word_embeddings": false
 }"#,
     )
     .expect("config should be written");
 
-    let tensor_names = [
-        "model.embed_tokens.weight",
-        "model.norm.weight",
-        "lm_head.weight",
-        "model.layers.0.self_attn.q_proj.weight",
-        "model.layers.0.self_attn.k_proj.weight",
-        "model.layers.0.self_attn.v_proj.weight",
-        "model.layers.0.self_attn.o_proj.weight",
-        "model.layers.0.input_layernorm.weight",
-        "model.layers.0.post_attention_layernorm.weight",
-        "model.layers.0.mlp.gate_proj.weight",
-        "model.layers.0.mlp.up_proj.weight",
-        "model.layers.0.mlp.down_proj.weight",
+    fs::write(
+        model_dir.join("tokenizer.json"),
+        word_level_tokenizer_json(),
+    )
+    .expect("Qwen tokenizer should be written");
+
+    let descriptors: Vec<(&str, Vec<usize>, Vec<f32>)> = vec![
+        (
+            "model.embed_tokens.weight",
+            vec![3, 2],
+            vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
+        ),
+        ("model.norm.weight", vec![2], vec![1.0, 1.0]),
+        (
+            "lm_head.weight",
+            vec![3, 2],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0],
+        ),
+        (
+            "model.layers.0.self_attn.q_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.self_attn.q_proj.bias",
+            vec![2],
+            vec![0.0; 2],
+        ),
+        (
+            "model.layers.0.self_attn.k_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.self_attn.k_proj.bias",
+            vec![2],
+            vec![0.0; 2],
+        ),
+        (
+            "model.layers.0.self_attn.v_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.self_attn.v_proj.bias",
+            vec![2],
+            vec![0.0; 2],
+        ),
+        (
+            "model.layers.0.self_attn.o_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.input_layernorm.weight",
+            vec![2],
+            vec![1.0; 2],
+        ),
+        (
+            "model.layers.0.post_attention_layernorm.weight",
+            vec![2],
+            vec![1.0; 2],
+        ),
+        (
+            "model.layers.0.mlp.gate_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.mlp.up_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.mlp.down_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
     ];
-    let tensors = tensor_names
-        .iter()
-        .enumerate()
-        .map(|(index, name)| (*name, "U8", &[1][..], [index, index + 1]))
-        .collect::<Vec<_>>();
-    write_safetensors_file(&model_dir.join("model.safetensors"), &tensors, &[1; 12])
+    let mut payload = Vec::new();
+    let mut tensors = Vec::new();
+    for (name, shape, values) in &descriptors {
+        let start = payload.len();
+        payload.extend(values.iter().flat_map(|value| value.to_le_bytes()));
+        tensors.push((*name, "F32", shape.as_slice(), [start, payload.len()]));
+    }
+    write_safetensors_file(&model_dir.join("model.safetensors"), &tensors, &payload)
         .expect("Qwen checkpoint should be written");
 }
 

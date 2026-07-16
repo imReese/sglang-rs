@@ -36,6 +36,180 @@ pub fn rms_norm(
     Ok(output)
 }
 
+pub fn linear(
+    input: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    rows: usize,
+    input_features: usize,
+    output_features: usize,
+) -> KernelResult<Vec<f32>> {
+    validate_matrix_len("input", input.len(), rows, input_features)?;
+    validate_matrix_len("weight", weight.len(), output_features, input_features)?;
+    if let Some(bias) = bias
+        && bias.len() != output_features
+    {
+        return Err(KernelError::Shape(format!(
+            "bias length {} does not match output features {output_features}",
+            bias.len()
+        )));
+    }
+
+    let mut output = vec![0.0; rows * output_features];
+    for row in 0..rows {
+        let input_row = &input[row * input_features..(row + 1) * input_features];
+        for output_feature in 0..output_features {
+            let weight_row =
+                &weight[output_feature * input_features..(output_feature + 1) * input_features];
+            let value = input_row
+                .iter()
+                .zip(weight_row)
+                .map(|(input, weight)| input * weight)
+                .sum::<f32>();
+            output[row * output_features + output_feature] =
+                value + bias.map_or(0.0, |bias| bias[output_feature]);
+        }
+    }
+    Ok(output)
+}
+
+pub fn silu_and_mul(gate: &[f32], up: &[f32]) -> KernelResult<Vec<f32>> {
+    if gate.len() != up.len() {
+        return Err(KernelError::Shape(format!(
+            "SiLU gate length {} does not match up length {}",
+            gate.len(),
+            up.len()
+        )));
+    }
+
+    Ok(gate
+        .iter()
+        .zip(up)
+        .map(|(gate, up)| gate / (1.0 + (-gate).exp()) * up)
+        .collect())
+}
+
+pub fn apply_neox_rope_inplace(
+    values: &mut [f32],
+    num_heads: usize,
+    head_dim: usize,
+    position: usize,
+    theta: f32,
+) -> KernelResult<()> {
+    validate_matrix_len("RoPE values", values.len(), num_heads, head_dim)?;
+    if !head_dim.is_multiple_of(2) {
+        return Err(KernelError::InvalidArgument(format!(
+            "NeoX RoPE head dimension {head_dim} must be even"
+        )));
+    }
+    if !theta.is_finite() || theta <= 0.0 {
+        return Err(KernelError::InvalidArgument(
+            "RoPE theta must be finite and positive".to_string(),
+        ));
+    }
+
+    let half_dim = head_dim / 2;
+    for head in 0..num_heads {
+        let offset = head * head_dim;
+        for index in 0..half_dim {
+            let inverse_frequency = theta.powf(-((2 * index) as f32) / head_dim as f32);
+            let angle = position as f32 * inverse_frequency;
+            let (cos, sin) = (angle.cos(), angle.sin());
+            let first = values[offset + index];
+            let second = values[offset + half_dim + index];
+            values[offset + index] = first * cos - second * sin;
+            values[offset + half_dim + index] = second * cos + first * sin;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GroupedQueryAttentionShape {
+    pub token_count: usize,
+    pub query_head_count: usize,
+    pub kv_head_count: usize,
+    pub head_dim: usize,
+    pub scale: f32,
+}
+
+pub fn grouped_query_attention(
+    query: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    shape: GroupedQueryAttentionShape,
+) -> KernelResult<Vec<f32>> {
+    let GroupedQueryAttentionShape {
+        token_count,
+        query_head_count,
+        kv_head_count,
+        head_dim,
+        scale,
+    } = shape;
+    validate_matrix_len("query", query.len(), query_head_count, head_dim)?;
+    let kv_token_width = kv_head_count
+        .checked_mul(head_dim)
+        .ok_or_else(|| KernelError::InvalidArgument("KV token width overflowed".to_string()))?;
+    validate_matrix_len("keys", keys.len(), token_count, kv_token_width)?;
+    validate_matrix_len("values", values.len(), token_count, kv_token_width)?;
+    if !query_head_count.is_multiple_of(kv_head_count) {
+        return Err(KernelError::InvalidArgument(format!(
+            "query head count {query_head_count} must be divisible by KV head count {kv_head_count}"
+        )));
+    }
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(KernelError::InvalidArgument(
+            "attention scale must be finite and positive".to_string(),
+        ));
+    }
+
+    let queries_per_kv_head = query_head_count / kv_head_count;
+    let mut output = vec![0.0; query.len()];
+    let mut scores = vec![0.0; token_count];
+    for query_head in 0..query_head_count {
+        let kv_head = query_head / queries_per_kv_head;
+        let query_offset = query_head * head_dim;
+        let query_row = &query[query_offset..query_offset + head_dim];
+        for (token, score) in scores.iter_mut().enumerate() {
+            let key_offset = token * kv_token_width + kv_head * head_dim;
+            let key_row = &keys[key_offset..key_offset + head_dim];
+            *score = query_row
+                .iter()
+                .zip(key_row)
+                .map(|(query, key)| query * key)
+                .sum::<f32>()
+                * scale;
+        }
+
+        let max_score = scores
+            .iter()
+            .copied()
+            .max_by(f32::total_cmp)
+            .ok_or_else(|| KernelError::InvalidArgument("attention has no tokens".to_string()))?;
+        let normalizer = scores
+            .iter_mut()
+            .map(|score| {
+                *score = (*score - max_score).exp();
+                *score
+            })
+            .sum::<f32>();
+        if !normalizer.is_finite() || normalizer <= 0.0 {
+            return Err(KernelError::InvalidArgument(
+                "attention softmax normalization is invalid".to_string(),
+            ));
+        }
+
+        for (token, probability) in scores.iter().enumerate() {
+            let value_offset = token * kv_token_width + kv_head * head_dim;
+            for dimension in 0..head_dim {
+                output[query_offset + dimension] +=
+                    probability / normalizer * values[value_offset + dimension];
+            }
+        }
+    }
+    Ok(output)
+}
+
 pub fn top_k_renorm_probs(
     probs: &[f32],
     rows: usize,

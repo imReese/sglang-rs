@@ -25,7 +25,7 @@ impl ModelAdapter for EmbeddingLmAdapter {
             EMBEDDING_LM_ARCHITECTURE,
             config,
             ModelExecutionArchitecture::Embedding,
-            RuntimeDtype::F32,
+            vec![RuntimeDtype::F32],
             None,
         ))
     }

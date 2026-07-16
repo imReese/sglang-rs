@@ -230,9 +230,11 @@ impl BootstrapForwardModel {
         tensor_parallel_size: usize,
         requested_attention_backend: Option<&'a str>,
     ) -> RuntimeRequirements<'a> {
-        self.registered
-            .definition
-            .runtime_requirements(tensor_parallel_size, requested_attention_backend)
+        self.registered.definition.runtime_requirements(
+            self.registered.runtime.execution_dtype(),
+            tensor_parallel_size,
+            requested_attention_backend,
+        )
     }
 
     pub fn kv_cache_layout(&self) -> Option<KvCacheModelLayout> {
@@ -409,6 +411,7 @@ fn runtime_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_artifacts::HfConfigFloat;
     use crate::models::{
         AttentionArchitecture, FeedForwardArchitecture, ModelExecutionArchitecture,
     };
@@ -434,11 +437,17 @@ mod tests {
         HfModelConfig {
             model_type: Some("qwen2".to_string()),
             architectures: vec!["Qwen2ForCausalLM".to_string()],
+            vocab_size: Some(32_000),
+            max_position_embeddings: Some(32_768),
             num_hidden_layers: Some(4),
             hidden_size: Some(1024),
             intermediate_size: Some(4096),
             num_attention_heads: Some(16),
             num_key_value_heads: Some(4),
+            hidden_act: Some("silu".to_string()),
+            rms_norm_eps: Some(HfConfigFloat::new(1e-6)),
+            rope_theta: Some(HfConfigFloat::new(1_000_000.0)),
+            tie_word_embeddings: Some(false),
             ..HfModelConfig::default()
         }
     }
@@ -508,20 +517,14 @@ mod tests {
 
         let mla_error = validate_runtime_support(&mla, &backend, 1)
             .expect_err("CPU reference backend has no production MLA executor");
-        let dense_error = validate_runtime_support(&dense, &backend, 1)
-            .expect_err("CPU reference backend has no production dense executor");
+        validate_runtime_support(&dense, &backend, 1)
+            .expect("CPU reference backend should execute the shared dense decoder plan");
 
         assert!(matches!(
             mla_error,
             ModelRuntimeLoadError::MissingCapabilities(ref missing)
-                if missing.iter().any(|item| item == "multi-latent attention decoder execution")
-                    && missing.iter().any(|item| item == "mixture-of-experts kernels")
-        ));
-        assert!(matches!(
-            dense_error,
-            ModelRuntimeLoadError::MissingCapabilities(ref missing)
-                if missing.iter().any(|item| item == "multi-head attention decoder execution")
-                    && missing.iter().any(|item| item == "dense feed-forward kernels")
+                if missing.iter().any(|item| item.contains("multi-latent attention"))
+                    && missing.iter().any(|item| item.contains("mixture-of-experts"))
         ));
     }
 

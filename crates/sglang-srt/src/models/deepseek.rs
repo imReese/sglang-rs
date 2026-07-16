@@ -93,7 +93,7 @@ pub(super) fn build_mla_moe_definition(
                 expert_intermediate_size,
             },
         },
-        RuntimeDtype::Bf16,
+        vec![RuntimeDtype::Bf16],
         Some(kv_cache_layout),
     ))
 }

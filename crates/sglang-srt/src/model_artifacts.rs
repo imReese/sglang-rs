@@ -1033,6 +1033,10 @@ impl DeepSeekLoadedRoutedExpertWeights {
 pub struct HfConfigFloat(f64);
 
 impl HfConfigFloat {
+    pub fn new(value: f64) -> Self {
+        Self(value)
+    }
+
     pub fn get(self) -> f64 {
         self.0
     }
@@ -1066,11 +1070,16 @@ pub struct HfModelConfig {
     pub moe_layer_freq: Option<usize>,
     pub hc_mult: Option<usize>,
     pub hc_sinkhorn_iters: Option<usize>,
+    pub hidden_act: Option<String>,
     pub rms_norm_eps: Option<HfConfigFloat>,
     pub rope_theta: Option<HfConfigFloat>,
+    pub rope_scaling: Option<serde_json::Value>,
+    pub use_sliding_window: Option<bool>,
+    pub sliding_window: Option<usize>,
     pub hc_eps: Option<HfConfigFloat>,
     pub tie_word_embeddings: Option<bool>,
     pub num_attention_heads: Option<usize>,
+    pub original_num_attention_heads: Option<usize>,
     pub num_key_value_heads: Option<usize>,
     pub head_dim: Option<usize>,
     pub qk_nope_head_dim: Option<usize>,
@@ -1118,6 +1127,19 @@ impl HfModelConfig {
                 message: error.to_string(),
             })?;
 
+        let rope_parameters = value
+            .get("rope_parameters")
+            .filter(|value| !value.is_null());
+        let rope_theta = read_f64_field(&value, "rope_theta", config_path)?.or(rope_parameters
+            .map(|parameters| read_f64_field(parameters, "rope_theta", config_path))
+            .transpose()?
+            .flatten());
+        let rope_scaling = value
+            .get("rope_scaling")
+            .filter(|value| !value.is_null())
+            .or(rope_parameters)
+            .cloned();
+
         Ok(Self {
             model_type: read_string_field(&value, "model_type"),
             architectures: read_string_array_field(&value, "architectures"),
@@ -1141,11 +1163,20 @@ impl HfModelConfig {
             moe_layer_freq: read_usize_field(&value, "moe_layer_freq", config_path)?,
             hc_mult: read_usize_field(&value, "hc_mult", config_path)?,
             hc_sinkhorn_iters: read_usize_field(&value, "hc_sinkhorn_iters", config_path)?,
+            hidden_act: read_string_field(&value, "hidden_act"),
             rms_norm_eps: read_f64_field(&value, "rms_norm_eps", config_path)?,
-            rope_theta: read_f64_field(&value, "rope_theta", config_path)?,
+            rope_theta,
+            rope_scaling,
+            use_sliding_window: read_bool_field(&value, "use_sliding_window", config_path)?,
+            sliding_window: read_usize_field(&value, "sliding_window", config_path)?,
             hc_eps: read_f64_field(&value, "hc_eps", config_path)?,
             tie_word_embeddings: read_bool_field(&value, "tie_word_embeddings", config_path)?,
             num_attention_heads: read_usize_field(&value, "num_attention_heads", config_path)?,
+            original_num_attention_heads: read_usize_field(
+                &value,
+                "original_num_attention_heads",
+                config_path,
+            )?,
             num_key_value_heads: read_usize_field(&value, "num_key_value_heads", config_path)?,
             head_dim: read_usize_field(&value, "head_dim", config_path)?,
             qk_nope_head_dim: read_usize_field(&value, "qk_nope_head_dim", config_path)?,

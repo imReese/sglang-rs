@@ -775,8 +775,12 @@ fn try_build_bootstrap_grpc_router_service_from_model(
     args: &ServerArgs,
     model: BootstrapForwardModel,
 ) -> Result<BootstrapGrpcRouterService, ServerLaunchError> {
-    let scheduler = Scheduler::new(bootstrap_model_runner(model))
-        .with_max_running_requests(args.max_running_requests);
+    let scheduler = Scheduler::with_cache_resources(
+        bootstrap_model_runner(model),
+        RadixCache::default(),
+        cache_page_allocator_from_server_args(args)?,
+    )
+    .with_max_running_requests(args.max_running_requests);
     let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
         &args.model_path,
         args.tokenizer_path.as_deref(),
@@ -803,8 +807,12 @@ fn try_build_bootstrap_http_router_service_from_model(
     args: &ServerArgs,
     model: BootstrapForwardModel,
 ) -> Result<BootstrapHttpRouterService, ServerLaunchError> {
-    let scheduler = Scheduler::new(bootstrap_model_runner(model))
-        .with_max_running_requests(args.max_running_requests);
+    let scheduler = Scheduler::with_cache_resources(
+        bootstrap_model_runner(model),
+        RadixCache::default(),
+        cache_page_allocator_from_server_args(args)?,
+    )
+    .with_max_running_requests(args.max_running_requests);
     let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
         &args.model_path,
         args.tokenizer_path.as_deref(),
