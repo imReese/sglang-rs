@@ -20,6 +20,9 @@ pub struct SamplingParams {
     pub top_p: Option<f32>,
     pub top_k: Option<i32>,
     pub min_p: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub repetition_penalty: Option<f32>,
     pub stop_token_ids: Vec<u32>,
     pub ignore_eos: bool,
 }

@@ -560,13 +560,19 @@ async fn assert_centralized_qwen_generation(model_dir: &std::path::Path, request
         .await
         .expect("decode response")
         .expect("decode response should succeed");
+    let third = tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
+        .await
+        .expect("completion response")
+        .expect("completion response should succeed");
 
     assert_eq!(first.request_id, request_id);
     assert!(matches!(first.body, Some(Body::Chunk(_))));
     assert_eq!(second.request_id, request_id);
+    assert!(matches!(second.body, Some(Body::Chunk(_))));
+    assert_eq!(third.request_id, request_id);
     assert!(
         matches!(
-            second.body,
+            third.body,
             Some(Body::Complete(ref complete))
                 if complete.output_ids == [2, 1]
                     && complete.prompt_tokens == 1
@@ -574,7 +580,7 @@ async fn assert_centralized_qwen_generation(model_dir: &std::path::Path, request
                     && complete.cached_tokens == 0
                     && complete.finish_reason == "stop"
         ),
-        "unexpected decode response: {second:?}"
+        "unexpected completion response: {third:?}"
     );
     assert!(
         tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
@@ -609,11 +615,16 @@ async fn bootstrap_grpc_router_service_generates_through_model_runner() {
         .expect("text generate should execute")
         .into_inner();
 
+    let chunk = tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
+        .await
+        .expect("token response")
+        .expect("token response should be ok");
     let response = tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
         .await
-        .expect("one response")
-        .expect("response should be ok");
+        .expect("completion response")
+        .expect("completion response should be ok");
 
+    assert!(matches!(chunk.body, Some(Body::Chunk(_))));
     assert_eq!(response.request_id, "bootstrap-generate");
     assert_eq!(
         response.body,
@@ -706,11 +717,16 @@ async fn bootstrap_grpc_router_service_generates_from_local_fp8_safetensors_weig
         .expect("text generate should execute")
         .into_inner();
 
+    let chunk = tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
+        .await
+        .expect("token response")
+        .expect("token response should be ok");
     let response = tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
         .await
-        .expect("one response")
-        .expect("response should be ok");
+        .expect("completion response")
+        .expect("completion response should be ok");
 
+    assert!(matches!(chunk.body, Some(Body::Chunk(_))));
     assert_eq!(response.request_id, "bootstrap-weight-backed");
     assert_eq!(
         response.body,
@@ -770,11 +786,16 @@ async fn bootstrap_grpc_router_service_uses_config_eos_token_as_default_stop() {
         .expect("text generate should execute")
         .into_inner();
 
+    let chunk = tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
+        .await
+        .expect("token response")
+        .expect("token response should be ok");
     let response = tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
         .await
-        .expect("one response")
-        .expect("response should be ok");
+        .expect("completion response")
+        .expect("completion response should be ok");
 
+    assert!(matches!(chunk.body, Some(Body::Chunk(_))));
     assert_eq!(response.request_id, "bootstrap-config-eos-stop");
     assert_eq!(
         response.body,
@@ -848,6 +869,10 @@ async fn bootstrap_grpc_router_service_ignores_config_eos_when_requested() {
         .await
         .expect("second response")
         .expect("response should be ok");
+    let third = tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
+        .await
+        .expect("completion response")
+        .expect("completion response should be ok");
 
     assert_eq!(first.request_id, "bootstrap-ignore-config-eos");
     assert_eq!(
@@ -865,6 +890,19 @@ async fn bootstrap_grpc_router_service_ignores_config_eos_when_requested() {
     );
     assert_eq!(
         second.body,
+        Some(Body::Chunk(
+            sglang_srt::proto::sglang::runtime::v1::GenerateStreamChunk {
+                token_ids: vec![b' ' as u32],
+                text: " ".to_string(),
+                prompt_tokens: 5,
+                completion_tokens: 2,
+                cached_tokens: 0,
+                index: 0,
+            }
+        ))
+    );
+    assert_eq!(
+        third.body,
         Some(Body::Complete(
             sglang_srt::proto::sglang::runtime::v1::GenerateComplete {
                 output_ids: vec![b' ' as u32, b' ' as u32],
@@ -1011,11 +1049,17 @@ async fn bootstrap_pd_grpc_router_service_polls_transfer_before_decode() {
         .await
         .expect("second response")
         .expect("second response should be ok");
+    let third = tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
+        .await
+        .expect("final response")
+        .expect("final response should be ok");
 
     assert_eq!(first.request_id, "bootstrap-pd");
     assert!(matches!(first.body, Some(Body::Chunk(_))));
     assert_eq!(second.request_id, "bootstrap-pd");
-    assert!(matches!(second.body, Some(Body::Complete(_))));
+    assert!(matches!(second.body, Some(Body::Chunk(_))));
+    assert_eq!(third.request_id, "bootstrap-pd");
+    assert!(matches!(third.body, Some(Body::Complete(_))));
     assert!(
         tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
             .await
@@ -1075,11 +1119,17 @@ async fn bootstrap_fake_pd_grpc_router_service_uses_decode_transfer_path() {
         .await
         .expect("second response")
         .expect("second response should be ok");
+    let third = tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
+        .await
+        .expect("final response")
+        .expect("final response should be ok");
 
     assert_eq!(first.request_id, "bootstrap-fake-pd");
     assert!(matches!(first.body, Some(Body::Chunk(_))));
     assert_eq!(second.request_id, "bootstrap-fake-pd");
-    assert!(matches!(second.body, Some(Body::Complete(_))));
+    assert!(matches!(second.body, Some(Body::Chunk(_))));
+    assert_eq!(third.request_id, "bootstrap-fake-pd");
+    assert!(matches!(third.body, Some(Body::Complete(_))));
 }
 
 #[tokio::test]

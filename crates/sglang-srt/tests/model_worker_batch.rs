@@ -365,6 +365,18 @@ impl ForwardModel for SamplingForwardModel {
     }
 }
 
+#[derive(Default)]
+struct RepetitionPenaltyForwardModel;
+
+impl ForwardModel for RepetitionPenaltyForwardModel {
+    fn forward(
+        &mut self,
+        _batch: &ModelWorkerBatch,
+    ) -> Result<ModelForwardOutput, ModelForwardError> {
+        ModelForwardOutput::new(vec![vec![4.0, 3.0]])
+    }
+}
+
 #[test]
 fn model_runner_samples_from_temperature_scaled_logits() {
     let sampler = LogitSampler::new(FixedSamplingRandomSource { values: vec![0.85] });
@@ -374,6 +386,24 @@ fn model_runner_samples_from_temperature_scaled_logits() {
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("sampled"),
         vec![10, 11],
+        sampling,
+    ));
+
+    let outputs = scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill should dispatch through model runner");
+
+    assert_eq!(outputs[0].token_ids, vec![1]);
+}
+
+#[test]
+fn model_runner_applies_repetition_penalty_to_seen_tokens() {
+    let mut scheduler = Scheduler::new(ModelRunner::new(RepetitionPenaltyForwardModel));
+    let mut sampling = SamplingParams::new(1);
+    sampling.repetition_penalty = Some(2.0);
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("repetition-penalty"),
+        vec![0],
         sampling,
     ));
 

@@ -138,6 +138,25 @@ fn write_embedding_lm_artifacts_with_weight_values(model_dir: &std::path::Path, 
     }
     fs::write(model_dir.join("model.safetensors"), bytes)
         .expect("safetensors shard should be written");
+    fs::write(
+        model_dir.join("tokenizer.json"),
+        r#"{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "Whitespace"},
+  "post_processor": null,
+  "decoder": null,
+  "model": {
+    "type": "WordLevel",
+    "vocab": {"[UNK]": 0, "hello": 1, "world": 2},
+    "unk_token": "[UNK]"
+  }
+}"#,
+    )
+    .expect("tokenizer should be written");
 }
 
 // Protocol tests serve the explicit reference builder; launch tests use the production alias.

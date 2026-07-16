@@ -4,7 +4,8 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use sglang_srt::tokenizer::{HfTokenizer, RuntimeTokenizer, Tokenizer};
+use serde_json::json;
+use sglang_srt::tokenizer::{ChatTemplateInput, HfTokenizer, RuntimeTokenizer, Tokenizer};
 
 static HF_ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -49,6 +50,44 @@ fn hf_tokenizer_loads_direct_tokenizer_json_path() {
 }
 
 #[test]
+fn hf_tokenizer_applies_qwen_style_chat_template() {
+    let model_dir = temp_model_dir("qwen-chat-template");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("tokenizer.json"),
+        word_level_tokenizer_json(),
+    )
+    .expect("tokenizer.json should be written");
+    fs::write(
+        model_dir.join("tokenizer_config.json"),
+        json!({
+            "chat_template": "{% for message in messages %}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+        })
+        .to_string(),
+    )
+    .expect("tokenizer_config.json should be written");
+    let tokenizer = HfTokenizer::from_tokenizer_path(&model_dir)
+        .expect("tokenizer and chat template should load");
+
+    let prompt = tokenizer
+        .apply_chat_template(&ChatTemplateInput {
+            messages: vec![
+                json!({"role": "system", "content": "You are concise."}),
+                json!({"role": "user", "content": "Hello"}),
+            ],
+            ..Default::default()
+        })
+        .expect("Qwen-style chat template should render");
+
+    assert_eq!(
+        prompt,
+        "<|im_start|>system\nYou are concise.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n"
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
 fn runtime_tokenizer_loads_repo_id_from_huggingface_cache_snapshot() {
     let hub_dir = temp_model_dir("hf-tokenizer-cache-hub");
     let snapshot_dir = hub_dir
@@ -82,6 +121,21 @@ fn runtime_tokenizer_loads_repo_id_from_huggingface_cache_snapshot() {
     assert_eq!(tokenizer.encode("hello world"), vec![1, 2]);
 
     fs::remove_dir_all(hub_dir).expect("temp hub dir should be removed");
+}
+
+#[test]
+fn runtime_tokenizer_rejects_local_model_without_tokenizer() {
+    let model_dir = temp_model_dir("missing-tokenizer");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+
+    let error = RuntimeTokenizer::from_model_or_tokenizer_path(
+        model_dir.to_str().expect("temp path should be utf8"),
+        None,
+    )
+    .expect_err("a real local model must not fall back to the byte tokenizer");
+
+    assert!(error.to_string().contains("tokenizer.json was not found"));
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
 
 #[test]

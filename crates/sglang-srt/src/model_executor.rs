@@ -1,7 +1,7 @@
 use crate::cache::CachePageId;
 use crate::scheduler::{ForwardMode, ScheduleBatch, ScheduledRequest};
 use crate::transfer::{KvCacheModelLayout, KvCacheTransferError, TransferableKvCacheMemory};
-use crate::types::{DisaggregatedParams, RequestId, SamplingParams};
+use crate::types::{DisaggregatedParams, RequestId};
 use rand::RngExt as _;
 use std::fmt;
 
@@ -722,7 +722,7 @@ where
             .zip(batch.requests())
             .enumerate()
             .map(|(request_index, (logits, request))| {
-                self.sample_row(request_index, &logits, request.sampling())
+                self.sample_row(request_index, &logits, request)
             })
             .collect()
     }
@@ -731,8 +731,11 @@ where
         &mut self,
         request_index: usize,
         logits: &[f32],
-        sampling: &SamplingParams,
+        request: &ScheduledRequest,
     ) -> Result<u32, ModelForwardError> {
+        let sampling = request.sampling();
+        let adjusted_logits = apply_token_penalties(logits, request);
+        let logits = adjusted_logits.as_deref().unwrap_or(logits);
         if sampling.temperature.is_none()
             && sampling.top_p.is_none()
             && sampling.top_k.is_none()
@@ -780,12 +783,19 @@ where
             .map(|(_, probability)| *probability)
             .ok_or(ModelForwardError::EmptyVocabulary)?;
         let min_probability = max_probability * min_p;
+        let candidate_probability = candidates
+            .iter()
+            .map(|(_, probability)| *probability)
+            .sum::<f32>();
+        if !candidate_probability.is_finite() || candidate_probability <= 0.0 {
+            return Err(ModelForwardError::InvalidProbabilityDistribution { request_index });
+        }
         let mut cumulative_probability = 0.0;
         let mut filtered = Vec::with_capacity(candidates.len());
 
         for (token_id, probability) in candidates {
-            let keep_for_top_p = cumulative_probability <= top_p;
-            cumulative_probability += probability;
+            let keep_for_top_p = cumulative_probability < top_p;
+            cumulative_probability += probability / candidate_probability;
 
             if keep_for_top_p && probability >= min_probability {
                 filtered.push((token_id, probability));
@@ -824,6 +834,40 @@ where
             0.0
         }
     }
+}
+
+fn apply_token_penalties(logits: &[f32], request: &ScheduledRequest) -> Option<Vec<f32>> {
+    let sampling = request.sampling();
+    let frequency_penalty = sampling.frequency_penalty.unwrap_or(0.0);
+    let presence_penalty = sampling.presence_penalty.unwrap_or(0.0);
+    let repetition_penalty = sampling.repetition_penalty.unwrap_or(1.0);
+    if frequency_penalty == 0.0 && presence_penalty == 0.0 && repetition_penalty == 1.0 {
+        return None;
+    }
+
+    let mut counts = std::collections::HashMap::<u32, usize>::new();
+    for token_id in request.input_ids().iter().chain(request.output_ids()) {
+        *counts.entry(*token_id).or_default() += 1;
+    }
+    let mut adjusted = logits.to_vec();
+    for (token_id, count) in counts {
+        let Some(logit) = usize::try_from(token_id)
+            .ok()
+            .and_then(|token_id| adjusted.get_mut(token_id))
+        else {
+            continue;
+        };
+        if repetition_penalty != 1.0 {
+            *logit = if *logit < 0.0 {
+                *logit * repetition_penalty
+            } else {
+                *logit / repetition_penalty
+            };
+        }
+        *logit -= presence_penalty;
+        *logit -= frequency_penalty * count as f32;
+    }
+    Some(adjusted)
 }
 
 fn argmax_token(logits: &[f32]) -> Result<u32, ModelForwardError> {

@@ -290,6 +290,11 @@ async fn grpc_generate_streams_router_runtime_outputs() {
         .await
         .expect("second response")
         .expect("second response ok");
+    let third = stream
+        .next()
+        .await
+        .expect("final response")
+        .expect("final response ok");
 
     assert_eq!(first.request_id, "grpc-generate");
     assert_eq!(
@@ -307,6 +312,19 @@ async fn grpc_generate_streams_router_runtime_outputs() {
     );
     assert_eq!(
         second.body,
+        Some(Body::Chunk(
+            sglang_srt::proto::sglang::runtime::v1::GenerateStreamChunk {
+                token_ids: vec![43],
+                text: String::new(),
+                prompt_tokens: 3,
+                completion_tokens: 2,
+                cached_tokens: 0,
+                index: 0,
+            }
+        ))
+    );
+    assert_eq!(
+        third.body,
         Some(Body::Complete(
             sglang_srt::proto::sglang::runtime::v1::GenerateComplete {
                 output_ids: vec![42, 43],
@@ -646,6 +664,11 @@ async fn grpc_chat_complete_streams_openai_chat_chunks() {
     let second = stream
         .next()
         .await
+        .expect("second chat chunk")
+        .expect("second chat chunk ok");
+    let third = stream
+        .next()
+        .await
         .expect("final chat chunk")
         .expect("final chat chunk ok");
     assert!(stream.next().await.is_none());
@@ -658,10 +681,16 @@ async fn grpc_chat_complete_streams_openai_chat_chunks() {
     assert!(first["choices"][0]["finish_reason"].is_null());
 
     let second: serde_json::Value =
-        serde_json::from_slice(&second.json).expect("final chunk should be JSON");
+        serde_json::from_slice(&second.json).expect("second chunk should be JSON");
     assert_eq!(second["object"], "chat.completion.chunk");
     assert_eq!(second["model"], "tiny");
-    assert_eq!(second["choices"][0]["finish_reason"], "stop");
+    assert_eq!(second["choices"][0]["delta"]["content"], "+");
+    assert!(second["choices"][0]["finish_reason"].is_null());
+
+    let third: serde_json::Value =
+        serde_json::from_slice(&third.json).expect("final chunk should be JSON");
+    assert_eq!(third["object"], "chat.completion.chunk");
+    assert_eq!(third["choices"][0]["finish_reason"], "stop");
 }
 
 #[tokio::test]
@@ -748,6 +777,11 @@ async fn grpc_complete_streams_openai_completion_chunks() {
     let second = stream
         .next()
         .await
+        .expect("second completion chunk")
+        .expect("second completion chunk ok");
+    let third = stream
+        .next()
+        .await
         .expect("final completion chunk")
         .expect("final completion chunk ok");
     assert!(stream.next().await.is_none());
@@ -759,9 +793,15 @@ async fn grpc_complete_streams_openai_completion_chunks() {
     assert!(first["choices"][0]["finish_reason"].is_null());
 
     let second: serde_json::Value =
-        serde_json::from_slice(&second.json).expect("final chunk should be JSON");
+        serde_json::from_slice(&second.json).expect("second chunk should be JSON");
     assert_eq!(second["object"], "text_completion");
-    assert_eq!(second["choices"][0]["finish_reason"], "stop");
+    assert_eq!(second["choices"][0]["text"], "+");
+    assert!(second["choices"][0]["finish_reason"].is_null());
+
+    let third: serde_json::Value =
+        serde_json::from_slice(&third.json).expect("final chunk should be JSON");
+    assert_eq!(third["object"], "text_completion");
+    assert_eq!(third["choices"][0]["finish_reason"], "stop");
 }
 
 #[tokio::test]
@@ -1021,9 +1061,15 @@ async fn grpc_generate_can_poll_pd_transfer_before_decode() {
         .await
         .expect("second response")
         .expect("second response ok");
+    let third = stream
+        .next()
+        .await
+        .expect("final response")
+        .expect("final response ok");
 
     assert!(matches!(first.body, Some(Body::Chunk(_))));
-    assert!(matches!(second.body, Some(Body::Complete(_))));
+    assert!(matches!(second.body, Some(Body::Chunk(_))));
+    assert!(matches!(third.body, Some(Body::Complete(_))));
     assert!(stream.next().await.is_none());
 }
 
@@ -1083,11 +1129,18 @@ async fn grpc_text_generate_can_poll_pd_transfer_before_decode() {
         .await
         .expect("second response")
         .expect("second response ok");
+    let third = stream
+        .next()
+        .await
+        .expect("final response")
+        .expect("final response ok");
 
     assert_eq!(first.request_id, "grpc-text-pd-poll");
     assert!(matches!(first.body, Some(Body::Chunk(_))));
     assert_eq!(second.request_id, "grpc-text-pd-poll");
-    assert!(matches!(second.body, Some(Body::Complete(_))));
+    assert!(matches!(second.body, Some(Body::Chunk(_))));
+    assert_eq!(third.request_id, "grpc-text-pd-poll");
+    assert!(matches!(third.body, Some(Body::Complete(_))));
     assert!(stream.next().await.is_none());
 }
 
@@ -1127,6 +1180,11 @@ async fn grpc_text_generate_tokenizes_prompt_and_streams_decoded_text() {
         .await
         .expect("second response")
         .expect("second response ok");
+    let third = stream
+        .next()
+        .await
+        .expect("final response")
+        .expect("final response ok");
 
     assert_eq!(
         first.body,
@@ -1143,6 +1201,19 @@ async fn grpc_text_generate_tokenizes_prompt_and_streams_decoded_text() {
     );
     assert_eq!(
         second.body,
+        Some(Body::Chunk(
+            sglang_srt::proto::sglang::runtime::v1::GenerateStreamChunk {
+                token_ids: vec![43],
+                text: "+".to_string(),
+                prompt_tokens: 5,
+                completion_tokens: 2,
+                cached_tokens: 0,
+                index: 0,
+            }
+        ))
+    );
+    assert_eq!(
+        third.body,
         Some(Body::Complete(
             sglang_srt::proto::sglang::runtime::v1::GenerateComplete {
                 output_ids: vec![42, 43],
@@ -1504,7 +1575,7 @@ async fn grpc_poll_transfers_advances_async_pd_batches() {
         Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(3)),
     ));
 
-    let error = match service
+    let mut stream = service
         .generate(Request::new(GenerateRequest {
             input_ids: vec![1, 2],
             original_text: String::new(),
@@ -1525,10 +1596,19 @@ async fn grpc_poll_transfers_advances_async_pd_batches() {
             }),
         }))
         .await
-    {
-        Ok(_) => panic!("decode should wait before explicit transfer poll"),
-        Err(error) => error,
-    };
+        .expect("prefill should start before transfer completion")
+        .into_inner();
+    let first = stream
+        .next()
+        .await
+        .expect("prefill response")
+        .expect("prefill response should succeed");
+    assert!(matches!(first.body, Some(Body::Chunk(_))));
+    let error = stream
+        .next()
+        .await
+        .expect("decode readiness error")
+        .expect_err("decode should wait before explicit transfer poll");
     assert_eq!(error.code(), Code::Internal);
 
     let response = service

@@ -8,7 +8,7 @@ use crate::cli::ServerArgs;
 use crate::engine::{Engine, RuntimeError};
 use crate::model_artifacts::{HfModelConfig, LocalModelArtifacts, RoutedExpertCheckpointCoverage};
 use crate::scheduler::SchedulerError;
-use crate::tokenizer::{Tokenizer, TokenizerError};
+use crate::tokenizer::{ChatTemplateInput, IncrementalDecoder, Tokenizer, TokenizerError};
 use crate::types::{
     BootstrapRoom, DisaggregatedParams, RequestId, SamplingParams, TokenGenerateOutput,
     TokenGenerateRequest,
@@ -47,14 +47,32 @@ impl RouterSamplingParams {
         validate_optional_non_negative_float("temperature", self.temperature)?;
         validate_optional_positive_unit_float("top_p", self.top_p)?;
         validate_optional_unit_float("min_p", self.min_p)?;
-        validate_optional_non_negative_float("frequency_penalty", self.frequency_penalty)?;
-        validate_optional_non_negative_float("presence_penalty", self.presence_penalty)?;
-        validate_optional_positive_float("repetition_penalty", self.repetition_penalty)?;
+        validate_optional_bounded_float("frequency_penalty", self.frequency_penalty, -2.0, 2.0)?;
+        validate_optional_bounded_float("presence_penalty", self.presence_penalty, -2.0, 2.0)?;
+        validate_optional_bounded_float("repetition_penalty", self.repetition_penalty, 0.0, 2.0)?;
+        if self.repetition_penalty == Some(0.0) {
+            return Err(RouterProtocolError::InvalidFloatSamplingParam {
+                field: "repetition_penalty",
+                value: 0.0,
+                expected: "in (0, 2]",
+            });
+        }
         validate_optional_unbounded_or_positive_i32("top_k", self.top_k)?;
         validate_optional_non_negative_i32("stop_token_id", self.stop_token_id)?;
         validate_non_negative_i32s("stop_token_ids", &self.stop_token_ids)?;
         validate_optional_positive_i32("n", self.n)?;
         validate_optional_positive_i32("best_of", self.best_of)?;
+        for (field, value) in [("n", self.n), ("best_of", self.best_of)] {
+            if let Some(value) = value
+                && value != 1
+            {
+                return Err(RouterProtocolError::InvalidIntegerSamplingParam {
+                    field,
+                    value,
+                    expected: "equal to 1 because parallel candidates are not implemented",
+                });
+            }
+        }
 
         let max_new_tokens = match self.max_new_tokens {
             Some(value) if value <= 0 => {
@@ -74,10 +92,35 @@ impl RouterSamplingParams {
             top_p: self.top_p,
             top_k: self.top_k,
             min_p: self.min_p,
+            frequency_penalty: self.frequency_penalty,
+            presence_penalty: self.presence_penalty,
+            repetition_penalty: self.repetition_penalty,
             stop_token_ids: merged_stop_token_ids(self.stop_token_id, self.stop_token_ids),
             ignore_eos: self.ignore_eos.unwrap_or(false),
         })
     }
+}
+
+fn validate_optional_bounded_float(
+    field: &'static str,
+    value: Option<f32>,
+    minimum: f32,
+    maximum: f32,
+) -> Result<(), RouterProtocolError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if !value.is_finite() || value < minimum || value > maximum {
+        return Err(RouterProtocolError::InvalidFloatSamplingParam {
+            field,
+            value,
+            expected: match field {
+                "repetition_penalty" => "in (0, 2]",
+                _ => "in [-2, 2]",
+            },
+        });
+    }
+    Ok(())
 }
 
 fn merged_stop_token_ids(stop_token_id: Option<i32>, stop_token_ids: Vec<i32>) -> Vec<u32> {
@@ -129,24 +172,6 @@ fn validate_optional_non_negative_float(
             field,
             value,
             expected: "finite and non-negative",
-        });
-    }
-
-    Ok(())
-}
-
-fn validate_optional_positive_float(
-    field: &'static str,
-    value: Option<f32>,
-) -> Result<(), RouterProtocolError> {
-    let Some(value) = value else {
-        return Ok(());
-    };
-    if !value.is_finite() || value <= 0.0 {
-        return Err(RouterProtocolError::InvalidFloatSamplingParam {
-            field,
-            value,
-            expected: "finite and positive",
         });
     }
 
@@ -865,6 +890,10 @@ where
             text: self.engine.detokenize(token_ids)?,
         })
     }
+
+    pub fn apply_chat_template(&self, input: &ChatTemplateInput) -> Result<String, TokenizerError> {
+        self.engine.apply_chat_template(input)
+    }
 }
 
 impl<T, W> RouterRuntime<T, W>
@@ -905,6 +934,27 @@ where
             prompt_tokens,
             stream,
         ))
+    }
+
+    pub fn generate_stream_with_sink<F>(
+        &mut self,
+        request: RouterGenerateRequest,
+        mut sink: F,
+    ) -> Result<(), RouterRuntimeError>
+    where
+        F: FnMut(RouterGenerateResponse) -> bool,
+    {
+        let validated_request = request.try_into_validated_token_request(self.validation_config)?;
+        self.ensure_generation_ready()?;
+        let mut state = RouterStreamState::new(
+            validated_request.prompt_tokens as i32,
+            validated_request.stream,
+        );
+        self.engine.generate_token_stream_with_sink(
+            self.apply_default_stop_token_ids(validated_request.request),
+            |output| state.responses(output).into_iter().all(&mut sink),
+        )?;
+        Ok(())
     }
 
     pub fn generate_batch_stream(
@@ -961,6 +1011,51 @@ where
         }
 
         Ok(responses)
+    }
+
+    pub fn generate_text_stream_with_sink<F>(
+        &mut self,
+        request: RouterTextGenerateRequest,
+        mut sink: F,
+    ) -> Result<(), RouterRuntimeError>
+    where
+        F: FnMut(RouterGenerateResponse) -> bool,
+    {
+        if request.text.is_empty() {
+            return Err(RouterProtocolError::EmptyTextInput.into());
+        }
+
+        let input_ids = self.engine.tokenize(&request.text);
+        let tokenizer = self.engine.tokenizer().clone();
+        let mut decoder = tokenizer.incremental_decoder();
+        let mut decode_error = None;
+        self.generate_stream_with_sink(
+            RouterGenerateRequest {
+                request_id: request.request_id,
+                tokenized: Some(RouterTokenizedInput {
+                    original_text: request.text,
+                    input_ids,
+                }),
+                sampling_params: request.sampling_params,
+                disaggregated_params: request.disaggregated_params,
+                stream: true,
+                data_parallel_rank: request.data_parallel_rank,
+                trace_headers: request.trace_headers,
+            },
+            |mut response| {
+                if let Err(error) =
+                    fill_incremental_response_text(decoder.as_mut(), &tokenizer, &mut response)
+                {
+                    decode_error = Some(error);
+                    return false;
+                }
+                sink(response)
+            },
+        )?;
+        if let Some(error) = decode_error {
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn generate_text_batch_stream(
@@ -1061,6 +1156,30 @@ where
         ))
     }
 
+    pub fn generate_stream_with_transfer_polling_sink<F>(
+        &mut self,
+        request: RouterGenerateRequest,
+        max_transfer_polls: usize,
+        mut sink: F,
+    ) -> Result<(), RouterRuntimeError>
+    where
+        F: FnMut(RouterGenerateResponse) -> bool,
+    {
+        let validated_request = request.try_into_validated_token_request(self.validation_config)?;
+        self.ensure_generation_ready()?;
+        let mut state = RouterStreamState::new(
+            validated_request.prompt_tokens as i32,
+            validated_request.stream,
+        );
+        self.engine
+            .generate_token_stream_with_transfer_polling_sink(
+                self.apply_default_stop_token_ids(validated_request.request),
+                max_transfer_polls,
+                |output| state.responses(output).into_iter().all(&mut sink),
+            )?;
+        Ok(())
+    }
+
     pub fn generate_batch_stream_with_transfer_polling(
         &mut self,
         requests: Vec<RouterGenerateRequest>,
@@ -1127,6 +1246,53 @@ where
         Ok(responses)
     }
 
+    pub fn generate_text_stream_with_transfer_polling_sink<F>(
+        &mut self,
+        request: RouterTextGenerateRequest,
+        max_transfer_polls: usize,
+        mut sink: F,
+    ) -> Result<(), RouterRuntimeError>
+    where
+        F: FnMut(RouterGenerateResponse) -> bool,
+    {
+        if request.text.is_empty() {
+            return Err(RouterProtocolError::EmptyTextInput.into());
+        }
+
+        let input_ids = self.engine.tokenize(&request.text);
+        let tokenizer = self.engine.tokenizer().clone();
+        let mut decoder = tokenizer.incremental_decoder();
+        let mut decode_error = None;
+        self.generate_stream_with_transfer_polling_sink(
+            RouterGenerateRequest {
+                request_id: request.request_id,
+                tokenized: Some(RouterTokenizedInput {
+                    original_text: request.text,
+                    input_ids,
+                }),
+                sampling_params: request.sampling_params,
+                disaggregated_params: request.disaggregated_params,
+                stream: true,
+                data_parallel_rank: request.data_parallel_rank,
+                trace_headers: request.trace_headers,
+            },
+            max_transfer_polls,
+            |mut response| {
+                if let Err(error) =
+                    fill_incremental_response_text(decoder.as_mut(), &tokenizer, &mut response)
+                {
+                    decode_error = Some(error);
+                    return false;
+                }
+                sink(response)
+            },
+        )?;
+        if let Some(error) = decode_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub fn generate_text_batch_stream_with_transfer_polling(
         &mut self,
         requests: Vec<RouterTextGenerateRequest>,
@@ -1163,6 +1329,95 @@ where
 
         Ok(batch_responses)
     }
+}
+
+struct RouterStreamState {
+    output_ids: Vec<u32>,
+    prompt_tokens: i32,
+    stream: bool,
+}
+
+impl RouterStreamState {
+    fn new(prompt_tokens: i32, stream: bool) -> Self {
+        Self {
+            output_ids: Vec::new(),
+            prompt_tokens,
+            stream,
+        }
+    }
+
+    fn responses(&mut self, output: TokenGenerateOutput) -> Vec<RouterGenerateResponse> {
+        let request_id = output.request_id.as_str().to_string();
+        self.output_ids.extend_from_slice(&output.output_ids);
+        let completion_tokens = self.output_ids.len() as i32;
+        let cached_tokens = output.cached_tokens as i32;
+        if output.finished {
+            let complete = RouterGenerateResponse {
+                request_id: request_id.clone(),
+                body: RouterGenerateResponseBody::Complete(RouterGenerateComplete {
+                    output_ids: self.output_ids.clone(),
+                    text: String::new(),
+                    finish_reason: "stop".to_string(),
+                    prompt_tokens: self.prompt_tokens,
+                    completion_tokens,
+                    cached_tokens,
+                    index: 0,
+                }),
+            };
+            if self.stream && !output.output_ids.is_empty() {
+                return vec![
+                    RouterGenerateResponse {
+                        request_id,
+                        body: RouterGenerateResponseBody::Chunk(RouterGenerateStreamChunk {
+                            token_ids: output.output_ids,
+                            text: String::new(),
+                            prompt_tokens: self.prompt_tokens,
+                            completion_tokens,
+                            cached_tokens,
+                            index: 0,
+                        }),
+                    },
+                    complete,
+                ];
+            }
+            return vec![complete];
+        }
+
+        vec![RouterGenerateResponse {
+            request_id,
+            body: RouterGenerateResponseBody::Chunk(RouterGenerateStreamChunk {
+                token_ids: output.output_ids,
+                text: String::new(),
+                prompt_tokens: self.prompt_tokens,
+                completion_tokens,
+                cached_tokens,
+                index: 0,
+            }),
+        }]
+    }
+}
+
+fn fill_incremental_response_text<T: Tokenizer>(
+    decoder: &mut dyn IncrementalDecoder,
+    tokenizer: &T,
+    response: &mut RouterGenerateResponse,
+) -> Result<(), RouterRuntimeError> {
+    match &mut response.body {
+        RouterGenerateResponseBody::Chunk(chunk) => {
+            for token_id in &chunk.token_ids {
+                if let Some(text) = decoder.step(*token_id).map_err(RuntimeError::from)? {
+                    chunk.text.push_str(&text);
+                }
+            }
+        }
+        RouterGenerateResponseBody::Complete(complete) => {
+            complete.text = tokenizer
+                .decode(&complete.output_ids)
+                .map_err(RuntimeError::from)?;
+        }
+        RouterGenerateResponseBody::Error(_) => {}
+    }
+    Ok(())
 }
 
 fn token_outputs_to_generate_responses(

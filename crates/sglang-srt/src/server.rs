@@ -103,10 +103,7 @@ pub mod test_support {
     ) -> Result<ReferenceGrpcRouterService, ServerLaunchError> {
         let scheduler = Scheduler::new(ModelRunner::new(CpuReferenceModel))
             .with_max_running_requests(args.max_running_requests);
-        let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
-            &args.model_path,
-            args.tokenizer_path.as_deref(),
-        )?;
+        let tokenizer = reference_tokenizer_from_args(args)?;
         let runtime = RouterRuntime::new(Engine::new(tokenizer, scheduler))
             .with_default_stop_token_ids(model_config_eos_token_ids(&args.model_path));
         Ok(GrpcRouterService::with_server_args(runtime, args))
@@ -115,11 +112,8 @@ pub mod test_support {
     pub fn build_reference_http_router_service(args: &ServerArgs) -> ReferenceHttpRouterService {
         let scheduler = Scheduler::new(ModelRunner::new(CpuReferenceModel))
             .with_max_running_requests(args.max_running_requests);
-        let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
-            &args.model_path,
-            args.tokenizer_path.as_deref(),
-        )
-        .expect("reference tokenizer should load");
+        let tokenizer =
+            reference_tokenizer_from_args(args).expect("reference tokenizer should load");
         let runtime = RouterRuntime::new(Engine::new(tokenizer, scheduler))
             .with_default_stop_token_ids(model_config_eos_token_ids(&args.model_path));
         HttpRouterService::new(runtime, RouterGetModelInfoResponse::from_server_args(args))
@@ -218,11 +212,8 @@ pub mod test_support {
                 .expect("reference KV cache arguments should be valid"),
         )
         .with_max_running_requests(args.max_running_requests);
-        let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
-            &args.model_path,
-            args.tokenizer_path.as_deref(),
-        )
-        .expect("reference tokenizer should load");
+        let tokenizer =
+            reference_tokenizer_from_args(args).expect("reference tokenizer should load");
         let runtime = RouterRuntime::new(Engine::new(tokenizer, scheduler))
             .with_default_stop_token_ids(model_config_eos_token_ids(&args.model_path));
         GrpcRouterService::with_server_args(runtime, args)
@@ -246,15 +237,30 @@ pub mod test_support {
     where
         W: WorkerExecutor,
     {
-        let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
-            &args.model_path,
-            args.tokenizer_path.as_deref(),
-        )
-        .expect("reference tokenizer should load");
+        let tokenizer =
+            reference_tokenizer_from_args(args).expect("reference tokenizer should load");
         let runtime = RouterRuntime::new(Engine::new(tokenizer, scheduler))
             .with_default_stop_token_ids(model_config_eos_token_ids(&args.model_path));
         HttpRouterService::new(runtime, RouterGetModelInfoResponse::from_server_args(args))
             .with_server_info(http_server_info_from_args(args))
+    }
+
+    fn reference_tokenizer_from_args(
+        args: &ServerArgs,
+    ) -> Result<RuntimeTokenizer, TokenizerError> {
+        if args.tokenizer_path.is_some()
+            || Path::new(&args.model_path).join("tokenizer.json").is_file()
+            || Path::new(&args.model_path)
+                .file_name()
+                .is_some_and(|name| name == "tokenizer.json")
+        {
+            return RuntimeTokenizer::from_model_or_tokenizer_path(
+                &args.model_path,
+                args.tokenizer_path.as_deref(),
+            );
+        }
+
+        Ok(RuntimeTokenizer::Byte(crate::tokenizer::ByteTokenizer))
     }
 }
 
@@ -667,6 +673,7 @@ fn http_server_info_from_args(args: &ServerArgs) -> HttpServerInfo {
         } else {
             None
         },
+        enable_metrics: args.enable_metrics,
         kv_events: None,
         kv_cache: None,
     };

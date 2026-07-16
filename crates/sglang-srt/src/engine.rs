@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::scheduler::{ScheduledOutput, ScheduledRequest, Scheduler, SchedulerError};
-use crate::tokenizer::{Tokenizer, TokenizerError};
+use crate::tokenizer::{ChatTemplateInput, Tokenizer, TokenizerError};
 use crate::transfer::{KvCacheTransferError, MooncakeTransferPollSummary};
 use crate::types::{
     GenerateOutput, GenerateRequest, RequestId, TokenGenerateOutput, TokenGenerateRequest,
@@ -76,6 +76,10 @@ impl<T, W> Engine<T, W> {
         &mut self.scheduler
     }
 
+    pub fn tokenizer(&self) -> &T {
+        &self.tokenizer
+    }
+
     pub fn flush_cache(&mut self) -> bool {
         self.scheduler.flush_cache()
     }
@@ -132,6 +136,10 @@ where
     pub fn detokenize(&self, token_ids: &[u32]) -> Result<String, TokenizerError> {
         self.tokenizer.decode(token_ids)
     }
+
+    pub fn apply_chat_template(&self, input: &ChatTemplateInput) -> Result<String, TokenizerError> {
+        self.tokenizer.apply_chat_template(input)
+    }
 }
 
 impl<T, W> Engine<T, W>
@@ -178,21 +186,35 @@ where
         &mut self,
         request: TokenGenerateRequest,
     ) -> Result<Vec<TokenGenerateOutput>, RuntimeError> {
-        let outputs = self.generate_scheduled_stream(
+        let mut outputs = Vec::new();
+        self.generate_token_stream_with_sink(request, |output| {
+            outputs.push(output);
+            true
+        })?;
+        Ok(outputs)
+    }
+
+    pub fn generate_token_stream_with_sink<F>(
+        &mut self,
+        request: TokenGenerateRequest,
+        mut sink: F,
+    ) -> Result<(), RuntimeError>
+    where
+        F: FnMut(TokenGenerateOutput) -> bool,
+    {
+        self.generate_scheduled_stream_with_sink(
             ScheduledRequest::new(request.request_id, request.input_ids, request.sampling)
                 .with_disaggregated_params(request.disaggregated_params)
                 .with_data_parallel_rank(request.data_parallel_rank),
-        )?;
-
-        Ok(outputs
-            .into_iter()
-            .map(|output| TokenGenerateOutput {
-                request_id: output.request_id,
-                output_ids: output.token_ids,
-                cached_tokens: output.cached_tokens,
-                finished: output.finished,
-            })
-            .collect())
+            |output| {
+                sink(TokenGenerateOutput {
+                    request_id: output.request_id,
+                    output_ids: output.token_ids,
+                    cached_tokens: output.cached_tokens,
+                    finished: output.finished,
+                })
+            },
+        )
     }
 
     pub fn generate_token_batch_stream(
@@ -238,6 +260,22 @@ where
         &mut self,
         request: ScheduledRequest,
     ) -> Result<Vec<ScheduledOutput>, RuntimeError> {
+        let mut outputs = Vec::new();
+        self.generate_scheduled_stream_with_sink(request, |output| {
+            outputs.push(output);
+            true
+        })?;
+        Ok(outputs)
+    }
+
+    fn generate_scheduled_stream_with_sink<F>(
+        &mut self,
+        request: ScheduledRequest,
+        mut sink: F,
+    ) -> Result<(), RuntimeError>
+    where
+        F: FnMut(ScheduledOutput) -> bool,
+    {
         let request_id = request.request_id().clone();
         self.scheduler.enqueue(request);
         let mut scheduled_output = match self.scheduler.dispatch_next() {
@@ -247,14 +285,28 @@ where
                 return Err(error.into());
             }
         };
-        let mut outputs = vec![scheduled_output.clone()];
-
-        while !scheduled_output.finished {
-            scheduled_output = self.next_decode_output()?;
-            outputs.push(scheduled_output.clone());
+        loop {
+            let finished = scheduled_output.finished;
+            if !sink(scheduled_output) {
+                self.scheduler.abort_request(&request_id);
+                return Ok(());
+            }
+            if finished {
+                return Ok(());
+            }
+            scheduled_output = match self.next_decode_output() {
+                Ok(output) => output,
+                Err(error) => {
+                    if !matches!(
+                        error,
+                        RuntimeError::Scheduler(SchedulerError::DecodeNotReady { .. })
+                    ) {
+                        self.scheduler.abort_request(&request_id);
+                    }
+                    return Err(error);
+                }
+            };
         }
-
-        Ok(outputs)
     }
 
     fn generate_scheduled_batch_stream(
@@ -342,22 +394,41 @@ where
         request: TokenGenerateRequest,
         max_transfer_polls: usize,
     ) -> Result<Vec<TokenGenerateOutput>, RuntimeError> {
-        let outputs = self.generate_scheduled_stream_with_transfer_polling(
+        let mut outputs = Vec::new();
+        self.generate_token_stream_with_transfer_polling_sink(
+            request,
+            max_transfer_polls,
+            |output| {
+                outputs.push(output);
+                true
+            },
+        )?;
+        Ok(outputs)
+    }
+
+    pub fn generate_token_stream_with_transfer_polling_sink<F>(
+        &mut self,
+        request: TokenGenerateRequest,
+        max_transfer_polls: usize,
+        mut sink: F,
+    ) -> Result<(), RuntimeError>
+    where
+        F: FnMut(TokenGenerateOutput) -> bool,
+    {
+        self.generate_scheduled_stream_with_transfer_polling_sink(
             ScheduledRequest::new(request.request_id, request.input_ids, request.sampling)
                 .with_disaggregated_params(request.disaggregated_params)
                 .with_data_parallel_rank(request.data_parallel_rank),
             max_transfer_polls,
-        )?;
-
-        Ok(outputs
-            .into_iter()
-            .map(|output| TokenGenerateOutput {
-                request_id: output.request_id,
-                output_ids: output.token_ids,
-                cached_tokens: output.cached_tokens,
-                finished: output.finished,
-            })
-            .collect())
+            |output| {
+                sink(TokenGenerateOutput {
+                    request_id: output.request_id,
+                    output_ids: output.token_ids,
+                    cached_tokens: output.cached_tokens,
+                    finished: output.finished,
+                })
+            },
+        )
     }
 
     pub fn generate_token_batch_stream_with_transfer_polling(
@@ -385,18 +456,62 @@ where
         request: ScheduledRequest,
         max_transfer_polls: usize,
     ) -> Result<Vec<ScheduledOutput>, RuntimeError> {
+        let mut outputs = Vec::new();
+        self.generate_scheduled_stream_with_transfer_polling_sink(
+            request,
+            max_transfer_polls,
+            |output| {
+                outputs.push(output);
+                true
+            },
+        )?;
+        Ok(outputs)
+    }
+
+    fn generate_scheduled_stream_with_transfer_polling_sink<F>(
+        &mut self,
+        request: ScheduledRequest,
+        max_transfer_polls: usize,
+        mut sink: F,
+    ) -> Result<(), RuntimeError>
+    where
+        F: FnMut(ScheduledOutput) -> bool,
+    {
+        let request_id = request.request_id().clone();
         self.scheduler.enqueue(request);
-        let mut scheduled_output = self.scheduler.dispatch_next()?;
-        let mut outputs = vec![scheduled_output.clone()];
+        let mut scheduled_output = match self.scheduler.dispatch_next() {
+            Ok(output) => output,
+            Err(error) => {
+                self.scheduler.abort_request(&request_id);
+                return Err(error.into());
+            }
+        };
         let mut remaining_transfer_polls = max_transfer_polls;
 
-        while !scheduled_output.finished {
-            scheduled_output =
-                self.next_decode_output_with_transfer_polling(&mut remaining_transfer_polls)?;
-            outputs.push(scheduled_output.clone());
+        loop {
+            let finished = scheduled_output.finished;
+            if !sink(scheduled_output) {
+                self.scheduler.abort_request(&request_id);
+                return Ok(());
+            }
+            if finished {
+                return Ok(());
+            }
+            scheduled_output = match self
+                .next_decode_output_with_transfer_polling(&mut remaining_transfer_polls)
+            {
+                Ok(output) => output,
+                Err(error) => {
+                    if !matches!(
+                        error,
+                        RuntimeError::Scheduler(SchedulerError::DecodeNotReady { .. })
+                    ) {
+                        self.scheduler.abort_request(&request_id);
+                    }
+                    return Err(error);
+                }
+            };
         }
-
-        Ok(outputs)
     }
 
     fn generate_scheduled_batch_stream_with_transfer_polling(

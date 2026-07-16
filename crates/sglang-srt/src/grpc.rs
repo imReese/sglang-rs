@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
+use tokio_stream::StreamExt;
 use tonic::{Code, Request, Response, Status};
 
 use crate::cli::ServerArgs;
@@ -61,6 +62,24 @@ type GenerateResponseStream = Pin<
 type OpenAiJsonResponseStream = Pin<
     Box<dyn tonic::codegen::tokio_stream::Stream<Item = Result<OpenAiJsonResponse, Status>> + Send>,
 >;
+
+async fn start_grpc_stream<T: Send + 'static>(
+    mut receiver: tokio::sync::mpsc::Receiver<Result<T, Status>>,
+) -> Result<
+    Pin<Box<dyn tonic::codegen::tokio_stream::Stream<Item = Result<T, Status>> + Send>>,
+    Status,
+> {
+    match receiver.recv().await {
+        Some(Ok(first)) => Ok(Box::pin(
+            tokio_stream::once(Ok(first))
+                .chain(tokio_stream::wrappers::ReceiverStream::new(receiver)),
+        )),
+        Some(Err(error)) => Err(error),
+        None => Err(Status::internal(
+            "streaming generation ended before its first response",
+        )),
+    }
+}
 
 const DEFAULT_PROTO_EMBEDDING_DIMENSIONS: usize = 8;
 const DEFAULT_PROTO_CLASS_COUNT: usize = 3;
@@ -570,25 +589,30 @@ fn openai_responses_response_from_router_responses(
     Ok(OpenAiJsonResponse { json })
 }
 
+#[derive(Default)]
+struct GrpcResponsesStreamState {
+    sequence_number: i32,
+    message_open: bool,
+    response_id: String,
+    item_id: String,
+}
+
 fn openai_responses_stream_from_router_responses(
     responses: Vec<RouterGenerateResponse>,
     model: &str,
+    state: &mut GrpcResponsesStreamState,
 ) -> Result<Vec<OpenAiJsonResponse>, Status> {
     let mut events = Vec::new();
-    let mut sequence_number = 0_i32;
-    let mut message_open = false;
-    let mut response_id = String::new();
-    let mut item_id = String::new();
 
     for response in responses {
-        if response_id.is_empty() {
-            response_id = openai_response_id("resp-", &response.request_id);
-            item_id = openai_responses_message_id(&response.request_id);
+        if state.response_id.is_empty() {
+            state.response_id = openai_response_id("resp-", &response.request_id);
+            state.item_id = openai_responses_message_id(&response.request_id);
             events.push(openai_responses_event_json(
                 json!({
                     "type": "response.created",
                     "response": {
-                        "id": response_id,
+                        "id": state.response_id,
                         "object": "response",
                         "created_at": unix_timestamp_secs(),
                         "status": "in_progress",
@@ -597,19 +621,19 @@ fn openai_responses_stream_from_router_responses(
                         "output_text": "",
                     },
                 }),
-                &mut sequence_number,
+                &mut state.sequence_number,
             )?);
         }
 
         match response.body {
             RouterGenerateResponseBody::Chunk(chunk) => {
-                if !message_open {
+                if !state.message_open {
                     openai_responses_message_open_events(
                         &mut events,
-                        &mut sequence_number,
-                        &item_id,
+                        &mut state.sequence_number,
+                        &state.item_id,
                     )?;
-                    message_open = true;
+                    state.message_open = true;
                 }
                 if !chunk.text.is_empty() {
                     events.push(openai_responses_event_json(
@@ -617,22 +641,22 @@ fn openai_responses_stream_from_router_responses(
                             "type": "response.output_text.delta",
                             "output_index": chunk.index,
                             "content_index": 0,
-                            "item_id": item_id,
+                            "item_id": state.item_id,
                             "delta": chunk.text,
                             "logprobs": [],
                         }),
-                        &mut sequence_number,
+                        &mut state.sequence_number,
                     )?);
                 }
             }
             RouterGenerateResponseBody::Complete(complete) => {
-                if !message_open {
+                if !state.message_open {
                     openai_responses_message_open_events(
                         &mut events,
-                        &mut sequence_number,
-                        &item_id,
+                        &mut state.sequence_number,
+                        &state.item_id,
                     )?;
-                    message_open = true;
+                    state.message_open = true;
                 }
                 let output_index = complete.index;
                 let output_text = complete.text.clone();
@@ -641,11 +665,11 @@ fn openai_responses_stream_from_router_responses(
                         "type": "response.output_text.done",
                         "output_index": output_index,
                         "content_index": 0,
-                        "item_id": item_id,
+                        "item_id": state.item_id,
                         "text": output_text,
                         "logprobs": [],
                     }),
-                    &mut sequence_number,
+                    &mut state.sequence_number,
                 )?);
 
                 let text_part = json!({
@@ -656,12 +680,12 @@ fn openai_responses_stream_from_router_responses(
                 events.push(openai_responses_event_json(
                     json!({
                         "type": "response.content_part.done",
-                        "item_id": item_id,
+                        "item_id": state.item_id,
                         "output_index": output_index,
                         "content_index": 0,
                         "part": text_part,
                     }),
-                    &mut sequence_number,
+                    &mut state.sequence_number,
                 )?);
 
                 events.push(openai_responses_event_json(
@@ -669,14 +693,14 @@ fn openai_responses_stream_from_router_responses(
                         "type": "response.output_item.done",
                         "output_index": output_index,
                         "item": {
-                            "id": item_id,
+                            "id": state.item_id,
                             "type": "message",
                             "status": "completed",
                             "role": "assistant",
                             "content": [text_part],
                         },
                     }),
-                    &mut sequence_number,
+                    &mut state.sequence_number,
                 )?);
 
                 events.push(openai_responses_event_json(
@@ -688,7 +712,7 @@ fn openai_responses_stream_from_router_responses(
                             complete,
                         ),
                     }),
-                    &mut sequence_number,
+                    &mut state.sequence_number,
                 )?);
             }
             RouterGenerateResponseBody::Error(error) => {
@@ -699,7 +723,7 @@ fn openai_responses_stream_from_router_responses(
                             "message": error.message,
                         },
                     }),
-                    &mut sequence_number,
+                    &mut state.sequence_number,
                 )?);
             }
         }
@@ -931,6 +955,35 @@ where
         request: Request<TextGenerateRequest>,
     ) -> Result<Response<Self::TextGenerateStream>, Status> {
         let request = proto_text_generate_request_to_router_request(request.into_inner())?;
+        if request.stream {
+            let (sender, receiver) = tokio::sync::mpsc::channel(16);
+            let runtime = Arc::clone(&self.runtime);
+            let max_transfer_polls = self.max_transfer_polls;
+            tokio::task::spawn_blocking(move || {
+                let result = match runtime.lock() {
+                    Ok(mut runtime) => runtime.generate_text_stream_with_transfer_polling_sink(
+                        request,
+                        max_transfer_polls,
+                        |response| {
+                            sender
+                                .blocking_send(Ok(router_generate_response_to_proto_response(
+                                    response,
+                                )))
+                                .is_ok()
+                        },
+                    ),
+                    Err(_) => {
+                        let _ = sender
+                            .blocking_send(Err(Status::internal("router runtime mutex poisoned")));
+                        return;
+                    }
+                };
+                if let Err(error) = result {
+                    let _ = sender.blocking_send(Err(router_runtime_error_to_status(error)));
+                }
+            });
+            return Ok(Response::new(start_grpc_stream(receiver).await?));
+        }
         let responses = self
             .runtime
             .lock()
@@ -952,6 +1005,35 @@ where
         request: Request<ProtoGenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
         let request = proto_generate_request_to_router_request(request.into_inner())?;
+        if request.stream {
+            let (sender, receiver) = tokio::sync::mpsc::channel(16);
+            let runtime = Arc::clone(&self.runtime);
+            let max_transfer_polls = self.max_transfer_polls;
+            tokio::task::spawn_blocking(move || {
+                let result = match runtime.lock() {
+                    Ok(mut runtime) => runtime.generate_stream_with_transfer_polling_sink(
+                        request,
+                        max_transfer_polls,
+                        |response| {
+                            sender
+                                .blocking_send(Ok(router_generate_response_to_proto_response(
+                                    response,
+                                )))
+                                .is_ok()
+                        },
+                    ),
+                    Err(_) => {
+                        let _ = sender
+                            .blocking_send(Err(Status::internal("router runtime mutex poisoned")));
+                        return;
+                    }
+                };
+                if let Err(error) = result {
+                    let _ = sender.blocking_send(Err(router_runtime_error_to_status(error)));
+                }
+            });
+            return Ok(Response::new(start_grpc_stream(receiver).await?));
+        }
         let responses = self
             .runtime
             .lock()
@@ -1220,7 +1302,15 @@ where
         let payload: Value = serde_json::from_slice(&request.json)
             .map_err(|e| Status::invalid_argument(format!("invalid OpenAI JSON payload: {e}")))?;
         let model = self.model_info()?.served_model_name;
-        let mut request = crate::http::http_chat_payload_to_router_request(payload, &model)
+        let template_input = crate::http::chat_template_input_from_payload(&payload)
+            .map_err(Status::invalid_argument)?;
+        let prompt = self
+            .runtime
+            .lock()
+            .map_err(|_| Status::internal("router runtime mutex poisoned"))?
+            .apply_chat_template(&template_input)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let mut request = crate::http::http_chat_payload_to_router_request(payload, &model, prompt)
             .map_err(Status::invalid_argument)?;
         match &mut request {
             crate::http::HttpChatRequest::Single(request) => {
@@ -1233,6 +1323,44 @@ where
             }
         }
         let stream = request.stream();
+
+        if stream {
+            let request = match request {
+                crate::http::HttpChatRequest::Single(request) => *request,
+                crate::http::HttpChatRequest::Batch(_) => {
+                    return Err(Status::invalid_argument(
+                        "streaming batched chat completions are not supported yet",
+                    ));
+                }
+            };
+            let (sender, receiver) = tokio::sync::mpsc::channel(16);
+            let runtime = Arc::clone(&self.runtime);
+            let max_transfer_polls = self.max_transfer_polls;
+            tokio::task::spawn_blocking(move || {
+                let result = match runtime.lock() {
+                    Ok(mut runtime) => runtime.generate_text_stream_with_transfer_polling_sink(
+                        request,
+                        max_transfer_polls,
+                        |response| {
+                            sender
+                                .blocking_send(openai_chat_stream_response_from_router_response(
+                                    response, &model,
+                                ))
+                                .is_ok()
+                        },
+                    ),
+                    Err(_) => {
+                        let _ = sender
+                            .blocking_send(Err(Status::internal("router runtime mutex poisoned")));
+                        return;
+                    }
+                };
+                if let Err(error) = result {
+                    let _ = sender.blocking_send(Err(router_runtime_error_to_status(error)));
+                }
+            });
+            return Ok(Response::new(start_grpc_stream(receiver).await?));
+        }
 
         let mut runtime = self
             .runtime
@@ -1259,17 +1387,6 @@ where
         .map_err(router_runtime_error_to_status)?;
 
         match response {
-            GrpcChatResponse::Single(responses) if stream => {
-                let stream = responses
-                    .into_iter()
-                    .map(|response| {
-                        openai_chat_stream_response_from_router_response(response, &model)
-                    })
-                    .collect::<Vec<_>>();
-                Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
-                    stream,
-                ))))
-            }
             GrpcChatResponse::Single(responses) => {
                 let response = openai_chat_response_from_router_responses(responses, &model)?;
                 Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
@@ -1309,6 +1426,46 @@ where
         }
         let stream = request.stream();
 
+        if stream {
+            let request = match request {
+                crate::http::HttpCompletionRequest::Single(request) => *request,
+                crate::http::HttpCompletionRequest::Batch(_) => {
+                    return Err(Status::invalid_argument(
+                        "streaming batched completions are not supported yet",
+                    ));
+                }
+            };
+            let (sender, receiver) = tokio::sync::mpsc::channel(16);
+            let runtime = Arc::clone(&self.runtime);
+            let max_transfer_polls = self.max_transfer_polls;
+            tokio::task::spawn_blocking(move || {
+                let result = match runtime.lock() {
+                    Ok(mut runtime) => runtime.generate_text_stream_with_transfer_polling_sink(
+                        request,
+                        max_transfer_polls,
+                        |response| {
+                            sender
+                                .blocking_send(
+                                    openai_completion_stream_response_from_router_response(
+                                        response, &model,
+                                    ),
+                                )
+                                .is_ok()
+                        },
+                    ),
+                    Err(_) => {
+                        let _ = sender
+                            .blocking_send(Err(Status::internal("router runtime mutex poisoned")));
+                        return;
+                    }
+                };
+                if let Err(error) = result {
+                    let _ = sender.blocking_send(Err(router_runtime_error_to_status(error)));
+                }
+            });
+            return Ok(Response::new(start_grpc_stream(receiver).await?));
+        }
+
         let mut runtime = self
             .runtime
             .lock()
@@ -1334,17 +1491,6 @@ where
         .map_err(router_runtime_error_to_status)?;
 
         match response {
-            GrpcCompletionResponse::Single(responses) if stream => {
-                let stream = responses
-                    .into_iter()
-                    .map(|response| {
-                        openai_completion_stream_response_from_router_response(response, &model)
-                    })
-                    .collect::<Vec<_>>();
-                Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
-                    stream,
-                ))))
-            }
             GrpcCompletionResponse::Single(responses) => {
                 let response = openai_completion_response_from_router_responses(responses, &model)?;
                 Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
@@ -1378,23 +1524,53 @@ where
         let stream = request.request.stream;
         let response_model = request.model;
 
+        if stream {
+            let (sender, receiver) = tokio::sync::mpsc::channel(16);
+            let runtime = Arc::clone(&self.runtime);
+            let max_transfer_polls = self.max_transfer_polls;
+            let router_request = request.request;
+            tokio::task::spawn_blocking(move || {
+                let mut stream_state = GrpcResponsesStreamState::default();
+                let result = match runtime.lock() {
+                    Ok(mut runtime) => runtime.generate_text_stream_with_transfer_polling_sink(
+                        router_request,
+                        max_transfer_polls,
+                        |response| {
+                            let events = match openai_responses_stream_from_router_responses(
+                                vec![response],
+                                &response_model,
+                                &mut stream_state,
+                            ) {
+                                Ok(events) => events,
+                                Err(error) => {
+                                    let _ = sender.blocking_send(Err(error));
+                                    return false;
+                                }
+                            };
+                            events
+                                .into_iter()
+                                .all(|event| sender.blocking_send(Ok(event)).is_ok())
+                        },
+                    ),
+                    Err(_) => {
+                        let _ = sender
+                            .blocking_send(Err(Status::internal("router runtime mutex poisoned")));
+                        return;
+                    }
+                };
+                if let Err(error) = result {
+                    let _ = sender.blocking_send(Err(router_runtime_error_to_status(error)));
+                }
+            });
+            return Ok(Response::new(start_grpc_stream(receiver).await?));
+        }
+
         let responses = self
             .runtime
             .lock()
             .map_err(|_| Status::internal("router runtime mutex poisoned"))?
             .generate_text_stream_with_transfer_polling(request.request, self.max_transfer_polls)
             .map_err(router_runtime_error_to_status)?;
-
-        if stream {
-            let responses =
-                openai_responses_stream_from_router_responses(responses, &response_model)?
-                    .into_iter()
-                    .map(Ok)
-                    .collect::<Vec<_>>();
-            return Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(
-                responses,
-            ))));
-        }
 
         let response = openai_responses_response_from_router_responses(responses, &response_model)?;
         Ok(Response::new(Box::pin(tonic::codegen::tokio_stream::iter(

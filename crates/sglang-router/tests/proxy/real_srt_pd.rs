@@ -247,7 +247,7 @@ async fn router_pd_chat_completes_with_real_cpu_embedding_lm_http_workers() {
     assert_eq!(body["model"], "tiny");
     assert_eq!(body["choices"][0]["message"]["content"], "world");
     assert_eq!(body["choices"][0]["finish_reason"], "stop");
-    assert_eq!(body["usage"]["prompt_tokens"], 1);
+    assert_eq!(body["usage"]["prompt_tokens"], 3);
     assert_eq!(body["usage"]["completion_tokens"], 1);
 
     prefill_shutdown_tx
@@ -542,6 +542,13 @@ fn write_cpu_embedding_lm_fixture_model(name: &str) -> TempDir {
         word_level_tokenizer_json(),
     )
     .expect("tokenizer.json should be written");
+    fs::write(
+        model_dir.path().join("tokenizer_config.json"),
+        r#"{
+  "chat_template": "{% for message in messages %}{{ message['role'] }} {{ message['content'] }} {% endfor %}{% if add_generation_prompt %}assistant {% endif %}"
+}"#,
+    )
+    .expect("tokenizer_config.json should be written");
     model_dir
 }
 

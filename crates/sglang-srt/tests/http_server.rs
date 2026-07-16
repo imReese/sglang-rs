@@ -1,5 +1,8 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     fs,
@@ -15,7 +18,7 @@ use sglang_srt::engine::Engine;
 use sglang_srt::engine_info_bootstrap::{
     EngineInfoBootstrapService, TransferEngineInfo, TransferEngineInfoRegistration,
 };
-use sglang_srt::http::{HttpRouterService, serve_http_router_with_shutdown};
+use sglang_srt::http::{HttpRouterService, HttpServerInfo, serve_http_router_with_shutdown};
 use sglang_srt::pd_bootstrap::{PrefillBootstrapService, serve_prefill_bootstrap_with_shutdown};
 use sglang_srt::router::{RouterGetModelInfoResponse, RouterRuntime};
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
@@ -47,6 +50,26 @@ impl ModelWorker for HttpTwoStepWorker {
         let token = match batch.forward_mode() {
             sglang_srt::scheduler::ForwardMode::Prefill => GeneratedToken::unfinished(vec![42]),
             sglang_srt::scheduler::ForwardMode::Decode => GeneratedToken::finished(vec![43]),
+        };
+
+        BatchGeneratedTokens::from_batch(batch, vec![token])
+            .expect("output shape should match batch")
+    }
+}
+
+struct SlowHttpWorker {
+    decode_started: Arc<AtomicBool>,
+}
+
+impl ModelWorker for SlowHttpWorker {
+    fn generate_batch(&mut self, batch: &ScheduleBatch) -> BatchGeneratedTokens {
+        let token = match batch.forward_mode() {
+            sglang_srt::scheduler::ForwardMode::Prefill => GeneratedToken::unfinished(vec![42]),
+            sglang_srt::scheduler::ForwardMode::Decode => {
+                self.decode_started.store(true, Ordering::Release);
+                std::thread::sleep(Duration::from_secs(1));
+                GeneratedToken::finished(vec![43])
+            }
         };
 
         BatchGeneratedTokens::from_batch(batch, vec![token])
@@ -608,6 +631,92 @@ async fn http_server_accepts_streaming_generate_requests() {
     assert!(
         chunks.iter().any(|chunk| chunk["finish_reason"] == "stop"),
         "expected final stop chunk, got {chunks:?}"
+    );
+
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_streams_before_decode_finishes_and_keeps_health_lock_free() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "slow-http-stream",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let decode_started = Arc::new(AtomicBool::new(false));
+    let runtime = RouterRuntime::new(Engine::new(
+        ByteTokenizer,
+        Scheduler::new(SlowHttpWorker {
+            decode_started: Arc::clone(&decode_started),
+        }),
+    ));
+    let service =
+        HttpRouterService::new(runtime, RouterGetModelInfoResponse::from_server_args(&args))
+            .with_server_info(HttpServerInfo {
+                enable_metrics: true,
+                ..Default::default()
+            });
+    let addr = unused_local_addr();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let ready = request_raw_with_retry(addr, "GET", "/health", None).await;
+    assert!(ready.starts_with("HTTP/1.1 200"), "{ready}");
+
+    let started = Instant::now();
+    let first_event = read_first_sse_event(
+        addr,
+        "/generate",
+        r#"{"text":"hello","sampling_params":{"max_new_tokens":2},"stream":true}"#,
+    )
+    .await
+    .expect("first SSE event should arrive");
+    assert!(first_event.contains("data: "), "{first_event}");
+    assert!(
+        started.elapsed() < Duration::from_millis(800),
+        "the first SSE event waited for decode completion"
+    );
+
+    for _ in 0..100 {
+        if decode_started.load(Ordering::Acquire) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(decode_started.load(Ordering::Acquire));
+
+    let health = request_raw_with_retry(addr, "GET", "/health", None).await;
+    let deep_health = request_raw_with_retry(addr, "GET", "/health_generate", None).await;
+    let metrics = request_raw_with_retry(addr, "GET", "/metrics", None).await;
+    assert!(health.starts_with("HTTP/1.1 200"), "{health}");
+    assert!(deep_health.starts_with("HTTP/1.1 200"), "{deep_health}");
+    assert!(
+        deep_health.contains("runtime is actively serving a request"),
+        "{deep_health}"
+    );
+    assert!(metrics.contains("sglang_requests_total 1"), "{metrics}");
+    assert!(metrics.contains("sglang_requests_in_flight 1"), "{metrics}");
+    assert!(
+        metrics.contains("sglang_time_to_first_token_seconds_count 1"),
+        "{metrics}"
     );
 
     shutdown_tx
@@ -3073,6 +3182,25 @@ fn write_minimal_embedding_lm_artifacts(model_dir: &Path) {
     bytes.resize(bytes.len() + tensor_byte_len * 2, 0);
     fs::write(model_dir.join("model.safetensors"), bytes)
         .expect("safetensors shard should be written");
+    fs::write(
+        model_dir.join("tokenizer.json"),
+        r#"{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "Whitespace"},
+  "post_processor": null,
+  "decoder": null,
+  "model": {
+    "type": "WordLevel",
+    "vocab": {"[UNK]": 0, "hello": 1},
+    "unk_token": "[UNK]"
+  }
+}"#,
+    )
+    .expect("tokenizer should be written");
 }
 
 fn write_minimal_generic_model_artifacts_with_weight_values(model_dir: &Path, values: &[f32]) {
@@ -3341,6 +3469,42 @@ async fn request_raw(
     })
     .await
     .expect("blocking HTTP request should join")
+}
+
+async fn read_first_sse_event(
+    addr: SocketAddr,
+    path: &'static str,
+    body: &'static str,
+) -> Result<String, std::io::Error> {
+    tokio::task::spawn_blocking(move || {
+        let mut stream = TcpStream::connect(addr)?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes())?;
+
+        let mut response = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            response.extend_from_slice(&buffer[..read]);
+            if response
+                .windows(b"\n\n".len())
+                .any(|window| window == b"\n\n")
+                && response.windows(b"data: ".len()).any(|window| window == b"data: ")
+            {
+                break;
+            }
+        }
+        String::from_utf8(response).map_err(std::io::Error::other)
+    })
+    .await
+    .expect("blocking streaming HTTP request should join")
 }
 
 fn parse_sse_data(raw_response: &str) -> Vec<String> {

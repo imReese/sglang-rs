@@ -1,9 +1,11 @@
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Query, State};
@@ -13,6 +15,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::engine_info_bootstrap::EngineInfoBootstrapService;
 use crate::openai_classify::{classify_response_json, parse_classify_request};
@@ -31,7 +34,7 @@ use crate::router::{
     RouterProtocolError, RouterRuntime, RouterRuntimeError, RouterSamplingParams, RouterStatusCode,
     RouterTextGenerateRequest, RouterTokenizedInput,
 };
-use crate::tokenizer::Tokenizer;
+use crate::tokenizer::{ChatTemplateInput, Tokenizer};
 use crate::types::BootstrapRoom;
 use crate::weight_update::{get_weights_by_name_from_disk, update_model_info_from_disk};
 use crate::worker::WorkerExecutor;
@@ -42,6 +45,7 @@ pub struct HttpRouterService<T, W> {
     profile: Arc<Mutex<Option<ProfileSession>>>,
     profile_attributes: HashMap<String, String>,
     server_info: HttpServerInfo,
+    metrics: Arc<HttpMetrics>,
     engine_info_bootstrap: Option<EngineInfoBootstrapService>,
     allow_disaggregated_requests: bool,
     max_transfer_polls: usize,
@@ -55,6 +59,7 @@ impl<T, W> Clone for HttpRouterService<T, W> {
             profile: Arc::clone(&self.profile),
             profile_attributes: self.profile_attributes.clone(),
             server_info: self.server_info.clone(),
+            metrics: Arc::clone(&self.metrics),
             engine_info_bootstrap: self.engine_info_bootstrap.clone(),
             allow_disaggregated_requests: self.allow_disaggregated_requests,
             max_transfer_polls: self.max_transfer_polls,
@@ -72,6 +77,7 @@ pub struct HttpServerInfo {
     pub max_total_tokens: Option<usize>,
     pub disaggregation_mode: String,
     pub disaggregation_bootstrap_port: Option<u16>,
+    pub enable_metrics: bool,
     pub kv_events: Option<HttpKvEventsInfo>,
     pub kv_cache: Option<HttpKvCacheInfo>,
 }
@@ -87,6 +93,7 @@ impl Default for HttpServerInfo {
             max_total_tokens: None,
             disaggregation_mode: "null".to_string(),
             disaggregation_bootstrap_port: None,
+            enable_metrics: false,
             kv_events: None,
             kv_cache: None,
         }
@@ -123,6 +130,7 @@ impl<T, W> HttpRouterService<T, W> {
             profile: Arc::new(Mutex::new(None)),
             profile_attributes: HashMap::from([("transport".to_string(), "axum-http".to_string())]),
             server_info: HttpServerInfo::default(),
+            metrics: Arc::new(HttpMetrics::default()),
             engine_info_bootstrap: None,
             allow_disaggregated_requests: false,
             max_transfer_polls: 0,
@@ -181,8 +189,10 @@ where
     W: WorkerExecutor + Send + 'static,
 {
     fn into_router(self) -> Router {
-        Router::new()
+        let enable_metrics = self.server_info.enable_metrics;
+        let router = Router::new()
             .route("/health", get(health))
+            .route("/health_generate", get(health_generate::<T, W>))
             .route("/v1/models", get(list_models::<T, W>))
             .route("/model_info", get(model_info::<T, W>))
             .route("/get_model_info", get(model_info::<T, W>))
@@ -242,8 +252,145 @@ where
             .route("/v1/score", post(score::<T, W>))
             .route("/v1/embeddings", post(embeddings::<T, W>))
             .route("/v1/classify", post(classify::<T, W>))
-            .route("/generate", post(generate::<T, W>))
-            .with_state(self)
+            .route("/generate", post(generate::<T, W>));
+        let router = if enable_metrics {
+            router.route("/metrics", get(metrics::<T, W>))
+        } else {
+            router
+        };
+        router.with_state(self)
+    }
+}
+
+#[derive(Default)]
+struct HttpMetrics {
+    requests_total: AtomicU64,
+    requests_failed_total: AtomicU64,
+    requests_in_flight: AtomicU64,
+    prompt_tokens_total: AtomicU64,
+    generation_tokens_total: AtomicU64,
+    cached_tokens_total: AtomicU64,
+    time_to_first_token_micros_total: AtomicU64,
+    time_to_first_token_count: AtomicU64,
+    request_duration_micros_total: AtomicU64,
+    request_duration_count: AtomicU64,
+}
+
+impl HttpMetrics {
+    fn render(&self) -> String {
+        let seconds = |micros: u64| micros as f64 / 1_000_000.0;
+        format!(
+            concat!(
+                "# TYPE sglang_requests_total counter\nsglang_requests_total {}\n",
+                "# TYPE sglang_requests_failed_total counter\nsglang_requests_failed_total {}\n",
+                "# TYPE sglang_requests_in_flight gauge\nsglang_requests_in_flight {}\n",
+                "# TYPE sglang_prompt_tokens_total counter\nsglang_prompt_tokens_total {}\n",
+                "# TYPE sglang_generation_tokens_total counter\nsglang_generation_tokens_total {}\n",
+                "# TYPE sglang_cached_tokens_total counter\nsglang_cached_tokens_total {}\n",
+                "# TYPE sglang_time_to_first_token_seconds summary\n",
+                "sglang_time_to_first_token_seconds_sum {}\n",
+                "sglang_time_to_first_token_seconds_count {}\n",
+                "# TYPE sglang_request_duration_seconds summary\n",
+                "sglang_request_duration_seconds_sum {}\n",
+                "sglang_request_duration_seconds_count {}\n"
+            ),
+            self.requests_total.load(Ordering::Relaxed),
+            self.requests_failed_total.load(Ordering::Relaxed),
+            self.requests_in_flight.load(Ordering::Relaxed),
+            self.prompt_tokens_total.load(Ordering::Relaxed),
+            self.generation_tokens_total.load(Ordering::Relaxed),
+            self.cached_tokens_total.load(Ordering::Relaxed),
+            seconds(
+                self.time_to_first_token_micros_total
+                    .load(Ordering::Relaxed)
+            ),
+            self.time_to_first_token_count.load(Ordering::Relaxed),
+            seconds(self.request_duration_micros_total.load(Ordering::Relaxed)),
+            self.request_duration_count.load(Ordering::Relaxed),
+        )
+    }
+}
+
+struct RequestObservation {
+    metrics: Arc<HttpMetrics>,
+    started: Instant,
+    first_output_observed: bool,
+    finished: bool,
+}
+
+impl RequestObservation {
+    fn new(metrics: Arc<HttpMetrics>) -> Self {
+        metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+        metrics.requests_in_flight.fetch_add(1, Ordering::Relaxed);
+        Self {
+            metrics,
+            started: Instant::now(),
+            first_output_observed: false,
+            finished: false,
+        }
+    }
+
+    fn observe(&mut self, response: &RouterGenerateResponse) {
+        if !self.first_output_observed {
+            self.first_output_observed = true;
+            self.metrics
+                .time_to_first_token_micros_total
+                .fetch_add(elapsed_micros(self.started), Ordering::Relaxed);
+            self.metrics
+                .time_to_first_token_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if let RouterGenerateResponseBody::Complete(complete) = &response.body {
+            self.metrics
+                .prompt_tokens_total
+                .fetch_add(complete.prompt_tokens.max(0) as u64, Ordering::Relaxed);
+            self.metrics
+                .generation_tokens_total
+                .fetch_add(complete.completion_tokens.max(0) as u64, Ordering::Relaxed);
+            self.metrics
+                .cached_tokens_total
+                .fetch_add(complete.cached_tokens.max(0) as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn finish(&mut self, success: bool) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.metrics
+            .requests_in_flight
+            .fetch_sub(1, Ordering::Relaxed);
+        if !success {
+            self.metrics
+                .requests_failed_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.metrics
+            .request_duration_micros_total
+            .fetch_add(elapsed_micros(self.started), Ordering::Relaxed);
+        self.metrics
+            .request_duration_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl Drop for RequestObservation {
+    fn drop(&mut self) {
+        self.finish(false);
+    }
+}
+
+fn elapsed_micros(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+fn observe_router_responses(
+    observation: &mut RequestObservation,
+    responses: &[RouterGenerateResponse],
+) {
+    for response in responses {
+        observation.observe(response);
     }
 }
 
@@ -303,6 +450,93 @@ async fn health() -> Json<Value> {
     }))
 }
 
+async fn metrics<T, W>(State(service): State<HttpRouterService<T, W>>) -> Response
+where
+    T: Send + 'static,
+    W: Send + 'static,
+{
+    let mut response = Response::new(Body::from(service.metrics.render()));
+    response.headers_mut().insert(
+        HeaderName::from_static("content-type"),
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    response
+}
+
+async fn health_generate<T, W>(State(service): State<HttpRouterService<T, W>>) -> Response
+where
+    T: Tokenizer + Send + 'static,
+    W: WorkerExecutor + Send + 'static,
+{
+    let mut runtime = match service.runtime.try_lock() {
+        Ok(runtime) => runtime,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "healthy": true,
+                    "message": "runtime is actively serving a request"
+                })),
+            )
+                .into_response();
+        }
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "healthy": false,
+                    "message": "router runtime mutex poisoned"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    if service.allow_disaggregated_requests {
+        let load = runtime.load();
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "healthy": true,
+                "message": "PD runtime control plane is ready",
+                "waiting_queue_depth": load.waiting_queue_depth,
+                "decode_queue_depth": load.decode_queue_depth,
+            })),
+        )
+            .into_response();
+    }
+
+    let probe = RouterGenerateRequest {
+        request_id: String::new(),
+        tokenized: Some(RouterTokenizedInput {
+            original_text: String::new(),
+            input_ids: vec![0],
+        }),
+        sampling_params: Some(RouterSamplingParams {
+            max_new_tokens: Some(1),
+            temperature: Some(0.0),
+            ..RouterSamplingParams::default()
+        }),
+        stream: false,
+        ..RouterGenerateRequest::default()
+    };
+    match runtime.generate_stream(probe) {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(json!({ "healthy": true, "message": "ready" })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "healthy": false,
+                "message": error.to_string(),
+            })),
+        )
+            .into_response(),
+    }
+}
+
 async fn list_models<T, W>(State(service): State<HttpRouterService<T, W>>) -> Response
 where
     T: Send + 'static,
@@ -340,6 +574,7 @@ where
         "dp_size": service.server_info.dp_size,
         "load_balance_method": service.server_info.load_balance_method,
         "disaggregation_mode": service.server_info.disaggregation_mode,
+        "enable_metrics": service.server_info.enable_metrics,
     });
 
     if let Some(max_running_requests) = service.server_info.max_running_requests {
@@ -1339,7 +1574,20 @@ where
         )
             .into_response();
     }
-
+    if stream {
+        return match request {
+            HttpGenerateRequest::Text(request) => {
+                http_text_stream_response(service, request, |response| {
+                    generate_stream_frame(response).map(|frame| vec![frame])
+                })
+            }
+            HttpGenerateRequest::Tokenized(request) => http_token_stream_response(service, request),
+            HttpGenerateRequest::BatchText(_) | HttpGenerateRequest::BatchTokenized(_) => {
+                bad_request_json("streaming batched /generate is not supported yet")
+            }
+        };
+    }
+    let mut observation = RequestObservation::new(Arc::clone(&service.metrics));
     let response = {
         let mut runtime = service
             .runtime
@@ -1426,11 +1674,20 @@ where
         }
     };
 
+    match &response {
+        Ok(HttpGenerateResponse::Single(responses)) => {
+            observe_router_responses(&mut observation, responses)
+        }
+        Ok(HttpGenerateResponse::Batch(batch)) => {
+            for responses in batch {
+                observe_router_responses(&mut observation, responses);
+            }
+        }
+        Err(_) => {}
+    }
+    observation.finish(response.is_ok());
     match response {
         Ok(HttpGenerateResponse::Single(mut responses)) => {
-            if stream {
-                return http_generate_stream_response_from_router_responses(responses);
-            }
             let Some(response) = responses.pop() else {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1525,53 +1782,91 @@ fn generate_complete_response_json(
     }
 }
 
-fn http_generate_stream_response_from_router_responses(
-    responses: Vec<RouterGenerateResponse>,
-) -> Response {
-    let mut body = String::new();
-    for response in responses {
-        let json = match response.body {
-            RouterGenerateResponseBody::Chunk(chunk) => json!({
-                "request_id": response.request_id,
-                "text": chunk.text,
-                "output_ids": chunk.token_ids,
-                "usage": {
-                    "prompt_tokens": chunk.prompt_tokens,
-                    "completion_tokens": chunk.completion_tokens,
-                    "cached_tokens": chunk.cached_tokens,
-                }
-            }),
-            RouterGenerateResponseBody::Complete(complete) => json!({
-                "request_id": response.request_id,
-                "text": complete.text,
-                "output_ids": complete.output_ids,
-                "finish_reason": complete.finish_reason,
-                "usage": {
-                    "prompt_tokens": complete.prompt_tokens,
-                    "completion_tokens": complete.completion_tokens,
-                    "cached_tokens": complete.cached_tokens,
-                }
-            }),
-            RouterGenerateResponseBody::Error(error) => json!({
-                "error": {
-                    "message": error.message,
-                }
-            }),
-        };
-        let Ok(json) = serde_json::to_string(&json) else {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": { "message": "serialize SGLang generate stream JSON" } })),
-            )
-                .into_response();
-        };
-        body.push_str("data: ");
-        body.push_str(&json);
-        body.push_str("\n\n");
-    }
-    body.push_str("data: [DONE]\n\n");
+fn generate_stream_frame(response: RouterGenerateResponse) -> Result<Bytes, String> {
+    let payload = match response.body {
+        RouterGenerateResponseBody::Chunk(chunk) => json!({
+            "request_id": response.request_id,
+            "text": chunk.text,
+            "output_ids": chunk.token_ids,
+            "usage": {
+                "prompt_tokens": chunk.prompt_tokens,
+                "completion_tokens": chunk.completion_tokens,
+                "cached_tokens": chunk.cached_tokens,
+            }
+        }),
+        RouterGenerateResponseBody::Complete(complete) => json!({
+            "request_id": response.request_id,
+            "text": complete.text,
+            "output_ids": complete.output_ids,
+            "finish_reason": complete.finish_reason,
+            "usage": {
+                "prompt_tokens": complete.prompt_tokens,
+                "completion_tokens": complete.completion_tokens,
+                "cached_tokens": complete.cached_tokens,
+            }
+        }),
+        RouterGenerateResponseBody::Error(error) => {
+            json!({ "error": { "message": error.message } })
+        }
+    };
+    let payload = serde_json::to_string(&payload)
+        .map_err(|error| format!("serialize SGLang generate stream JSON: {error}"))?;
+    Ok(Bytes::from(format!("data: {payload}\n\n")))
+}
 
-    let mut response = Response::new(Body::from(body));
+fn http_token_stream_response<T, W>(
+    service: HttpRouterService<T, W>,
+    request: RouterGenerateRequest,
+) -> Response
+where
+    T: Tokenizer + Send + 'static,
+    W: WorkerExecutor + Send + 'static,
+{
+    let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(16);
+    let runtime = Arc::clone(&service.runtime);
+    let metrics = Arc::clone(&service.metrics);
+    let max_transfer_polls = service.max_transfer_polls;
+    tokio::task::spawn_blocking(move || {
+        let mut observation = RequestObservation::new(metrics);
+        let mut connected = true;
+        let result = match runtime.lock() {
+            Ok(mut runtime) => {
+                let mut send = |response: RouterGenerateResponse| {
+                    observation.observe(&response);
+                    let sent = match generate_stream_frame(response) {
+                        Ok(frame) => sender.blocking_send(Ok(frame)).is_ok(),
+                        Err(message) => {
+                            let _ = sender.blocking_send(Ok(sse_error_frame(message)));
+                            false
+                        }
+                    };
+                    connected &= sent;
+                    sent
+                };
+                if max_transfer_polls == 0 {
+                    runtime.generate_stream_with_sink(request, &mut send)
+                } else {
+                    runtime.generate_stream_with_transfer_polling_sink(
+                        request,
+                        max_transfer_polls,
+                        &mut send,
+                    )
+                }
+            }
+            Err(_) => Err(RouterRuntimeError::Runtime(
+                crate::engine::RuntimeError::InvalidState(
+                    "HTTP router runtime mutex poisoned".to_string(),
+                ),
+            )),
+        };
+        if let Err(error) = &result {
+            let _ = sender.blocking_send(Ok(sse_error_frame(error.to_string())));
+        }
+        let _ = sender.blocking_send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
+        observation.finish(result.is_ok() && connected);
+    });
+
+    let mut response = Response::new(Body::from_stream(ReceiverStream::new(receiver)));
     response.headers_mut().insert(
         HeaderName::from_static("content-type"),
         HeaderValue::from_static("text/event-stream"),
@@ -1623,17 +1918,28 @@ where
         Ok(info) => info.served_model_name,
         Err(message) => return internal_error_json(message),
     };
-    let request = match http_chat_payload_to_router_request_with_headers(payload, &model, &headers)
-    {
-        Ok(request) => request,
-        Err(error) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": { "message": error } })),
-            )
-                .into_response();
-        }
+    let chat_template_input = match chat_template_input_from_payload(&payload) {
+        Ok(input) => input,
+        Err(error) => return bad_request_json(error),
     };
+    let prompt = match service.runtime.lock() {
+        Ok(runtime) => match runtime.apply_chat_template(&chat_template_input) {
+            Ok(prompt) => prompt,
+            Err(error) => return bad_request_json(error.to_string()),
+        },
+        Err(_) => return internal_error_json("HTTP router runtime mutex poisoned"),
+    };
+    let request =
+        match http_chat_payload_to_router_request_with_headers(payload, &model, &headers, prompt) {
+            Ok(request) => request,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": { "message": error } })),
+                )
+                    .into_response();
+            }
+        };
     let stream = request.stream();
     if request.disaggregated_params().is_some() && !service.allow_disaggregated_requests {
         return (
@@ -1646,7 +1952,16 @@ where
         )
             .into_response();
     }
+    if stream {
+        return match request {
+            HttpChatRequest::Single(request) => http_chat_stream_response(service, *request, model),
+            HttpChatRequest::Batch(_) => {
+                bad_request_json("streaming batched /v1/chat/completions is not supported yet")
+            }
+        };
+    }
 
+    let mut observation = RequestObservation::new(Arc::clone(&service.metrics));
     let response = {
         let mut runtime = service
             .runtime
@@ -1696,11 +2011,20 @@ where
         }
     };
 
+    match &response {
+        Ok(HttpChatResponse::Single(responses)) => {
+            observe_router_responses(&mut observation, responses)
+        }
+        Ok(HttpChatResponse::Batch(batch)) => {
+            for responses in batch {
+                observe_router_responses(&mut observation, responses);
+            }
+        }
+        Err(_) => {}
+    }
+    observation.finish(response.is_ok());
     match response {
         Ok(HttpChatResponse::Single(mut responses)) => {
-            if stream {
-                return http_chat_stream_response_from_router_responses(responses, &model);
-            }
             let Some(response) = responses.pop() else {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1767,10 +2091,12 @@ fn http_chat_payload_to_router_request_with_headers(
     payload: Value,
     served_model_name: &str,
     headers: &HeaderMap,
+    prompt: String,
 ) -> Result<HttpChatRequest, String> {
     http_chat_payload_to_router_request(
         payload_with_routed_dp_rank_header(payload, headers)?,
         served_model_name,
+        prompt,
     )
 }
 
@@ -1878,67 +2204,123 @@ fn http_chat_batch_response_from_router_responses(
         .into_response()
 }
 
-fn http_chat_stream_response_from_router_responses(
-    responses: Vec<RouterGenerateResponse>,
-    model: &str,
-) -> Response {
-    let mut body = String::new();
-    for response in responses {
-        let json = match response.body {
-            RouterGenerateResponseBody::Chunk(chunk) => json!({
-                "id": openai_response_id("chatcmpl-", &response.request_id),
-                "object": "chat.completion.chunk",
-                "model": model,
-                "choices": [{
-                    "index": chunk.index,
-                    "delta": {
-                        "content": chunk.text,
-                    },
-                    "finish_reason": Value::Null,
-                }],
-            }),
-            RouterGenerateResponseBody::Complete(complete) => json!({
-                "id": openai_response_id("chatcmpl-", &response.request_id),
-                "object": "chat.completion.chunk",
-                "model": model,
-                "choices": [{
-                    "index": complete.index,
-                    "delta": {},
-                    "finish_reason": complete.finish_reason,
-                }],
-                "usage": {
-                    "prompt_tokens": complete.prompt_tokens,
-                    "completion_tokens": complete.completion_tokens,
-                    "cached_tokens": complete.cached_tokens,
-                }
-            }),
-            RouterGenerateResponseBody::Error(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": { "message": error.message } })),
-                )
-                    .into_response();
-            }
-        };
-        let Ok(json) = serde_json::to_string(&json) else {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": { "message": "serialize OpenAI chat stream JSON" } })),
-            )
-                .into_response();
-        };
-        body.push_str("data: ");
-        body.push_str(&json);
-        body.push_str("\n\n");
-    }
-    body.push_str("data: [DONE]\n\n");
+fn http_chat_stream_response<T, W>(
+    service: HttpRouterService<T, W>,
+    request: RouterTextGenerateRequest,
+    model: String,
+) -> Response
+where
+    T: Tokenizer + Send + 'static,
+    W: WorkerExecutor + Send + 'static,
+{
+    http_text_stream_response(service, request, move |response| {
+        chat_stream_frame(response, &model).map(|frame| vec![frame])
+    })
+}
 
-    let mut response = Response::new(Body::from(body));
+fn http_text_stream_response<T, W, F>(
+    service: HttpRouterService<T, W>,
+    request: RouterTextGenerateRequest,
+    mut encode: F,
+) -> Response
+where
+    T: Tokenizer + Send + 'static,
+    W: WorkerExecutor + Send + 'static,
+    F: FnMut(RouterGenerateResponse) -> Result<Vec<Bytes>, String> + Send + 'static,
+{
+    let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Bytes, Infallible>>(16);
+    let runtime = Arc::clone(&service.runtime);
+    let metrics = Arc::clone(&service.metrics);
+    let max_transfer_polls = service.max_transfer_polls;
+    tokio::task::spawn_blocking(move || {
+        let mut observation = RequestObservation::new(metrics);
+        let mut connected = true;
+        let result = match runtime.lock() {
+            Ok(mut runtime) => {
+                let mut send = |response: RouterGenerateResponse| {
+                    observation.observe(&response);
+                    let sent = match encode(response) {
+                        Ok(frames) => frames
+                            .into_iter()
+                            .all(|frame| sender.blocking_send(Ok(frame)).is_ok()),
+                        Err(message) => {
+                            let _ = sender.blocking_send(Ok(sse_error_frame(message)));
+                            false
+                        }
+                    };
+                    connected &= sent;
+                    sent
+                };
+                if max_transfer_polls == 0 {
+                    runtime.generate_text_stream_with_sink(request, &mut send)
+                } else {
+                    runtime.generate_text_stream_with_transfer_polling_sink(
+                        request,
+                        max_transfer_polls,
+                        &mut send,
+                    )
+                }
+            }
+            Err(_) => Err(RouterRuntimeError::Runtime(
+                crate::engine::RuntimeError::InvalidState(
+                    "HTTP router runtime mutex poisoned".to_string(),
+                ),
+            )),
+        };
+        if let Err(error) = &result {
+            let _ = sender.blocking_send(Ok(sse_error_frame(error.to_string())));
+        }
+        let _ = sender.blocking_send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
+        observation.finish(result.is_ok() && connected);
+    });
+
+    let mut response = Response::new(Body::from_stream(ReceiverStream::new(receiver)));
     response.headers_mut().insert(
         HeaderName::from_static("content-type"),
         HeaderValue::from_static("text/event-stream"),
     );
     response
+}
+
+fn chat_stream_frame(response: RouterGenerateResponse, model: &str) -> Result<Bytes, String> {
+    let payload = match response.body {
+        RouterGenerateResponseBody::Chunk(chunk) => json!({
+            "id": openai_response_id("chatcmpl-", &response.request_id),
+            "object": "chat.completion.chunk",
+            "model": model,
+            "choices": [{
+                "index": chunk.index,
+                "delta": { "content": chunk.text },
+                "finish_reason": Value::Null,
+            }],
+        }),
+        RouterGenerateResponseBody::Complete(complete) => json!({
+            "id": openai_response_id("chatcmpl-", &response.request_id),
+            "object": "chat.completion.chunk",
+            "model": model,
+            "choices": [{
+                "index": complete.index,
+                "delta": {},
+                "finish_reason": complete.finish_reason,
+            }],
+            "usage": {
+                "prompt_tokens": complete.prompt_tokens,
+                "completion_tokens": complete.completion_tokens,
+                "cached_tokens": complete.cached_tokens,
+            }
+        }),
+        RouterGenerateResponseBody::Error(error) => {
+            json!({ "error": { "message": error.message } })
+        }
+    };
+    let payload = serde_json::to_string(&payload)
+        .map_err(|error| format!("serialize OpenAI chat stream JSON: {error}"))?;
+    Ok(Bytes::from(format!("data: {payload}\n\n")))
+}
+
+fn sse_error_frame(message: impl Into<String>) -> Bytes {
+    let payload = json!({ "error": { "message": message.into() } });
+    Bytes::from(format!("data: {payload}\n\n"))
 }
 
 async fn responses<T, W>(
@@ -1974,6 +2356,13 @@ where
 
     let response_model = request.model;
     let router_request = request.request;
+    if stream {
+        let mut encoder = ResponsesStreamEncoder::new(response_model);
+        return http_text_stream_response(service, router_request, move |response| {
+            encoder.encode(response)
+        });
+    }
+    let mut observation = RequestObservation::new(Arc::clone(&service.metrics));
     let responses = {
         let mut runtime = service
             .runtime
@@ -1989,10 +2378,11 @@ where
         }
     };
 
+    if let Ok(responses) = &responses {
+        observe_router_responses(&mut observation, responses);
+    }
+    observation.finish(responses.is_ok());
     match responses {
-        Ok(responses) if stream => {
-            http_responses_stream_response_from_router_responses(responses, &response_model)
-        }
         Ok(responses) => http_responses_response_from_router_responses(responses, &response_model),
         Err(error) => router_runtime_error_json(error),
     }
@@ -2033,20 +2423,9 @@ pub(crate) fn http_responses_payload_to_router_request(
         .map(json_to_sampling_params)
         .transpose()?
         .unwrap_or_default();
+    apply_openai_sampling_params(&payload, &mut sampling_params)?;
     if let Some(max_output_tokens) = optional_i32(&payload, "max_output_tokens")? {
         sampling_params.max_new_tokens = Some(max_output_tokens);
-    }
-    if let Some(temperature) = optional_f32(&payload, "temperature")? {
-        sampling_params.temperature = Some(temperature);
-    }
-    if let Some(top_p) = optional_f32(&payload, "top_p")? {
-        sampling_params.top_p = Some(top_p);
-    }
-    if let Some(frequency_penalty) = optional_f32(&payload, "frequency_penalty")? {
-        sampling_params.frequency_penalty = Some(frequency_penalty);
-    }
-    if let Some(presence_penalty) = optional_f32(&payload, "presence_penalty")? {
-        sampling_params.presence_penalty = Some(presence_penalty);
     }
 
     let mut text = responses_input_to_text(&payload)?;
@@ -2159,198 +2538,131 @@ fn http_responses_response_from_router_responses(
     }
 }
 
-fn http_responses_stream_response_from_router_responses(
-    responses: Vec<RouterGenerateResponse>,
-    model: &str,
-) -> Response {
-    let mut body = String::new();
-    let mut sequence_number = 0_i32;
-    let mut message_open = false;
-    let mut response_id = String::new();
-    let mut item_id = String::new();
+struct ResponsesStreamEncoder {
+    model: String,
+    sequence_number: i32,
+    message_open: bool,
+    response_id: String,
+    item_id: String,
+}
 
-    for response in responses {
-        if response_id.is_empty() {
-            response_id = openai_response_id("resp-", &response.request_id);
-            item_id = responses_message_id(&response.request_id);
-            let created = json!({
-                "id": response_id,
-                "object": "response",
-                "created_at": unix_timestamp_secs(),
-                "status": "in_progress",
-                "model": model,
-                "output": [],
-                "output_text": "",
-            });
-            if !push_responses_sse_event(
-                &mut body,
-                &mut sequence_number,
-                json!({
-                    "type": "response.created",
-                    "response": created,
-                }),
-            ) {
-                return serialize_responses_stream_error();
-            }
+impl ResponsesStreamEncoder {
+    fn new(model: String) -> Self {
+        Self {
+            model,
+            sequence_number: 0,
+            message_open: false,
+            response_id: String::new(),
+            item_id: String::new(),
+        }
+    }
+
+    fn encode(&mut self, response: RouterGenerateResponse) -> Result<Vec<Bytes>, String> {
+        let mut frames = Vec::new();
+        if self.response_id.is_empty() {
+            self.response_id = openai_response_id("resp-", &response.request_id);
+            self.item_id = responses_message_id(&response.request_id);
+            frames.push(self.event(json!({
+                "type": "response.created",
+                "response": {
+                    "id": self.response_id,
+                    "object": "response",
+                    "created_at": unix_timestamp_secs(),
+                    "status": "in_progress",
+                    "model": self.model,
+                    "output": [],
+                    "output_text": "",
+                },
+            }))?);
         }
 
         match response.body {
             RouterGenerateResponseBody::Chunk(chunk) => {
-                if !message_open {
-                    if !push_responses_message_open_events(
-                        &mut body,
-                        &mut sequence_number,
-                        &item_id,
-                    ) {
-                        return serialize_responses_stream_error();
-                    }
-                    message_open = true;
-                }
-                if !chunk.text.is_empty()
-                    && !push_responses_sse_event(
-                        &mut body,
-                        &mut sequence_number,
-                        json!({
-                            "type": "response.output_text.delta",
-                            "output_index": chunk.index,
-                            "content_index": 0,
-                            "item_id": item_id,
-                            "delta": chunk.text,
-                            "logprobs": [],
-                        }),
-                    )
-                {
-                    return serialize_responses_stream_error();
+                self.open_message(&mut frames)?;
+                if !chunk.text.is_empty() {
+                    frames.push(self.event(json!({
+                        "type": "response.output_text.delta",
+                        "output_index": chunk.index,
+                        "content_index": 0,
+                        "item_id": self.item_id,
+                        "delta": chunk.text,
+                        "logprobs": [],
+                    }))?);
                 }
             }
             RouterGenerateResponseBody::Complete(complete) => {
-                if !message_open {
-                    if !push_responses_message_open_events(
-                        &mut body,
-                        &mut sequence_number,
-                        &item_id,
-                    ) {
-                        return serialize_responses_stream_error();
-                    }
-                    message_open = true;
-                }
+                self.open_message(&mut frames)?;
                 let output_index = complete.index;
                 let output_text = complete.text.clone();
-                if !push_responses_sse_event(
-                    &mut body,
-                    &mut sequence_number,
-                    json!({
-                        "type": "response.output_text.done",
-                        "output_index": output_index,
-                        "content_index": 0,
-                        "item_id": item_id,
-                        "text": output_text,
-                        "logprobs": [],
-                    }),
-                ) {
-                    return serialize_responses_stream_error();
-                }
-
+                frames.push(self.event(json!({
+                    "type": "response.output_text.done",
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "item_id": self.item_id,
+                    "text": output_text,
+                    "logprobs": [],
+                }))?);
                 let text_part = json!({
                     "type": "output_text",
                     "text": output_text,
                     "annotations": [],
                 });
-                if !push_responses_sse_event(
-                    &mut body,
-                    &mut sequence_number,
-                    json!({
-                        "type": "response.content_part.done",
-                        "item_id": item_id,
-                        "output_index": output_index,
-                        "content_index": 0,
-                        "part": text_part,
-                    }),
-                ) {
-                    return serialize_responses_stream_error();
-                }
-
-                let message_item = json!({
-                    "id": item_id,
-                    "type": "message",
-                    "status": "completed",
-                    "role": "assistant",
-                    "content": [text_part],
-                });
-                if !push_responses_sse_event(
-                    &mut body,
-                    &mut sequence_number,
-                    json!({
-                        "type": "response.output_item.done",
-                        "output_index": output_index,
-                        "item": message_item,
-                    }),
-                ) {
-                    return serialize_responses_stream_error();
-                }
-
-                if !push_responses_sse_event(
-                    &mut body,
-                    &mut sequence_number,
-                    json!({
-                        "type": "response.completed",
-                        "response": responses_complete_json(model, &response.request_id, complete),
-                    }),
-                ) {
-                    return serialize_responses_stream_error();
-                }
+                frames.push(self.event(json!({
+                    "type": "response.content_part.done",
+                    "item_id": self.item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "part": text_part,
+                }))?);
+                frames.push(self.event(json!({
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": {
+                        "id": self.item_id,
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [text_part],
+                    },
+                }))?);
+                frames.push(self.event(json!({
+                    "type": "response.completed",
+                    "response": responses_complete_json(
+                        &self.model,
+                        &response.request_id,
+                        complete,
+                    ),
+                }))?);
             }
             RouterGenerateResponseBody::Error(error) => {
-                if !push_responses_sse_event(
-                    &mut body,
-                    &mut sequence_number,
-                    json!({
-                        "type": "response.failed",
-                        "error": {
-                            "message": error.message,
-                        },
-                    }),
-                ) {
-                    return serialize_responses_stream_error();
-                }
+                frames.push(self.event(json!({
+                    "type": "response.failed",
+                    "error": { "message": error.message },
+                }))?);
             }
         }
+        Ok(frames)
     }
-    body.push_str("data: [DONE]\n\n");
 
-    let mut response = Response::new(Body::from(body));
-    response.headers_mut().insert(
-        HeaderName::from_static("content-type"),
-        HeaderValue::from_static("text/event-stream"),
-    );
-    response
-}
-
-fn push_responses_message_open_events(
-    body: &mut String,
-    sequence_number: &mut i32,
-    item_id: &str,
-) -> bool {
-    push_responses_sse_event(
-        body,
-        sequence_number,
-        json!({
+    fn open_message(&mut self, frames: &mut Vec<Bytes>) -> Result<(), String> {
+        if self.message_open {
+            return Ok(());
+        }
+        self.message_open = true;
+        frames.push(self.event(json!({
             "type": "response.output_item.added",
             "output_index": 0,
             "item": {
-                "id": item_id,
+                "id": self.item_id,
                 "type": "message",
                 "status": "in_progress",
                 "role": "assistant",
                 "content": [],
             },
-        }),
-    ) && push_responses_sse_event(
-        body,
-        sequence_number,
-        json!({
+        }))?);
+        frames.push(self.event(json!({
             "type": "response.content_part.added",
-            "item_id": item_id,
+            "item_id": self.item_id,
             "output_index": 0,
             "content_index": 0,
             "part": {
@@ -2359,34 +2671,19 @@ fn push_responses_message_open_events(
                 "annotations": [],
                 "logprobs": Value::Null,
             },
-        }),
-    )
-}
-
-fn push_responses_sse_event(
-    body: &mut String,
-    sequence_number: &mut i32,
-    mut event: Value,
-) -> bool {
-    if let Some(object) = event.as_object_mut() {
-        object.insert("sequence_number".to_string(), json!(*sequence_number));
+        }))?);
+        Ok(())
     }
-    *sequence_number += 1;
-    let Ok(json) = serde_json::to_string(&event) else {
-        return false;
-    };
-    body.push_str("data: ");
-    body.push_str(&json);
-    body.push_str("\n\n");
-    true
-}
 
-fn serialize_responses_stream_error() -> Response {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "error": { "message": "serialize OpenAI responses stream JSON" } })),
-    )
-        .into_response()
+    fn event(&mut self, mut event: Value) -> Result<Bytes, String> {
+        if let Some(object) = event.as_object_mut() {
+            object.insert("sequence_number".to_string(), json!(self.sequence_number));
+        }
+        self.sequence_number += 1;
+        let event = serde_json::to_string(&event)
+            .map_err(|error| format!("serialize OpenAI responses stream JSON: {error}"))?;
+        Ok(Bytes::from(format!("data: {event}\n\n")))
+    }
 }
 
 pub(crate) fn responses_complete_json(
@@ -2464,7 +2761,21 @@ where
         )
             .into_response();
     }
+    if stream {
+        return match request {
+            HttpCompletionRequest::Single(request) => {
+                let stream_model = model.clone();
+                http_text_stream_response(service, *request, move |response| {
+                    completion_stream_frame(response, &stream_model).map(|frame| vec![frame])
+                })
+            }
+            HttpCompletionRequest::Batch(_) => {
+                bad_request_json("streaming batched /v1/completions is not supported yet")
+            }
+        };
+    }
 
+    let mut observation = RequestObservation::new(Arc::clone(&service.metrics));
     let response = {
         let mut runtime = service
             .runtime
@@ -2514,10 +2825,19 @@ where
         }
     };
 
-    match response {
-        Ok(HttpCompletionResponse::Single(responses)) if stream => {
-            http_completion_stream_response_from_router_responses(responses, &model)
+    match &response {
+        Ok(HttpCompletionResponse::Single(responses)) => {
+            observe_router_responses(&mut observation, responses)
         }
+        Ok(HttpCompletionResponse::Batch(batch)) => {
+            for responses in batch {
+                observe_router_responses(&mut observation, responses);
+            }
+        }
+        Err(_) => {}
+    }
+    observation.finish(response.is_ok());
+    match response {
         Ok(HttpCompletionResponse::Single(responses)) => {
             http_completion_response_from_router_responses(responses, &model)
         }
@@ -2708,66 +3028,43 @@ fn http_completion_batch_response_from_router_responses(
         .into_response()
 }
 
-fn http_completion_stream_response_from_router_responses(
-    responses: Vec<RouterGenerateResponse>,
-    model: &str,
-) -> Response {
-    let mut body = String::new();
-    for response in responses {
-        let json = match response.body {
-            RouterGenerateResponseBody::Chunk(chunk) => json!({
-                "id": openai_response_id("cmpl-", &response.request_id),
-                "object": "text_completion",
-                "model": model,
-                "choices": [{
-                    "index": chunk.index,
-                    "text": chunk.text,
-                    "logprobs": Value::Null,
-                    "finish_reason": Value::Null,
-                }],
-            }),
-            RouterGenerateResponseBody::Complete(complete) => json!({
-                "id": openai_response_id("cmpl-", &response.request_id),
-                "object": "text_completion",
-                "model": model,
-                "choices": [{
-                    "index": complete.index,
-                    "text": "",
-                    "logprobs": Value::Null,
-                    "finish_reason": complete.finish_reason,
-                }],
-                "usage": {
-                    "prompt_tokens": complete.prompt_tokens,
-                    "completion_tokens": complete.completion_tokens,
-                    "total_tokens": complete.prompt_tokens + complete.completion_tokens,
-                    "cached_tokens": complete.cached_tokens,
-                }
-            }),
-            RouterGenerateResponseBody::Error(error) => json!({
-                "error": {
-                    "message": error.message,
-                }
-            }),
-        };
-        let Ok(json) = serde_json::to_string(&json) else {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": { "message": "serialize OpenAI completion stream JSON" } })),
-            )
-                .into_response();
-        };
-        body.push_str("data: ");
-        body.push_str(&json);
-        body.push_str("\n\n");
-    }
-    body.push_str("data: [DONE]\n\n");
-
-    let mut response = Response::new(Body::from(body));
-    response.headers_mut().insert(
-        HeaderName::from_static("content-type"),
-        HeaderValue::from_static("text/event-stream"),
-    );
-    response
+fn completion_stream_frame(response: RouterGenerateResponse, model: &str) -> Result<Bytes, String> {
+    let payload = match response.body {
+        RouterGenerateResponseBody::Chunk(chunk) => json!({
+            "id": openai_response_id("cmpl-", &response.request_id),
+            "object": "text_completion",
+            "model": model,
+            "choices": [{
+                "index": chunk.index,
+                "text": chunk.text,
+                "logprobs": Value::Null,
+                "finish_reason": Value::Null,
+            }],
+        }),
+        RouterGenerateResponseBody::Complete(complete) => json!({
+            "id": openai_response_id("cmpl-", &response.request_id),
+            "object": "text_completion",
+            "model": model,
+            "choices": [{
+                "index": complete.index,
+                "text": "",
+                "logprobs": Value::Null,
+                "finish_reason": complete.finish_reason,
+            }],
+            "usage": {
+                "prompt_tokens": complete.prompt_tokens,
+                "completion_tokens": complete.completion_tokens,
+                "total_tokens": complete.prompt_tokens + complete.completion_tokens,
+                "cached_tokens": complete.cached_tokens,
+            }
+        }),
+        RouterGenerateResponseBody::Error(error) => {
+            json!({ "error": { "message": error.message } })
+        }
+    };
+    let payload = serde_json::to_string(&payload)
+        .map_err(|error| format!("serialize OpenAI completion stream JSON: {error}"))?;
+    Ok(Bytes::from(format!("data: {payload}\n\n")))
 }
 
 enum HttpGenerateRequest {
@@ -3127,6 +3424,7 @@ pub(crate) fn http_completion_payload_to_router_request(
         .map(json_to_sampling_params)
         .transpose()?
         .unwrap_or_default();
+    apply_openai_sampling_params(&payload, &mut sampling_params)?;
     if let Some(max_tokens) = optional_i32(&payload, "max_tokens")? {
         sampling_params.max_new_tokens = Some(max_tokens);
     }
@@ -3178,6 +3476,7 @@ pub(crate) fn http_completion_payload_to_router_request(
 pub(crate) fn http_chat_payload_to_router_request(
     payload: Value,
     served_model_name: &str,
+    prompt: String,
 ) -> Result<HttpChatRequest, String> {
     let model = payload
         .get("model")
@@ -3194,7 +3493,10 @@ pub(crate) fn http_chat_payload_to_router_request(
         .map(json_to_sampling_params)
         .transpose()?
         .unwrap_or_default();
-    if let Some(max_tokens) = optional_i32(&payload, "max_tokens")? {
+    apply_openai_sampling_params(&payload, &mut sampling_params)?;
+    if let Some(max_tokens) =
+        optional_i32(&payload, "max_completion_tokens")?.or(optional_i32(&payload, "max_tokens")?)
+    {
         sampling_params.max_new_tokens = Some(max_tokens);
     }
     let stream = optional_bool(&payload, "stream")?.unwrap_or(false);
@@ -3202,7 +3504,6 @@ pub(crate) fn http_chat_payload_to_router_request(
     if n < 1 {
         return Err("n must be at least 1".to_string());
     }
-    let text = chat_messages_to_prompt_text(&payload)?;
 
     if n == 1 {
         return Ok(HttpChatRequest::Single(Box::new(
@@ -3212,7 +3513,7 @@ pub(crate) fn http_chat_payload_to_router_request(
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
-                text,
+                text: prompt,
                 sampling_params: Some(sampling_params),
                 disaggregated_params: json_to_disaggregated_params(&payload)?,
                 stream,
@@ -3231,7 +3532,7 @@ pub(crate) fn http_chat_payload_to_router_request(
     for index in 0..batch_size {
         requests.push(RouterTextGenerateRequest {
             request_id: request_ids[index].clone(),
-            text: text.clone(),
+            text: prompt.clone(),
             sampling_params: Some(sampling_params.clone()),
             disaggregated_params: disaggregated_params[index].clone(),
             stream,
@@ -3270,7 +3571,9 @@ fn completion_prompt_to_texts(payload: &Value) -> Result<CompletionPrompts, Stri
     Err("prompt must be a string or array of strings".to_string())
 }
 
-fn chat_messages_to_prompt_text(payload: &Value) -> Result<String, String> {
+pub(crate) fn chat_template_input_from_payload(
+    payload: &Value,
+) -> Result<ChatTemplateInput, String> {
     let messages = payload
         .get("messages")
         .and_then(Value::as_array)
@@ -3279,19 +3582,60 @@ fn chat_messages_to_prompt_text(payload: &Value) -> Result<String, String> {
         return Err("messages must not be empty".to_string());
     }
 
-    messages
+    let messages = messages
         .iter()
-        .map(chat_message_content_text)
-        .collect::<Result<Vec<_>, _>>()
-        .map(|contents| contents.join("\n"))
+        .map(normalize_chat_message)
+        .collect::<Result<Vec<_>, _>>()?;
+    let tools = match payload.get("tools") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(tools)) => Some(tools.clone()),
+        Some(_) => return Err("tools must be an array".to_string()),
+    };
+    let template_kwargs = match payload.get("chat_template_kwargs") {
+        None | Some(Value::Null) => serde_json::Map::new(),
+        Some(Value::Object(kwargs)) => kwargs.clone(),
+        Some(_) => return Err("chat_template_kwargs must be an object".to_string()),
+    };
+    for reserved in ["messages", "tools", "add_generation_prompt"] {
+        if template_kwargs.contains_key(reserved) {
+            return Err(format!(
+                "chat_template_kwargs.{reserved} is controlled by the serving runtime"
+            ));
+        }
+    }
+
+    Ok(ChatTemplateInput {
+        messages,
+        tools,
+        template_kwargs,
+    })
 }
 
-fn chat_message_content_text(message: &Value) -> Result<String, String> {
-    let content = message
-        .get("content")
-        .ok_or_else(|| "chat message content is required".to_string())?;
+fn normalize_chat_message(message: &Value) -> Result<Value, String> {
+    let Some(message) = message.as_object() else {
+        return Err("chat message entries must be objects".to_string());
+    };
+    let role = message
+        .get("role")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "chat message role is required".to_string())?;
+    if !matches!(role, "system" | "developer" | "user" | "assistant" | "tool") {
+        return Err(format!("unsupported chat message role: {role}"));
+    }
+    let mut normalized = message.clone();
+    let Some(content) = message.get("content") else {
+        if role == "assistant" && message.get("tool_calls").is_some() {
+            normalized.insert("content".to_string(), Value::Null);
+            return Ok(Value::Object(normalized));
+        }
+        return Err("chat message content is required".to_string());
+    };
     if let Some(text) = content.as_str() {
-        return Ok(text.to_string());
+        normalized.insert("content".to_string(), Value::String(text.to_string()));
+        return Ok(Value::Object(normalized));
+    }
+    if content.is_null() && role == "assistant" {
+        return Ok(Value::Object(normalized));
     }
     let Some(parts) = content.as_array() else {
         return Err("chat message content must be a string or array".to_string());
@@ -3299,15 +3643,19 @@ fn chat_message_content_text(message: &Value) -> Result<String, String> {
 
     let mut text = String::new();
     for part in parts {
-        if part.get("type").and_then(Value::as_str) == Some("text") {
-            let part_text = part
-                .get("text")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "chat text content part requires text".to_string())?;
-            text.push_str(part_text);
+        if part.get("type").and_then(Value::as_str) != Some("text") {
+            return Err(
+                "multimodal chat content is not supported by this text runtime".to_string(),
+            );
         }
+        let part_text = part
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "chat text content part requires text".to_string())?;
+        text.push_str(part_text);
     }
-    Ok(text)
+    normalized.insert("content".to_string(), Value::String(text));
+    Ok(Value::Object(normalized))
 }
 
 fn json_to_disaggregated_params(
@@ -3387,6 +3735,51 @@ fn json_to_sampling_params(value: &Value) -> Result<RouterSamplingParams, String
         n: optional_i32(value, "n")?,
         best_of: optional_i32(value, "best_of")?,
     })
+}
+
+fn apply_openai_sampling_params(
+    payload: &Value,
+    sampling: &mut RouterSamplingParams,
+) -> Result<(), String> {
+    if let Some(value) = optional_f32(payload, "temperature")? {
+        sampling.temperature = Some(value);
+    }
+    if let Some(value) = optional_f32(payload, "top_p")? {
+        sampling.top_p = Some(value);
+    }
+    if let Some(value) = optional_i32(payload, "top_k")? {
+        sampling.top_k = Some(value);
+    }
+    if let Some(value) = optional_f32(payload, "min_p")? {
+        sampling.min_p = Some(value);
+    }
+    if let Some(value) = optional_f32(payload, "frequency_penalty")? {
+        sampling.frequency_penalty = Some(value);
+    }
+    if let Some(value) = optional_f32(payload, "presence_penalty")? {
+        sampling.presence_penalty = Some(value);
+    }
+    if let Some(value) = optional_f32(payload, "repetition_penalty")? {
+        sampling.repetition_penalty = Some(value);
+    }
+    if let Some(value) = optional_bool(payload, "ignore_eos")? {
+        sampling.ignore_eos = Some(value);
+    }
+    if let Some(value) = optional_i32_array(payload, "stop_token_ids")? {
+        sampling.stop_token_ids = value;
+    }
+
+    for field in ["stop", "seed", "logit_bias", "response_format", "best_of"] {
+        if payload.get(field).is_some_and(|value| !value.is_null()) {
+            return Err(format!(
+                "{field} is not supported by the current sampling runtime"
+            ));
+        }
+    }
+    if payload.get("logprobs").is_some_and(|value| value != false) {
+        return Err("logprobs is not supported by the current sampling runtime".to_string());
+    }
+    Ok(())
 }
 
 fn required_string<'a>(value: &'a Value, field: &'static str) -> Result<&'a str, String> {
@@ -3637,6 +4030,7 @@ mod tests {
                 "routed_dp_rank": 4
             }),
             "tiny",
+            "hello".to_string(),
         )
         .expect("chat payload should parse");
 
@@ -3646,6 +4040,47 @@ mod tests {
             }
             _ => panic!("expected single chat request"),
         }
+    }
+
+    #[test]
+    fn chat_payload_maps_openai_sampling_parameters() {
+        let request = http_chat_payload_to_router_request(
+            json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 3,
+                "max_completion_tokens": 5,
+                "temperature": 0.7,
+                "top_p": 0.8,
+                "top_k": 20,
+                "min_p": 0.05,
+                "frequency_penalty": 0.2,
+                "presence_penalty": -0.3,
+                "repetition_penalty": 1.1,
+                "ignore_eos": true,
+                "stop_token_ids": [1, 2]
+            }),
+            "tiny",
+            "rendered prompt".to_string(),
+        )
+        .expect("chat payload should parse");
+
+        let HttpChatRequest::Single(request) = request else {
+            panic!("expected single chat request");
+        };
+        let sampling = request
+            .sampling_params
+            .expect("sampling params should be populated");
+        assert_eq!(sampling.max_new_tokens, Some(5));
+        assert_eq!(sampling.temperature, Some(0.7));
+        assert_eq!(sampling.top_p, Some(0.8));
+        assert_eq!(sampling.top_k, Some(20));
+        assert_eq!(sampling.min_p, Some(0.05));
+        assert_eq!(sampling.frequency_penalty, Some(0.2));
+        assert_eq!(sampling.presence_penalty, Some(-0.3));
+        assert_eq!(sampling.repetition_penalty, Some(1.1));
+        assert_eq!(sampling.ignore_eos, Some(true));
+        assert_eq!(sampling.stop_token_ids, vec![1, 2]);
     }
 
     #[test]
@@ -3683,6 +4118,7 @@ mod tests {
             }),
             "tiny",
             &headers,
+            "hello".to_string(),
         )
         .expect("chat payload should parse");
 
