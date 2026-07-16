@@ -66,6 +66,29 @@ fn cpu_pd_smoke_script_is_syntax_checked_and_asserts_real_generation() {
     assert!(status.success(), "smoke script should pass bash -n");
 }
 
+#[test]
+fn glm5_gpu_script_requires_a_model_and_has_valid_shell_syntax() {
+    let script = workspace_root().join("scripts/run_glm5_pd_gpu.sh");
+
+    let status = Command::new("bash")
+        .arg("-n")
+        .arg(&script)
+        .status()
+        .expect("bash should syntax-check GPU script");
+    assert!(status.success(), "GPU script should pass bash -n");
+
+    let output = Command::new("bash")
+        .arg(&script)
+        .env_remove("MODEL_PATH")
+        .output()
+        .expect("GPU script should report missing configuration");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("MODEL_PATH is required"),
+        "GPU script should explain how to configure the model"
+    );
+}
+
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()

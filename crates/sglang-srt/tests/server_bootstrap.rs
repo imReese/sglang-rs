@@ -1561,7 +1561,7 @@ fn prefill_mooncake_route_registration_uses_dist_init_host_for_wildcard_bind_hos
         "--host",
         "0.0.0.0",
         "--dist-init-addr",
-        "10.95.250.21:6676",
+        "192.0.2.21:6676",
         "--tp-size",
         "1",
         "--disaggregation-mode",
@@ -1583,7 +1583,7 @@ fn prefill_mooncake_route_registration_uses_dist_init_host_for_wildcard_bind_hos
             .rank_info(0, 0, 0, 0)
             .expect("rank endpoint should be registered")
             .rank_ip,
-        "10.95.250.21"
+        "192.0.2.21"
     );
 }
 

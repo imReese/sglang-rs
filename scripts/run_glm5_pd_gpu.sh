@@ -4,11 +4,11 @@ set -euo pipefail
 # Single-host GLM-5 PD-disaggregation smoke launcher for sglang-rs.
 #
 # Usage:
-#   MODEL_PATH=/GLM-5-0212-FP8 ./scripts/run_glm5_pd_gpu.sh
+#   MODEL_PATH=/models/glm-5-fp8 TP_SIZE=8 ./scripts/run_glm5_pd_gpu.sh
 #
 # Useful overrides:
 #   TP_SIZE=8 DP_SIZE=1 ROUTER_PORT=8000 PREFILL_PORT=30001 DECODE_PORT=30002 \
-#   BOOTSTRAP_PORT=8200 ZMQ_PORTS=7000-7007 ./scripts/run_glm5_pd_gpu.sh
+#   BOOTSTRAP_PORT=8200 ZMQ_PORT_START=7000 ./scripts/run_glm5_pd_gpu.sh
 #   MOONCAKE_LINK=1 MOONCAKE_RPC_PORT=41002 ./scripts/run_glm5_pd_gpu.sh
 #
 # Notes:
@@ -21,10 +21,18 @@ set -euo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-MODEL_PATH="${MODEL_PATH:-/GLM-5-0212-FP8}"
-SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-aiak_bzz2_glm_5_community_rd1}"
+MODEL_PATH="${MODEL_PATH:-}"
+if [[ -z "$MODEL_PATH" ]]; then
+    echo "MODEL_PATH is required; set it to a local checkpoint or model repository ID" >&2
+    exit 2
+fi
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-glm-5}"
 
-TP_SIZE="${TP_SIZE:-8}"
+TP_SIZE="${TP_SIZE:-1}"
+if ! [[ "$TP_SIZE" =~ ^[1-9][0-9]*$ ]]; then
+    echo "TP_SIZE must be a positive integer, got: $TP_SIZE" >&2
+    exit 2
+fi
 DP_SIZE="${DP_SIZE:-1}"
 PAGE_SIZE="${PAGE_SIZE:-64}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-auto}"
@@ -36,7 +44,17 @@ PREFILL_HOST="${PREFILL_HOST:-127.0.0.1}"
 PREFILL_ADVERTISE_HOST="${PREFILL_ADVERTISE_HOST:-$PREFILL_HOST}"
 PREFILL_PORT="${PREFILL_PORT:-30001}"
 BOOTSTRAP_PORT="${BOOTSTRAP_PORT:-8200}"
-ZMQ_PORTS="${ZMQ_PORTS:-7000-7007}"
+ZMQ_PORT_START="${ZMQ_PORT_START:-7000}"
+if ! [[ "$ZMQ_PORT_START" =~ ^[0-9]+$ ]]; then
+    echo "ZMQ_PORT_START must be an integer, got: $ZMQ_PORT_START" >&2
+    exit 2
+fi
+ZMQ_PORT_END=$((ZMQ_PORT_START + TP_SIZE - 1))
+if ((ZMQ_PORT_END > 65535)); then
+    echo "derived ZMQ port range exceeds 65535: ${ZMQ_PORT_START}-${ZMQ_PORT_END}" >&2
+    exit 2
+fi
+ZMQ_PORTS="${ZMQ_PORTS:-${ZMQ_PORT_START}-${ZMQ_PORT_END}}"
 
 DECODE_HOST="${DECODE_HOST:-127.0.0.1}"
 DECODE_ADVERTISE_HOST="${DECODE_ADVERTISE_HOST:-$DECODE_HOST}"

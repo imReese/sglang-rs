@@ -1388,7 +1388,7 @@ async fn grpc_get_server_info_reports_pd_prefill_attributes() {
         "--host",
         "0.0.0.0",
         "--dist-init-addr",
-        "10.95.250.21:6676",
+        "192.0.2.21:6676",
         "--disaggregation-mode",
         "prefill",
         "--disaggregation-transfer-backend",
@@ -1441,7 +1441,7 @@ async fn grpc_get_server_info_reports_pd_prefill_attributes() {
     );
     assert_eq!(
         response.attributes.get("kv_events.endpoint_host"),
-        Some(&"10.95.250.21".to_string())
+        Some(&"192.0.2.21".to_string())
     );
     assert_eq!(
         response.attributes.get("kv_events.endpoint_port_base"),
