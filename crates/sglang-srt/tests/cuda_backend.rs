@@ -1,5 +1,6 @@
 use sglang_kernel::cuda::CudaComputeCapability;
 use sglang_kernel::cuda_kernels::CudaF32Kernels;
+use sglang_kernel::cuda_kv_kernels::CudaKvPairCopyKernels;
 use sglang_srt::backend::{ComputeCapability, CudaBackend};
 use sglang_srt::cuda_kv_cache::CudaKvCachePool;
 use sglang_srt::transfer::{
@@ -51,6 +52,33 @@ fn assert_f32_close(actual: &[f32], expected: &[f32], tolerance: f32) {
             (actual - expected).abs() <= tolerance,
             "value {index} differs: actual={actual}, expected={expected}, tolerance={tolerance}"
         );
+    }
+}
+
+fn strided_byte_rows(
+    row_count: usize,
+    row_bytes: usize,
+    row_stride_bytes: usize,
+    seed: usize,
+) -> (Vec<u8>, Vec<Vec<u8>>) {
+    let byte_len = (row_count - 1) * row_stride_bytes + row_bytes;
+    let mut storage = vec![0_u8; byte_len];
+    let mut rows = Vec::with_capacity(row_count);
+    for row_index in 0..row_count {
+        let row = (0..row_bytes)
+            .map(|byte_index| ((seed + row_index * 37 + byte_index * 13) % 251) as u8)
+            .collect::<Vec<_>>();
+        let start = row_index * row_stride_bytes;
+        storage[start..start + row_bytes].copy_from_slice(&row);
+        rows.push(row);
+    }
+    (storage, rows)
+}
+
+fn assert_strided_byte_rows(storage: &[u8], row_stride_bytes: usize, expected_rows: &[Vec<u8>]) {
+    for (row_index, expected) in expected_rows.iter().enumerate() {
+        let start = row_index * row_stride_bytes;
+        assert_eq!(&storage[start..start + expected.len()], expected);
     }
 }
 
@@ -231,6 +259,138 @@ fn b200_cuda_runtime_kernels_execute_and_write_kv_slots() {
         .copy_to_host(0, &mut round_trip)
         .expect("KV slot should download for verification");
     assert_eq!(round_trip, pattern);
+}
+
+#[test]
+#[ignore = "requires a B200-class CUDA device, NVIDIA driver, and NVRTC"]
+fn b200_cuda_kv_kernels_scatter_and_gather_batched_physical_slots() {
+    let backend = CudaBackend::initialize(0).expect("CUDA backend should initialize on B200");
+    let capability = backend.capabilities();
+    let ComputeCapability::Cuda(compute_capability) = capability.compute_capability else {
+        panic!("CUDA backend must report CUDA compute capability");
+    };
+    assert!(
+        compute_capability >= CudaComputeCapability::new(10, 0),
+        "B200 acceptance requires sm_100 or newer, found {compute_capability}"
+    );
+    let mut kernels = CudaKvPairCopyKernels::compile(backend.context(), compute_capability)
+        .expect("NVRTC should compile dtype-independent KV copy kernels");
+    let mut kv_cache = CudaKvCachePool::allocate(backend.context(), b200_test_layout(), 2)
+        .expect("CUDA KV cache should allocate two physical pages");
+    let slots = [1_usize, 15, 16, 31];
+    let slot_map = kv_cache
+        .upload_slot_map(&slots)
+        .expect("scheduler physical slots should upload after validation");
+    let row_bytes = kv_cache.layout().bytes_per_token_per_tensor();
+    let key_stride = row_bytes + 37;
+    let value_stride = row_bytes + 53;
+    let (key_bytes, expected_keys) = strided_byte_rows(slots.len(), row_bytes, key_stride, 17);
+    let (value_bytes, expected_values) =
+        strided_byte_rows(slots.len(), row_bytes, value_stride, 91);
+    let mut keys = backend
+        .context()
+        .allocate(key_bytes.len())
+        .expect("strided key rows should allocate");
+    let mut values = backend
+        .context()
+        .allocate(value_bytes.len())
+        .expect("strided value rows should allocate");
+    keys.copy_from_host(0, &key_bytes)
+        .expect("key rows should upload");
+    values
+        .copy_from_host(0, &value_bytes)
+        .expect("value rows should upload");
+
+    let transferable_before = kv_cache
+        .transferable_memory()
+        .expect("KV pool should expose its Mooncake memory before model writes");
+    kv_cache
+        .write_kv_slots_from_device(
+            &mut kernels,
+            1,
+            &slot_map,
+            &keys,
+            0,
+            key_stride,
+            &values,
+            0,
+            value_stride,
+        )
+        .expect("one CUDA launch should scatter batched K/V rows into physical slots");
+    assert_eq!(
+        transferable_before.regions()[0].base_addr,
+        kv_cache.allocation().device_ptr() as usize,
+        "attention writes and Mooncake registration must use the same allocation"
+    );
+
+    let gathered_key_stride = row_bytes + 11;
+    let gathered_value_stride = row_bytes + 19;
+    let gathered_key_len = (slots.len() - 1) * gathered_key_stride + row_bytes;
+    let gathered_value_len = (slots.len() - 1) * gathered_value_stride + row_bytes;
+    let mut gathered_keys = backend
+        .context()
+        .allocate(gathered_key_len)
+        .expect("gathered key rows should allocate");
+    let mut gathered_values = backend
+        .context()
+        .allocate(gathered_value_len)
+        .expect("gathered value rows should allocate");
+    gathered_keys.fill(0).expect("key output should clear");
+    gathered_values.fill(0).expect("value output should clear");
+    kv_cache
+        .read_kv_slots_to_device(
+            &mut kernels,
+            1,
+            &slot_map,
+            &mut gathered_keys,
+            0,
+            gathered_key_stride,
+            &mut gathered_values,
+            0,
+            gathered_value_stride,
+        )
+        .expect("one CUDA launch should gather batched K/V rows from physical slots");
+    let mut gathered_key_bytes = vec![0_u8; gathered_key_len];
+    let mut gathered_value_bytes = vec![0_u8; gathered_value_len];
+    gathered_keys
+        .copy_to_host(0, &mut gathered_key_bytes)
+        .expect("gathered keys should download");
+    gathered_values
+        .copy_to_host(0, &mut gathered_value_bytes)
+        .expect("gathered values should download");
+    assert_strided_byte_rows(&gathered_key_bytes, gathered_key_stride, &expected_keys);
+    assert_strided_byte_rows(
+        &gathered_value_bytes,
+        gathered_value_stride,
+        &expected_values,
+    );
+
+    let layout = kv_cache.layout();
+    for page_index in 0..layout.page_count() {
+        let mut page = vec![0_u8; layout.runtime().page_size_bytes];
+        kv_cache
+            .read_page(page_index, &mut page)
+            .expect("physical page should be readable for acceptance verification");
+        let page_start = layout
+            .page_byte_range(page_index)
+            .expect("page range should be valid")
+            .start;
+        for (row_index, slot) in slots.iter().copied().enumerate() {
+            if slot / layout.runtime().page_size != page_index {
+                continue;
+            }
+            for (tensor_index, expected) in [
+                (0, &expected_keys[row_index]),
+                (1, &expected_values[row_index]),
+            ] {
+                let range = layout
+                    .tensor_slot_byte_range(1, tensor_index, slot)
+                    .expect("slot tensor range should be valid");
+                let start = range.start - page_start;
+                assert_eq!(&page[start..start + row_bytes], expected);
+            }
+        }
+    }
 }
 
 #[cfg(feature = "mooncake-link")]

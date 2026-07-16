@@ -114,3 +114,52 @@ fn page_major_layout_fails_fast_on_inconsistent_runtime_metadata() {
         Err(CudaKvCachePoolError::SizeOverflow)
     );
 }
+
+#[test]
+fn page_major_layout_builds_dtype_independent_batched_kv_copy_plan() {
+    let layout = CudaKvCachePoolLayout::new(runtime_layout(), 3).expect("layout should be valid");
+    let plan = layout
+        .kv_pair_copy_plan(1, 3, 40, 48)
+        .expect("layer K/V pair should map into the physical pool");
+
+    assert_eq!(plan.row_count(), 3);
+    assert_eq!(plan.slot_count(), 12);
+    assert_eq!(plan.layout().page_size(), 4);
+    assert_eq!(plan.layout().page_stride_bytes(), 512);
+    assert_eq!(plan.layout().key_in_page_offset(), 256);
+    assert_eq!(plan.layout().value_in_page_offset(), 384);
+    assert_eq!(plan.layout().row_bytes(), 32);
+    assert_eq!(plan.key_row_stride_bytes(), 40);
+    assert_eq!(plan.value_row_stride_bytes(), 48);
+    assert_eq!(plan.pool_required_bytes(), layout.total_byte_len());
+}
+
+#[test]
+fn page_major_layout_validates_scheduler_slot_maps_before_cuda_upload() {
+    let layout = CudaKvCachePoolLayout::new(runtime_layout(), 3).expect("layout should be valid");
+
+    layout
+        .validate_slot_indices(&[0, 4, 11])
+        .expect("physical slots spanning pages should validate");
+    assert_eq!(
+        layout.validate_slot_indices(&[]),
+        Err(CudaKvCachePoolError::EmptySlotMap)
+    );
+    assert_eq!(
+        layout.validate_slot_indices(&[0, 12, 1]),
+        Err(CudaKvCachePoolError::BatchSlotOutOfRange {
+            batch_index: 1,
+            slot_index: 12,
+            slot_count: 12,
+        })
+    );
+
+    let mut single_tensor_runtime = runtime_layout();
+    single_tensor_runtime.kv_tensors_per_token = 1;
+    let single_tensor_layout = CudaKvCachePoolLayout::new(single_tensor_runtime, 1)
+        .expect("single-tensor metadata is valid but cannot hold a K/V pair");
+    assert_eq!(
+        single_tensor_layout.kv_pair_copy_plan(0, 1, 64, 64),
+        Err(CudaKvCachePoolError::KvPairRequiresTwoTensors { tensor_count: 1 })
+    );
+}

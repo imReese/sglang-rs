@@ -229,9 +229,12 @@ owns a contiguous allocation laid out as
 `page -> layer -> K/V tensor -> token`, matching SGLang's page-major layout.
 The pool exposes checked tensor locations for attention kernels, while
 Mooncake registers the same physical allocation instead of transfer-owned
-staging memory. The current executable forward provider is the CPU reference
-GLM runtime; the CUDA embedding LM does not have attention or a KV cache and
-therefore fails fast if Mooncake PD is requested.
+staging memory. Dtype-independent CUDA scatter/gather kernels accept strided
+K/V rows plus scheduler physical-slot indices and write them directly into that
+registered allocation; invalid slot maps fail before launch and are guarded
+again on the device. The current executable forward provider is the CPU
+reference GLM runtime; the CUDA embedding LM does not have attention or a KV
+cache and therefore fails fast if Mooncake PD is requested.
 
 `--device auto` follows the community CLI surface. It selects CUDA when a
 working NVIDIA driver and visible device are present, and selects the CPU
@@ -265,8 +268,8 @@ cargo test --workspace
 
 On a MacBook, these tests validate allocator geometry, page-aligned prefix
 reuse, physical-page transfer planning, decode bootstrap metadata, the CPU
-reference backing store, and checked CUDA layout arithmetic without requiring a
-CUDA driver:
+reference backing store, checked CUDA layout arithmetic, batched K/V copy plans,
+and physical-slot validation without requiring a CUDA driver:
 
 ```bash
 cargo test -p sglang-srt --test cache_allocator \
@@ -289,6 +292,14 @@ slot writes:
 ```bash
 cargo test -p sglang-srt --test cuda_backend \
   b200_cuda_runtime_kernels_execute_and_write_kv_slots -- --ignored --nocapture
+```
+
+Validate a batched, strided K/V scatter across physical page boundaries and
+gather it back from the exact allocation exposed to Mooncake:
+
+```bash
+cargo test -p sglang-srt --test cuda_backend \
+  b200_cuda_kv_kernels_scatter_and_gather_batched_physical_slots -- --ignored --nocapture
 ```
 
 Validate real safetensors weight upload, cuBLAS logits, token sampling, and the

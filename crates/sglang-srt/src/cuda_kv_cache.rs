@@ -2,6 +2,9 @@ use std::fmt;
 use std::ops::Range;
 
 use sglang_kernel::cuda::{CudaContext, CudaDeviceAllocation, CudaError};
+use sglang_kernel::cuda_kv_kernels::{
+    CudaKvPairCopyError, CudaKvPairCopyKernels, CudaKvPairCopyLayout, CudaKvPairCopyPlan,
+};
 
 use crate::transfer::{
     KvCacheMemoryLocation, KvCacheRuntimeLayout, KvCacheTransferError,
@@ -45,11 +48,25 @@ pub enum CudaKvCachePoolError {
         slot_index: usize,
         slot_count: usize,
     },
+    EmptySlotMap,
+    BatchSlotOutOfRange {
+        batch_index: usize,
+        slot_index: usize,
+        slot_count: usize,
+    },
+    SlotMapCapacityMismatch {
+        map_slot_count: usize,
+        pool_slot_count: usize,
+    },
+    KvPairRequiresTwoTensors {
+        tensor_count: usize,
+    },
     PageBufferSizeMismatch {
         expected: usize,
         actual: usize,
     },
     Cuda(CudaError),
+    CudaKvCopy(CudaKvPairCopyError),
     Transfer(KvCacheTransferError),
 }
 
@@ -117,11 +134,34 @@ impl fmt::Display for CudaKvCachePoolError {
                 formatter,
                 "CUDA KV cache slot index {slot_index} is outside {slot_count} token slots"
             ),
+            Self::EmptySlotMap => formatter.write_str("CUDA KV cache slot map must not be empty"),
+            Self::BatchSlotOutOfRange {
+                batch_index,
+                slot_index,
+                slot_count,
+            } => write!(
+                formatter,
+                "CUDA KV cache batch slot {batch_index} references physical slot {slot_index}, outside {slot_count} token slots"
+            ),
+            Self::SlotMapCapacityMismatch {
+                map_slot_count,
+                pool_slot_count,
+            } => write!(
+                formatter,
+                "CUDA KV cache slot map was validated for {map_slot_count} slots but the pool contains {pool_slot_count} slots"
+            ),
+            Self::KvPairRequiresTwoTensors { tensor_count } => write!(
+                formatter,
+                "CUDA KV cache K/V pair copy requires at least two tensors per token, layout has {tensor_count}"
+            ),
             Self::PageBufferSizeMismatch { expected, actual } => write!(
                 formatter,
                 "CUDA KV cache page buffer has {actual} bytes but requires exactly {expected} bytes"
             ),
             Self::Cuda(error) => write!(formatter, "CUDA KV cache operation failed: {error}"),
+            Self::CudaKvCopy(error) => {
+                write!(formatter, "CUDA KV cache device copy failed: {error}")
+            }
             Self::Transfer(error) => {
                 write!(formatter, "CUDA KV cache transfer layout failed: {error}")
             }
@@ -134,6 +174,12 @@ impl std::error::Error for CudaKvCachePoolError {}
 impl From<CudaError> for CudaKvCachePoolError {
     fn from(value: CudaError) -> Self {
         Self::Cuda(value)
+    }
+}
+
+impl From<CudaKvPairCopyError> for CudaKvCachePoolError {
+    fn from(value: CudaKvPairCopyError) -> Self {
+        Self::CudaKvCopy(value)
     }
 }
 
@@ -348,6 +394,62 @@ impl CudaKvCachePoolLayout {
         )
     }
 
+    pub fn validate_slot_indices(&self, slots: &[usize]) -> Result<(), CudaKvCachePoolError> {
+        if slots.is_empty() {
+            return Err(CudaKvCachePoolError::EmptySlotMap);
+        }
+        for (batch_index, slot_index) in slots.iter().copied().enumerate() {
+            if slot_index >= self.slot_count {
+                return Err(CudaKvCachePoolError::BatchSlotOutOfRange {
+                    batch_index,
+                    slot_index,
+                    slot_count: self.slot_count,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn kv_pair_copy_plan(
+        &self,
+        layer_index: usize,
+        row_count: usize,
+        key_row_stride_bytes: usize,
+        value_row_stride_bytes: usize,
+    ) -> Result<CudaKvPairCopyPlan, CudaKvCachePoolError> {
+        if layer_index >= self.runtime.num_layers {
+            return Err(CudaKvCachePoolError::LayerOutOfRange {
+                layer_index,
+                layer_count: self.runtime.num_layers,
+            });
+        }
+        if self.runtime.kv_tensors_per_token < 2 {
+            return Err(CudaKvCachePoolError::KvPairRequiresTwoTensors {
+                tensor_count: self.runtime.kv_tensors_per_token,
+            });
+        }
+        let layer_offset = layer_index
+            .checked_mul(self.bytes_per_layer_page)
+            .ok_or(CudaKvCachePoolError::SizeOverflow)?;
+        let value_offset = layer_offset
+            .checked_add(self.bytes_per_tensor_page)
+            .ok_or(CudaKvCachePoolError::SizeOverflow)?;
+        let copy_layout = CudaKvPairCopyLayout::new(
+            self.runtime.page_size,
+            self.runtime.page_size_bytes,
+            layer_offset,
+            value_offset,
+            self.bytes_per_token_per_tensor,
+        );
+        Ok(CudaKvPairCopyPlan::new(
+            row_count,
+            self.slot_count,
+            copy_layout,
+            key_row_stride_bytes,
+            value_row_stride_bytes,
+        )?)
+    }
+
     fn validate_page(&self, page_index: usize) -> Result<(), CudaKvCachePoolError> {
         if page_index >= self.page_count {
             Err(CudaKvCachePoolError::PageOutOfRange {
@@ -360,7 +462,43 @@ impl CudaKvCachePoolLayout {
     }
 }
 
+pub struct CudaKvCacheSlotMap {
+    allocation: CudaDeviceAllocation,
+    slots: Vec<usize>,
+    slot_count: usize,
+}
+
+impl fmt::Debug for CudaKvCacheSlotMap {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CudaKvCacheSlotMap")
+            .field("device_ordinal", &self.allocation.device_ordinal())
+            .field("slots", &self.slots)
+            .field("slot_count", &self.slot_count)
+            .finish()
+    }
+}
+
+impl CudaKvCacheSlotMap {
+    pub fn slots(&self) -> &[usize] {
+        &self.slots
+    }
+
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    pub fn allocation(&self) -> &CudaDeviceAllocation {
+        &self.allocation
+    }
+}
+
 pub struct CudaKvCachePool {
+    context: CudaContext,
     layout: CudaKvCachePoolLayout,
     allocation: CudaDeviceAllocation,
 }
@@ -374,7 +512,11 @@ impl CudaKvCachePool {
         let layout = CudaKvCachePoolLayout::new(runtime, page_count)?;
         let mut allocation = context.allocate(layout.total_byte_len())?;
         allocation.fill(0)?;
-        Ok(Self { layout, allocation })
+        Ok(Self {
+            context: context.clone(),
+            layout,
+            allocation,
+        })
     }
 
     pub fn layout(&self) -> CudaKvCachePoolLayout {
@@ -392,6 +534,29 @@ impl CudaKvCachePool {
     pub fn clear(&mut self) -> Result<(), CudaKvCachePoolError> {
         self.allocation.fill(0)?;
         Ok(())
+    }
+
+    pub fn upload_slot_map(
+        &self,
+        slots: &[usize],
+    ) -> Result<CudaKvCacheSlotMap, CudaKvCachePoolError> {
+        self.layout.validate_slot_indices(slots)?;
+        let byte_len = slots
+            .len()
+            .checked_mul(size_of::<u64>())
+            .ok_or(CudaKvCachePoolError::SizeOverflow)?;
+        let mut bytes = Vec::with_capacity(byte_len);
+        for slot in slots {
+            let slot = u64::try_from(*slot).map_err(|_| CudaKvCachePoolError::SizeOverflow)?;
+            bytes.extend_from_slice(&slot.to_ne_bytes());
+        }
+        let mut allocation = self.context.allocate(byte_len)?;
+        allocation.copy_from_host(0, &bytes)?;
+        Ok(CudaKvCacheSlotMap {
+            allocation,
+            slots: slots.to_vec(),
+            slot_count: self.layout.slot_count,
+        })
     }
 
     pub fn write_page(
@@ -462,6 +627,74 @@ impl CudaKvCachePool {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_kv_slots_from_device(
+        &mut self,
+        kernels: &mut CudaKvPairCopyKernels,
+        layer_index: usize,
+        slot_map: &CudaKvCacheSlotMap,
+        keys: &CudaDeviceAllocation,
+        keys_offset: usize,
+        key_row_stride_bytes: usize,
+        values: &CudaDeviceAllocation,
+        values_offset: usize,
+        value_row_stride_bytes: usize,
+    ) -> Result<(), CudaKvCachePoolError> {
+        self.validate_slot_map(slot_map)?;
+        let plan = self.layout.kv_pair_copy_plan(
+            layer_index,
+            slot_map.len(),
+            key_row_stride_bytes,
+            value_row_stride_bytes,
+        )?;
+        kernels.scatter(
+            plan,
+            keys,
+            keys_offset,
+            values,
+            values_offset,
+            &slot_map.allocation,
+            0,
+            &mut self.allocation,
+            0,
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn read_kv_slots_to_device(
+        &self,
+        kernels: &mut CudaKvPairCopyKernels,
+        layer_index: usize,
+        slot_map: &CudaKvCacheSlotMap,
+        keys: &mut CudaDeviceAllocation,
+        keys_offset: usize,
+        key_row_stride_bytes: usize,
+        values: &mut CudaDeviceAllocation,
+        values_offset: usize,
+        value_row_stride_bytes: usize,
+    ) -> Result<(), CudaKvCachePoolError> {
+        self.validate_slot_map(slot_map)?;
+        let plan = self.layout.kv_pair_copy_plan(
+            layer_index,
+            slot_map.len(),
+            key_row_stride_bytes,
+            value_row_stride_bytes,
+        )?;
+        kernels.gather(
+            plan,
+            &self.allocation,
+            0,
+            &slot_map.allocation,
+            0,
+            keys,
+            keys_offset,
+            values,
+            values_offset,
+        )?;
+        Ok(())
+    }
+
     pub fn tensor_location(
         &self,
         page_index: usize,
@@ -517,6 +750,16 @@ impl CudaKvCachePool {
                 device_id: self.allocation.device_ordinal(),
             },
         )?)
+    }
+
+    fn validate_slot_map(&self, slot_map: &CudaKvCacheSlotMap) -> Result<(), CudaKvCachePoolError> {
+        if slot_map.slot_count != self.layout.slot_count {
+            return Err(CudaKvCachePoolError::SlotMapCapacityMismatch {
+                map_slot_count: slot_map.slot_count,
+                pool_slot_count: self.layout.slot_count,
+            });
+        }
+        self.layout.validate_slot_indices(&slot_map.slots)
     }
 }
 
