@@ -24,7 +24,9 @@ use sglang_srt::engine_info_bootstrap::{
     EngineInfoBootstrapService, TransferEngineInfo, TransferEngineInfoRegistration,
 };
 use sglang_srt::http::serve_http_router_with_shutdown;
-use sglang_srt::server::{build_bootstrap_http_router_service, launch_http_server_with_shutdown};
+use sglang_srt::server::{
+    build_bootstrap_http_router_service, http_listen_addr, ServerLaunchError,
+};
 use tokio::sync::oneshot;
 use tower::ServiceExt;
 
@@ -68,6 +70,20 @@ fn build_ctx_with_http_worker(addr: SocketAddr) -> Arc<AppContext> {
     let policies = Arc::new(build_registry_with_defaults(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
     Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
+}
+
+// These protocol tests intentionally serve the reference model builder.
+async fn launch_http_server_with_shutdown<F>(
+    args: ServerArgs,
+    shutdown: F,
+) -> Result<(), ServerLaunchError>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let addr = http_listen_addr(&args)?;
+    let service = build_bootstrap_http_router_service(&args);
+    serve_http_router_with_shutdown(addr, service, shutdown).await?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

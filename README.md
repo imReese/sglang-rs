@@ -96,7 +96,7 @@ This repository currently contains the first `sglang-srt` runtime crate and the
   GPU host it performs real device discovery, compute-capability queries,
   primary-context management, memory accounting, and RAII `cuMemAlloc_v2` /
   `cuMemFree_v2` device allocation. Checked host/device copies and dynamically
-  loaded cuBLAS provide the first real CUDA weight-execution path without
+  loaded cuBLAS provide F32 embedding inference and BF16 row-major GEMM without
   requiring a CUDA SDK at Rust compile time. Dynamically compiled BF16 paged
   attention consumes scheduler request metadata and reads GQA K/V rows directly
   from physical slots in the page-major CUDA KV pool.
@@ -221,9 +221,9 @@ This repository currently contains the first `sglang-srt` runtime crate and the
 
 The implementation is intentionally small while the architecture is being
 carved out. A CUDA/cuBLAS executor now runs the weight-backed embedding LM used
-for end-to-end protocol validation. A BF16 GQA paged-attention primitive is
-implemented, while MoE CUDA kernels and a production GLM/DeepSeek CUDA executor
-are not implemented yet. PD support
+for end-to-end protocol validation. BF16 GEMM and GQA paged-attention primitives
+are implemented, while MoE CUDA kernels and a production GLM/DeepSeek CUDA
+executor are not implemented yet. PD support
 covers the scheduler/router execution split, bootstrap metadata propagation,
 bounded transfer polling, fake/local snapshot transfer paths, control-plane
 descriptor checksums, snapshot-content checksums, and the Mooncake-linked
@@ -247,6 +247,10 @@ working NVIDIA driver and visible device are present, and selects the CPU
 reference backend only when CUDA is absent. A broken CUDA installation,
 missing cuBLAS, unsupported model/backend pair, or unsupported accelerator
 fails at startup instead of falling back to CPU execution.
+Production launch also requires `--model-path` to resolve to a local directory
+or Hugging Face cache snapshot containing safetensors weights. The built-in
+`Space` reference model is available to tests only and is never served by the
+production launcher.
 
 ## KV Page Contract
 
@@ -277,8 +281,9 @@ Real CUDA acceptance runs in the separate `CUDA Acceptance` workflow. Register
 a Linux self-hosted runner with the `cuda` label, then start the workflow
 manually. Set the repository variable `ENABLE_CUDA_CI=true` to run it
 automatically after pushes to `main`. The workflow executes the real CUDA
-allocation, KV copy, BF16 paged-attention, cuBLAS inference, and HTTP service
-tests serially and cleans its per-run Cargo target directory when finished.
+allocation, KV copy, BF16 GEMM, BF16 paged-attention, cuBLAS inference, and HTTP
+service tests serially and cleans its per-run Cargo target directory when
+finished.
 The first production runner is expected to be B200, but the workflow has no
 product label or product check; A100, H100, and later compatible CUDA devices
 run the same capability-gated tests.
@@ -317,6 +322,13 @@ global token-slot addressing, and the transferable-memory view:
 ```bash
 cargo test -p sglang-srt --test cuda_backend \
   cuda_backend_round_trips_page_major_device_kv_memory -- --ignored --nocapture
+```
+
+Validate the BF16 row-major GEMM used by Transformer linear projections:
+
+```bash
+cargo test -p sglang-srt --test cuda_backend \
+  cuda_bf16_gemm_runs_transformer_linear_projection -- --ignored --nocapture
 ```
 
 With the CUDA toolkit's NVRTC library available to the dynamic loader, validate
@@ -363,11 +375,11 @@ MOONCAKE_BUILD_DIR=/path/to/Mooncake/build \
 
 CUDA is the first production backend and B200 is the first hardware acceptance
 target; the runtime and kernel interfaces do not encode a B200 product check.
-The BF16 attention implementation accepts CUDA compute capability 8.0 or newer,
-which leaves A100 and H100 on the same backend path, but those devices are not
-yet part of the committed hardware acceptance matrix. Metal, ROCm, and MUSA
-execution are not implemented yet. Requesting one of those devices fails at
-startup with the unavailable backend/capability instead of running the CPU
+The BF16 GEMM and attention implementations accept CUDA compute capability 8.0
+or newer, which leaves A100 and H100 on the same backend path, but those devices
+are not yet part of the committed hardware acceptance matrix. Metal, ROCm, and
+MUSA execution are not implemented yet. Requesting one of those devices fails
+at startup with the unavailable backend/capability instead of running the CPU
 reference model.
 
 Run a local process-level PD smoke with a tiny real safetensors model:

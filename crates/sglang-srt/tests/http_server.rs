@@ -2725,10 +2725,12 @@ async fn prefill_http_launch_rejects_unstartable_dummy_mooncake_runtime() {
 async fn http_launch_starts_engine_info_bootstrap_and_serves_remote_info() {
     let http_addr = unused_local_addr();
     let engine_info_addr = unused_local_addr();
+    let model_dir = temp_model_dir("http-launch-engine-info");
+    write_minimal_embedding_lm_artifacts(&model_dir);
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
-        "dummy",
+        model_dir.to_str().expect("temp model dir should be utf-8"),
         "--served-model-name",
         "tiny-http",
         "--host",
@@ -2775,6 +2777,7 @@ async fn http_launch_starts_engine_info_bootstrap_and_serves_remote_info() {
         .await
         .expect("server task should join")
         .expect("server should stop cleanly");
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2885,7 +2888,7 @@ fn assert_dummy_mooncake_startup_error(error: &ServerLaunchError) {
     assert!(
         error
             .to_string()
-            .contains("does not expose transferable Mooncake KV memory"),
+            .contains("production serving cannot use the Space reference model"),
         "{error}"
     );
 }
@@ -3038,6 +3041,33 @@ fn write_minimal_generic_model_artifacts(model_dir: &Path) {
     )
     .expect("config should be written");
     write_minimal_safetensors_file(&model_dir.join("model.safetensors"));
+}
+
+fn write_minimal_embedding_lm_artifacts(model_dir: &Path) {
+    const VOCAB_SIZE: usize = 256;
+    fs::create_dir_all(model_dir).expect("temp model dir should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        format!(
+            r#"{{
+  "model_type": "sglang_embedding_lm",
+  "vocab_size": {VOCAB_SIZE},
+  "hidden_size": 1
+}}"#
+        ),
+    )
+    .expect("config should be written");
+    let tensor_byte_len = VOCAB_SIZE * std::mem::size_of::<f32>();
+    let header = format!(
+        r#"{{"model.embed_tokens.weight":{{"dtype":"F32","shape":[{VOCAB_SIZE},1],"data_offsets":[0,{tensor_byte_len}]}},"lm_head.weight":{{"dtype":"F32","shape":[{VOCAB_SIZE},1],"data_offsets":[{tensor_byte_len},{}]}}}}"#,
+        tensor_byte_len * 2
+    );
+    let mut bytes = Vec::with_capacity(8 + header.len() + tensor_byte_len * 2);
+    bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(header.as_bytes());
+    bytes.resize(bytes.len() + tensor_byte_len * 2, 0);
+    fs::write(model_dir.join("model.safetensors"), bytes)
+        .expect("safetensors shard should be written");
 }
 
 fn write_minimal_generic_model_artifacts_with_weight_values(model_dir: &Path, values: &[f32]) {

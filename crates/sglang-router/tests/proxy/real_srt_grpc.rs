@@ -26,11 +26,16 @@ use sglang_router::server::app_context::AppContext;
 use sglang_router::tokenizer::TokenizerRegistry;
 use sglang_router::workers::WorkerRegistry;
 use sglang_srt::cli::ServerArgs;
+use sglang_srt::grpc::serve_grpc_router_with_shutdown;
 use sglang_srt::proto::sglang::runtime::v1::sglang_service_client::SglangServiceClient;
 use sglang_srt::proto::sglang::runtime::v1::{
     GetModelInfoRequest, GetWeightsByNameRequest, HealthCheckRequest,
 };
-use sglang_srt::server::launch_grpc_server_with_shutdown;
+use sglang_srt::server::{
+    build_bootstrap_grpc_router_service, grpc_listen_addr,
+    launch_grpc_server_with_shutdown as launch_production_grpc_server_with_shutdown,
+    ServerLaunchError,
+};
 use tokio::sync::oneshot;
 use tower::ServiceExt;
 
@@ -131,6 +136,20 @@ fn write_embedding_lm_artifacts_with_weight_values(model_dir: &std::path::Path, 
     }
     fs::write(model_dir.join("model.safetensors"), bytes)
         .expect("safetensors shard should be written");
+}
+
+// Protocol tests serve the explicit reference builder; launch tests use the production alias.
+async fn launch_grpc_server_with_shutdown<F>(
+    args: ServerArgs,
+    shutdown: F,
+) -> Result<(), ServerLaunchError>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let addr = grpc_listen_addr(&args)?;
+    let service = build_bootstrap_grpc_router_service(&args);
+    serve_grpc_router_with_shutdown(addr, service, true, shutdown).await?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1851,13 +1870,19 @@ async fn real_rust_srt_grpc_mooncake_workers_reject_unlinked_transfer_backend() 
     .expect("decode args should parse");
 
     let (prefill_shutdown_tx, prefill_shutdown_rx) = oneshot::channel::<()>();
-    let prefill_server = tokio::spawn(launch_grpc_server_with_shutdown(prefill_args, async move {
-        let _ = prefill_shutdown_rx.await;
-    }));
+    let prefill_server = tokio::spawn(launch_production_grpc_server_with_shutdown(
+        prefill_args,
+        async move {
+            let _ = prefill_shutdown_rx.await;
+        },
+    ));
     let (decode_shutdown_tx, decode_shutdown_rx) = oneshot::channel::<()>();
-    let decode_server = tokio::spawn(launch_grpc_server_with_shutdown(decode_args, async move {
-        let _ = decode_shutdown_rx.await;
-    }));
+    let decode_server = tokio::spawn(launch_production_grpc_server_with_shutdown(
+        decode_args,
+        async move {
+            let _ = decode_shutdown_rx.await;
+        },
+    ));
 
     let prefill_error = prefill_server
         .await

@@ -1,7 +1,5 @@
 use std::fs;
 use std::io::{Read, Write};
-#[cfg(feature = "mooncake-link")]
-use std::net::SocketAddr;
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -16,8 +14,6 @@ use sglang_srt::proto::sglang::runtime::v1::sglang_service_server::SglangService
 use sglang_srt::proto::sglang::runtime::v1::{
     GetModelInfoRequest, RequestOptions, SamplingParams, TextGenerateRequest, TokenizeRequest,
 };
-#[cfg(not(feature = "mooncake-link"))]
-use sglang_srt::server::try_build_launch_mooncake_decode_http_router_service_for_test;
 use sglang_srt::server::{
     ServerLaunchError, build_bootstrap_fake_pd_grpc_router_service,
     build_bootstrap_grpc_router_service, build_bootstrap_pd_grpc_router_service, grpc_listen_addr,
@@ -162,55 +158,21 @@ fn unsupported_accelerator_fails_before_cpu_weight_materialization() {
 }
 
 #[tokio::test]
-async fn launch_cpu_reference_rejects_ignored_attention_backend() {
-    let args = ServerArgs::parse_from([
-        "serve",
-        "--model-path",
-        "dummy",
-        "--device",
-        "cpu",
-        "--attention-backend",
-        "flashinfer",
-    ])
-    .expect("args should parse");
+async fn launch_rejects_space_reference_model() {
+    let args = ServerArgs::parse_from(["serve", "--model-path", "dummy", "--grpc-mode"])
+        .expect("args should parse");
 
     let error = launch_grpc_server(args)
         .await
-        .expect_err("CPU reference must not silently ignore an attention backend");
+        .expect_err("production launch must not serve the Space reference model");
 
     assert_eq!(
         error,
-        ServerLaunchError::MissingRuntimeCapabilities {
-            runtime_name: "space-reference".to_string(),
-            missing: vec!["attention backend flashinfer".to_string()],
+        ServerLaunchError::ReferenceModelUnavailableForLaunch {
+            model_path: "dummy".to_string(),
         }
     );
-}
-
-#[tokio::test]
-async fn launch_cpu_reference_rejects_ignored_tensor_parallel_size() {
-    let args = ServerArgs::parse_from([
-        "serve",
-        "--model-path",
-        "dummy",
-        "--device",
-        "cpu",
-        "--tp-size",
-        "2",
-    ])
-    .expect("args should parse");
-
-    let error = launch_grpc_server(args)
-        .await
-        .expect_err("CPU reference must not silently ignore tensor parallelism");
-
-    assert_eq!(
-        error,
-        ServerLaunchError::MissingRuntimeCapabilities {
-            runtime_name: "space-reference".to_string(),
-            missing: vec!["tensor parallel size 2".to_string()],
-        }
-    );
+    assert!(error.to_string().contains("production serving"));
 }
 
 #[tokio::test]
@@ -1283,89 +1245,6 @@ async fn launch_grpc_server_rejects_unlinked_mooncake_before_serving() {
     );
 }
 
-#[cfg(feature = "mooncake-link")]
-#[tokio::test]
-async fn launch_grpc_server_rejects_mooncake_decode_dummy_runtime_without_kv_memory() {
-    let addr = unused_local_addr();
-    let args = ServerArgs::parse_from([
-        "serve",
-        "--model-path",
-        "dummy",
-        "--host",
-        &addr.ip().to_string(),
-        "--port",
-        &addr.port().to_string(),
-        "--grpc-mode",
-        "--disaggregation-mode",
-        "decode",
-        "--disaggregation-transfer-backend",
-        "mooncake",
-        "--kv-cache-dtype",
-        "bfloat16",
-        "--kv-cache-num-layers",
-        "61",
-        "--kv-cache-kv-heads",
-        "1",
-        "--kv-cache-head-dim",
-        "512",
-    ])
-    .expect("args should parse");
-
-    let error = launch_grpc_server(args)
-        .await
-        .expect_err("dummy Mooncake decode runtime should fail before serving");
-
-    assert!(
-        error
-            .to_string()
-            .contains("does not expose transferable Mooncake KV memory"),
-        "{error}"
-    );
-}
-
-#[cfg(feature = "mooncake-link")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn launch_grpc_server_rejects_mooncake_prefill_dummy_runtime_without_kv_memory() {
-    let addrs = unused_distinct_local_addrs(3);
-    let grpc_addr = addrs[0];
-    let bootstrap_addr = addrs[1];
-    let zmq_addr = addrs[2];
-    let args = ServerArgs::parse_from([
-        "serve",
-        "--model-path",
-        "dummy",
-        "--host",
-        &grpc_addr.ip().to_string(),
-        "--port",
-        &grpc_addr.port().to_string(),
-        "--grpc-mode",
-        "--disaggregation-mode",
-        "prefill",
-        "--disaggregation-transfer-backend",
-        "mooncake",
-        "--disaggregation-bootstrap-port",
-        &bootstrap_addr.port().to_string(),
-        "--disaggregation-zmq-ports",
-        &format!("{}-{}", zmq_addr.port(), zmq_addr.port()),
-        "--kv-cache-dtype",
-        "bfloat16",
-        "--page-size",
-        "64",
-    ])
-    .expect("args should parse");
-
-    let error = launch_grpc_server(args)
-        .await
-        .expect_err("dummy Mooncake prefill runtime should fail before serving");
-
-    assert!(
-        error
-            .to_string()
-            .contains("does not expose transferable Mooncake KV memory"),
-        "{error}"
-    );
-}
-
 #[tokio::test]
 async fn launch_grpc_server_requires_kv_model_layout_for_mooncake_decode() {
     let args = ServerArgs::parse_from([
@@ -1394,47 +1273,6 @@ async fn launch_grpc_server_requires_kv_model_layout_for_mooncake_decode() {
     assert!(message.contains("--kv-cache-num-layers"));
     assert!(message.contains("--kv-cache-kv-heads"));
     assert!(message.contains("--kv-cache-head-dim"));
-}
-
-#[cfg(not(feature = "mooncake-link"))]
-#[test]
-fn mooncake_decode_builder_rejects_runtime_without_transferable_kv_memory() {
-    let args = ServerArgs::parse_from([
-        "serve",
-        "--model-path",
-        "dummy",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        "30002",
-        "--disaggregation-mode",
-        "decode",
-        "--disaggregation-transfer-backend",
-        "mooncake",
-        "--kv-cache-dtype",
-        "bfloat16",
-        "--kv-cache-num-layers",
-        "1",
-        "--kv-cache-kv-heads",
-        "1",
-        "--kv-cache-head-dim",
-        "8",
-    ])
-    .expect("args should parse");
-    let pd_config = PdConfig::from_server_args(&args).expect("pd config should parse");
-
-    let error =
-        match try_build_launch_mooncake_decode_http_router_service_for_test(&args, &pd_config) {
-            Ok(_) => panic!("dummy Space model should not expose Mooncake KV memory"),
-            Err(error) => error,
-        };
-
-    assert!(
-        error
-            .to_string()
-            .contains("does not expose transferable Mooncake KV memory"),
-        "{error}"
-    );
 }
 
 #[test]
@@ -2093,27 +1931,4 @@ fn glm_moe_dsa_config_json() -> &'static str {
 
 fn temp_model_dir(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("sglang-rs-{name}-{}", std::process::id()))
-}
-
-#[cfg(feature = "mooncake-link")]
-fn unused_local_addr() -> SocketAddr {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("local port should bind")
-        .local_addr()
-        .expect("local port should have address")
-}
-
-#[cfg(feature = "mooncake-link")]
-fn unused_distinct_local_addrs(count: usize) -> Vec<SocketAddr> {
-    let listeners = (0..count)
-        .map(|_| TcpListener::bind("127.0.0.1:0").expect("local port should bind"))
-        .collect::<Vec<_>>();
-    listeners
-        .iter()
-        .map(|listener| {
-            listener
-                .local_addr()
-                .expect("local port should have address")
-        })
-        .collect()
 }

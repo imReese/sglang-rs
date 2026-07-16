@@ -224,7 +224,7 @@ async fn manager_does_not_register_unstartable_dummy_mooncake_srt_worker() {
     assert!(
         error
             .to_string()
-            .contains("does not expose transferable Mooncake KV memory"),
+            .contains("production serving cannot use the Space reference model"),
         "{error}"
     );
     drop(shutdown_tx);

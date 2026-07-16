@@ -295,7 +295,13 @@ fn bootstrap_forward_model_from_server_args(
 fn bootstrap_forward_model_for_launch(
     args: &ServerArgs,
 ) -> Result<BootstrapForwardModel, ServerLaunchError> {
-    let model = bootstrap_forward_model_from_server_args(args)?;
+    let model = BootstrapForwardModel::from_server_args(args)?;
+    if matches!(model, BootstrapForwardModel::Space) {
+        return Err(ServerLaunchError::ReferenceModelUnavailableForLaunch {
+            model_path: args.model_path.clone(),
+        });
+    }
+    validate_bootstrap_runtime_backend(args, &model)?;
     validate_bootstrap_runtime_requirements(args, &model)?;
     Ok(model)
 }
@@ -381,6 +387,9 @@ pub enum ServerLaunchError {
         model_path: String,
         model_type: Option<String>,
     },
+    ReferenceModelUnavailableForLaunch {
+        model_path: String,
+    },
     InvalidDevice(String),
     UnsupportedDevice {
         requested: String,
@@ -447,6 +456,14 @@ impl PartialEq for ServerLaunchError {
                     model_type: right_model_type,
                 },
             ) => left_model_path == right_model_path && left_model_type == right_model_type,
+            (
+                Self::ReferenceModelUnavailableForLaunch {
+                    model_path: left_model_path,
+                },
+                Self::ReferenceModelUnavailableForLaunch {
+                    model_path: right_model_path,
+                },
+            ) => left_model_path == right_model_path,
             (Self::InvalidDevice(left), Self::InvalidDevice(right)) => left == right,
             (
                 Self::UnsupportedDevice {
@@ -548,6 +565,10 @@ impl fmt::Display for ServerLaunchError {
                 formatter,
                 "model {model_path} type {} does not expose transferable Mooncake KV memory",
                 model_type.as_deref().unwrap_or("<unknown>")
+            ),
+            Self::ReferenceModelUnavailableForLaunch { model_path } => write!(
+                formatter,
+                "model {model_path} did not resolve to a local or Hugging Face cached safetensors checkpoint; production serving cannot use the Space reference model"
             ),
             Self::InvalidDevice(value) => {
                 write!(formatter, "invalid --device: {value}")
@@ -1273,21 +1294,6 @@ fn try_build_launch_mooncake_decode_http_router_service(
         ),
         true,
     )
-}
-
-#[cfg(not(feature = "mooncake-link"))]
-#[doc(hidden)]
-pub fn try_build_launch_mooncake_decode_http_router_service_for_test(
-    args: &ServerArgs,
-    pd_config: &PdConfig,
-) -> Result<
-    BootstrapPdHttpRouterService<
-        MooncakeKvCacheTransferExecutor<UnlinkedMooncakeTransferEngine>,
-        MooncakeDecodeBootstrapPublisher,
-    >,
-    ServerLaunchError,
-> {
-    try_build_launch_mooncake_decode_http_router_service(args, pd_config)
 }
 
 #[cfg(not(feature = "mooncake-link"))]

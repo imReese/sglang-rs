@@ -1,3 +1,4 @@
+use sglang_kernel::cublas::CudaBlas;
 use sglang_kernel::cuda_kernels::{CudaF32Kernels, CudaRmsNormLaunch, CudaSiluMulLaunch};
 use sglang_kernel::cuda_kv_kernels::CudaKvPairCopyKernels;
 use sglang_srt::backend::{ComputeCapability, CudaBackend};
@@ -296,6 +297,49 @@ fn cuda_backend_round_trips_page_major_device_kv_memory() {
         .memory_info()
         .expect("CUDA memory info should remain available after release");
     assert!(memory_released.free_bytes > memory_after.free_bytes);
+}
+
+#[test]
+#[ignore = "requires a CUDA device, NVIDIA driver, and BF16-capable cuBLAS"]
+fn cuda_bf16_gemm_runs_transformer_linear_projection() {
+    let backend = CudaBackend::initialize(0).expect("CUDA backend should initialize");
+    let blas = CudaBlas::load(backend.context()).expect("cuBLAS should load");
+    let input_values = [1.0_f32, 2.0, 3.0, -1.0, 0.5, 2.0];
+    let weight_values = [
+        1.0_f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, -1.0, 0.5,
+    ];
+    let output_element_count = 2 * 4;
+    let mut input = backend
+        .context()
+        .allocate(input_values.len() * size_of::<u16>())
+        .expect("input should allocate");
+    let mut weight = backend
+        .context()
+        .allocate(weight_values.len() * size_of::<u16>())
+        .expect("weight should allocate");
+    let mut output = backend
+        .context()
+        .allocate(output_element_count * size_of::<u16>())
+        .expect("output should allocate");
+    input
+        .copy_from_host(0, &bf16_bytes(&input_values))
+        .expect("input should upload");
+    weight
+        .copy_from_host(0, &bf16_bytes(&weight_values))
+        .expect("weight should upload");
+
+    blas.bf16_gemm_row_major(&input, 2, 3, &weight, 4, &mut output)
+        .expect("BF16 projection should execute");
+
+    let mut output_bytes = vec![0_u8; output_element_count * size_of::<u16>()];
+    output
+        .copy_to_host(0, &mut output_bytes)
+        .expect("output should download");
+    assert_f32_close(
+        &bytes_bf16(&output_bytes),
+        &[1.0, 2.0, 3.0, 0.5, -1.0, 0.5, 2.0, -0.5],
+        0.01,
+    );
 }
 
 #[test]
