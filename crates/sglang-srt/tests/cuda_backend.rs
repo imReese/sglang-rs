@@ -2,7 +2,11 @@ use sglang_kernel::cuda::CudaComputeCapability;
 use sglang_kernel::cuda_kernels::CudaF32Kernels;
 use sglang_kernel::cuda_kv_kernels::CudaKvPairCopyKernels;
 use sglang_srt::backend::{ComputeCapability, CudaBackend};
+use sglang_srt::cache::{CachePageAllocator, RadixCache};
+use sglang_srt::cuda_attention::{CudaBf16PagedAttentionExecutor, CudaPagedAttentionMetadata};
 use sglang_srt::cuda_kv_cache::CudaKvCachePool;
+use sglang_srt::model_executor::ModelWorkerBatch;
+use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::transfer::{
     KvCacheDtype, KvCacheMemoryLocation, KvCacheRuntimeLayout, MooncakeKvCacheMemoryProvider,
 };
@@ -11,6 +15,8 @@ use sglang_srt::transfer::{
     MooncakeTransferEngineConfig, RegisteredMooncakeKvCacheMemory,
     SharedLinkedMooncakeTransferEngine,
 };
+use sglang_srt::types::{RequestId, SamplingParams};
+use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
 
 fn b200_test_layout() -> KvCacheRuntimeLayout {
     let page_size = 16;
@@ -31,6 +37,64 @@ fn b200_test_layout() -> KvCacheRuntimeLayout {
     }
 }
 
+fn attention_test_layout() -> KvCacheRuntimeLayout {
+    let page_size = 4;
+    let num_layers = 1;
+    let kv_heads = 2;
+    let head_dim = 4;
+    let kv_tensors_per_token = 2;
+    let bytes_per_token = num_layers * kv_heads * head_dim * kv_tensors_per_token * 2;
+    KvCacheRuntimeLayout {
+        dtype: KvCacheDtype::Bfloat16,
+        page_size,
+        num_layers,
+        kv_heads,
+        head_dim,
+        kv_tensors_per_token,
+        bytes_per_token,
+        page_size_bytes: page_size * bytes_per_token,
+    }
+}
+
+#[derive(Default)]
+struct AttentionTestWorker;
+
+impl ModelWorker for AttentionTestWorker {
+    fn generate_batch(&mut self, batch: &ScheduleBatch) -> BatchGeneratedTokens {
+        BatchGeneratedTokens::from_batch(
+            batch,
+            batch
+                .requests()
+                .iter()
+                .map(|_| GeneratedToken::finished(vec![0]))
+                .collect(),
+        )
+        .expect("output shape should match batch")
+    }
+}
+
+fn attention_test_batch() -> ModelWorkerBatch {
+    let mut scheduler = Scheduler::with_cache_resources(
+        AttentionTestWorker,
+        RadixCache::default(),
+        CachePageAllocator::new(8),
+    );
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("attention-a"),
+        vec![10, 11, 12],
+        SamplingParams::new(1),
+    ));
+    scheduler.enqueue(ScheduledRequest::new(
+        RequestId::from("attention-b"),
+        vec![20, 21],
+        SamplingParams::new(1),
+    ));
+    let batch = scheduler
+        .next_prefill_batch(2)
+        .expect("attention acceptance batch should schedule");
+    ModelWorkerBatch::from_schedule_batch(&batch)
+}
+
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
     values
         .iter()
@@ -42,6 +106,29 @@ fn bytes_f32(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(size_of::<f32>())
         .map(|chunk| f32::from_ne_bytes(chunk.try_into().expect("f32 chunk should be exact")))
+        .collect()
+}
+
+fn f32_to_bf16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let rounding_bias = 0x7fff + ((bits >> 16) & 1);
+    ((bits.wrapping_add(rounding_bias)) >> 16) as u16
+}
+
+fn bf16_bytes(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| f32_to_bf16(*value).to_ne_bytes())
+        .collect()
+}
+
+fn bytes_bf16(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(size_of::<u16>())
+        .map(|chunk| {
+            let bits = u16::from_ne_bytes(chunk.try_into().expect("BF16 chunk should be exact"));
+            f32::from_bits((bits as u32) << 16)
+        })
         .collect()
 }
 
@@ -80,6 +167,65 @@ fn assert_strided_byte_rows(storage: &[u8], row_stride_bytes: usize, expected_ro
         let start = row_index * row_stride_bytes;
         assert_eq!(&storage[start..start + expected.len()], expected);
     }
+}
+
+fn reference_paged_attention(
+    metadata: &CudaPagedAttentionMetadata,
+    queries: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    query_head_count: usize,
+    kv_head_count: usize,
+    head_dim: usize,
+    scale: f32,
+) -> Vec<f32> {
+    let mut output = Vec::with_capacity(queries.len());
+    let query_heads_per_kv_head = query_head_count / kv_head_count;
+    for query_index in 0..metadata.query_count() {
+        let request_index = metadata.query_request_indices()[query_index] as usize;
+        let sequence_start = metadata.request_slot_offsets()[request_index] as usize;
+        let sequence_length = metadata.query_sequence_lengths()[query_index] as usize;
+        for query_head in 0..query_head_count {
+            let kv_head = query_head / query_heads_per_kv_head;
+            let query_start = (query_index * query_head_count + query_head) * head_dim;
+            let query = &queries[query_start..query_start + head_dim];
+            let scores = (0..sequence_length)
+                .map(|sequence_index| {
+                    let kv_start =
+                        ((sequence_start + sequence_index) * kv_head_count + kv_head) * head_dim;
+                    query
+                        .iter()
+                        .zip(&keys[kv_start..kv_start + head_dim])
+                        .map(|(query, key)| query * key)
+                        .sum::<f32>()
+                        * scale
+                })
+                .collect::<Vec<_>>();
+            let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let weights = scores
+                .iter()
+                .map(|score| (score - maximum).exp())
+                .collect::<Vec<_>>();
+            let denominator = weights.iter().sum::<f32>();
+            for dimension in 0..head_dim {
+                output.push(
+                    weights
+                        .iter()
+                        .enumerate()
+                        .map(|(sequence_index, weight)| {
+                            let value_index = ((sequence_start + sequence_index) * kv_head_count
+                                + kv_head)
+                                * head_dim
+                                + dimension;
+                            weight * values[value_index]
+                        })
+                        .sum::<f32>()
+                        / denominator,
+                );
+            }
+        }
+    }
+    output
 }
 
 #[test]
@@ -391,6 +537,140 @@ fn b200_cuda_kv_kernels_scatter_and_gather_batched_physical_slots() {
             }
         }
     }
+}
+
+#[test]
+#[ignore = "requires a B200-class CUDA device, NVIDIA driver, and NVRTC"]
+fn b200_cuda_bf16_paged_attention_reads_mooncake_registered_physical_kv_slots() {
+    let backend = CudaBackend::initialize(0).expect("CUDA backend should initialize on B200");
+    let capability = backend.capabilities();
+    let ComputeCapability::Cuda(compute_capability) = capability.compute_capability else {
+        panic!("CUDA backend must report CUDA compute capability");
+    };
+    assert!(
+        compute_capability >= CudaComputeCapability::new(10, 0),
+        "B200 acceptance requires sm_100 or newer, found {compute_capability}"
+    );
+
+    let mut kv_copy_kernels = CudaKvPairCopyKernels::compile(backend.context(), compute_capability)
+        .expect("NVRTC should compile KV scatter kernels");
+    let mut attention =
+        CudaBf16PagedAttentionExecutor::compile(backend.context(), compute_capability)
+            .expect("NVRTC should compile BF16 paged attention");
+    let mut kv_cache = CudaKvCachePool::allocate(backend.context(), attention_test_layout(), 2)
+        .expect("two physical KV pages should allocate");
+    let worker_batch = attention_test_batch();
+    let metadata =
+        CudaPagedAttentionMetadata::from_model_worker_batch(&worker_batch, kv_cache.layout())
+            .expect("scheduler batch should produce physical attention metadata");
+    let device_metadata = metadata
+        .upload(backend.context())
+        .expect("attention metadata should upload");
+    let physical_slots = metadata
+        .sequence_slots()
+        .iter()
+        .map(|slot| *slot as usize)
+        .collect::<Vec<_>>();
+    let slot_map = kv_cache
+        .upload_slot_map(&physical_slots)
+        .expect("physical KV slots should upload");
+
+    let runtime = attention_test_layout();
+    let kv_elements = metadata.sequence_slot_count() * runtime.kv_heads * runtime.head_dim;
+    let key_source = (0..kv_elements)
+        .map(|index| (index as f32 - 11.0) * 0.03125)
+        .collect::<Vec<_>>();
+    let value_source = (0..kv_elements)
+        .map(|index| (17.0 - index as f32) * 0.046875)
+        .collect::<Vec<_>>();
+    let key_bytes = bf16_bytes(&key_source);
+    let value_bytes = bf16_bytes(&value_source);
+    let quantized_keys = bytes_bf16(&key_bytes);
+    let quantized_values = bytes_bf16(&value_bytes);
+    let mut keys = backend
+        .context()
+        .allocate(key_bytes.len())
+        .expect("BF16 keys should allocate");
+    let mut values = backend
+        .context()
+        .allocate(value_bytes.len())
+        .expect("BF16 values should allocate");
+    keys.copy_from_host(0, &key_bytes)
+        .expect("BF16 keys should upload");
+    values
+        .copy_from_host(0, &value_bytes)
+        .expect("BF16 values should upload");
+    let row_bytes = kv_cache.layout().bytes_per_token_per_tensor();
+    kv_cache
+        .write_kv_slots_from_device(
+            &mut kv_copy_kernels,
+            0,
+            &slot_map,
+            &keys,
+            0,
+            row_bytes,
+            &values,
+            0,
+            row_bytes,
+        )
+        .expect("KV scatter should write scheduler slots into the physical pool");
+
+    let query_head_count = 4;
+    let query_elements = metadata.query_count() * query_head_count * runtime.head_dim;
+    let query_source = (0..query_elements)
+        .map(|index| ((index * 7 % 29) as f32 - 14.0) * 0.0625)
+        .collect::<Vec<_>>();
+    let query_bytes = bf16_bytes(&query_source);
+    let quantized_queries = bytes_bf16(&query_bytes);
+    let mut queries = backend
+        .context()
+        .allocate(query_bytes.len())
+        .expect("BF16 queries should allocate");
+    let mut output = backend
+        .context()
+        .allocate(query_bytes.len())
+        .expect("BF16 attention output should allocate");
+    queries
+        .copy_from_host(0, &query_bytes)
+        .expect("BF16 queries should upload");
+
+    let transferable = kv_cache
+        .transferable_memory()
+        .expect("attention KV pool should expose Mooncake memory");
+    assert_eq!(
+        transferable.regions()[0].base_addr,
+        kv_cache.allocation().device_ptr() as usize,
+        "attention and Mooncake must read and register the same CUDA allocation"
+    );
+    let scale = (runtime.head_dim as f32).sqrt().recip();
+    attention
+        .forward(
+            &kv_cache,
+            0,
+            &device_metadata,
+            &queries,
+            0,
+            query_head_count,
+            scale,
+            &mut output,
+            0,
+        )
+        .expect("BF16 paged attention should execute over physical KV slots");
+    let mut output_bytes = vec![0_u8; query_bytes.len()];
+    output
+        .copy_to_host(0, &mut output_bytes)
+        .expect("attention output should download");
+    let expected = reference_paged_attention(
+        &metadata,
+        &quantized_queries,
+        &quantized_keys,
+        &quantized_values,
+        query_head_count,
+        runtime.kv_heads,
+        runtime.head_dim,
+        scale,
+    );
+    assert_f32_close(&bytes_bf16(&output_bytes), &expected, 0.02);
 }
 
 #[cfg(feature = "mooncake-link")]

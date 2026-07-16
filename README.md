@@ -75,7 +75,7 @@ binding selected upstream implementations through thin FFI layers. The backend
 layout should stay cross-platform:
 
 - CUDA/CUTLASS/FlashInfer kernels for NVIDIA deployments.
-- CPU kernels for local correctness tests and non-GPU fallback paths.
+- CPU kernels for explicitly selected local reference and correctness tests.
 - Metal kernels for Apple Silicon development and eventual MLX-backed paths.
 - ROCm/HIP and MUSA-oriented sources where upstream support already exists.
 
@@ -97,7 +97,9 @@ This repository currently contains the first `sglang-srt` runtime crate and the
   primary-context management, memory accounting, and RAII `cuMemAlloc_v2` /
   `cuMemFree_v2` device allocation. Checked host/device copies and dynamically
   loaded cuBLAS provide the first real CUDA weight-execution path without
-  requiring a CUDA SDK at Rust compile time.
+  requiring a CUDA SDK at Rust compile time. Dynamically compiled BF16 paged
+  attention consumes scheduler request metadata and reads GQA K/V rows directly
+  from physical slots in the page-major CUDA KV pool.
 - `backend`: runtime capability contracts for compute capability, supported
   dtypes, attention implementations, tensor parallelism, KV memory
   registration, Mooncake, RDMA, and NVLink. CUDA dtype support is derived from
@@ -219,8 +221,9 @@ This repository currently contains the first `sglang-srt` runtime crate and the
 
 The implementation is intentionally small while the architecture is being
 carved out. A CUDA/cuBLAS executor now runs the weight-backed embedding LM used
-for end-to-end protocol validation; transformer attention, MoE CUDA kernels,
-and a production GLM/DeepSeek CUDA executor are not implemented yet. PD support
+for end-to-end protocol validation. A BF16 GQA paged-attention primitive is
+implemented, while MoE CUDA kernels and a production GLM/DeepSeek CUDA executor
+are not implemented yet. PD support
 covers the scheduler/router execution split, bootstrap metadata propagation,
 bounded transfer polling, fake/local snapshot transfer paths, control-plane
 descriptor checksums, snapshot-content checksums, and the Mooncake-linked
@@ -232,9 +235,12 @@ Mooncake registers the same physical allocation instead of transfer-owned
 staging memory. Dtype-independent CUDA scatter/gather kernels accept strided
 K/V rows plus scheduler physical-slot indices and write them directly into that
 registered allocation; invalid slot maps fail before launch and are guarded
-again on the device. The current executable forward provider is the CPU
-reference GLM runtime; the CUDA embedding LM does not have attention or a KV
-cache and therefore fails fast if Mooncake PD is requested.
+again on the device. The BF16 paged-attention kernel uses FP32 online-softmax
+accumulation and reads that same allocation for variable-length prefill and
+decode metadata. It is not yet connected to a complete production GLM/DeepSeek
+CUDA executor, so those model/backend pairs still fail at startup instead of
+serving through the CPU reference path. The current complete GLM forward
+provider remains the explicitly selected CPU reference runtime.
 
 `--device auto` follows the community CLI surface. It selects CUDA when a
 working NVIDIA driver and visible device are present, and selects the CPU
@@ -269,12 +275,13 @@ cargo test --workspace
 On a MacBook, these tests validate allocator geometry, page-aligned prefix
 reuse, physical-page transfer planning, decode bootstrap metadata, the CPU
 reference backing store, checked CUDA layout arithmetic, batched K/V copy plans,
-and physical-slot validation without requiring a CUDA driver:
+physical-slot validation, and causal paged-attention metadata construction
+without requiring a CUDA driver:
 
 ```bash
 cargo test -p sglang-srt --test cache_allocator \
   --test scheduler_cache_allocation --test pd_transfer_plan \
-  --test glm_runtime --test cuda_kv_cache
+  --test glm_runtime --test cuda_kv_cache --test cuda_attention
 ```
 
 On a B200 host, validate real page-major CUDA allocation, page write/read,
@@ -302,6 +309,15 @@ cargo test -p sglang-srt --test cuda_backend \
   b200_cuda_kv_kernels_scatter_and_gather_batched_physical_slots -- --ignored --nocapture
 ```
 
+Validate BF16 GQA paged attention against a CPU numerical reference after K/V
+has been scattered across physical page boundaries. This also asserts that
+attention reads the exact CUDA allocation exposed for Mooncake registration:
+
+```bash
+cargo test -p sglang-srt --test cuda_backend \
+  b200_cuda_bf16_paged_attention_reads_mooncake_registered_physical_kv_slots -- --ignored --nocapture
+```
+
 Validate real safetensors weight upload, cuBLAS logits, token sampling, and the
 HTTP inference service on B200:
 
@@ -319,10 +335,13 @@ MOONCAKE_BUILD_DIR=/path/to/Mooncake/build \
 ```
 
 CUDA is the first production backend and B200 is the first hardware acceptance
-target; the capability interfaces do not encode a B200 product check. Metal,
-ROCm, and MUSA execution are not implemented yet. Requesting one of those
-devices fails at startup with the unavailable backend/capability instead of
-running the CPU reference model.
+target; the runtime and kernel interfaces do not encode a B200 product check.
+The BF16 attention implementation accepts CUDA compute capability 8.0 or newer,
+which leaves A100 and H100 on the same backend path, but those devices are not
+yet part of the committed hardware acceptance matrix. Metal, ROCm, and MUSA
+execution are not implemented yet. Requesting one of those devices fails at
+startup with the unavailable backend/capability instead of running the CPU
+reference model.
 
 Run a local process-level PD smoke with a tiny real safetensors model:
 

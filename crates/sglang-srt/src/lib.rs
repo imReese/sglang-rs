@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod cache;
 pub mod cli;
+pub mod cuda_attention;
 pub mod cuda_kv_cache;
 pub mod cuda_runtime;
 pub mod deepseek_runtime;

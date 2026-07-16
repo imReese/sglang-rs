@@ -9,6 +9,7 @@ use std::fmt;
 pub mod cpu;
 pub mod cublas;
 pub mod cuda;
+pub mod cuda_attention;
 pub mod cuda_kernels;
 pub mod cuda_kv_kernels;
 pub mod nvrtc;
