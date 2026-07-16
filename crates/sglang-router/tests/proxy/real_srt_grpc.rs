@@ -31,8 +31,9 @@ use sglang_srt::proto::sglang::runtime::v1::sglang_service_client::SglangService
 use sglang_srt::proto::sglang::runtime::v1::{
     GetModelInfoRequest, GetWeightsByNameRequest, HealthCheckRequest,
 };
+use sglang_srt::server::test_support::build_reference_grpc_router_service;
 use sglang_srt::server::{
-    build_bootstrap_grpc_router_service, grpc_listen_addr,
+    grpc_listen_addr,
     launch_grpc_server_with_shutdown as launch_production_grpc_server_with_shutdown,
     ServerLaunchError,
 };
@@ -148,7 +149,7 @@ where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     let addr = grpc_listen_addr(&args)?;
-    let service = build_bootstrap_grpc_router_service(&args);
+    let service = build_reference_grpc_router_service(&args);
     serve_grpc_router_with_shutdown(addr, service, true, shutdown).await?;
     Ok(())
 }
@@ -462,9 +463,12 @@ async fn router_get_weights_by_name_reaches_real_rust_srt_grpc_worker() {
     .expect("gRPC SRT args should parse");
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server = tokio::spawn(launch_grpc_server_with_shutdown(args, async move {
-        let _ = shutdown_rx.await;
-    }));
+    let server = tokio::spawn(launch_production_grpc_server_with_shutdown(
+        args,
+        async move {
+            let _ = shutdown_rx.await;
+        },
+    ));
     wait_for_grpc_health(addr).await;
 
     let app = build_router(build_ctx_with_grpc_worker(addr));

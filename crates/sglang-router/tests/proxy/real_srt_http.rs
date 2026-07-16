@@ -24,9 +24,8 @@ use sglang_srt::engine_info_bootstrap::{
     EngineInfoBootstrapService, TransferEngineInfo, TransferEngineInfoRegistration,
 };
 use sglang_srt::http::serve_http_router_with_shutdown;
-use sglang_srt::server::{
-    build_bootstrap_http_router_service, http_listen_addr, ServerLaunchError,
-};
+use sglang_srt::server::test_support::build_reference_http_router_service;
+use sglang_srt::server::{http_listen_addr, ServerLaunchError};
 use tokio::sync::oneshot;
 use tower::ServiceExt;
 
@@ -81,7 +80,7 @@ where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     let addr = http_listen_addr(&args)?;
-    let service = build_bootstrap_http_router_service(&args);
+    let service = build_reference_http_router_service(&args);
     serve_http_router_with_shutdown(addr, service, shutdown).await?;
     Ok(())
 }
@@ -484,7 +483,7 @@ async fn router_remote_instance_transfer_engine_info_reaches_real_rust_srt_http_
             },
         });
     let service =
-        build_bootstrap_http_router_service(&args).with_engine_info_bootstrap_service(engine_info);
+        build_reference_http_router_service(&args).with_engine_info_bootstrap_service(engine_info);
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server = tokio::spawn(serve_http_router_with_shutdown(addr, service, async move {

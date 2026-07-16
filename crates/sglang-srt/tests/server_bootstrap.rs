@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use tonic::Request;
 
 use sglang_srt::cli::ServerArgs;
+use sglang_srt::model_artifacts::ModelArtifactError;
 use sglang_srt::model_registry::ModelRegistryError;
 use sglang_srt::pd_bootstrap::PrefillBootstrapService;
 use sglang_srt::proto::sglang::runtime::v1::generate_response::Body;
@@ -15,11 +16,15 @@ use sglang_srt::proto::sglang::runtime::v1::{
     GetModelInfoRequest, RequestOptions, SamplingParams, TextGenerateRequest, TokenizeRequest,
 };
 use sglang_srt::router::RouterGetModelInfoResponse;
+use sglang_srt::server::test_support::{
+    build_reference_fake_pd_grpc_router_service, build_reference_grpc_router_service,
+    build_reference_pd_grpc_router_service, try_build_reference_grpc_router_service,
+    try_build_reference_prefill_http_router_service,
+};
 use sglang_srt::server::{
-    ServerLaunchError, build_bootstrap_fake_pd_grpc_router_service,
-    build_bootstrap_grpc_router_service, build_bootstrap_pd_grpc_router_service, grpc_listen_addr,
-    launch_grpc_server, prefill_mooncake_zmq_endpoints, register_prefill_mooncake_routes_from_args,
-    try_build_bootstrap_grpc_router_service, try_build_bootstrap_prefill_http_router_service,
+    ServerLaunchError, build_bootstrap_grpc_router_service, grpc_listen_addr, launch_grpc_server,
+    prefill_mooncake_zmq_endpoints, register_prefill_mooncake_routes_from_args,
+    try_build_bootstrap_grpc_router_service,
 };
 use sglang_srt::tokenizer::TokenizerError;
 use sglang_srt::transfer::{
@@ -65,7 +70,7 @@ fn bootstrap_pd_service_rejects_unaligned_kv_slot_capacity_before_serving() {
     ])
     .expect("args should parse");
 
-    let error = match try_build_bootstrap_prefill_http_router_service(&args) {
+    let error = match try_build_reference_prefill_http_router_service(&args) {
         Ok(_) => panic!("unaligned KV slot capacity should fail during service construction"),
         Err(error) => error,
     };
@@ -81,7 +86,7 @@ fn bootstrap_pd_service_rejects_unaligned_kv_slot_capacity_before_serving() {
 }
 
 #[test]
-fn bootstrap_cuda_device_rejects_space_reference_fallback() {
+fn bootstrap_cuda_device_rejects_missing_model_without_fallback() {
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
@@ -93,18 +98,16 @@ fn bootstrap_cuda_device_rejects_space_reference_fallback() {
     .expect("args should parse");
 
     let error = match try_build_bootstrap_grpc_router_service(&args) {
-        Ok(_) => panic!("cuda device must not fall back to bootstrap Space reference model"),
+        Ok(_) => panic!("cuda device must not fall back when model artifacts are missing"),
         Err(error) => error,
     };
 
     assert!(
         matches!(
             error,
-            ServerLaunchError::UnsupportedDevice {
-                ref requested,
-                ref actual,
-                ..
-            } if requested == "cuda" && actual == "cpu-reference"
+            ServerLaunchError::ModelRegistry(ModelRegistryError::ModelArtifact(
+                ModelArtifactError::ModelPathNotLocalDirectory { .. }
+            ))
         ),
         "unexpected error: {error:?}"
     );
@@ -163,21 +166,24 @@ fn unsupported_accelerator_fails_before_cpu_weight_materialization() {
 }
 
 #[tokio::test]
-async fn launch_rejects_space_reference_model() {
+async fn launch_rejects_missing_model_without_reference_fallback() {
     let args = ServerArgs::parse_from(["serve", "--model-path", "dummy", "--grpc-mode"])
         .expect("args should parse");
 
     let error = launch_grpc_server(args)
         .await
-        .expect_err("production launch must not serve the Space reference model");
+        .expect_err("production launch must reject missing model artifacts");
 
-    assert_eq!(
-        error,
-        ServerLaunchError::ReferenceModelUnavailableForLaunch {
-            model_path: "dummy".to_string(),
-        }
+    assert!(
+        matches!(
+            error,
+            ServerLaunchError::ModelRegistry(ModelRegistryError::ModelArtifact(
+                ModelArtifactError::ModelPathNotLocalDirectory { .. }
+            ))
+        ),
+        "unexpected error: {error:?}"
     );
-    assert!(error.to_string().contains("production serving"));
+    assert!(error.to_string().contains("not a local directory"));
 }
 
 #[tokio::test]
@@ -193,7 +199,7 @@ async fn bootstrap_grpc_router_service_carries_model_metadata() {
         "--grpc-mode",
     ])
     .expect("args should parse");
-    let service = build_bootstrap_grpc_router_service(&args);
+    let service = build_reference_grpc_router_service(&args);
 
     let response = service
         .get_model_info(Request::new(GetModelInfoRequest {}))
@@ -222,7 +228,7 @@ async fn bootstrap_grpc_router_service_reports_local_model_config_metadata() {
         "--grpc-mode",
     ])
     .expect("args should parse");
-    let service = build_bootstrap_grpc_router_service(&args);
+    let service = build_reference_grpc_router_service(&args);
 
     let response = service
         .get_model_info(Request::new(GetModelInfoRequest {}))
@@ -406,7 +412,9 @@ fn bootstrap_grpc_router_service_rejects_generation_for_unsupported_local_model_
                 backend: sglang_srt::backend::RuntimeBackend::Cpu,
                 ref missing,
                 ..
-            }) if missing == &["registered model forward executor"]
+            }) if missing.iter().any(|capability| capability == "multi-latent attention decoder execution")
+                && missing.iter().any(|capability| capability == "mixture-of-experts kernels")
+                && missing.iter().any(|capability| capability == "runtime-owned KV cache allocation")
         ),
         "unexpected error: {error:?}"
     );
@@ -415,7 +423,7 @@ fn bootstrap_grpc_router_service_rejects_generation_for_unsupported_local_model_
 }
 
 #[test]
-fn bootstrap_rejects_glm_legacy_executor_before_service_construction() {
+fn bootstrap_rejects_glm_through_the_shared_mla_moe_runtime_preflight() {
     let model_dir = temp_model_dir("server-glm-runtime-forward");
     fs::create_dir_all(&model_dir).expect("temp model dir should be created");
     write_complete_glm_moe_dsa_forward_checkpoint(&model_dir);
@@ -429,7 +437,7 @@ fn bootstrap_rejects_glm_legacy_executor_before_service_construction() {
     ])
     .expect("args should parse");
     let error = match try_build_bootstrap_grpc_router_service(&args) {
-        Ok(_) => panic!("GLM legacy executor must not enter the generic serving path"),
+        Ok(_) => panic!("GLM must not bypass the shared MLA/MoE runtime capability preflight"),
         Err(error) => error,
     };
 
@@ -441,7 +449,46 @@ fn bootstrap_rejects_glm_legacy_executor_before_service_construction() {
                 backend: sglang_srt::backend::RuntimeBackend::Cpu,
                 ref missing,
                 ..
-            }) if missing == &["registered model forward executor"]
+            }) if missing.iter().any(|capability| capability == "multi-latent attention decoder execution")
+                && missing.iter().any(|capability| capability == "mixture-of-experts kernels")
+                && missing.iter().any(|capability| capability == "runtime-owned KV cache allocation")
+        ),
+        "unexpected error: {error:?}"
+    );
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
+#[test]
+fn bootstrap_rejects_qwen_through_the_same_generic_runtime_preflight() {
+    let model_dir = temp_model_dir("server-qwen-runtime-forward");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_complete_qwen2_checkpoint(&model_dir);
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_dir.to_str().expect("temp model dir should be utf-8"),
+        "--device",
+        "cpu",
+        "--grpc-mode",
+    ])
+    .expect("args should parse");
+    let error = match try_build_bootstrap_grpc_router_service(&args) {
+        Ok(_) => panic!("Qwen must not bypass the generic runtime capability preflight"),
+        Err(error) => error,
+    };
+
+    assert!(
+        matches!(
+            error,
+            ServerLaunchError::ModelRegistry(ModelRegistryError::MissingCapabilities {
+                architecture: "Qwen2ForCausalLM",
+                backend: sglang_srt::backend::RuntimeBackend::Cpu,
+                ref missing,
+                ..
+            }) if missing.iter().any(|capability| capability == "multi-head attention decoder execution")
+                && missing.iter().any(|capability| capability == "dense feed-forward kernels")
+                && missing.iter().any(|capability| capability == "runtime-owned KV cache allocation")
         ),
         "unexpected error: {error:?}"
     );
@@ -453,7 +500,7 @@ fn bootstrap_rejects_glm_legacy_executor_before_service_construction() {
 async fn bootstrap_grpc_router_service_generates_through_model_runner() {
     let args = ServerArgs::parse_from(["serve", "--model-path", "dummy", "--grpc-mode"])
         .expect("args should parse");
-    let service = build_bootstrap_grpc_router_service(&args);
+    let service = build_reference_grpc_router_service(&args);
 
     let mut stream = service
         .text_generate(Request::new(TextGenerateRequest {
@@ -615,7 +662,7 @@ async fn bootstrap_grpc_router_service_uses_config_eos_token_as_default_stop() {
         "--grpc-mode",
     ])
     .expect("args should parse");
-    let service = build_bootstrap_grpc_router_service(&args);
+    let service = build_reference_grpc_router_service(&args);
 
     let mut stream = service
         .text_generate(Request::new(TextGenerateRequest {
@@ -684,7 +731,7 @@ async fn bootstrap_grpc_router_service_ignores_config_eos_when_requested() {
         "--grpc-mode",
     ])
     .expect("args should parse");
-    let service = build_bootstrap_grpc_router_service(&args);
+    let service = build_reference_grpc_router_service(&args);
 
     let mut stream = service
         .text_generate(Request::new(TextGenerateRequest {
@@ -768,7 +815,7 @@ async fn bootstrap_grpc_router_service_uses_local_hf_tokenizer_when_available() 
         "--grpc-mode",
     ])
     .expect("args should parse");
-    let service = build_bootstrap_grpc_router_service(&args);
+    let service = build_reference_grpc_router_service(&args);
 
     let response = service
         .tokenize(Request::new(TokenizeRequest {
@@ -801,7 +848,7 @@ fn bootstrap_grpc_router_service_rejects_missing_explicit_tokenizer_path() {
     ])
     .expect("args should parse");
 
-    let error = match try_build_bootstrap_grpc_router_service(&args) {
+    let error = match try_build_reference_grpc_router_service(&args) {
         Ok(_) => panic!("explicit missing tokenizer path should fail"),
         Err(error) => error,
     };
@@ -838,7 +885,7 @@ async fn bootstrap_pd_grpc_router_service_polls_transfer_before_decode() {
         },
         MooncakeTransferTarget { target_id: 17 },
     );
-    let service = build_bootstrap_pd_grpc_router_service(
+    let service = build_reference_pd_grpc_router_service(
         &args,
         DecodeBootstrapRegistry::default(),
         transfer_executor,
@@ -906,7 +953,7 @@ async fn bootstrap_fake_pd_grpc_router_service_uses_decode_transfer_path() {
         "8",
     ])
     .expect("args should parse");
-    let service = build_bootstrap_fake_pd_grpc_router_service(&args);
+    let service = build_reference_fake_pd_grpc_router_service(&args);
 
     let mut stream = service
         .text_generate(Request::new(TextGenerateRequest {
@@ -963,7 +1010,7 @@ async fn bootstrap_pd_grpc_router_service_applies_max_running_requests() {
         "1",
     ])
     .expect("args should parse");
-    let service = build_bootstrap_fake_pd_grpc_router_service(&args);
+    let service = build_reference_fake_pd_grpc_router_service(&args);
     let runtime = service
         .runtime()
         .lock()
@@ -1332,8 +1379,11 @@ fn write_complete_deepseek_v4_checkpoint(model_dir: &std::path::Path) {
   "model_type": "deepseek_v4",
   "num_hidden_layers": 1,
   "hidden_size": 1,
+  "num_attention_heads": 1,
   "hc_mult": 1,
   "n_routed_experts": 1,
+  "num_experts_per_tok": 1,
+  "moe_intermediate_size": 1,
   "first_k_dense_replace": 0,
   "moe_layer_freq": 1,
   "num_key_value_heads": 1,
@@ -1448,6 +1498,46 @@ fn write_complete_deepseek_v4_checkpoint(model_dir: &std::path::Path) {
     .expect("shard should be written");
 }
 
+fn write_complete_qwen2_checkpoint(model_dir: &std::path::Path) {
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "architectures": ["Qwen2ForCausalLM"],
+  "model_type": "qwen2",
+  "vocab_size": 2,
+  "num_hidden_layers": 1,
+  "hidden_size": 2,
+  "intermediate_size": 4,
+  "num_attention_heads": 2,
+  "num_key_value_heads": 1,
+  "tie_word_embeddings": false
+}"#,
+    )
+    .expect("config should be written");
+
+    let tensor_names = [
+        "model.embed_tokens.weight",
+        "model.norm.weight",
+        "lm_head.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.k_proj.weight",
+        "model.layers.0.self_attn.v_proj.weight",
+        "model.layers.0.self_attn.o_proj.weight",
+        "model.layers.0.input_layernorm.weight",
+        "model.layers.0.post_attention_layernorm.weight",
+        "model.layers.0.mlp.gate_proj.weight",
+        "model.layers.0.mlp.up_proj.weight",
+        "model.layers.0.mlp.down_proj.weight",
+    ];
+    let tensors = tensor_names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (*name, "U8", &[1][..], [index, index + 1]))
+        .collect::<Vec<_>>();
+    write_safetensors_file(&model_dir.join("model.safetensors"), &tensors, &[1; 12])
+        .expect("Qwen checkpoint should be written");
+}
+
 fn write_complete_glm_moe_dsa_forward_checkpoint(model_dir: &std::path::Path) {
     fs::write(
         model_dir.join("config.json"),
@@ -1461,11 +1551,13 @@ fn write_complete_glm_moe_dsa_forward_checkpoint(model_dir: &std::path::Path) {
   "num_attention_heads": 2,
   "num_key_value_heads": 2,
   "head_dim": 1,
-  "qk_nope_head_dim": 1,
-  "qk_rope_head_dim": 0,
-  "v_head_dim": 1,
+  "qk_nope_head_dim": 64,
+  "qk_rope_head_dim": 32,
+  "v_head_dim": 64,
   "rms_norm_eps": 0.0,
   "n_routed_experts": 1,
+  "num_experts_per_tok": 1,
+  "moe_intermediate_size": 2,
   "first_k_dense_replace": 1,
   "moe_layer_freq": 1
 }"#,

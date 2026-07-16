@@ -19,11 +19,12 @@ use sglang_srt::http::{HttpRouterService, serve_http_router_with_shutdown};
 use sglang_srt::pd_bootstrap::{PrefillBootstrapService, serve_prefill_bootstrap_with_shutdown};
 use sglang_srt::router::{RouterGetModelInfoResponse, RouterRuntime};
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
+use sglang_srt::server::test_support::{
+    build_reference_http_router_service, build_reference_mooncake_prefill_http_router_service,
+    build_reference_pd_http_router_service, build_reference_prefill_http_router_service,
+};
 use sglang_srt::server::{
-    ServerLaunchError, build_bootstrap_http_router_service,
-    build_bootstrap_mooncake_prefill_http_router_service, build_bootstrap_pd_http_router_service,
-    build_bootstrap_prefill_http_router_service, launch_http_server_with_shutdown,
-    register_prefill_mooncake_routes_from_args,
+    ServerLaunchError, launch_http_server_with_shutdown, register_prefill_mooncake_routes_from_args,
 };
 use sglang_srt::tokenizer::ByteTokenizer;
 use sglang_srt::transfer::{
@@ -107,7 +108,7 @@ async fn http_server_accepts_model_and_generate_requests() {
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_http_router_service(&args);
+    let service = build_reference_http_router_service(&args);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
@@ -154,7 +155,7 @@ async fn http_server_accepts_tokenized_generate_requests() {
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_http_router_service(&args);
+    let service = build_reference_http_router_service(&args);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
@@ -200,7 +201,7 @@ async fn http_server_accepts_rerank_requests() {
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_http_router_service(&args);
+    let service = build_reference_http_router_service(&args);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
@@ -262,7 +263,7 @@ async fn http_server_accepts_score_requests() {
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_http_router_service(&args);
+    let service = build_reference_http_router_service(&args);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
@@ -325,7 +326,7 @@ async fn http_server_accepts_embedding_requests() {
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_http_router_service(&args);
+    let service = build_reference_http_router_service(&args);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
@@ -388,7 +389,7 @@ async fn http_server_accepts_classify_requests() {
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_http_router_service(&args);
+    let service = build_reference_http_router_service(&args);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
@@ -459,7 +460,7 @@ async fn http_server_accepts_tokenize_and_detokenize_requests_for_sglang_clients
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_http_router_service(&args);
+    let service = build_reference_http_router_service(&args);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
@@ -514,7 +515,7 @@ async fn http_server_rejects_invalid_detokenize_tokens() {
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_http_router_service(&args);
+    let service = build_reference_http_router_service(&args);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
@@ -562,7 +563,7 @@ async fn http_server_accepts_streaming_generate_requests() {
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_http_router_service(&args);
+    let service = build_reference_http_router_service(&args);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
@@ -633,7 +634,7 @@ async fn http_server_accepts_non_streaming_chat_completions_for_sgl_router() {
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_http_router_service(&args);
+    let service = build_reference_http_router_service(&args);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
@@ -683,7 +684,7 @@ async fn http_server_accepts_non_streaming_responses_for_openai_clients() {
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_http_router_service(&args);
+    let service = build_reference_http_router_service(&args);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
@@ -734,7 +735,7 @@ async fn http_server_accepts_streaming_responses_for_openai_clients() {
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_http_router_service(&args);
+    let service = build_reference_http_router_service(&args);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
@@ -820,7 +821,7 @@ async fn http_server_preserves_prefixed_openai_chat_request_id() {
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_http_router_service(&args);
+    let service = build_reference_http_router_service(&args);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
@@ -863,7 +864,7 @@ async fn http_server_accepts_streaming_chat_completions_for_openai_clients() {
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_http_router_service(&args);
+    let service = build_reference_http_router_service(&args);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
@@ -938,7 +939,7 @@ async fn http_server_accepts_openai_completions() {
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_http_router_service(&args);
+    let service = build_reference_http_router_service(&args);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
@@ -996,7 +997,7 @@ async fn http_server_accepts_streaming_openai_completions() {
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_http_router_service(&args);
+    let service = build_reference_http_router_service(&args);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
@@ -1080,7 +1081,7 @@ async fn http_server_reports_plain_worker_server_info_for_sgl_router() {
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_http_router_service(&args);
+    let service = build_reference_http_router_service(&args);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
@@ -1137,7 +1138,7 @@ async fn http_prefill_server_info_reports_follow_bootstrap_room_for_gateway_poli
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_http_router_service(&args);
+    let service = build_reference_http_router_service(&args);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
@@ -1181,7 +1182,7 @@ async fn http_server_reports_model_info_and_legacy_aliases_for_sgl_gateway_disco
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_http_router_service(&args);
+    let service = build_reference_http_router_service(&args);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
@@ -1243,7 +1244,7 @@ async fn http_server_model_info_reports_local_model_architectures_for_gateway_di
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_http_router_service(&args);
+    let service = build_reference_http_router_service(&args);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
@@ -1361,7 +1362,7 @@ async fn http_server_update_weights_from_disk_rejects_invalid_requests() {
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_http_router_service(&args);
+    let service = build_reference_http_router_service(&args);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
@@ -1415,7 +1416,7 @@ async fn http_server_update_weight_version_updates_model_info() {
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_http_router_service(&args);
+    let service = build_reference_http_router_service(&args);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
@@ -1492,7 +1493,7 @@ async fn http_server_reports_remote_instance_transfer_engine_info() {
         });
     let addr = unused_local_addr();
     let service =
-        build_bootstrap_http_router_service(&args).with_engine_info_bootstrap_service(engine_info);
+        build_reference_http_router_service(&args).with_engine_info_bootstrap_service(engine_info);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
@@ -1560,7 +1561,7 @@ async fn http_server_get_weights_by_name_reads_safetensors_parameter() {
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_http_router_service(&args);
+    let service = build_reference_http_router_service(&args);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
@@ -1822,7 +1823,7 @@ async fn http_server_flush_cache_uses_router_runtime_state() {
         .expect("server task should join")
         .expect("server should stop cleanly");
 
-    let idle_service = build_bootstrap_http_router_service(&args);
+    let idle_service = build_reference_http_router_service(&args);
     let idle_addr = unused_local_addr();
     let (idle_shutdown_tx, idle_shutdown_rx) = oneshot::channel();
     let idle_server = tokio::spawn(async move {
@@ -1860,7 +1861,7 @@ async fn http_server_pause_and_continue_generation_use_router_runtime_state() {
         "0",
     ])
     .expect("args should parse");
-    let service = build_bootstrap_http_router_service(&args);
+    let service = build_reference_http_router_service(&args);
     let addr = unused_local_addr();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server = tokio::spawn(async move {
@@ -1915,7 +1916,7 @@ async fn http_server_start_and_stop_profile_writes_trace_file() {
     ])
     .expect("args should parse");
     let output_dir = unique_profile_dir("http-profile");
-    let service = build_bootstrap_http_router_service(&args);
+    let service = build_reference_http_router_service(&args);
     let addr = unused_local_addr();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server = tokio::spawn(async move {
@@ -1983,7 +1984,7 @@ async fn http_server_rejects_disaggregated_generate_without_transfer_runtime() {
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_http_router_service(&args);
+    let service = build_reference_http_router_service(&args);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
@@ -2054,7 +2055,7 @@ async fn http_prefill_server_reports_router_server_info_with_kv_events() {
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_prefill_http_router_service(&args);
+    let service = build_reference_prefill_http_router_service(&args);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
@@ -2123,7 +2124,7 @@ async fn http_prefill_server_accepts_disaggregated_generate_requests() {
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_prefill_http_router_service(&args);
+    let service = build_reference_prefill_http_router_service(&args);
     let inspected_service = service.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
@@ -2186,7 +2187,7 @@ async fn http_prefill_server_accepts_batched_disaggregated_token_generate_reques
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_prefill_http_router_service(&args);
+    let service = build_reference_prefill_http_router_service(&args);
     let inspected_service = service.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
@@ -2255,7 +2256,7 @@ async fn http_prefill_server_accepts_batched_disaggregated_text_generate_request
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_prefill_http_router_service(&args);
+    let service = build_reference_prefill_http_router_service(&args);
     let inspected_service = service.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
@@ -2324,7 +2325,7 @@ async fn http_prefill_server_accepts_batched_disaggregated_openai_completions() 
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_prefill_http_router_service(&args);
+    let service = build_reference_prefill_http_router_service(&args);
     let inspected_service = service.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
@@ -2399,7 +2400,7 @@ async fn http_prefill_server_accepts_batched_disaggregated_chat_completions() {
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_prefill_http_router_service(&args);
+    let service = build_reference_prefill_http_router_service(&args);
     let inspected_service = service.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
@@ -2485,7 +2486,7 @@ async fn http_pd_server_polls_async_transfer_before_decode() {
         },
         MooncakeTransferTarget { target_id: 17 },
     );
-    let service = build_bootstrap_pd_http_router_service(
+    let service = build_reference_pd_http_router_service(
         &args,
         DecodeBootstrapRegistry::default(),
         transfer_executor,
@@ -2548,7 +2549,7 @@ async fn http_server_poll_transfers_advances_async_pd_batches() {
         },
         MooncakeTransferTarget { target_id: 18 },
     );
-    let service = build_bootstrap_pd_http_router_service(
+    let service = build_reference_pd_http_router_service(
         &args,
         DecodeBootstrapRegistry::default(),
         transfer_executor,
@@ -2644,7 +2645,7 @@ async fn mooncake_prefill_http_uses_bootstrap_kv_layout_for_transfer() {
         },
         MooncakeTransferTarget { target_id: 7 },
     );
-    let service = build_bootstrap_mooncake_prefill_http_router_service(
+    let service = build_reference_mooncake_prefill_http_router_service(
         &args,
         bootstrap_service,
         transfer_executor,
@@ -2890,9 +2891,7 @@ fn assert_dummy_mooncake_startup_error(error: &ServerLaunchError) {
     );
     #[cfg(feature = "mooncake-link")]
     assert!(
-        error
-            .to_string()
-            .contains("production serving cannot use the Space reference model"),
+        error.to_string().contains("not a local directory"),
         "{error}"
     );
 }

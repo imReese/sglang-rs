@@ -1,5 +1,6 @@
 use crate::cache::CachePageId;
 use crate::scheduler::{ForwardMode, ScheduleBatch, ScheduledRequest};
+use crate::transfer::{KvCacheModelLayout, KvCacheTransferError, TransferableKvCacheMemory};
 use crate::types::{DisaggregatedParams, RequestId, SamplingParams};
 use rand::RngExt as _;
 use std::fmt;
@@ -834,17 +835,41 @@ fn argmax_token(logits: &[f32]) -> Result<u32, ModelForwardError> {
 pub struct ModelRunner<M, S = LogitSampler<SystemRandomSource>> {
     model: M,
     sampler: S,
+    kv_cache_layout: Option<KvCacheModelLayout>,
+    transferable_kv_cache_memory: Option<TransferableKvCacheMemory>,
 }
 
 impl<M> ModelRunner<M, LogitSampler<SystemRandomSource>> {
     pub fn new(model: M) -> Self {
         Self::with_sampler(model, LogitSampler::default())
     }
+
+    pub fn new_with_kv_cache_layout(model: M, kv_cache_layout: Option<KvCacheModelLayout>) -> Self {
+        Self::with_kv_cache_layout(model, LogitSampler::default(), kv_cache_layout)
+    }
 }
 
 impl<M, S> ModelRunner<M, S> {
     pub fn with_sampler(model: M, sampler: S) -> Self {
-        Self { model, sampler }
+        Self {
+            model,
+            sampler,
+            kv_cache_layout: None,
+            transferable_kv_cache_memory: None,
+        }
+    }
+
+    pub fn with_kv_cache_layout(
+        model: M,
+        sampler: S,
+        kv_cache_layout: Option<KvCacheModelLayout>,
+    ) -> Self {
+        Self {
+            model,
+            sampler,
+            kv_cache_layout,
+            transferable_kv_cache_memory: None,
+        }
     }
 
     pub fn model(&self) -> &M {
@@ -853,6 +878,52 @@ impl<M, S> ModelRunner<M, S> {
 
     pub fn model_mut(&mut self) -> &mut M {
         &mut self.model
+    }
+
+    pub fn kv_cache_layout(&self) -> Option<KvCacheModelLayout> {
+        self.kv_cache_layout
+    }
+
+    pub fn install_transferable_kv_cache_memory(
+        &mut self,
+        memory: TransferableKvCacheMemory,
+    ) -> Result<(), KvCacheTransferError> {
+        if self.kv_cache_layout.is_none() {
+            return Err(KvCacheTransferError::Runtime(
+                "cannot install transferable KV memory for a model without KV cache geometry"
+                    .to_string(),
+            ));
+        }
+        self.transferable_kv_cache_memory = Some(memory);
+        Ok(())
+    }
+
+    pub fn reserve_mooncake_kv_cache_slots(
+        &mut self,
+        slot_capacity: usize,
+        page_size: usize,
+    ) -> Result<(), KvCacheTransferError> {
+        if self.kv_cache_layout.is_none() {
+            return Err(KvCacheTransferError::Runtime(
+                "model execution definition does not declare KV cache geometry".to_string(),
+            ));
+        }
+        if self.transferable_kv_cache_memory.is_none() {
+            return Err(KvCacheTransferError::Runtime(format!(
+                "runtime backend did not allocate transferable KV memory for {slot_capacity} slots with page size {page_size}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn mooncake_kv_cache_memory(
+        &self,
+    ) -> Result<TransferableKvCacheMemory, KvCacheTransferError> {
+        self.transferable_kv_cache_memory.clone().ok_or_else(|| {
+            KvCacheTransferError::Runtime(
+                "ModelRunner does not own registered transferable KV cache memory".to_string(),
+            )
+        })
     }
 }
 

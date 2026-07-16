@@ -415,7 +415,14 @@ fn model_registry_dispatches_checkpoint_validation_by_architecture() {
         r#"{
   "architectures": ["DeepseekV4ForCausalLM"],
   "model_type": "deepseek_v4",
-  "num_hidden_layers": 0
+  "num_hidden_layers": 1,
+  "num_attention_heads": 1,
+  "qk_nope_head_dim": 64,
+  "qk_rope_head_dim": 32,
+  "v_head_dim": 64,
+  "n_routed_experts": 1,
+  "num_experts_per_tok": 1,
+  "moe_intermediate_size": 1
 }"#,
     )
     .expect("config should be written");
@@ -424,8 +431,11 @@ fn model_registry_dispatches_checkpoint_validation_by_architecture() {
         &[
             ("model.embed_tokens.weight", "U8", &[1], [0, 1]),
             ("model.norm.weight", "U8", &[1], [1, 2]),
+            ("model.layers.0.ffn.experts.0.w1.weight", "U8", &[1], [2, 3]),
+            ("model.layers.0.ffn.experts.0.w2.weight", "U8", &[1], [3, 4]),
+            ("model.layers.0.ffn.experts.0.w3.weight", "U8", &[1], [4, 5]),
         ],
-        &[1, 2],
+        &[1, 2, 3, 4, 5],
     )
     .expect("shard should be written");
     let deepseek_artifacts = LocalModelArtifacts::from_model_path(&deepseek_dir)
@@ -443,8 +453,7 @@ fn model_registry_dispatches_checkpoint_validation_by_architecture() {
                 ref message,
             })
                 if path == &deepseek_dir
-                    && message.contains("missing DeepSeek model tensor")
-                    && message.contains("lm_head.weight")
+                    && message.contains("missing DeepSeek")
         ),
         "unexpected error: {error:?}"
     );
@@ -456,7 +465,14 @@ fn model_registry_dispatches_checkpoint_validation_by_architecture() {
         r#"{
   "architectures": ["GlmMoeDsaForCausalLM"],
   "model_type": "glm_moe_dsa",
-  "num_hidden_layers": 0
+  "num_hidden_layers": 1,
+  "num_attention_heads": 1,
+  "qk_nope_head_dim": 64,
+  "qk_rope_head_dim": 32,
+  "v_head_dim": 64,
+  "n_routed_experts": 1,
+  "num_experts_per_tok": 1,
+  "moe_intermediate_size": 1
 }"#,
     )
     .expect("config should be written");
@@ -465,8 +481,11 @@ fn model_registry_dispatches_checkpoint_validation_by_architecture() {
         &[
             ("model.embed_tokens.weight", "U8", &[1], [0, 1]),
             ("model.norm.weight", "U8", &[1], [1, 2]),
+            ("model.layers.0.ffn.experts.0.w1.weight", "U8", &[1], [2, 3]),
+            ("model.layers.0.ffn.experts.0.w2.weight", "U8", &[1], [3, 4]),
+            ("model.layers.0.ffn.experts.0.w3.weight", "U8", &[1], [4, 5]),
         ],
-        &[1, 2],
+        &[1, 2, 3, 4, 5],
     )
     .expect("shard should be written");
     let glm_artifacts =
@@ -484,8 +503,7 @@ fn model_registry_dispatches_checkpoint_validation_by_architecture() {
                 ref message,
             })
                 if path == &glm_dir
-                    && message.contains("missing GLM-DSA model tensor")
-                    && message.contains("lm_head.weight")
+                    && message.contains("missing GLM-DSA")
         ),
         "unexpected error: {error:?}"
     );

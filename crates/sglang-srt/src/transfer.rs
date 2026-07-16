@@ -242,13 +242,12 @@ impl KvCacheModelLayout {
             return Ok(None);
         };
 
-        if config.model_type.as_deref() == Some("deepseek_v4") {
+        if config.qk_nope_head_dim.is_some() || config.qk_rope_head_dim.is_some() {
             let qk_nope_head_dim =
                 required_hf_config_usize(config.qk_nope_head_dim, "qk_nope_head_dim")?;
             let qk_rope_head_dim =
                 required_hf_config_usize(config.qk_rope_head_dim, "qk_rope_head_dim")?;
-            return Self::deepseek_v4_packed_layout(num_layers, qk_nope_head_dim, qk_rope_head_dim)
-                .map(Some);
+            return Self::packed_mla(num_layers, qk_nope_head_dim, qk_rope_head_dim).map(Some);
         }
 
         let num_attention_heads =
@@ -301,11 +300,10 @@ impl KvCacheModelLayout {
             return Ok(None);
         };
 
-        if config.get("model_type").and_then(serde_json::Value::as_str) == Some("deepseek_v4") {
+        if config.get("qk_nope_head_dim").is_some() || config.get("qk_rope_head_dim").is_some() {
             let qk_nope_head_dim = required_usize_field(config, "qk_nope_head_dim")?;
             let qk_rope_head_dim = required_usize_field(config, "qk_rope_head_dim")?;
-            return Self::deepseek_v4_packed_layout(num_layers, qk_nope_head_dim, qk_rope_head_dim)
-                .map(Some);
+            return Self::packed_mla(num_layers, qk_nope_head_dim, qk_rope_head_dim).map(Some);
         }
 
         let num_attention_heads = required_usize_field(config, "num_attention_heads")?;
@@ -327,14 +325,14 @@ impl KvCacheModelLayout {
         Ok(Some(Self::multi_tensor(num_layers, kv_heads, head_dim, 2)))
     }
 
-    fn deepseek_v4_packed_layout(
+    pub fn packed_mla(
         num_layers: usize,
         qk_nope_head_dim: usize,
         qk_rope_head_dim: usize,
     ) -> Result<Self, PdConfigError> {
         if !qk_nope_head_dim.is_multiple_of(64) {
             return Err(PdConfigError::InvalidModelConfig(format!(
-                "qk_nope_head_dim must be divisible by 64 for DeepSeek V4 packed KV layout: {qk_nope_head_dim}"
+                "qk_nope_head_dim must be divisible by 64 for packed MLA KV layout: {qk_nope_head_dim}"
             )));
         }
 

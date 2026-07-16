@@ -182,6 +182,14 @@ impl InitializedRuntimeBackend {
             Self::Unavailable(backend) => *backend,
         }
     }
+
+    pub(crate) fn capabilities(&self) -> RuntimeCapability {
+        match self {
+            Self::CpuReference => RuntimeCapability::cpu_reference("cpu-reference-backend", false),
+            Self::Cuda(backend) => backend.capabilities(),
+            Self::Unavailable(backend) => RuntimeCapability::unsupported(backend.as_str()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

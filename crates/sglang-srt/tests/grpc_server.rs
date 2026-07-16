@@ -9,7 +9,7 @@ use sglang_srt::proto::sglang::runtime::v1::sglang_service_client::SglangService
 use sglang_srt::proto::sglang::runtime::v1::{
     GetModelInfoRequest, GetServerInfoRequest, HealthCheckRequest,
 };
-use sglang_srt::server::build_bootstrap_grpc_router_service;
+use sglang_srt::server::test_support::build_reference_grpc_router_service;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn grpc_server_accepts_generated_client_requests() {
@@ -37,7 +37,7 @@ async fn grpc_server_accepts_generated_client_requests() {
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let service = build_bootstrap_grpc_router_service(&args);
+    let service = build_reference_grpc_router_service(&args);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
