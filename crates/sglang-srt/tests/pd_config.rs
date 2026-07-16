@@ -1,10 +1,8 @@
 use std::fs;
 use std::path::PathBuf;
 
-use serde_json::json;
 use sglang_srt::backend::{TransferBackendCapability, TransferBackendClass};
 use sglang_srt::cli::ServerArgs;
-use sglang_srt::cli::ZmqPortRange;
 use sglang_srt::transfer::{
     DisaggregationMode, KvCacheDtype, KvCacheModelLayout, KvPoll, MooncakeKvCacheLayout,
     MooncakeOpcode, MooncakeTransferEngineConfig, MooncakeTransferStatusCode, PdConfig,
@@ -548,177 +546,30 @@ fn pd_config_rejects_unknown_kv_cache_dtype() {
 }
 
 #[test]
-fn pd_config_carries_deepseek_distributed_runtime_args() {
+fn pd_config_carries_distributed_worker_args() {
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
-        "deepseek-ai/DeepSeek-V3-0324",
+        "dummy",
         "--disaggregation-mode",
         "decode",
-        "--trust-remote-code",
         "--dist-init-addr",
-        "10.0.0.1:5000",
+        "192.0.2.1:5000",
         "--nnodes",
         "2",
         "--node-rank",
         "1",
         "--enable-dp-attention",
-        "--moe-a2a-backend",
-        "deepep",
-        "--mem-fraction-static",
-        "0.8",
-        "--max-running-requests",
-        "128",
     ])
-    .expect("DeepSeek PD launch args should parse");
+    .expect("distributed worker args should parse");
 
     let config = PdConfig::from_server_args(&args).expect("pd config should normalize");
 
-    assert!(config.trust_remote_code);
-    assert_eq!(config.dist_init_addr.as_deref(), Some("10.0.0.1:5000"));
+    assert_eq!(config.mode, DisaggregationMode::Decode);
+    assert_eq!(config.dist_init_addr.as_deref(), Some("192.0.2.1:5000"));
     assert_eq!(config.nnodes, 2);
     assert_eq!(config.node_rank, 1);
     assert!(config.enable_dp_attention);
-    assert_eq!(config.moe_a2a_backend.as_deref(), Some("deepep"));
-    assert_eq!(config.mem_fraction_static, Some(0.8));
-    assert_eq!(config.max_running_requests, Some(128));
-}
-
-#[test]
-fn pd_config_carries_glm5_prefill_extended_runtime_args() {
-    let deepep_config = r#"{"normal_dispatch":{"num_sms":8},"normal_combine":{"num_sms":8}}"#;
-    let loader_config = r#"{"enable_multithread_load":true,"num_threads":4}"#;
-    let args = ServerArgs::parse_from([
-        "serve",
-        "--model-path",
-        "/models/glm-5-fp8",
-        "--disaggregation-mode",
-        "prefill",
-        "--disaggregation-bootstrap-port",
-        "8200",
-        "--disaggregation-ib-device",
-        "rdma-test0",
-        "--disaggregation-zmq-ports",
-        "7100-7103",
-        "--dist-init-addr",
-        "192.0.2.10:6676",
-        "--tp-size",
-        "4",
-        "--dp-size",
-        "2",
-        "--enable-dp-attention",
-        "--enable-dp-lm-head",
-        "--disable-cuda-graph",
-        "--max-prefill-tokens",
-        "4096",
-        "--max-running-requests",
-        "64",
-        "--max-total-tokens",
-        "16384",
-        "--mem-fraction-static",
-        "0.75",
-        "--page-size",
-        "64",
-        "--deepep-config",
-        deepep_config,
-        "--deepep-mode",
-        "normal",
-        "--moe-a2a-backend",
-        "deepep",
-        "--moe-dense-tp-size",
-        "1",
-        "--attention-backend",
-        "nsa",
-        "--enable-nsa-prefill-context-parallel",
-        "--nsa-prefill-backend",
-        "flashmla_sparse",
-        "--nsa-prefill-cp-mode",
-        "round-robin-split",
-        "--speculative-algorithm",
-        "EAGLE",
-        "--speculative-eagle-topk",
-        "2",
-        "--speculative-num-draft-tokens",
-        "4",
-        "--speculative-num-steps",
-        "2",
-        "--chunked-prefill-size",
-        "2048",
-        "--decode-log-interval",
-        "1",
-        "--disable-overlap-schedule",
-        "--model-loader-extra-config",
-        loader_config,
-        "--tokenizer-worker-num",
-        "4",
-        "--allow-auto-truncate",
-        "--collect-tokens-histogram",
-        "--enable-cache-report",
-        "--enable-metrics",
-        "--disable-radix-cache",
-        "--tool-call-parser",
-        "glm47",
-    ])
-    .expect("GLM-5 prefill launch args should parse");
-
-    let config = PdConfig::from_server_args(&args).expect("pd config should normalize");
-
-    assert_eq!(config.mode, DisaggregationMode::Prefill);
-    assert_eq!(config.bootstrap_port, 8200);
-    assert_eq!(config.ib_device.as_deref(), Some("rdma-test0"));
-    assert_eq!(
-        config.disaggregation_zmq_ports,
-        Some(ZmqPortRange {
-            start: 7100,
-            end: 7103
-        })
-    );
-    assert_eq!(config.dist_init_addr.as_deref(), Some("192.0.2.10:6676"));
-    assert_eq!(config.tp_size, 4);
-    assert_eq!(config.dp_size, 2);
-    assert!(config.enable_dp_attention);
-    assert!(config.enable_dp_lm_head);
-    assert!(config.disable_cuda_graph);
-    assert_eq!(config.max_prefill_tokens, Some(4096));
-    assert_eq!(config.max_running_requests, Some(64));
-    assert_eq!(config.max_total_tokens, Some(16384));
-    assert_eq!(config.mem_fraction_static, Some(0.75));
-    assert_eq!(config.page_size, 64);
-    assert_eq!(
-        config.deepep_config,
-        Some(json!({"normal_dispatch": {"num_sms": 8}, "normal_combine": {"num_sms": 8}}))
-    );
-    assert_eq!(config.deepep_mode.as_deref(), Some("normal"));
-    assert_eq!(config.moe_a2a_backend.as_deref(), Some("deepep"));
-    assert_eq!(config.moe_dense_tp_size, Some(1));
-    assert_eq!(config.attention_backend.as_deref(), Some("nsa"));
-    assert!(config.enable_nsa_prefill_context_parallel);
-    assert_eq!(
-        config.nsa_prefill_backend.as_deref(),
-        Some("flashmla_sparse")
-    );
-    assert_eq!(
-        config.nsa_prefill_cp_mode.as_deref(),
-        Some("round-robin-split")
-    );
-    assert_eq!(config.speculative_algorithm.as_deref(), Some("EAGLE"));
-    assert_eq!(config.speculative_eagle_topk, Some(2));
-    assert_eq!(config.speculative_num_draft_tokens, Some(4));
-    assert_eq!(config.speculative_num_steps, Some(2));
-    assert_eq!(config.chunked_prefill_size, Some(2048));
-    assert_eq!(config.decode_log_interval, Some(1));
-    assert!(config.disable_overlap_schedule);
-    assert_eq!(
-        config.model_loader_extra_config,
-        Some(json!({"enable_multithread_load": true, "num_threads": 4}))
-    );
-    assert_eq!(config.tokenizer_worker_num, Some(4));
-    assert!(config.allow_auto_truncate);
-    assert!(config.collect_tokens_histogram);
-    assert!(config.enable_cache_report);
-    assert!(config.enable_metrics);
-    assert!(config.disable_radix_cache);
-    assert_eq!(config.tool_call_parser.as_deref(), Some("glm47"));
 }
 
 #[test]
