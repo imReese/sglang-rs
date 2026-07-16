@@ -234,7 +234,7 @@ fn pd_config_builds_mooncake_layout_from_model_kv_geometry() {
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
-        "deepseek-ai/DeepSeek-V3-0324",
+        "dummy",
         "--disaggregation-mode",
         "decode",
         "--kv-cache-dtype",
