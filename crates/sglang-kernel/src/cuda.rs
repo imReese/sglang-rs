@@ -1104,7 +1104,7 @@ mod tests {
     }
 
     #[test]
-    fn fake_driver_probes_b200_and_manages_allocation_lifetime() {
+    fn fake_driver_reports_capabilities_and_manages_allocation_lifetime() {
         let _test_guard = CUDA_TEST_LOCK
             .lock()
             .expect("CUDA test lock should be held");
@@ -1112,7 +1112,7 @@ mod tests {
         let driver = fake_driver();
 
         let info = driver.device_info(0).expect("fake device should probe");
-        assert_eq!(info.name, "NVIDIA B200");
+        assert_eq!(info.name, "Test CUDA Device");
         assert_eq!(info.compute_capability, CudaComputeCapability::new(10, 0));
         assert_eq!(info.total_memory_bytes, 192 * 1024 * 1024 * 1024);
         assert!(info.unified_addressing);
@@ -1363,7 +1363,7 @@ mod tests {
         len: c_int,
         _device: CuDevice,
     ) -> c_int {
-        let value = b"NVIDIA B200\0";
+        let value = b"Test CUDA Device\0";
         assert!(len as usize >= value.len());
         unsafe { std::ptr::copy_nonoverlapping(value.as_ptr().cast(), name, value.len()) };
         CUDA_SUCCESS
@@ -1565,7 +1565,6 @@ mod tests {
         CUDA_SUCCESS
     }
 
-    #[allow(clippy::too_many_arguments)]
     unsafe extern "C" fn fake_launch_kernel(
         function: CuFunctionHandle,
         grid_x: c_uint,

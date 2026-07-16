@@ -469,7 +469,7 @@ fn kv_events_block_from_attributes(attributes: &HashMap<String, String>) -> Opti
     let dp_size = parse_u32_attribute(attributes, "kv_events.dp_size")?;
 
     Some(KvEventsBlock {
-        publisher: non_empty_attribute(attributes, "kv_events.publisher"),
+        _publisher: non_empty_attribute(attributes, "kv_events.publisher"),
         endpoint_host,
         endpoint_port_base,
         topic: attributes
@@ -552,9 +552,9 @@ pub(crate) struct KvEventsBlock {
     // means a future SGLang that adds a non-ZMQ publisher string won't
     // fail deserialize; the resulting subscriber will still try to open
     // a ZMQ connection and fail visibly.
-    #[allow(dead_code)]
+    #[serde(rename = "publisher")]
     #[serde(default)]
-    publisher: Option<String>,
+    _publisher: Option<String>,
     pub endpoint_host: String,
     pub endpoint_port_base: u16,
     #[serde(default)]

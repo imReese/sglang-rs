@@ -2,8 +2,8 @@ use std::fmt;
 
 use sglang_kernel::cuda::{CudaComputeCapability, CudaContext, CudaDeviceAllocation, CudaError};
 use sglang_kernel::cuda_attention::{
-    CudaBf16PagedAttentionError, CudaBf16PagedAttentionKernels, CudaBf16PagedAttentionLayout,
-    CudaBf16PagedAttentionPlan,
+    CudaBf16PagedAttentionError, CudaBf16PagedAttentionKernels, CudaBf16PagedAttentionLaunch,
+    CudaBf16PagedAttentionLayout, CudaBf16PagedAttentionPlan, CudaBf16PagedAttentionPlanConfig,
 };
 
 use crate::cuda_kv_cache::{CudaKvCachePool, CudaKvCachePoolError, CudaKvCachePoolLayout};
@@ -384,6 +384,18 @@ pub struct CudaBf16PagedAttentionExecutor {
     kernels: CudaBf16PagedAttentionKernels,
 }
 
+pub struct CudaPagedAttentionForward<'a> {
+    pub kv_cache: &'a CudaKvCachePool,
+    pub layer_index: usize,
+    pub metadata: &'a CudaPagedAttentionDeviceMetadata,
+    pub queries: &'a CudaDeviceAllocation,
+    pub queries_offset: usize,
+    pub query_head_count: usize,
+    pub scale: f32,
+    pub output: &'a mut CudaDeviceAllocation,
+    pub output_offset: usize,
+}
+
 impl CudaBf16PagedAttentionExecutor {
     pub fn compile(
         context: &CudaContext,
@@ -412,19 +424,21 @@ impl CudaBf16PagedAttentionExecutor {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &mut self,
-        kv_cache: &CudaKvCachePool,
-        layer_index: usize,
-        metadata: &CudaPagedAttentionDeviceMetadata,
-        queries: &CudaDeviceAllocation,
-        queries_offset: usize,
-        query_head_count: usize,
-        scale: f32,
-        output: &mut CudaDeviceAllocation,
-        output_offset: usize,
+        forward: CudaPagedAttentionForward<'_>,
     ) -> Result<(), CudaPagedAttentionError> {
+        let CudaPagedAttentionForward {
+            kv_cache,
+            layer_index,
+            metadata,
+            queries,
+            queries_offset,
+            query_head_count,
+            scale,
+            output,
+            output_offset,
+        } = forward;
         let plan = build_plan(
             kv_cache.layout(),
             layer_index,
@@ -436,26 +450,27 @@ impl CudaBf16PagedAttentionExecutor {
         )?;
         self.kernels.forward(
             plan,
-            queries,
-            queries_offset,
-            &metadata.query_request_indices,
-            0,
-            &metadata.query_sequence_lengths,
-            0,
-            &metadata.request_slot_offsets,
-            0,
-            &metadata.sequence_slots,
-            0,
-            kv_cache.allocation(),
-            0,
-            output,
-            output_offset,
+            CudaBf16PagedAttentionLaunch {
+                queries,
+                queries_offset,
+                query_request_indices: &metadata.query_request_indices,
+                query_request_indices_offset: 0,
+                query_sequence_lengths: &metadata.query_sequence_lengths,
+                query_sequence_lengths_offset: 0,
+                request_slot_offsets: &metadata.request_slot_offsets,
+                request_slot_offsets_offset: 0,
+                sequence_slots: &metadata.sequence_slots,
+                sequence_slots_offset: 0,
+                pool: kv_cache.allocation(),
+                pool_offset: 0,
+                output,
+                output_offset,
+            },
         )?;
         Ok(())
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_plan(
     pool_layout: CudaKvCachePoolLayout,
     layer_index: usize,
@@ -497,15 +512,17 @@ fn build_plan(
         pool_layout.bytes_per_token_per_tensor(),
     );
     Ok(CudaBf16PagedAttentionPlan::new(
-        query_count,
-        request_count,
-        sequence_slot_count,
-        pool_layout.slot_count(),
-        query_head_count,
-        runtime.kv_heads,
-        runtime.head_dim,
-        scale,
-        attention_layout,
+        CudaBf16PagedAttentionPlanConfig {
+            query_count,
+            request_count,
+            sequence_slot_count,
+            slot_count: pool_layout.slot_count(),
+            query_head_count,
+            kv_head_count: runtime.kv_heads,
+            head_dim: runtime.head_dim,
+            scale,
+            layout: attention_layout,
+        },
     )?)
 }
 
@@ -525,7 +542,6 @@ fn validate_batch_field_len(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn validate_flattened_range(
     field: &'static str,
     request_index: usize,

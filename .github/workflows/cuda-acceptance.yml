@@ -1,0 +1,105 @@
+name: CUDA Acceptance
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      mooncake:
+        description: Run the native Mooncake CUDA memory registration test
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cuda-acceptance-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  cuda:
+    name: CUDA runtime
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.ENABLE_CUDA_CI == 'true' }}
+    runs-on:
+      - self-hosted
+      - linux
+      - cuda
+    timeout-minutes: 90
+
+    steps:
+      - name: Prepare isolated build directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "CARGO_TARGET_DIR=${RUNNER_TEMP}/sglang-rs-cuda-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "${GITHUB_ENV}"
+
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Validate runner prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v rustup >/dev/null || {
+            echo "::error::The CUDA runner must provide rustup."
+            exit 1
+          }
+          command -v nvidia-smi >/dev/null || {
+            echo "::error::The CUDA runner must provide the NVIDIA driver and nvidia-smi."
+            exit 1
+          }
+          nvidia-smi
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup set profile minimal
+          rustup toolchain install stable --no-self-update
+          rustc --version --verbose
+          cargo --version --verbose
+
+      - name: Run CUDA allocation, KV, kernel, and attention acceptance
+        run: >-
+          cargo test -p sglang-srt --locked --test cuda_backend --
+          --ignored --nocapture --test-threads=1
+
+      - name: Run CUDA HTTP inference acceptance
+        run: >-
+          cargo test -p sglang-srt --locked --test cuda_inference --
+          --ignored --nocapture --test-threads=1
+
+      - name: Run linked Mooncake CUDA registration acceptance
+        if: ${{ (github.event_name == 'workflow_dispatch' && inputs.mooncake) || vars.ENABLE_MOONCAKE_CI == 'true' }}
+        env:
+          MOONCAKE_BUILD_DIR: ${{ vars.MOONCAKE_BUILD_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${MOONCAKE_BUILD_DIR}" ]]; then
+            echo "::error::Set the MOONCAKE_BUILD_DIR repository variable to the native Mooncake build directory on the runner."
+            exit 1
+          fi
+          cargo test -p sglang-srt --locked --features mooncake-link \
+            --test cuda_backend \
+            cuda_mooncake_registers_real_cuda_kv_memory -- \
+            --ignored --nocapture --test-threads=1
+
+      - name: Remove CUDA build artifacts
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v cargo >/dev/null && [[ -n "${CARGO_TARGET_DIR:-}" ]] && [[ -d "${CARGO_TARGET_DIR}" ]]; then
+            cargo clean --target-dir "${CARGO_TARGET_DIR}"
+          fi

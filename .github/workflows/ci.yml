@@ -1,0 +1,84 @@
+name: Rust CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  rust:
+    name: Ubuntu / fmt, clippy, test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup set profile minimal
+          rustup toolchain install stable --component clippy,rustfmt --no-self-update
+          rustc --version --verbose
+          cargo --version --verbose
+
+      - name: Cache Cargo downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-downloads-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-downloads-${{ runner.os }}-
+
+      - name: Enforce repository source policy
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if git grep -n -E '#!?[[:space:]]*\[[^]]*(allow|expect)[[:space:]]*\(' -- \
+            ':(glob)crates/*/src/*.rs' ':(glob)crates/*/src/**/*.rs'; then
+            echo "::error::Production source must fix lint findings instead of suppressing them with lint attributes."
+            exit 1
+          fi
+
+          tracked_internal_docs="$(
+            git ls-files -- AGENTS.md CLAUDE.md docs/superpowers superpowers/specs
+          )"
+          if [[ -n "${tracked_internal_docs}" ]]; then
+            echo "${tracked_internal_docs}"
+            echo "::error::Agent-only plans and instructions must remain untracked."
+            exit 1
+          fi
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check all targets
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Run strict Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run workspace tests
+        run: cargo test --workspace --locked

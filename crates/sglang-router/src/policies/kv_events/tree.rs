@@ -131,13 +131,6 @@ type NodeId = u64;
 #[derive(Debug)]
 struct Node {
     block_hash: i64,
-    /// Hash of the parent block on the chain that produced this node, or
-    /// `None` if this node hangs directly off the root sentinel.
-    /// Stored for diagnostic / chain-reconstruction only — the actual
-    /// parent pointer lives in [`Node::parent`]. Tests and future
-    /// inspectors read this; suppress dead-code warning in non-test builds.
-    #[allow(dead_code)]
-    parent_block_hash: Option<i64>,
     /// `None` only for the root sentinel.
     parent: Option<NodeId>,
     workers: HashSet<KvWorkerId>,
@@ -147,10 +140,9 @@ struct Node {
 }
 
 impl Node {
-    fn new_child(block_hash: i64, parent_block_hash: Option<i64>, parent: NodeId) -> Self {
+    fn new_child(block_hash: i64, parent: NodeId) -> Self {
         Self {
             block_hash,
-            parent_block_hash,
             parent: Some(parent),
             workers: HashSet::new(),
             children: HashMap::new(),
@@ -190,7 +182,6 @@ impl TreeState {
             ROOT_ID,
             Node {
                 block_hash: ROOT_HASH_SENTINEL,
-                parent_block_hash: None,
                 parent: None,
                 workers: HashSet::new(),
                 children: HashMap::new(),
@@ -217,17 +208,10 @@ impl TreeState {
     /// Returns `None` if `parent_id` does not exist — an invariant
     /// violation. The pump runs in a long-lived task; panicking here would
     /// take down the entire cache-aware path, so we log and bail.
-    fn create_child(
-        &mut self,
-        parent_id: NodeId,
-        block_hash: i64,
-        parent_block_hash: Option<i64>,
-    ) -> Option<NodeId> {
+    fn create_child(&mut self, parent_id: NodeId, block_hash: i64) -> Option<NodeId> {
         let id = self.alloc_id();
-        self.nodes.insert(
-            id,
-            Node::new_child(block_hash, parent_block_hash, parent_id),
-        );
+        self.nodes
+            .insert(id, Node::new_child(block_hash, parent_id));
         let Some(parent) = self.nodes.get_mut(&parent_id) else {
             error!(
                 parent_id,
@@ -293,7 +277,6 @@ impl TreeState {
             return;
         }
         let mut current = self.resolve_parent(worker, parent_hash);
-        let mut prev_hash = parent_hash;
         let now = now_millis();
         for &h in block_hashes {
             let child_id = match self
@@ -302,7 +285,7 @@ impl TreeState {
                 .and_then(|n| n.children.get(&h).copied())
             {
                 Some(id) => id,
-                None => match self.create_child(current, h, prev_hash) {
+                None => match self.create_child(current, h) {
                     Some(id) => id,
                     None => return,
                 },
@@ -318,7 +301,6 @@ impl TreeState {
             child.workers.insert(worker.clone());
             child.last_used.store(now, Ordering::Relaxed);
             current = child_id;
-            prev_hash = Some(h);
         }
     }
 
@@ -1063,15 +1045,20 @@ mod tests {
         assert_eq!(m.matched_blocks, 3);
         assert_eq!(m.workers, workers(&[&a]));
 
-        // Confirm parent_block_hash chain: node carrying 30 should record
-        // parent_block_hash = Some(20).
+        // Confirm the stored parent links reconstruct the emitted hash chain.
         let st = tree.state.read();
+        let parent_hash = |node_id| {
+            st.nodes[&node_id]
+                .parent
+                .filter(|parent_id| *parent_id != ROOT_ID)
+                .map(|parent_id| st.nodes[&parent_id].block_hash)
+        };
         let n30_id = *st.by_hash.get(&30).unwrap().iter().next().unwrap();
-        assert_eq!(st.nodes[&n30_id].parent_block_hash, Some(20));
+        assert_eq!(parent_hash(n30_id), Some(20));
         let n20_id = *st.by_hash.get(&20).unwrap().iter().next().unwrap();
-        assert_eq!(st.nodes[&n20_id].parent_block_hash, Some(10));
+        assert_eq!(parent_hash(n20_id), Some(10));
         let n10_id = *st.by_hash.get(&10).unwrap().iter().next().unwrap();
-        assert_eq!(st.nodes[&n10_id].parent_block_hash, None);
+        assert_eq!(parent_hash(n10_id), None);
     }
 
     #[test]

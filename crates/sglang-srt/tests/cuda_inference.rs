@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
-use sglang_kernel::cuda::CudaComputeCapability;
 use sglang_srt::backend::{ComputeCapability, CudaBackend};
 use sglang_srt::cli::ServerArgs;
 use sglang_srt::http::serve_http_router_with_shutdown;
@@ -13,17 +12,12 @@ use sglang_srt::server::build_bootstrap_http_router_service;
 use tokio::sync::oneshot;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a B200-class CUDA device, NVIDIA driver, and cuBLAS"]
-async fn b200_auto_selects_cuda_cublas_for_weight_backed_http_inference() {
-    let backend = CudaBackend::initialize(0).expect("CUDA backend should initialize on B200");
-    let ComputeCapability::Cuda(compute_capability) = backend.capabilities().compute_capability
-    else {
+#[ignore = "requires a CUDA device, NVIDIA driver, and cuBLAS"]
+async fn cuda_auto_selects_cublas_for_weight_backed_http_inference() {
+    let backend = CudaBackend::initialize(0).expect("CUDA backend should initialize");
+    let ComputeCapability::Cuda(_) = backend.capabilities().compute_capability else {
         panic!("CUDA backend must report CUDA compute capability");
     };
-    assert!(
-        compute_capability >= CudaComputeCapability::new(10, 0),
-        "B200 acceptance requires sm_100 or newer, found {compute_capability}"
-    );
     drop(backend);
 
     let model_dir = temp_model_dir("cuda-cublas-http");

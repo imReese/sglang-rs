@@ -36,8 +36,8 @@ struct Fixture {
     shape: String,
     prompt_text: String,
     expected_token_ids: Vec<u32>,
-    #[allow(dead_code)]
-    skip_special_tokens: bool,
+    #[serde(rename = "skip_special_tokens")]
+    _skip_special_tokens: bool,
 }
 
 fn fixture_root() -> PathBuf {

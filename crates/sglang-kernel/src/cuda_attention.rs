@@ -229,19 +229,34 @@ pub struct CudaBf16PagedAttentionPlan {
     shared_memory_bytes: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CudaBf16PagedAttentionPlanConfig {
+    pub query_count: usize,
+    pub request_count: usize,
+    pub sequence_slot_count: usize,
+    pub slot_count: usize,
+    pub query_head_count: usize,
+    pub kv_head_count: usize,
+    pub head_dim: usize,
+    pub scale: f32,
+    pub layout: CudaBf16PagedAttentionLayout,
+}
+
 impl CudaBf16PagedAttentionPlan {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        query_count: usize,
-        request_count: usize,
-        sequence_slot_count: usize,
-        slot_count: usize,
-        query_head_count: usize,
-        kv_head_count: usize,
-        head_dim: usize,
-        scale: f32,
-        layout: CudaBf16PagedAttentionLayout,
+        config: CudaBf16PagedAttentionPlanConfig,
     ) -> Result<Self, CudaBf16PagedAttentionError> {
+        let CudaBf16PagedAttentionPlanConfig {
+            query_count,
+            request_count,
+            sequence_slot_count,
+            slot_count,
+            query_head_count,
+            kv_head_count,
+            head_dim,
+            scale,
+            layout,
+        } = config;
         for (dimension, value) in [
             ("query_count", query_count),
             ("request_count", request_count),
@@ -568,6 +583,23 @@ pub struct CudaBf16PagedAttentionKernels {
     error_flag: CudaDeviceAllocation,
 }
 
+pub struct CudaBf16PagedAttentionLaunch<'a> {
+    pub queries: &'a CudaDeviceAllocation,
+    pub queries_offset: usize,
+    pub query_request_indices: &'a CudaDeviceAllocation,
+    pub query_request_indices_offset: usize,
+    pub query_sequence_lengths: &'a CudaDeviceAllocation,
+    pub query_sequence_lengths_offset: usize,
+    pub request_slot_offsets: &'a CudaDeviceAllocation,
+    pub request_slot_offsets_offset: usize,
+    pub sequence_slots: &'a CudaDeviceAllocation,
+    pub sequence_slots_offset: usize,
+    pub pool: &'a CudaDeviceAllocation,
+    pub pool_offset: usize,
+    pub output: &'a mut CudaDeviceAllocation,
+    pub output_offset: usize,
+}
+
 impl CudaBf16PagedAttentionKernels {
     pub fn compile(
         context: &CudaContext,
@@ -597,25 +629,27 @@ impl CudaBf16PagedAttentionKernels {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &mut self,
         plan: CudaBf16PagedAttentionPlan,
-        queries: &CudaDeviceAllocation,
-        queries_offset: usize,
-        query_request_indices: &CudaDeviceAllocation,
-        query_request_indices_offset: usize,
-        query_sequence_lengths: &CudaDeviceAllocation,
-        query_sequence_lengths_offset: usize,
-        request_slot_offsets: &CudaDeviceAllocation,
-        request_slot_offsets_offset: usize,
-        sequence_slots: &CudaDeviceAllocation,
-        sequence_slots_offset: usize,
-        pool: &CudaDeviceAllocation,
-        pool_offset: usize,
-        output: &mut CudaDeviceAllocation,
-        output_offset: usize,
+        launch: CudaBf16PagedAttentionLaunch<'_>,
     ) -> Result<(), CudaBf16PagedAttentionError> {
+        let CudaBf16PagedAttentionLaunch {
+            queries,
+            queries_offset,
+            query_request_indices,
+            query_request_indices_offset,
+            query_sequence_lengths,
+            query_sequence_lengths_offset,
+            request_slot_offsets,
+            request_slot_offsets_offset,
+            sequence_slots,
+            sequence_slots_offset,
+            pool,
+            pool_offset,
+            output,
+            output_offset,
+        } = launch;
         for (name, allocation) in [
             ("queries", queries),
             ("query_request_indices", query_request_indices),
@@ -781,19 +815,30 @@ mod tests {
         CudaBf16PagedAttentionLayout::new(4, 512, 256, 384, 32)
     }
 
+    fn test_plan_config() -> CudaBf16PagedAttentionPlanConfig {
+        CudaBf16PagedAttentionPlanConfig {
+            query_count: 1,
+            request_count: 1,
+            sequence_slot_count: 1,
+            slot_count: 4,
+            query_head_count: 4,
+            kv_head_count: 2,
+            head_dim: 8,
+            scale: 1.0,
+            layout: test_layout(),
+        }
+    }
+
     #[test]
     fn plan_maps_gqa_queries_into_page_major_bf16_kv() {
-        let plan = CudaBf16PagedAttentionPlan::new(
-            3,
-            2,
-            6,
-            12,
-            4,
-            2,
-            8,
-            8.0_f32.sqrt().recip(),
-            test_layout(),
-        )
+        let plan = CudaBf16PagedAttentionPlan::new(CudaBf16PagedAttentionPlanConfig {
+            query_count: 3,
+            request_count: 2,
+            sequence_slot_count: 6,
+            slot_count: 12,
+            scale: 8.0_f32.sqrt().recip(),
+            ..test_plan_config()
+        })
         .expect("valid BF16 paged attention plan should build");
 
         assert_eq!(plan.query_count(), 3);
@@ -814,7 +859,10 @@ mod tests {
     #[test]
     fn plan_fails_fast_on_head_and_bf16_layout_mismatches() {
         assert_eq!(
-            CudaBf16PagedAttentionPlan::new(1, 1, 1, 4, 3, 2, 8, 1.0, test_layout(),),
+            CudaBf16PagedAttentionPlan::new(CudaBf16PagedAttentionPlanConfig {
+                query_head_count: 3,
+                ..test_plan_config()
+            }),
             Err(
                 CudaBf16PagedAttentionError::QueryHeadsNotDivisibleByKvHeads {
                     query_head_count: 3,
@@ -823,17 +871,10 @@ mod tests {
             )
         );
         assert_eq!(
-            CudaBf16PagedAttentionPlan::new(
-                1,
-                1,
-                1,
-                4,
-                4,
-                2,
-                8,
-                1.0,
-                CudaBf16PagedAttentionLayout::new(4, 512, 256, 384, 31),
-            ),
+            CudaBf16PagedAttentionPlan::new(CudaBf16PagedAttentionPlanConfig {
+                layout: CudaBf16PagedAttentionLayout::new(4, 512, 256, 384, 31),
+                ..test_plan_config()
+            }),
             Err(CudaBf16PagedAttentionError::KvRowByteSizeMismatch {
                 expected: 32,
                 actual: 31,
@@ -844,11 +885,17 @@ mod tests {
     #[test]
     fn plan_rejects_empty_or_invalid_scaled_attention() {
         assert_eq!(
-            CudaBf16PagedAttentionPlan::new(0, 1, 1, 4, 4, 2, 8, 1.0, test_layout(),),
+            CudaBf16PagedAttentionPlan::new(CudaBf16PagedAttentionPlanConfig {
+                query_count: 0,
+                ..test_plan_config()
+            }),
             Err(CudaBf16PagedAttentionError::ZeroDimension("query_count"))
         );
         assert_eq!(
-            CudaBf16PagedAttentionPlan::new(1, 1, 1, 4, 4, 2, 8, 0.0, test_layout(),),
+            CudaBf16PagedAttentionPlan::new(CudaBf16PagedAttentionPlanConfig {
+                scale: 0.0,
+                ..test_plan_config()
+            }),
             Err(CudaBf16PagedAttentionError::InvalidScale(0.0))
         );
     }

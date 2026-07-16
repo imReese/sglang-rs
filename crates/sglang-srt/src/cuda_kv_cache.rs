@@ -4,6 +4,7 @@ use std::ops::Range;
 use sglang_kernel::cuda::{CudaContext, CudaDeviceAllocation, CudaError};
 use sglang_kernel::cuda_kv_kernels::{
     CudaKvPairCopyError, CudaKvPairCopyKernels, CudaKvPairCopyLayout, CudaKvPairCopyPlan,
+    CudaKvPairGather, CudaKvPairScatter,
 };
 
 use crate::transfer::{
@@ -497,6 +498,30 @@ impl CudaKvCacheSlotMap {
     }
 }
 
+pub struct CudaKvSlotScatterLaunch<'a> {
+    pub kernels: &'a mut CudaKvPairCopyKernels,
+    pub layer_index: usize,
+    pub slot_map: &'a CudaKvCacheSlotMap,
+    pub keys: &'a CudaDeviceAllocation,
+    pub keys_offset: usize,
+    pub key_row_stride_bytes: usize,
+    pub values: &'a CudaDeviceAllocation,
+    pub values_offset: usize,
+    pub value_row_stride_bytes: usize,
+}
+
+pub struct CudaKvSlotGatherLaunch<'a> {
+    pub kernels: &'a mut CudaKvPairCopyKernels,
+    pub layer_index: usize,
+    pub slot_map: &'a CudaKvCacheSlotMap,
+    pub keys: &'a mut CudaDeviceAllocation,
+    pub keys_offset: usize,
+    pub key_row_stride_bytes: usize,
+    pub values: &'a mut CudaDeviceAllocation,
+    pub values_offset: usize,
+    pub value_row_stride_bytes: usize,
+}
+
 pub struct CudaKvCachePool {
     context: CudaContext,
     layout: CudaKvCachePoolLayout,
@@ -627,19 +652,21 @@ impl CudaKvCachePool {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn write_kv_slots_from_device(
         &mut self,
-        kernels: &mut CudaKvPairCopyKernels,
-        layer_index: usize,
-        slot_map: &CudaKvCacheSlotMap,
-        keys: &CudaDeviceAllocation,
-        keys_offset: usize,
-        key_row_stride_bytes: usize,
-        values: &CudaDeviceAllocation,
-        values_offset: usize,
-        value_row_stride_bytes: usize,
+        launch: CudaKvSlotScatterLaunch<'_>,
     ) -> Result<(), CudaKvCachePoolError> {
+        let CudaKvSlotScatterLaunch {
+            kernels,
+            layer_index,
+            slot_map,
+            keys,
+            keys_offset,
+            key_row_stride_bytes,
+            values,
+            values_offset,
+            value_row_stride_bytes,
+        } = launch;
         self.validate_slot_map(slot_map)?;
         let plan = self.layout.kv_pair_copy_plan(
             layer_index,
@@ -649,31 +676,35 @@ impl CudaKvCachePool {
         )?;
         kernels.scatter(
             plan,
-            keys,
-            keys_offset,
-            values,
-            values_offset,
-            &slot_map.allocation,
-            0,
-            &mut self.allocation,
-            0,
+            CudaKvPairScatter {
+                keys,
+                keys_offset,
+                values,
+                values_offset,
+                slot_indices: &slot_map.allocation,
+                slot_indices_offset: 0,
+                pool: &mut self.allocation,
+                pool_offset: 0,
+            },
         )?;
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn read_kv_slots_to_device(
         &self,
-        kernels: &mut CudaKvPairCopyKernels,
-        layer_index: usize,
-        slot_map: &CudaKvCacheSlotMap,
-        keys: &mut CudaDeviceAllocation,
-        keys_offset: usize,
-        key_row_stride_bytes: usize,
-        values: &mut CudaDeviceAllocation,
-        values_offset: usize,
-        value_row_stride_bytes: usize,
+        launch: CudaKvSlotGatherLaunch<'_>,
     ) -> Result<(), CudaKvCachePoolError> {
+        let CudaKvSlotGatherLaunch {
+            kernels,
+            layer_index,
+            slot_map,
+            keys,
+            keys_offset,
+            key_row_stride_bytes,
+            values,
+            values_offset,
+            value_row_stride_bytes,
+        } = launch;
         self.validate_slot_map(slot_map)?;
         let plan = self.layout.kv_pair_copy_plan(
             layer_index,
@@ -683,14 +714,16 @@ impl CudaKvCachePool {
         )?;
         kernels.gather(
             plan,
-            &self.allocation,
-            0,
-            &slot_map.allocation,
-            0,
-            keys,
-            keys_offset,
-            values,
-            values_offset,
+            CudaKvPairGather {
+                pool: &self.allocation,
+                pool_offset: 0,
+                slot_indices: &slot_map.allocation,
+                slot_indices_offset: 0,
+                keys,
+                keys_offset,
+                values,
+                values_offset,
+            },
         )?;
         Ok(())
     }

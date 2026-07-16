@@ -195,9 +195,9 @@ struct KvEventsBlock {
     // non-ZMQ publisher string won't fail this deserialize; the
     // resulting subscriber will still try to open a ZMQ connection on
     // `endpoint_host:endpoint_port_base` and fail visibly there.
-    #[allow(dead_code)]
+    #[serde(rename = "publisher")]
     #[serde(default)]
-    publisher: Option<String>,
+    _publisher: Option<String>,
     endpoint_host: String,
     endpoint_port_base: u16,
     #[serde(default)]

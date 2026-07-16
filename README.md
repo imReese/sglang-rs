@@ -265,11 +265,38 @@ fallback for a requested Mooncake deployment.
 
 ## Development
 
+GitHub Actions runs `Rust CI` for every pull request and push to `main` on a
+GitHub-hosted Ubuntu runner. It checks formatting, all workspace targets,
+Clippy with warnings denied, and the complete default-feature test suite. The
+workflow caches Cargo downloads but not `target`, so compiled artifacts remain
+on the disposable hosted runner rather than a developer machine or persistent
+CI cache. Production Rust source containing lint-suppression attributes such as
+`#[allow]` or `#[expect]` also fails this job.
+
+Real CUDA acceptance runs in the separate `CUDA Acceptance` workflow. Register
+a Linux self-hosted runner with the `cuda` label, then start the workflow
+manually. Set the repository variable `ENABLE_CUDA_CI=true` to run it
+automatically after pushes to `main`. The workflow executes the real CUDA
+allocation, KV copy, BF16 paged-attention, cuBLAS inference, and HTTP service
+tests serially and cleans its per-run Cargo target directory when finished.
+The first production runner is expected to be B200, but the workflow has no
+product label or product check; A100, H100, and later compatible CUDA devices
+run the same capability-gated tests.
+
+To include native Mooncake registration, set `MOONCAKE_BUILD_DIR` to the
+Mooncake build directory visible on that runner and select the `mooncake`
+manual input. `ENABLE_MOONCAKE_CI=true` enables the same test for automatic
+CUDA runs. Missing drivers, NVRTC, cuBLAS, compute capability, Mooncake build
+artifacts, or runner labels stop or queue the workflow explicitly; CI never
+substitutes the CPU reference backend or a fake transfer backend.
+
 Run all checks:
 
 ```bash
-cargo fmt --all --check
-cargo test --workspace
+cargo fmt --all -- --check
+cargo check --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
 ```
 
 On a MacBook, these tests validate allocator geometry, page-aligned prefix
@@ -284,12 +311,12 @@ cargo test -p sglang-srt --test cache_allocator \
   --test glm_runtime --test cuda_kv_cache --test cuda_attention
 ```
 
-On a B200 host, validate real page-major CUDA allocation, page write/read,
+On a CUDA host, validate real page-major allocation, page write/read,
 global token-slot addressing, and the transferable-memory view:
 
 ```bash
 cargo test -p sglang-srt --test cuda_backend \
-  b200_cuda_backend_round_trips_page_major_device_kv_memory -- --ignored --nocapture
+  cuda_backend_round_trips_page_major_device_kv_memory -- --ignored --nocapture
 ```
 
 With the CUDA toolkit's NVRTC library available to the dynamic loader, validate
@@ -298,7 +325,7 @@ slot writes:
 
 ```bash
 cargo test -p sglang-srt --test cuda_backend \
-  b200_cuda_runtime_kernels_execute_and_write_kv_slots -- --ignored --nocapture
+  cuda_runtime_kernels_execute_and_write_kv_slots -- --ignored --nocapture
 ```
 
 Validate a batched, strided K/V scatter across physical page boundaries and
@@ -306,7 +333,7 @@ gather it back from the exact allocation exposed to Mooncake:
 
 ```bash
 cargo test -p sglang-srt --test cuda_backend \
-  b200_cuda_kv_kernels_scatter_and_gather_batched_physical_slots -- --ignored --nocapture
+  cuda_kv_kernels_scatter_and_gather_batched_physical_slots -- --ignored --nocapture
 ```
 
 Validate BF16 GQA paged attention against a CPU numerical reference after K/V
@@ -315,15 +342,15 @@ attention reads the exact CUDA allocation exposed for Mooncake registration:
 
 ```bash
 cargo test -p sglang-srt --test cuda_backend \
-  b200_cuda_bf16_paged_attention_reads_mooncake_registered_physical_kv_slots -- --ignored --nocapture
+  cuda_bf16_paged_attention_reads_mooncake_registered_physical_kv_slots -- --ignored --nocapture
 ```
 
 Validate real safetensors weight upload, cuBLAS logits, token sampling, and the
-HTTP inference service on B200:
+HTTP inference service on CUDA:
 
 ```bash
 cargo test -p sglang-srt --test cuda_inference \
-  b200_auto_selects_cuda_cublas_for_weight_backed_http_inference -- --ignored --nocapture
+  cuda_auto_selects_cublas_for_weight_backed_http_inference -- --ignored --nocapture
 ```
 
 With native Mooncake built, validate CUDA KV registration and deregistration:
@@ -331,7 +358,7 @@ With native Mooncake built, validate CUDA KV registration and deregistration:
 ```bash
 MOONCAKE_BUILD_DIR=/path/to/Mooncake/build \
   cargo test -p sglang-srt --features mooncake-link --test cuda_backend \
-  b200_mooncake_registers_real_cuda_kv_memory -- --ignored --nocapture
+  cuda_mooncake_registers_real_cuda_kv_memory -- --ignored --nocapture
 ```
 
 CUDA is the first production backend and B200 is the first hardware acceptance

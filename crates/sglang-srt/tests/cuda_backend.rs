@@ -1,10 +1,11 @@
-use sglang_kernel::cuda::CudaComputeCapability;
-use sglang_kernel::cuda_kernels::CudaF32Kernels;
+use sglang_kernel::cuda_kernels::{CudaF32Kernels, CudaRmsNormLaunch, CudaSiluMulLaunch};
 use sglang_kernel::cuda_kv_kernels::CudaKvPairCopyKernels;
 use sglang_srt::backend::{ComputeCapability, CudaBackend};
 use sglang_srt::cache::{CachePageAllocator, RadixCache};
-use sglang_srt::cuda_attention::{CudaBf16PagedAttentionExecutor, CudaPagedAttentionMetadata};
-use sglang_srt::cuda_kv_cache::CudaKvCachePool;
+use sglang_srt::cuda_attention::{
+    CudaBf16PagedAttentionExecutor, CudaPagedAttentionForward, CudaPagedAttentionMetadata,
+};
+use sglang_srt::cuda_kv_cache::{CudaKvCachePool, CudaKvSlotGatherLaunch, CudaKvSlotScatterLaunch};
 use sglang_srt::model_executor::ModelWorkerBatch;
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::transfer::{
@@ -18,7 +19,7 @@ use sglang_srt::transfer::{
 use sglang_srt::types::{RequestId, SamplingParams};
 use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
 
-fn b200_test_layout() -> KvCacheRuntimeLayout {
+fn cuda_test_layout() -> KvCacheRuntimeLayout {
     let page_size = 16;
     let num_layers = 2;
     let kv_heads = 8;
@@ -234,25 +235,21 @@ fn reference_paged_attention(
 }
 
 #[test]
-#[ignore = "requires a B200-class CUDA device and NVIDIA driver"]
-fn b200_cuda_backend_round_trips_page_major_device_kv_memory() {
-    let backend = CudaBackend::initialize(0).expect("CUDA backend should initialize on B200");
+#[ignore = "requires a CUDA device and NVIDIA driver"]
+fn cuda_backend_round_trips_page_major_device_kv_memory() {
+    let backend = CudaBackend::initialize(0).expect("CUDA backend should initialize");
     let capability = backend.capabilities();
-    let ComputeCapability::Cuda(compute_capability) = capability.compute_capability else {
+    let ComputeCapability::Cuda(_) = capability.compute_capability else {
         panic!("CUDA backend must report CUDA compute capability");
     };
-    assert!(
-        compute_capability >= CudaComputeCapability::new(10, 0),
-        "B200 acceptance requires sm_100 or newer, found {compute_capability}"
-    );
 
     let memory_before = backend
         .context()
         .memory_info()
         .expect("CUDA memory info should be available");
-    let mut kv_cache = CudaKvCachePool::allocate(backend.context(), b200_test_layout(), 16)
+    let mut kv_cache = CudaKvCachePool::allocate(backend.context(), cuda_test_layout(), 16)
         .expect("CUDA KV cache should allocate a page-major device pool");
-    let pattern = (0..b200_test_layout().page_size_bytes)
+    let pattern = (0..cuda_test_layout().page_size_bytes)
         .map(|offset| (offset % 251) as u8)
         .collect::<Vec<_>>();
     kv_cache
@@ -302,17 +299,13 @@ fn b200_cuda_backend_round_trips_page_major_device_kv_memory() {
 }
 
 #[test]
-#[ignore = "requires a B200-class CUDA device, NVIDIA driver, and NVRTC"]
-fn b200_cuda_runtime_kernels_execute_and_write_kv_slots() {
-    let backend = CudaBackend::initialize(0).expect("CUDA backend should initialize on B200");
+#[ignore = "requires a CUDA device, NVIDIA driver, and NVRTC"]
+fn cuda_runtime_kernels_execute_and_write_kv_slots() {
+    let backend = CudaBackend::initialize(0).expect("CUDA backend should initialize");
     let capability = backend.capabilities();
     let ComputeCapability::Cuda(compute_capability) = capability.compute_capability else {
         panic!("CUDA backend must report CUDA compute capability");
     };
-    assert!(
-        compute_capability >= CudaComputeCapability::new(10, 0),
-        "B200 acceptance requires sm_100 or newer, found {compute_capability}"
-    );
     let kernels = CudaF32Kernels::compile(backend.context(), compute_capability)
         .expect("NVRTC should compile CUDA runtime kernels");
 
@@ -349,10 +342,28 @@ fn b200_cuda_runtime_kernels_execute_and_write_kv_slots() {
         .expect("up tensor should upload");
 
     kernels
-        .rms_norm(&input, 0, &weight, 0, &mut rms_output, 0, 2, 4, 1.0e-5)
+        .rms_norm(CudaRmsNormLaunch {
+            input: &input,
+            input_offset: 0,
+            weight: &weight,
+            weight_offset: 0,
+            output: &mut rms_output,
+            output_offset: 0,
+            rows: 2,
+            width: 4,
+            epsilon: 1.0e-5,
+        })
         .expect("RMSNorm should execute on CUDA");
     kernels
-        .silu_mul(&input, 0, &up, 0, &mut silu_output, 0, input_values.len())
+        .silu_mul(CudaSiluMulLaunch {
+            gate: &input,
+            gate_offset: 0,
+            up: &up,
+            up_offset: 0,
+            output: &mut silu_output,
+            output_offset: 0,
+            element_count: input_values.len(),
+        })
         .expect("SiLU-mul should execute on CUDA");
 
     let mut rms_bytes = vec![0_u8; input_values.len() * size_of::<f32>()];
@@ -382,7 +393,7 @@ fn b200_cuda_runtime_kernels_execute_and_write_kv_slots() {
         .collect::<Vec<_>>();
     assert_f32_close(&bytes_f32(&silu_bytes), &expected_silu, 1.0e-4);
 
-    let mut kv_cache = CudaKvCachePool::allocate(backend.context(), b200_test_layout(), 2)
+    let mut kv_cache = CudaKvCachePool::allocate(backend.context(), cuda_test_layout(), 2)
         .expect("CUDA KV cache should allocate");
     let slot_byte_len = kv_cache.layout().bytes_per_token_per_tensor();
     let pattern = (0..slot_byte_len)
@@ -413,20 +424,16 @@ fn b200_cuda_runtime_kernels_execute_and_write_kv_slots() {
 }
 
 #[test]
-#[ignore = "requires a B200-class CUDA device, NVIDIA driver, and NVRTC"]
-fn b200_cuda_kv_kernels_scatter_and_gather_batched_physical_slots() {
-    let backend = CudaBackend::initialize(0).expect("CUDA backend should initialize on B200");
+#[ignore = "requires a CUDA device, NVIDIA driver, and NVRTC"]
+fn cuda_kv_kernels_scatter_and_gather_batched_physical_slots() {
+    let backend = CudaBackend::initialize(0).expect("CUDA backend should initialize");
     let capability = backend.capabilities();
     let ComputeCapability::Cuda(compute_capability) = capability.compute_capability else {
         panic!("CUDA backend must report CUDA compute capability");
     };
-    assert!(
-        compute_capability >= CudaComputeCapability::new(10, 0),
-        "B200 acceptance requires sm_100 or newer, found {compute_capability}"
-    );
     let mut kernels = CudaKvPairCopyKernels::compile(backend.context(), compute_capability)
         .expect("NVRTC should compile dtype-independent KV copy kernels");
-    let mut kv_cache = CudaKvCachePool::allocate(backend.context(), b200_test_layout(), 2)
+    let mut kv_cache = CudaKvCachePool::allocate(backend.context(), cuda_test_layout(), 2)
         .expect("CUDA KV cache should allocate two physical pages");
     let slots = [1_usize, 15, 16, 31];
     let slot_map = kv_cache
@@ -456,17 +463,17 @@ fn b200_cuda_kv_kernels_scatter_and_gather_batched_physical_slots() {
         .transferable_memory()
         .expect("KV pool should expose its Mooncake memory before model writes");
     kv_cache
-        .write_kv_slots_from_device(
-            &mut kernels,
-            1,
-            &slot_map,
-            &keys,
-            0,
-            key_stride,
-            &values,
-            0,
-            value_stride,
-        )
+        .write_kv_slots_from_device(CudaKvSlotScatterLaunch {
+            kernels: &mut kernels,
+            layer_index: 1,
+            slot_map: &slot_map,
+            keys: &keys,
+            keys_offset: 0,
+            key_row_stride_bytes: key_stride,
+            values: &values,
+            values_offset: 0,
+            value_row_stride_bytes: value_stride,
+        })
         .expect("one CUDA launch should scatter batched K/V rows into physical slots");
     assert_eq!(
         transferable_before.regions()[0].base_addr,
@@ -489,17 +496,17 @@ fn b200_cuda_kv_kernels_scatter_and_gather_batched_physical_slots() {
     gathered_keys.fill(0).expect("key output should clear");
     gathered_values.fill(0).expect("value output should clear");
     kv_cache
-        .read_kv_slots_to_device(
-            &mut kernels,
-            1,
-            &slot_map,
-            &mut gathered_keys,
-            0,
-            gathered_key_stride,
-            &mut gathered_values,
-            0,
-            gathered_value_stride,
-        )
+        .read_kv_slots_to_device(CudaKvSlotGatherLaunch {
+            kernels: &mut kernels,
+            layer_index: 1,
+            slot_map: &slot_map,
+            keys: &mut gathered_keys,
+            keys_offset: 0,
+            key_row_stride_bytes: gathered_key_stride,
+            values: &mut gathered_values,
+            values_offset: 0,
+            value_row_stride_bytes: gathered_value_stride,
+        })
         .expect("one CUDA launch should gather batched K/V rows from physical slots");
     let mut gathered_key_bytes = vec![0_u8; gathered_key_len];
     let mut gathered_value_bytes = vec![0_u8; gathered_value_len];
@@ -545,17 +552,13 @@ fn b200_cuda_kv_kernels_scatter_and_gather_batched_physical_slots() {
 }
 
 #[test]
-#[ignore = "requires a B200-class CUDA device, NVIDIA driver, and NVRTC"]
-fn b200_cuda_bf16_paged_attention_reads_mooncake_registered_physical_kv_slots() {
-    let backend = CudaBackend::initialize(0).expect("CUDA backend should initialize on B200");
+#[ignore = "requires a BF16-capable CUDA device, NVIDIA driver, and NVRTC"]
+fn cuda_bf16_paged_attention_reads_mooncake_registered_physical_kv_slots() {
+    let backend = CudaBackend::initialize(0).expect("CUDA backend should initialize");
     let capability = backend.capabilities();
     let ComputeCapability::Cuda(compute_capability) = capability.compute_capability else {
         panic!("CUDA backend must report CUDA compute capability");
     };
-    assert!(
-        compute_capability >= CudaComputeCapability::new(10, 0),
-        "B200 acceptance requires sm_100 or newer, found {compute_capability}"
-    );
 
     let mut kv_copy_kernels = CudaKvPairCopyKernels::compile(backend.context(), compute_capability)
         .expect("NVRTC should compile KV scatter kernels");
@@ -607,17 +610,17 @@ fn b200_cuda_bf16_paged_attention_reads_mooncake_registered_physical_kv_slots() 
         .expect("BF16 values should upload");
     let row_bytes = kv_cache.layout().bytes_per_token_per_tensor();
     kv_cache
-        .write_kv_slots_from_device(
-            &mut kv_copy_kernels,
-            0,
-            &slot_map,
-            &keys,
-            0,
-            row_bytes,
-            &values,
-            0,
-            row_bytes,
-        )
+        .write_kv_slots_from_device(CudaKvSlotScatterLaunch {
+            kernels: &mut kv_copy_kernels,
+            layer_index: 0,
+            slot_map: &slot_map,
+            keys: &keys,
+            keys_offset: 0,
+            key_row_stride_bytes: row_bytes,
+            values: &values,
+            values_offset: 0,
+            value_row_stride_bytes: row_bytes,
+        })
         .expect("KV scatter should write scheduler slots into the physical pool");
 
     let query_head_count = 4;
@@ -649,17 +652,17 @@ fn b200_cuda_bf16_paged_attention_reads_mooncake_registered_physical_kv_slots() 
     );
     let scale = (runtime.head_dim as f32).sqrt().recip();
     attention
-        .forward(
-            &kv_cache,
-            0,
-            &device_metadata,
-            &queries,
-            0,
+        .forward(CudaPagedAttentionForward {
+            kv_cache: &kv_cache,
+            layer_index: 0,
+            metadata: &device_metadata,
+            queries: &queries,
+            queries_offset: 0,
             query_head_count,
             scale,
-            &mut output,
-            0,
-        )
+            output: &mut output,
+            output_offset: 0,
+        })
         .expect("BF16 paged attention should execute over physical KV slots");
     let mut output_bytes = vec![0_u8; query_bytes.len()];
     output
@@ -682,10 +685,10 @@ fn b200_cuda_bf16_paged_attention_reads_mooncake_registered_physical_kv_slots() 
 
 #[cfg(feature = "mooncake-link")]
 #[test]
-#[ignore = "requires B200, NVIDIA driver, and linked native Mooncake"]
-fn b200_mooncake_registers_real_cuda_kv_memory() {
-    let backend = CudaBackend::initialize(0).expect("CUDA backend should initialize on B200");
-    let kv_cache = CudaKvCachePool::allocate(backend.context(), b200_test_layout(), 16)
+#[ignore = "requires a CUDA device, NVIDIA driver, and linked native Mooncake"]
+fn cuda_mooncake_registers_real_cuda_kv_memory() {
+    let backend = CudaBackend::initialize(0).expect("CUDA backend should initialize");
+    let kv_cache = CudaKvCachePool::allocate(backend.context(), cuda_test_layout(), 16)
         .expect("CUDA KV cache should allocate a page-major device pool");
     let transferable = kv_cache
         .mooncake_kv_cache_memory()

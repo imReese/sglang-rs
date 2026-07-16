@@ -421,6 +421,28 @@ pub struct CudaKvPairCopyKernels {
     error_flag: CudaDeviceAllocation,
 }
 
+pub struct CudaKvPairScatter<'a> {
+    pub keys: &'a CudaDeviceAllocation,
+    pub keys_offset: usize,
+    pub values: &'a CudaDeviceAllocation,
+    pub values_offset: usize,
+    pub slot_indices: &'a CudaDeviceAllocation,
+    pub slot_indices_offset: usize,
+    pub pool: &'a mut CudaDeviceAllocation,
+    pub pool_offset: usize,
+}
+
+pub struct CudaKvPairGather<'a> {
+    pub pool: &'a CudaDeviceAllocation,
+    pub pool_offset: usize,
+    pub slot_indices: &'a CudaDeviceAllocation,
+    pub slot_indices_offset: usize,
+    pub keys: &'a mut CudaDeviceAllocation,
+    pub keys_offset: usize,
+    pub values: &'a mut CudaDeviceAllocation,
+    pub values_offset: usize,
+}
+
 impl CudaKvPairCopyKernels {
     pub fn compile(
         context: &CudaContext,
@@ -446,19 +468,21 @@ impl CudaKvPairCopyKernels {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn scatter(
         &mut self,
         plan: CudaKvPairCopyPlan,
-        keys: &CudaDeviceAllocation,
-        keys_offset: usize,
-        values: &CudaDeviceAllocation,
-        values_offset: usize,
-        slot_indices: &CudaDeviceAllocation,
-        slot_indices_offset: usize,
-        pool: &mut CudaDeviceAllocation,
-        pool_offset: usize,
+        launch: CudaKvPairScatter<'_>,
     ) -> Result<(), CudaKvPairCopyError> {
+        let CudaKvPairScatter {
+            keys,
+            keys_offset,
+            values,
+            values_offset,
+            slot_indices,
+            slot_indices_offset,
+            pool,
+            pool_offset,
+        } = launch;
         self.validate_device("keys", keys)?;
         self.validate_device("values", values)?;
         self.validate_device("slot_indices", slot_indices)?;
@@ -479,19 +503,21 @@ impl CudaKvPairCopyKernels {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn gather(
         &mut self,
         plan: CudaKvPairCopyPlan,
-        pool: &CudaDeviceAllocation,
-        pool_offset: usize,
-        slot_indices: &CudaDeviceAllocation,
-        slot_indices_offset: usize,
-        keys: &mut CudaDeviceAllocation,
-        keys_offset: usize,
-        values: &mut CudaDeviceAllocation,
-        values_offset: usize,
+        launch: CudaKvPairGather<'_>,
     ) -> Result<(), CudaKvPairCopyError> {
+        let CudaKvPairGather {
+            pool,
+            pool_offset,
+            slot_indices,
+            slot_indices_offset,
+            keys,
+            keys_offset,
+            values,
+            values_offset,
+        } = launch;
         self.validate_device("pool", pool)?;
         self.validate_device("slot_indices", slot_indices)?;
         self.validate_device("keys", keys)?;

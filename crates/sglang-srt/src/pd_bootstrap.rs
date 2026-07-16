@@ -526,7 +526,6 @@ impl std::error::Error for MooncakeRemoteKvLayoutError {}
 #[derive(Clone, Debug)]
 struct RegisteredDpRank {
     dp_rank: i32,
-    #[allow(dead_code)]
     timestamp_secs: u64,
 }
 

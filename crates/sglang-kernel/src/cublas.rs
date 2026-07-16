@@ -398,7 +398,6 @@ mod tests {
         CUBLAS_STATUS_SUCCESS
     }
 
-    #[allow(clippy::too_many_arguments)]
     unsafe extern "C" fn fake_sgemv(
         handle: CublasHandle,
         operation: c_int,

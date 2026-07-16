@@ -137,6 +137,28 @@ pub struct CudaF32Kernels {
     silu_mul: CudaFunction,
 }
 
+pub struct CudaRmsNormLaunch<'a> {
+    pub input: &'a CudaDeviceAllocation,
+    pub input_offset: usize,
+    pub weight: &'a CudaDeviceAllocation,
+    pub weight_offset: usize,
+    pub output: &'a mut CudaDeviceAllocation,
+    pub output_offset: usize,
+    pub rows: usize,
+    pub width: usize,
+    pub epsilon: f32,
+}
+
+pub struct CudaSiluMulLaunch<'a> {
+    pub gate: &'a CudaDeviceAllocation,
+    pub gate_offset: usize,
+    pub up: &'a CudaDeviceAllocation,
+    pub up_offset: usize,
+    pub output: &'a mut CudaDeviceAllocation,
+    pub output_offset: usize,
+    pub element_count: usize,
+}
+
 impl CudaF32Kernels {
     pub fn compile(
         context: &CudaContext,
@@ -159,19 +181,18 @@ impl CudaF32Kernels {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn rms_norm(
-        &self,
-        input: &CudaDeviceAllocation,
-        input_offset: usize,
-        weight: &CudaDeviceAllocation,
-        weight_offset: usize,
-        output: &mut CudaDeviceAllocation,
-        output_offset: usize,
-        rows: usize,
-        width: usize,
-        epsilon: f32,
-    ) -> Result<(), CudaF32KernelError> {
+    pub fn rms_norm(&self, launch: CudaRmsNormLaunch<'_>) -> Result<(), CudaF32KernelError> {
+        let CudaRmsNormLaunch {
+            input,
+            input_offset,
+            weight,
+            weight_offset,
+            output,
+            output_offset,
+            rows,
+            width,
+            epsilon,
+        } = launch;
         if rows == 0 {
             return Err(CudaF32KernelError::ZeroDimension("rows"));
         }
@@ -231,17 +252,16 @@ impl CudaF32Kernels {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn silu_mul(
-        &self,
-        gate: &CudaDeviceAllocation,
-        gate_offset: usize,
-        up: &CudaDeviceAllocation,
-        up_offset: usize,
-        output: &mut CudaDeviceAllocation,
-        output_offset: usize,
-        element_count: usize,
-    ) -> Result<(), CudaF32KernelError> {
+    pub fn silu_mul(&self, launch: CudaSiluMulLaunch<'_>) -> Result<(), CudaF32KernelError> {
+        let CudaSiluMulLaunch {
+            gate,
+            gate_offset,
+            up,
+            up_offset,
+            output,
+            output_offset,
+            element_count,
+        } = launch;
         if element_count == 0 {
             return Err(CudaF32KernelError::ZeroDimension("element_count"));
         }

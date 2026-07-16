@@ -421,10 +421,8 @@ mod tests {
     struct PumpHarness {
         tree: Arc<HashTree>,
         cursors: Arc<Mutex<HashMap<KvWorkerId, i64>>>,
-        #[allow(dead_code)]
-        live_set: Arc<Mutex<HashSet<KvWorkerId>>>,
-        #[allow(dead_code)]
-        cancel: CancellationToken,
+        _live_set: Arc<Mutex<HashSet<KvWorkerId>>>,
+        _cancel: CancellationToken,
         tx: mpsc::Sender<WorkerEvent>,
         pump: JoinHandle<()>,
     }
@@ -448,8 +446,8 @@ mod tests {
         PumpHarness {
             tree,
             cursors,
-            live_set,
-            cancel,
+            _live_set: live_set,
+            _cancel: cancel,
             tx,
             pump,
         }
