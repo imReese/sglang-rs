@@ -681,7 +681,13 @@ where
 {
     let requested_dir = match profile_output_dir_from_body(&body) {
         Ok(output_dir) => output_dir,
-        Err(response) => return response,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": { "message": message } })),
+            )
+                .into_response();
+        }
     };
     let output_dir = match profile_output_dir(requested_dir) {
         Ok(output_dir) => output_dir,
@@ -742,32 +748,19 @@ where
     .into_response()
 }
 
-fn profile_output_dir_from_body(body: &[u8]) -> Result<Option<String>, Response> {
+fn profile_output_dir_from_body(body: &[u8]) -> Result<Option<String>, &'static str> {
     if body.is_empty() {
         return Ok(None);
     }
-    let value: Value = serde_json::from_slice(body).map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": { "message": "request body must be a JSON object" } })),
-        )
-            .into_response()
-    })?;
-    let object = value.as_object().ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": { "message": "request body must be a JSON object" } })),
-        )
-            .into_response()
-    })?;
+    let value: Value =
+        serde_json::from_slice(body).map_err(|_| "request body must be a JSON object")?;
+    let object = value
+        .as_object()
+        .ok_or("request body must be a JSON object")?;
     match object.get("output_dir") {
         Some(Value::String(output_dir)) => Ok(Some(output_dir.clone())),
         Some(Value::Null) | None => Ok(None),
-        Some(_) => Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": { "message": "output_dir must be a string when provided" } })),
-        )
-            .into_response()),
+        Some(_) => Err("output_dir must be a string when provided"),
     }
 }
 
@@ -1663,12 +1656,12 @@ where
             HttpChatRequest::Single(request) => {
                 if service.max_transfer_polls == 0 {
                     runtime
-                        .generate_text_stream(request)
+                        .generate_text_stream(*request)
                         .map(HttpChatResponse::Single)
                 } else {
                     runtime
                         .generate_text_stream_with_transfer_polling(
-                            request,
+                            *request,
                             service.max_transfer_polls,
                         )
                         .map(HttpChatResponse::Single)
@@ -1766,7 +1759,7 @@ where
 }
 
 pub(crate) enum HttpChatRequest {
-    Single(RouterTextGenerateRequest),
+    Single(Box<RouterTextGenerateRequest>),
     Batch(Vec<RouterTextGenerateRequest>),
 }
 
@@ -2481,12 +2474,12 @@ where
             HttpCompletionRequest::Single(request) => {
                 if service.max_transfer_polls == 0 {
                     runtime
-                        .generate_text_stream(request)
+                        .generate_text_stream(*request)
                         .map(HttpCompletionResponse::Single)
                 } else {
                     runtime
                         .generate_text_stream_with_transfer_polling(
-                            request,
+                            *request,
                             service.max_transfer_polls,
                         )
                         .map(HttpCompletionResponse::Single)
@@ -2540,7 +2533,7 @@ where
 }
 
 pub(crate) enum HttpCompletionRequest {
-    Single(RouterTextGenerateRequest),
+    Single(Box<RouterTextGenerateRequest>),
     Batch(Vec<RouterTextGenerateRequest>),
 }
 
@@ -2825,7 +2818,7 @@ fn http_generate_payload_to_router_request(payload: Value) -> Result<HttpGenerat
     if payload.get("input_ids").is_some() {
         return match http_generate_payload_to_router_token_requests(payload)? {
             HttpTokenGenerateRequests::Single(request) => {
-                Ok(HttpGenerateRequest::Tokenized(request))
+                Ok(HttpGenerateRequest::Tokenized(*request))
             }
             HttpTokenGenerateRequests::Batch(requests) => {
                 Ok(HttpGenerateRequest::BatchTokenized(requests))
@@ -2833,7 +2826,7 @@ fn http_generate_payload_to_router_request(payload: Value) -> Result<HttpGenerat
         };
     }
     match http_generate_payload_to_router_text_requests(payload)? {
-        HttpTextGenerateRequests::Single(request) => Ok(HttpGenerateRequest::Text(request)),
+        HttpTextGenerateRequests::Single(request) => Ok(HttpGenerateRequest::Text(*request)),
         HttpTextGenerateRequests::Batch(requests) => Ok(HttpGenerateRequest::BatchText(requests)),
     }
 }
@@ -2865,7 +2858,7 @@ fn routed_dp_rank_header(headers: &HeaderMap) -> Result<Option<i32>, String> {
 }
 
 enum HttpTextGenerateRequests {
-    Single(RouterTextGenerateRequest),
+    Single(Box<RouterTextGenerateRequest>),
     Batch(Vec<RouterTextGenerateRequest>),
 }
 
@@ -2924,7 +2917,7 @@ fn http_generate_payload_to_router_text_requests(
     let disaggregated_params = json_to_disaggregated_params(&payload)?;
     let data_parallel_rank = optional_routed_dp_rank(&payload)?.unwrap_or_default();
 
-    Ok(HttpTextGenerateRequests::Single(
+    Ok(HttpTextGenerateRequests::Single(Box::new(
         RouterTextGenerateRequest {
             request_id,
             text,
@@ -2934,11 +2927,11 @@ fn http_generate_payload_to_router_text_requests(
             data_parallel_rank,
             ..Default::default()
         },
-    ))
+    )))
 }
 
 enum HttpTokenGenerateRequests {
-    Single(RouterGenerateRequest),
+    Single(Box<RouterGenerateRequest>),
     Batch(Vec<RouterGenerateRequest>),
 }
 
@@ -3002,18 +2995,20 @@ fn http_generate_payload_to_router_token_requests(
     let disaggregated_params = json_to_disaggregated_params(&payload)?;
     let data_parallel_rank = optional_routed_dp_rank(&payload)?.unwrap_or_default();
 
-    Ok(HttpTokenGenerateRequests::Single(RouterGenerateRequest {
-        request_id,
-        tokenized: Some(RouterTokenizedInput {
-            original_text,
-            input_ids,
-        }),
-        sampling_params,
-        disaggregated_params,
-        stream,
-        data_parallel_rank,
-        ..Default::default()
-    }))
+    Ok(HttpTokenGenerateRequests::Single(Box::new(
+        RouterGenerateRequest {
+            request_id,
+            tokenized: Some(RouterTokenizedInput {
+                original_text,
+                input_ids,
+            }),
+            sampling_params,
+            disaggregated_params,
+            stream,
+            data_parallel_rank,
+            ..Default::default()
+        },
+    )))
 }
 
 fn token_id_array(value: &Value) -> Result<Vec<u32>, String> {
@@ -3138,8 +3133,8 @@ pub(crate) fn http_completion_payload_to_router_request(
     let stream = optional_bool(&payload, "stream")?.unwrap_or(false);
 
     match completion_prompt_to_texts(&payload)? {
-        CompletionPrompts::Single(text) => {
-            Ok(HttpCompletionRequest::Single(RouterTextGenerateRequest {
+        CompletionPrompts::Single(text) => Ok(HttpCompletionRequest::Single(Box::new(
+            RouterTextGenerateRequest {
                 request_id: payload
                     .get("request_id")
                     .and_then(Value::as_str)
@@ -3151,8 +3146,8 @@ pub(crate) fn http_completion_payload_to_router_request(
                 stream,
                 data_parallel_rank: optional_routed_dp_rank(&payload)?.unwrap_or_default(),
                 ..Default::default()
-            }))
-        }
+            },
+        ))),
         CompletionPrompts::Batch(texts) => {
             let batch_size = texts.len();
             if batch_size == 0 {
@@ -3210,19 +3205,21 @@ pub(crate) fn http_chat_payload_to_router_request(
     let text = chat_messages_to_prompt_text(&payload)?;
 
     if n == 1 {
-        return Ok(HttpChatRequest::Single(RouterTextGenerateRequest {
-            request_id: payload
-                .get("request_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            text,
-            sampling_params: Some(sampling_params),
-            disaggregated_params: json_to_disaggregated_params(&payload)?,
-            stream,
-            data_parallel_rank: optional_routed_dp_rank(&payload)?.unwrap_or_default(),
-            ..Default::default()
-        }));
+        return Ok(HttpChatRequest::Single(Box::new(
+            RouterTextGenerateRequest {
+                request_id: payload
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                text,
+                sampling_params: Some(sampling_params),
+                disaggregated_params: json_to_disaggregated_params(&payload)?,
+                stream,
+                data_parallel_rank: optional_routed_dp_rank(&payload)?.unwrap_or_default(),
+                ..Default::default()
+            },
+        )));
     }
 
     let batch_size = usize::try_from(n).map_err(|_| "n is out of range".to_string())?;

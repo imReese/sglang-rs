@@ -1240,7 +1240,7 @@ where
             .map_err(|_| Status::internal("router runtime mutex poisoned"))?;
         let response = match request {
             crate::http::HttpChatRequest::Single(request) => runtime
-                .generate_text_stream_with_transfer_polling(request, self.max_transfer_polls)
+                .generate_text_stream_with_transfer_polling(*request, self.max_transfer_polls)
                 .map(GrpcChatResponse::Single),
             crate::http::HttpChatRequest::Batch(requests) => {
                 if stream {
@@ -1315,7 +1315,7 @@ where
             .map_err(|_| Status::internal("router runtime mutex poisoned"))?;
         let response = match request {
             crate::http::HttpCompletionRequest::Single(request) => runtime
-                .generate_text_stream_with_transfer_polling(request, self.max_transfer_polls)
+                .generate_text_stream_with_transfer_polling(*request, self.max_transfer_polls)
                 .map(GrpcCompletionResponse::Single),
             crate::http::HttpCompletionRequest::Batch(requests) => {
                 if stream {
@@ -1692,10 +1692,10 @@ fn server_info_attributes_from_args(args: &ServerArgs) -> HashMap<String, String
 }
 
 fn grpc_kv_events_endpoint_host(args: &ServerArgs) -> &str {
-    if matches!(args.host.as_str(), "0.0.0.0" | "::" | "[::]") {
-        if let Some(host) = args.dist_init_addr.as_deref().and_then(host_from_addr) {
-            return host;
-        }
+    if matches!(args.host.as_str(), "0.0.0.0" | "::" | "[::]")
+        && let Some(host) = args.dist_init_addr.as_deref().and_then(host_from_addr)
+    {
+        return host;
     }
     &args.host
 }
@@ -1723,9 +1723,7 @@ fn apply_openai_json_options_to_router_request(
     if request.data_parallel_rank == 0 {
         request.data_parallel_rank = options.data_parallel_rank;
     }
-    request
-        .trace_headers
-        .extend(options.trace_headers.into_iter());
+    request.trace_headers.extend(options.trace_headers);
 }
 
 fn proto_generate_request_to_router_request(

@@ -2142,18 +2142,18 @@ async fn http_prefill_server_accepts_disaggregated_generate_requests() {
     assert_eq!(generated["request_id"], "http-pd-prefill");
     assert_eq!(generated["text"], " ");
 
-    let runtime = inspected_service
-        .runtime()
-        .lock()
-        .expect("runtime lock should be held");
-    let worker = runtime.engine().scheduler().worker();
-    let summary = worker
-        .last_transfer_summary()
-        .expect("PD prefill request should record transfer summary");
-    assert_eq!(summary.submitted_spans(), 1);
-    assert_eq!(worker.transfer_executor().transferred_rooms(), &[77]);
-
-    drop(runtime);
+    {
+        let runtime = inspected_service
+            .runtime()
+            .lock()
+            .expect("runtime lock should be held");
+        let worker = runtime.engine().scheduler().worker();
+        let summary = worker
+            .last_transfer_summary()
+            .expect("PD prefill request should record transfer summary");
+        assert_eq!(summary.submitted_spans(), 1);
+        assert_eq!(worker.transfer_executor().transferred_rooms(), &[77]);
+    }
     shutdown_tx
         .send(())
         .expect("server should still be running");
@@ -2211,18 +2211,18 @@ async fn http_prefill_server_accepts_batched_disaggregated_token_generate_reques
     assert_eq!(generated[0]["usage"]["prompt_tokens"], 3);
     assert_eq!(generated[1]["usage"]["prompt_tokens"], 2);
 
-    let runtime = inspected_service
-        .runtime()
-        .lock()
-        .expect("runtime lock should be held");
-    let worker = runtime.engine().scheduler().worker();
-    let summary = worker
-        .last_transfer_summary()
-        .expect("PD prefill batch should record transfer summary");
-    assert_eq!(summary.submitted_spans(), 2);
-    assert_eq!(worker.transfer_executor().transferred_rooms(), &[77, 78]);
-
-    drop(runtime);
+    {
+        let runtime = inspected_service
+            .runtime()
+            .lock()
+            .expect("runtime lock should be held");
+        let worker = runtime.engine().scheduler().worker();
+        let summary = worker
+            .last_transfer_summary()
+            .expect("PD prefill batch should record transfer summary");
+        assert_eq!(summary.submitted_spans(), 2);
+        assert_eq!(worker.transfer_executor().transferred_rooms(), &[77, 78]);
+    }
     shutdown_tx
         .send(())
         .expect("server should still be running");
@@ -2280,18 +2280,18 @@ async fn http_prefill_server_accepts_batched_disaggregated_text_generate_request
     assert_eq!(generated[0]["text"], " ");
     assert_eq!(generated[1]["text"], " ");
 
-    let runtime = inspected_service
-        .runtime()
-        .lock()
-        .expect("runtime lock should be held");
-    let worker = runtime.engine().scheduler().worker();
-    let summary = worker
-        .last_transfer_summary()
-        .expect("PD prefill text batch should record transfer summary");
-    assert_eq!(summary.submitted_spans(), 2);
-    assert_eq!(worker.transfer_executor().transferred_rooms(), &[87, 88]);
-
-    drop(runtime);
+    {
+        let runtime = inspected_service
+            .runtime()
+            .lock()
+            .expect("runtime lock should be held");
+        let worker = runtime.engine().scheduler().worker();
+        let summary = worker
+            .last_transfer_summary()
+            .expect("PD prefill text batch should record transfer summary");
+        assert_eq!(summary.submitted_spans(), 2);
+        assert_eq!(worker.transfer_executor().transferred_rooms(), &[87, 88]);
+    }
     shutdown_tx
         .send(())
         .expect("server should still be running");
@@ -2355,18 +2355,18 @@ async fn http_prefill_server_accepts_batched_disaggregated_openai_completions() 
     assert_eq!(completion["usage"]["prompt_tokens"], 5);
     assert_eq!(completion["usage"]["completion_tokens"], 2);
 
-    let runtime = inspected_service
-        .runtime()
-        .lock()
-        .expect("runtime lock should be held");
-    let worker = runtime.engine().scheduler().worker();
-    let summary = worker
-        .last_transfer_summary()
-        .expect("PD prefill completion batch should record transfer summary");
-    assert_eq!(summary.submitted_spans(), 2);
-    assert_eq!(worker.transfer_executor().transferred_rooms(), &[97, 98]);
-
-    drop(runtime);
+    {
+        let runtime = inspected_service
+            .runtime()
+            .lock()
+            .expect("runtime lock should be held");
+        let worker = runtime.engine().scheduler().worker();
+        let summary = worker
+            .last_transfer_summary()
+            .expect("PD prefill completion batch should record transfer summary");
+        assert_eq!(summary.submitted_spans(), 2);
+        assert_eq!(worker.transfer_executor().transferred_rooms(), &[97, 98]);
+    }
     shutdown_tx
         .send(())
         .expect("server should still be running");
@@ -2432,18 +2432,18 @@ async fn http_prefill_server_accepts_batched_disaggregated_chat_completions() {
     assert_eq!(completion["usage"]["prompt_tokens"], 4);
     assert_eq!(completion["usage"]["completion_tokens"], 2);
 
-    let runtime = inspected_service
-        .runtime()
-        .lock()
-        .expect("runtime lock should be held");
-    let worker = runtime.engine().scheduler().worker();
-    let summary = worker
-        .last_transfer_summary()
-        .expect("PD prefill chat batch should record transfer summary");
-    assert_eq!(summary.submitted_spans(), 2);
-    assert_eq!(worker.transfer_executor().transferred_rooms(), &[107, 108]);
-
-    drop(runtime);
+    {
+        let runtime = inspected_service
+            .runtime()
+            .lock()
+            .expect("runtime lock should be held");
+        let worker = runtime.engine().scheduler().worker();
+        let summary = worker
+            .last_transfer_summary()
+            .expect("PD prefill chat batch should record transfer summary");
+        assert_eq!(summary.submitted_spans(), 2);
+        assert_eq!(worker.transfer_executor().transferred_rooms(), &[107, 108]);
+    }
     shutdown_tx
         .send(())
         .expect("server should still be running");
@@ -2667,24 +2667,24 @@ async fn mooncake_prefill_http_uses_bootstrap_kv_layout_for_transfer() {
     assert_eq!(generated["request_id"], "http-pd-mooncake-prefill");
     assert_eq!(generated["usage"]["completion_tokens"], 2);
 
-    let runtime = inspected_service
-        .runtime()
-        .lock()
-        .expect("runtime lock should be held");
-    let worker = runtime.engine().scheduler().worker();
-    let submitted_requests = &worker
-        .transfer_executor()
-        .inner()
-        .submitter()
-        .submitted_requests;
-    assert_eq!(submitted_requests.len(), 1);
-    assert_eq!(submitted_requests[0].len(), 2);
-    assert_eq!(submitted_requests[0][0].target_id, 7);
-    assert_eq!(submitted_requests[0][0].target_offset, 0x9000 + 4 * 128);
-    assert_eq!(submitted_requests[0][1].target_id, 7);
-    assert_eq!(submitted_requests[0][1].target_offset, 0x9000 + 5 * 128);
-
-    drop(runtime);
+    {
+        let runtime = inspected_service
+            .runtime()
+            .lock()
+            .expect("runtime lock should be held");
+        let worker = runtime.engine().scheduler().worker();
+        let submitted_requests = &worker
+            .transfer_executor()
+            .inner()
+            .submitter()
+            .submitted_requests;
+        assert_eq!(submitted_requests.len(), 1);
+        assert_eq!(submitted_requests[0].len(), 2);
+        assert_eq!(submitted_requests[0][0].target_id, 7);
+        assert_eq!(submitted_requests[0][0].target_offset, 0x9000 + 4 * 128);
+        assert_eq!(submitted_requests[0][1].target_id, 7);
+        assert_eq!(submitted_requests[0][1].target_offset, 0x9000 + 5 * 128);
+    }
     shutdown_tx
         .send(())
         .expect("server should still be running");
@@ -3067,7 +3067,7 @@ fn write_minimal_safetensors_file(path: &Path) {
 }
 
 fn write_safetensors_weight_values(path: &Path, values: &[f32]) {
-    let byte_len = values.len() * std::mem::size_of::<f32>();
+    let byte_len = std::mem::size_of_val(values);
     let header = format!(
         r#"{{"model.embed_tokens.weight":{{"dtype":"F32","shape":[{}],"data_offsets":[0,{}]}}}}"#,
         values.len(),

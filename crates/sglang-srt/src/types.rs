@@ -13,7 +13,7 @@ impl From<&str> for RequestId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct SamplingParams {
     pub max_new_tokens: usize,
     pub temperature: Option<f32>,
@@ -29,20 +29,6 @@ impl SamplingParams {
         Self {
             max_new_tokens,
             ..Self::default()
-        }
-    }
-}
-
-impl Default for SamplingParams {
-    fn default() -> Self {
-        Self {
-            max_new_tokens: 0,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            min_p: None,
-            stop_token_ids: Vec::new(),
-            ignore_eos: false,
         }
     }
 }

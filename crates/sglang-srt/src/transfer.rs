@@ -332,7 +332,7 @@ impl KvCacheModelLayout {
         qk_nope_head_dim: usize,
         qk_rope_head_dim: usize,
     ) -> Result<Self, PdConfigError> {
-        if qk_nope_head_dim % 64 != 0 {
+        if !qk_nope_head_dim.is_multiple_of(64) {
             return Err(PdConfigError::InvalidModelConfig(format!(
                 "qk_nope_head_dim must be divisible by 64 for DeepSeek V4 packed KV layout: {qk_nope_head_dim}"
             )));
@@ -2040,7 +2040,7 @@ impl TransferableKvCacheMemory {
                 "transferable KV memory must expose at least one region".to_string(),
             ));
         }
-        if page_size_bytes % regions.len() != 0 {
+        if !page_size_bytes.is_multiple_of(regions.len()) {
             return Err(KvCacheTransferError::Runtime(format!(
                 "transferable KV memory page size {page_size_bytes} must be divisible by {} regions",
                 regions.len()

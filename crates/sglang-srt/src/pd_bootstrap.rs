@@ -158,13 +158,17 @@ pub struct PrefillBootstrapState {
     kv_cache_dtype: Option<String>,
     follow_bootstrap_room: Option<bool>,
     registered_count: usize,
-    prefill_port_table:
-        BTreeMap<usize, BTreeMap<usize, BTreeMap<usize, BTreeMap<usize, PrefillRankInfo>>>>,
+    prefill_port_table: PrefillPortTable,
     room_to_dp_rank: BTreeMap<BootstrapRoom, RegisteredDpRank>,
     decode_kv_args_table: BTreeMap<String, MooncakeKvArgsRegisterInfo>,
     decode_kv_args_registration_count: usize,
     transfer_rooms: BTreeMap<BootstrapRoom, MooncakeTransferRoom>,
 }
+
+type PrefillPpRankTable = BTreeMap<usize, PrefillRankInfo>;
+type PrefillTpRankTable = BTreeMap<usize, PrefillPpRankTable>;
+type PrefillCpRankTable = BTreeMap<usize, PrefillTpRankTable>;
+type PrefillPortTable = BTreeMap<usize, PrefillCpRankTable>;
 
 impl PrefillBootstrapState {
     pub fn ingest_mooncake_bootstrap_frame(
@@ -271,13 +275,11 @@ impl PrefillBootstrapState {
                 registration.system_dp_size
             });
         self.pp_size.get_or_insert(registration.pp_size);
-        if registration.page_size.is_some() {
-            self.page_size
-                .get_or_insert(registration.page_size.unwrap());
+        if let Some(page_size) = registration.page_size {
+            self.page_size.get_or_insert(page_size);
         }
-        if registration.kv_cache_dtype.is_some() {
-            self.kv_cache_dtype
-                .get_or_insert_with(|| registration.kv_cache_dtype.clone().unwrap());
+        if let Some(kv_cache_dtype) = registration.kv_cache_dtype.clone() {
+            self.kv_cache_dtype.get_or_insert(kv_cache_dtype);
         }
         self.follow_bootstrap_room.get_or_insert_with(|| {
             registration
@@ -1039,24 +1041,22 @@ where
     }
 
     tokio::pin!(shutdown);
-    loop {
-        tokio::select! {
-            _ = &mut shutdown => {
-                let _ = shutdown_tx.send(true);
-                join_mooncake_zmq_tasks(tasks).await?;
-                return Ok(());
-            }
-            result = tasks.join_next(), if !tasks.is_empty() => {
-                let _ = shutdown_tx.send(true);
-                join_mooncake_zmq_tasks(tasks).await?;
-                match result {
-                    Some(Ok(Ok(()))) => return Ok(()),
-                    Some(Ok(Err(error))) => return Err(error),
-                    Some(Err(error)) => {
-                        return Err(PrefillBootstrapServeError::Zmq(error.to_string()));
-                    }
-                    None => return Ok(()),
+    tokio::select! {
+        _ = &mut shutdown => {
+            let _ = shutdown_tx.send(true);
+            join_mooncake_zmq_tasks(tasks).await?;
+            Ok(())
+        }
+        result = tasks.join_next(), if !tasks.is_empty() => {
+            let _ = shutdown_tx.send(true);
+            join_mooncake_zmq_tasks(tasks).await?;
+            match result {
+                Some(Ok(Ok(()))) => Ok(()),
+                Some(Ok(Err(error))) => Err(error),
+                Some(Err(error)) => {
+                    Err(PrefillBootstrapServeError::Zmq(error.to_string()))
                 }
+                None => Ok(()),
             }
         }
     }
@@ -1588,7 +1588,7 @@ fn unpack_fixed_width<T, F>(
 where
     F: Fn(&[u8]) -> T,
 {
-    if bytes.len() % width != 0 {
+    if !bytes.len().is_multiple_of(width) {
         return Err(MooncakeBootstrapFrameError::BinaryLength {
             field,
             width,

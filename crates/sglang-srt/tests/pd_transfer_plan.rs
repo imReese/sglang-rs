@@ -1115,7 +1115,7 @@ fn engine_token_generation_waits_when_pd_decode_kv_is_not_ready() {
     );
     let scheduler =
         Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(3));
-    let mut engine = Engine::new(ByteTokenizer::default(), scheduler);
+    let mut engine = Engine::new(ByteTokenizer, scheduler);
 
     let error = engine
         .generate_tokens(TokenGenerateRequest {
@@ -1153,7 +1153,7 @@ fn engine_poll_transfers_updates_registry_and_unblocks_decode_dispatch() {
     );
     let scheduler =
         Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(3));
-    let mut engine = Engine::new(ByteTokenizer::default(), scheduler);
+    let mut engine = Engine::new(ByteTokenizer, scheduler);
 
     let error = engine
         .generate_tokens(TokenGenerateRequest {
@@ -1202,7 +1202,7 @@ fn engine_token_generation_can_poll_transfer_and_continue_decode() {
     );
     let scheduler =
         Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(3));
-    let mut engine = Engine::new(ByteTokenizer::default(), scheduler);
+    let mut engine = Engine::new(ByteTokenizer, scheduler);
 
     let output = engine
         .generate_tokens_with_transfer_polling(
@@ -1242,7 +1242,7 @@ fn router_runtime_poll_transfers_exposes_control_plane_counts() {
     );
     let scheduler =
         Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(3));
-    let engine = Engine::new(ByteTokenizer::default(), scheduler);
+    let engine = Engine::new(ByteTokenizer, scheduler);
     let mut runtime = RouterRuntime::new(engine);
 
     let error = runtime
@@ -1308,7 +1308,7 @@ fn router_runtime_stream_can_poll_transfer_and_continue_decode() {
     );
     let scheduler =
         Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(3));
-    let engine = Engine::new(ByteTokenizer::default(), scheduler);
+    let engine = Engine::new(ByteTokenizer, scheduler);
     let mut runtime = RouterRuntime::new(engine);
 
     let responses = runtime

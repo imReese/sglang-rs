@@ -658,7 +658,7 @@ async fn bootstrap_grpc_router_service_generates_from_local_fp8_safetensors_weig
             ("lm_head.weight", "F8_E4M3", &[3, 2], [6, 12]),
             ("lm_head.weight_scale_inv", "F32", &[3], [12, 24]),
         ],
-        &[
+        [
             0x00, 0x00, // [UNK]
             0x38, 0x00, // hello
             0x00, 0x38, // world

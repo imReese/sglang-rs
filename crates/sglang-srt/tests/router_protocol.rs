@@ -758,7 +758,7 @@ fn router_model_info_uses_sglang_server_args_for_worker_registration() {
 
 #[test]
 fn router_runtime_executes_generate_request_through_engine() {
-    let tokenizer = ByteTokenizer::default();
+    let tokenizer = ByteTokenizer;
     let scheduler = Scheduler::new(RouterEchoWorker::default());
     let engine = Engine::new(tokenizer, scheduler);
     let mut runtime = RouterRuntime::new(engine);
@@ -802,7 +802,7 @@ fn router_runtime_executes_generate_request_through_engine() {
 
 #[test]
 fn router_runtime_reports_prefix_cache_hits_as_cached_tokens() {
-    let tokenizer = ByteTokenizer::default();
+    let tokenizer = ByteTokenizer;
     let scheduler = Scheduler::with_cache_resources(
         RouterEchoWorker::default(),
         RadixCache::default(),
@@ -864,7 +864,7 @@ fn router_runtime_reports_prefix_cache_hits_as_cached_tokens() {
 
 #[test]
 fn router_runtime_rejects_invalid_request_before_engine_dispatch() {
-    let tokenizer = ByteTokenizer::default();
+    let tokenizer = ByteTokenizer;
     let scheduler = Scheduler::new(RouterEchoWorker::default());
     let engine = Engine::new(tokenizer, scheduler);
     let mut runtime = RouterRuntime::with_validation_config(
@@ -913,7 +913,7 @@ fn router_runtime_rejects_invalid_request_before_engine_dispatch() {
 
 #[test]
 fn router_runtime_pause_generation_rejects_valid_requests_before_dispatch() {
-    let tokenizer = ByteTokenizer::default();
+    let tokenizer = ByteTokenizer;
     let scheduler = Scheduler::new(RouterEchoWorker::default());
     let engine = Engine::new(tokenizer, scheduler);
     let mut runtime = RouterRuntime::new(engine);
@@ -986,7 +986,7 @@ fn router_runtime_pause_generation_rejects_valid_requests_before_dispatch() {
 
 #[test]
 fn router_runtime_abort_request_removes_queued_request() {
-    let tokenizer = ByteTokenizer::default();
+    let tokenizer = ByteTokenizer;
     let mut scheduler = Scheduler::new(RouterEchoWorker::default());
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("abort-me"),
@@ -1021,7 +1021,7 @@ fn router_runtime_abort_request_removes_queued_request() {
 
 #[test]
 fn router_runtime_abort_all_requests_removes_all_queued_requests() {
-    let tokenizer = ByteTokenizer::default();
+    let tokenizer = ByteTokenizer;
     let mut scheduler = Scheduler::new(RouterEchoWorker::default());
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("abort-a"),
@@ -1045,7 +1045,7 @@ fn router_runtime_abort_all_requests_removes_all_queued_requests() {
 
 #[test]
 fn router_runtime_reports_running_request_limit_as_resource_exhausted_without_queuing_request() {
-    let tokenizer = ByteTokenizer::default();
+    let tokenizer = ByteTokenizer;
     let mut scheduler =
         Scheduler::new(AlwaysUnfinishedRouterWorker).with_max_running_requests(Some(1));
     scheduler.enqueue(ScheduledRequest::new(
@@ -1098,7 +1098,7 @@ fn router_runtime_reports_running_request_limit_as_resource_exhausted_without_qu
 
 #[test]
 fn router_runtime_streams_prefill_chunks_and_final_complete_response() {
-    let tokenizer = ByteTokenizer::default();
+    let tokenizer = ByteTokenizer;
     let scheduler = Scheduler::new(TwoStepRouterWorker::default());
     let engine = Engine::new(tokenizer, scheduler);
     let mut runtime = RouterRuntime::new(engine);
@@ -1160,7 +1160,7 @@ fn router_runtime_streams_prefill_chunks_and_final_complete_response() {
 
 #[test]
 fn router_runtime_non_stream_generate_returns_only_final_complete_response() {
-    let tokenizer = ByteTokenizer::default();
+    let tokenizer = ByteTokenizer;
     let scheduler = Scheduler::new(TwoStepRouterWorker::default());
     let engine = Engine::new(tokenizer, scheduler);
     let mut runtime = RouterRuntime::new(engine);
@@ -1209,7 +1209,7 @@ fn router_runtime_non_stream_generate_returns_only_final_complete_response() {
 
 #[test]
 fn router_runtime_text_generate_tokenizes_prompt_and_decodes_output_text() {
-    let tokenizer = ByteTokenizer::default();
+    let tokenizer = ByteTokenizer;
     let scheduler = Scheduler::new(RouterEchoWorker::default());
     let engine = Engine::new(tokenizer, scheduler);
     let mut runtime = RouterRuntime::new(engine);
@@ -1252,7 +1252,7 @@ fn router_runtime_text_generate_tokenizes_prompt_and_decodes_output_text() {
 
 #[test]
 fn router_runtime_text_generate_rejects_empty_text_before_dispatch() {
-    let tokenizer = ByteTokenizer::default();
+    let tokenizer = ByteTokenizer;
     let scheduler = Scheduler::new(RouterEchoWorker::default());
     let engine = Engine::new(tokenizer, scheduler);
     let mut runtime = RouterRuntime::new(engine);
@@ -1285,7 +1285,7 @@ fn router_runtime_text_generate_rejects_empty_text_before_dispatch() {
 
 #[test]
 fn router_runtime_flush_cache_calls_scheduler_and_reports_success() {
-    let tokenizer = ByteTokenizer::default();
+    let tokenizer = ByteTokenizer;
     let scheduler = Scheduler::with_cache_resources(
         RouterEchoWorker::default(),
         RadixCache::default(),
@@ -1334,7 +1334,7 @@ fn router_runtime_flush_cache_calls_scheduler_and_reports_success() {
 
 #[test]
 fn router_runtime_flush_cache_reports_failure_when_decode_requests_are_active() {
-    let tokenizer = ByteTokenizer::default();
+    let tokenizer = ByteTokenizer;
     let mut scheduler = Scheduler::with_cache_resources(
         AlwaysUnfinishedRouterWorker,
         RadixCache::default(),
@@ -1364,7 +1364,7 @@ fn router_runtime_flush_cache_reports_failure_when_decode_requests_are_active() 
 
 #[test]
 fn router_runtime_update_weights_from_disk_calls_worker_reload_hook() {
-    let tokenizer = ByteTokenizer::default();
+    let tokenizer = ByteTokenizer;
     let scheduler = Scheduler::new(RecordingWeightUpdateWorker::default());
     let engine = Engine::new(tokenizer, scheduler);
     let mut runtime = RouterRuntime::new(engine);
@@ -1389,7 +1389,7 @@ fn router_runtime_update_weights_from_disk_calls_worker_reload_hook() {
 
 #[test]
 fn router_runtime_update_weights_from_disk_rejects_when_requests_are_queued() {
-    let tokenizer = ByteTokenizer::default();
+    let tokenizer = ByteTokenizer;
     let mut scheduler = Scheduler::new(RecordingWeightUpdateWorker::default());
     scheduler.enqueue(ScheduledRequest::new(
         RequestId::from("queued"),

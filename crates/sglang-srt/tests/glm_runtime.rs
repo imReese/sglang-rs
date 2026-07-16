@@ -1455,7 +1455,7 @@ fn write_glm_moe_dsa_rope_attention_fixture(model_dir: &Path) {
     let mut payload = Vec::new();
     for (name, shape, values) in tensors {
         let start = cursor;
-        for value in values.into_iter().map(|value| value as f32) {
+        for value in values {
             payload.extend_from_slice(&value.to_le_bytes());
             cursor += 4;
         }

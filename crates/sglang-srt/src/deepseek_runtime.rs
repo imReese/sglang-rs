@@ -1488,7 +1488,7 @@ impl DeepSeekV4ForwardPlan {
             .map(|params| params.as_ref().map(|params| params.bootstrap_room))
             .collect::<Vec<_>>();
         let mut request_spans = Vec::with_capacity(batch.request_ids().len());
-        for request_index in 0..batch.request_ids().len() {
+        for (request_index, bootstrap_room) in bootstrap_rooms.iter().copied().enumerate() {
             let token_start = batch.request_offsets()[request_index];
             let token_count = batch.input_token_counts()[request_index];
             let token_end = token_start + token_count;
@@ -1503,7 +1503,7 @@ impl DeepSeekV4ForwardPlan {
                 prefix_cache_pages: batch.prefix_cache_pages()[request_index].clone(),
                 out_cache_pages,
                 data_parallel_rank: batch.data_parallel_ranks()[request_index],
-                bootstrap_room: bootstrap_rooms[request_index],
+                bootstrap_room,
             });
         }
 

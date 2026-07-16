@@ -41,10 +41,10 @@ pub(crate) fn parse_rerank_request(
             .ok_or_else(|| "missing query".to_string())?,
         "query",
     )?;
-    if let Some(instruct) = payload.get("instruct").and_then(Value::as_str) {
-        if !instruct.trim().is_empty() {
-            query = format!("{instruct}\n{query}");
-        }
+    if let Some(instruct) = payload.get("instruct").and_then(Value::as_str)
+        && !instruct.trim().is_empty()
+    {
+        query = format!("{instruct}\n{query}");
     }
     if query.trim().is_empty() {
         return Err("Query cannot be empty or whitespace only".to_string());
@@ -151,11 +151,11 @@ fn rerank_content_to_text(value: &Value, field: &'static str) -> Result<String, 
                     Value::String(text) => texts.push(text.clone()),
                     Value::Object(object) => {
                         let content_type = object.get("type").and_then(Value::as_str);
-                        if content_type.is_none_or(|kind| kind == "text") {
-                            if let Some(text) = object.get("text").and_then(Value::as_str) {
-                                texts.push(text.to_string());
-                                continue;
-                            }
+                        if content_type.is_none_or(|kind| kind == "text")
+                            && let Some(text) = object.get("text").and_then(Value::as_str)
+                        {
+                            texts.push(text.to_string());
+                            continue;
                         }
                         return Err(format!(
                             "{field} only supports text content in the Rust rerank worker"

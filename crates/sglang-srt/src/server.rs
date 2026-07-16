@@ -68,8 +68,8 @@ pub enum BootstrapForwardModel {
     Space,
     CpuEmbeddingLm(CpuEmbeddingLmModel),
     CudaEmbeddingLm(Box<CudaEmbeddingLmModel>),
-    DeepSeekV4(DeepSeekV4LoadedTensorParallelRuntime),
-    GlmMoeDsa(GlmMoeDsaF32CachedForwardModel),
+    DeepSeekV4(Box<DeepSeekV4LoadedTensorParallelRuntime>),
+    GlmMoeDsa(Box<GlmMoeDsaF32CachedForwardModel>),
     UnsupportedLocalModelRuntime {
         model_path: PathBuf,
         model_type: Option<String>,
@@ -128,15 +128,15 @@ impl BootstrapForwardModel {
                 Some(model) => Self::CpuEmbeddingLm(model),
                 None if artifacts.config().model_type.as_deref() == Some("deepseek_v4") => {
                     let runtime = DeepSeekV4Runtime::from_local_model_artifacts(artifacts)?;
-                    Self::DeepSeekV4(runtime.load_tensor_parallel_shards(tp_size)?)
+                    Self::DeepSeekV4(Box::new(runtime.load_tensor_parallel_shards(tp_size)?))
                 }
                 None if artifacts.config().model_type.as_deref() == Some("glm_moe_dsa") => {
                     let runtime = GlmMoeDsaRuntime::from_local_model_artifacts(artifacts)?;
-                    Self::GlmMoeDsa(GlmMoeDsaF32CachedForwardModel::new(
+                    Self::GlmMoeDsa(Box::new(GlmMoeDsaF32CachedForwardModel::new(
                         runtime
                             .load_tensor_parallel_shards(tp_size)?
                             .decode_f32_tensor_parallel_shards()?,
-                    ))
+                    )))
                 }
                 None => Self::UnsupportedLocalModelRuntime {
                     model_path: artifacts.model_path().to_path_buf(),
@@ -763,19 +763,18 @@ fn http_server_info_from_args(args: &ServerArgs) -> HttpServerInfo {
         kv_cache: None,
     };
 
-    if let Some(ports) = args.disaggregation_zmq_ports {
-        if let (Ok(block_size), Ok(dp_size)) =
+    if let Some(ports) = args.disaggregation_zmq_ports
+        && let (Ok(block_size), Ok(dp_size)) =
             (u32::try_from(args.page_size), u32::try_from(args.dp_size))
-        {
-            server_info.kv_events = Some(HttpKvEventsInfo {
-                publisher: "zmq".to_string(),
-                endpoint_host: prefill_mooncake_route_rank_ip(args),
-                endpoint_port_base: ports.start,
-                topic: String::new(),
-                block_size,
-                dp_size,
-            });
-        }
+    {
+        server_info.kv_events = Some(HttpKvEventsInfo {
+            publisher: "zmq".to_string(),
+            endpoint_host: prefill_mooncake_route_rank_ip(args),
+            endpoint_port_base: ports.start,
+            topic: String::new(),
+            block_size,
+            dp_size,
+        });
     }
 
     server_info.kv_cache = http_kv_cache_info_from_args(args);
@@ -851,10 +850,10 @@ pub fn register_prefill_mooncake_routes_from_args(
 }
 
 fn prefill_mooncake_route_rank_ip(args: &ServerArgs) -> String {
-    if is_wildcard_host(&args.host) {
-        if let Some(dist_init_host) = args.dist_init_addr.as_deref().and_then(host_from_addr) {
-            return dist_init_host.to_string();
-        }
+    if is_wildcard_host(&args.host)
+        && let Some(dist_init_host) = args.dist_init_addr.as_deref().and_then(host_from_addr)
+    {
+        return dist_init_host.to_string();
     }
     args.host.clone()
 }
@@ -1867,11 +1866,13 @@ where
             serve_prefill_http_and_bootstrap(
                 addr,
                 service,
-                bootstrap_addr,
-                bootstrap_service,
-                engine_info_addr,
-                engine_info_service,
-                zmq_endpoints,
+                PrefillHttpBootstrapServices {
+                    prefill_addr: bootstrap_addr,
+                    prefill_service: bootstrap_service,
+                    engine_info_addr,
+                    engine_info_service,
+                    zmq_endpoints,
+                },
                 shutdown,
             )
             .await?;
@@ -1944,14 +1945,18 @@ where
     }
 }
 
-async fn serve_prefill_http_and_bootstrap<T, W, F>(
-    http_addr: SocketAddr,
-    http_service: HttpRouterService<T, W>,
-    bootstrap_addr: SocketAddr,
-    bootstrap_service: PrefillBootstrapService,
+struct PrefillHttpBootstrapServices {
+    prefill_addr: SocketAddr,
+    prefill_service: PrefillBootstrapService,
     engine_info_addr: SocketAddr,
     engine_info_service: EngineInfoBootstrapService,
     zmq_endpoints: Vec<String>,
+}
+
+async fn serve_prefill_http_and_bootstrap<T, W, F>(
+    http_addr: SocketAddr,
+    http_service: HttpRouterService<T, W>,
+    bootstrap: PrefillHttpBootstrapServices,
     shutdown: F,
 ) -> Result<(), ServerLaunchError>
 where
@@ -1967,10 +1972,10 @@ where
     ));
     let mut bootstrap_tasks = tokio::task::JoinSet::new();
     let prefill_shutdown_rx = shutdown_rx.clone();
-    let prefill_bootstrap_service = bootstrap_service.clone();
+    let prefill_bootstrap_service = bootstrap.prefill_service.clone();
     bootstrap_tasks.spawn(async move {
         serve_prefill_bootstrap_with_shutdown(
-            bootstrap_addr,
+            bootstrap.prefill_addr,
             prefill_bootstrap_service,
             watch_shutdown(prefill_shutdown_rx),
         )
@@ -1980,18 +1985,18 @@ where
     let engine_info_shutdown_rx = shutdown_rx.clone();
     bootstrap_tasks.spawn(async move {
         serve_engine_info_bootstrap_with_shutdown(
-            engine_info_addr,
-            engine_info_service,
+            bootstrap.engine_info_addr,
+            bootstrap.engine_info_service,
             watch_shutdown(engine_info_shutdown_rx),
         )
         .await
         .map_err(ServerLaunchError::from)
     });
-    if !zmq_endpoints.is_empty() {
+    if !bootstrap.zmq_endpoints.is_empty() {
         bootstrap_tasks.spawn(async move {
             serve_mooncake_bootstrap_zmq_endpoints_with_shutdown(
-                zmq_endpoints,
-                bootstrap_service,
+                bootstrap.zmq_endpoints,
+                bootstrap.prefill_service,
                 watch_shutdown(shutdown_rx),
             )
             .await

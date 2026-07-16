@@ -379,23 +379,23 @@ fn validate_token_budget(
     max_new_tokens: usize,
     validation_config: RouterValidationConfig,
 ) -> Result<(), RouterProtocolError> {
-    if let Some(max_request_input_tokens) = validation_config.max_request_input_tokens {
-        if input_tokens > max_request_input_tokens {
-            return Err(RouterProtocolError::InputTooLong {
-                input_tokens,
-                max_request_input_tokens,
-            });
-        }
+    if let Some(max_request_input_tokens) = validation_config.max_request_input_tokens
+        && input_tokens > max_request_input_tokens
+    {
+        return Err(RouterProtocolError::InputTooLong {
+            input_tokens,
+            max_request_input_tokens,
+        });
     }
 
-    if let Some(max_context_tokens) = validation_config.max_context_tokens {
-        if input_tokens.saturating_add(max_new_tokens) > max_context_tokens {
-            return Err(RouterProtocolError::ContextOverflow {
-                input_tokens,
-                max_new_tokens,
-                max_context_tokens,
-            });
-        }
+    if let Some(max_context_tokens) = validation_config.max_context_tokens
+        && input_tokens.saturating_add(max_new_tokens) > max_context_tokens
+    {
+        return Err(RouterProtocolError::ContextOverflow {
+            input_tokens,
+            max_new_tokens,
+            max_context_tokens,
+        });
     }
 
     Ok(())
@@ -607,10 +607,10 @@ impl RouterGetModelInfoResponse {
         if let Ok(config) = HfModelConfig::from_model_path(&args.model_path) {
             response.apply_model_config(config);
         }
-        if let Ok(artifacts) = LocalModelArtifacts::from_model_path(&args.model_path) {
-            if let Ok(coverage) = artifacts.validate_routed_expert_checkpoint_coverage() {
-                response.apply_routed_expert_checkpoint_coverage(coverage);
-            }
+        if let Ok(artifacts) = LocalModelArtifacts::from_model_path(&args.model_path)
+            && let Ok(coverage) = artifacts.validate_routed_expert_checkpoint_coverage()
+        {
+            response.apply_routed_expert_checkpoint_coverage(coverage);
         }
 
         response

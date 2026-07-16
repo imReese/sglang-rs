@@ -527,7 +527,7 @@ fn request_batch_size(obj: &serde_json::Map<String, serde_json::Value>) -> Optio
         }
     }
     if let Some(items) = obj.get("input_ids").and_then(serde_json::Value::as_array) {
-        if items.first().map_or(true, serde_json::Value::is_array) {
+        if items.first().is_none_or(serde_json::Value::is_array) {
             return Some(items.len());
         }
     }

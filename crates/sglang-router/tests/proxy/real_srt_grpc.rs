@@ -5,7 +5,7 @@
 //! a `grpc://` worker, not only register it.
 
 use std::fs;
-use std::mem::size_of;
+use std::mem::size_of_val;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -115,7 +115,7 @@ fn write_embedding_lm_artifacts_with_weight_values(model_dir: &std::path::Path, 
 }"#,
     )
     .expect("config should be written");
-    let byte_len = values.len() * size_of::<f32>();
+    let byte_len = size_of_val(values);
     let header = format!(
         r#"{{"model.embed_tokens.weight":{{"dtype":"F32","shape":[3,1],"data_offsets":[0,{byte_len}]}},"lm_head.weight":{{"dtype":"F32","shape":[3,1],"data_offsets":[{byte_len},{}]}}}}"#,
         byte_len * 2

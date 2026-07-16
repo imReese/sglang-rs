@@ -1120,7 +1120,7 @@ impl HfModelConfig {
     }
 
     fn from_resolved_config_path(config_path: &Path) -> Result<Self, ModelArtifactError> {
-        let raw = fs::read_to_string(&config_path).map_err(|error| {
+        let raw = fs::read_to_string(config_path).map_err(|error| {
             ModelArtifactError::ReadModelConfig {
                 path: config_path.to_path_buf(),
                 message: error.to_string(),
@@ -1135,36 +1135,36 @@ impl HfModelConfig {
         Ok(Self {
             model_type: read_string_field(&value, "model_type"),
             architectures: read_string_array_field(&value, "architectures"),
-            eos_token_ids: read_u32_or_array_field(&value, "eos_token_id", &config_path)?,
-            vocab_size: read_usize_field(&value, "vocab_size", &config_path)?,
+            eos_token_ids: read_u32_or_array_field(&value, "eos_token_id", config_path)?,
+            vocab_size: read_usize_field(&value, "vocab_size", config_path)?,
             max_position_embeddings: read_usize_field(
                 &value,
                 "max_position_embeddings",
-                &config_path,
+                config_path,
             )?,
-            num_hidden_layers: read_usize_field(&value, "num_hidden_layers", &config_path)?,
-            hidden_size: read_usize_field(&value, "hidden_size", &config_path)?,
-            intermediate_size: read_usize_field(&value, "intermediate_size", &config_path)?,
-            moe_intermediate_size: read_usize_field(&value, "moe_intermediate_size", &config_path)?,
-            n_routed_experts: read_usize_field(&value, "n_routed_experts", &config_path)?,
-            n_shared_experts: read_usize_field(&value, "n_shared_experts", &config_path)?,
-            num_experts_per_tok: read_usize_field(&value, "num_experts_per_tok", &config_path)?,
-            norm_topk_prob: read_bool_field(&value, "norm_topk_prob", &config_path)?,
-            routed_scaling_factor: read_f64_field(&value, "routed_scaling_factor", &config_path)?,
-            first_k_dense_replace: read_usize_field(&value, "first_k_dense_replace", &config_path)?,
-            moe_layer_freq: read_usize_field(&value, "moe_layer_freq", &config_path)?,
-            hc_mult: read_usize_field(&value, "hc_mult", &config_path)?,
-            hc_sinkhorn_iters: read_usize_field(&value, "hc_sinkhorn_iters", &config_path)?,
-            rms_norm_eps: read_f64_field(&value, "rms_norm_eps", &config_path)?,
-            rope_theta: read_f64_field(&value, "rope_theta", &config_path)?,
-            hc_eps: read_f64_field(&value, "hc_eps", &config_path)?,
-            tie_word_embeddings: read_bool_field(&value, "tie_word_embeddings", &config_path)?,
-            num_attention_heads: read_usize_field(&value, "num_attention_heads", &config_path)?,
-            num_key_value_heads: read_usize_field(&value, "num_key_value_heads", &config_path)?,
-            head_dim: read_usize_field(&value, "head_dim", &config_path)?,
-            qk_nope_head_dim: read_usize_field(&value, "qk_nope_head_dim", &config_path)?,
-            qk_rope_head_dim: read_usize_field(&value, "qk_rope_head_dim", &config_path)?,
-            v_head_dim: read_usize_field(&value, "v_head_dim", &config_path)?,
+            num_hidden_layers: read_usize_field(&value, "num_hidden_layers", config_path)?,
+            hidden_size: read_usize_field(&value, "hidden_size", config_path)?,
+            intermediate_size: read_usize_field(&value, "intermediate_size", config_path)?,
+            moe_intermediate_size: read_usize_field(&value, "moe_intermediate_size", config_path)?,
+            n_routed_experts: read_usize_field(&value, "n_routed_experts", config_path)?,
+            n_shared_experts: read_usize_field(&value, "n_shared_experts", config_path)?,
+            num_experts_per_tok: read_usize_field(&value, "num_experts_per_tok", config_path)?,
+            norm_topk_prob: read_bool_field(&value, "norm_topk_prob", config_path)?,
+            routed_scaling_factor: read_f64_field(&value, "routed_scaling_factor", config_path)?,
+            first_k_dense_replace: read_usize_field(&value, "first_k_dense_replace", config_path)?,
+            moe_layer_freq: read_usize_field(&value, "moe_layer_freq", config_path)?,
+            hc_mult: read_usize_field(&value, "hc_mult", config_path)?,
+            hc_sinkhorn_iters: read_usize_field(&value, "hc_sinkhorn_iters", config_path)?,
+            rms_norm_eps: read_f64_field(&value, "rms_norm_eps", config_path)?,
+            rope_theta: read_f64_field(&value, "rope_theta", config_path)?,
+            hc_eps: read_f64_field(&value, "hc_eps", config_path)?,
+            tie_word_embeddings: read_bool_field(&value, "tie_word_embeddings", config_path)?,
+            num_attention_heads: read_usize_field(&value, "num_attention_heads", config_path)?,
+            num_key_value_heads: read_usize_field(&value, "num_key_value_heads", config_path)?,
+            head_dim: read_usize_field(&value, "head_dim", config_path)?,
+            qk_nope_head_dim: read_usize_field(&value, "qk_nope_head_dim", config_path)?,
+            qk_rope_head_dim: read_usize_field(&value, "qk_rope_head_dim", config_path)?,
+            v_head_dim: read_usize_field(&value, "v_head_dim", config_path)?,
         })
     }
 
@@ -1178,7 +1178,9 @@ impl HfModelConfig {
 
         let first_k_dense_replace = self.first_k_dense_replace.unwrap_or(0);
         let moe_layer_freq = self.moe_layer_freq.unwrap_or(1);
-        moe_layer_freq > 0 && layer_id >= first_k_dense_replace && layer_id % moe_layer_freq == 0
+        moe_layer_freq > 0
+            && layer_id >= first_k_dense_replace
+            && layer_id.is_multiple_of(moe_layer_freq)
     }
 
     pub fn moe_layer_ids(&self) -> Vec<usize> {
@@ -2144,7 +2146,7 @@ impl SafetensorsHeader {
             };
             tensors.insert(
                 tensor_name.clone(),
-                parse_tensor_metadata(&path.to_path_buf(), tensor_name, metadata)?,
+                parse_tensor_metadata(path, tensor_name, metadata)?,
             );
         }
 

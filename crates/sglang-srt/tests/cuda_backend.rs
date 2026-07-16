@@ -169,36 +169,41 @@ fn assert_strided_byte_rows(storage: &[u8], row_stride_bytes: usize, expected_ro
     }
 }
 
+struct ReferenceAttentionShape {
+    query_head_count: usize,
+    kv_head_count: usize,
+    head_dim: usize,
+    scale: f32,
+}
+
 fn reference_paged_attention(
     metadata: &CudaPagedAttentionMetadata,
     queries: &[f32],
     keys: &[f32],
     values: &[f32],
-    query_head_count: usize,
-    kv_head_count: usize,
-    head_dim: usize,
-    scale: f32,
+    shape: ReferenceAttentionShape,
 ) -> Vec<f32> {
     let mut output = Vec::with_capacity(queries.len());
-    let query_heads_per_kv_head = query_head_count / kv_head_count;
+    let query_heads_per_kv_head = shape.query_head_count / shape.kv_head_count;
     for query_index in 0..metadata.query_count() {
         let request_index = metadata.query_request_indices()[query_index] as usize;
         let sequence_start = metadata.request_slot_offsets()[request_index] as usize;
         let sequence_length = metadata.query_sequence_lengths()[query_index] as usize;
-        for query_head in 0..query_head_count {
+        for query_head in 0..shape.query_head_count {
             let kv_head = query_head / query_heads_per_kv_head;
-            let query_start = (query_index * query_head_count + query_head) * head_dim;
-            let query = &queries[query_start..query_start + head_dim];
+            let query_start = (query_index * shape.query_head_count + query_head) * shape.head_dim;
+            let query = &queries[query_start..query_start + shape.head_dim];
             let scores = (0..sequence_length)
                 .map(|sequence_index| {
-                    let kv_start =
-                        ((sequence_start + sequence_index) * kv_head_count + kv_head) * head_dim;
+                    let kv_start = ((sequence_start + sequence_index) * shape.kv_head_count
+                        + kv_head)
+                        * shape.head_dim;
                     query
                         .iter()
-                        .zip(&keys[kv_start..kv_start + head_dim])
+                        .zip(&keys[kv_start..kv_start + shape.head_dim])
                         .map(|(query, key)| query * key)
                         .sum::<f32>()
-                        * scale
+                        * shape.scale
                 })
                 .collect::<Vec<_>>();
             let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -207,16 +212,16 @@ fn reference_paged_attention(
                 .map(|score| (score - maximum).exp())
                 .collect::<Vec<_>>();
             let denominator = weights.iter().sum::<f32>();
-            for dimension in 0..head_dim {
+            for dimension in 0..shape.head_dim {
                 output.push(
                     weights
                         .iter()
                         .enumerate()
                         .map(|(sequence_index, weight)| {
-                            let value_index = ((sequence_start + sequence_index) * kv_head_count
-                                + kv_head)
-                                * head_dim
-                                + dimension;
+                            let value_index =
+                                ((sequence_start + sequence_index) * shape.kv_head_count + kv_head)
+                                    * shape.head_dim
+                                    + dimension;
                             weight * values[value_index]
                         })
                         .sum::<f32>()
@@ -665,10 +670,12 @@ fn b200_cuda_bf16_paged_attention_reads_mooncake_registered_physical_kv_slots() 
         &quantized_queries,
         &quantized_keys,
         &quantized_values,
-        query_head_count,
-        runtime.kv_heads,
-        runtime.head_dim,
-        scale,
+        ReferenceAttentionShape {
+            query_head_count,
+            kv_head_count: runtime.kv_heads,
+            head_dim: runtime.head_dim,
+            scale,
+        },
     );
     assert_f32_close(&bytes_bf16(&output_bytes), &expected, 0.02);
 }

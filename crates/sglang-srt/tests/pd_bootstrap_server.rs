@@ -198,7 +198,7 @@ async fn prefill_transfer_executor_registers_dp_rank_for_bootstrap_queries() {
     {
         let mut state = service.state().lock().expect("state lock should be held");
         state
-            .ingest_mooncake_bootstrap_frame(&vec![
+            .ingest_mooncake_bootstrap_frame(&[
                 b"None".to_vec(),
                 b"127.0.0.1".to_vec(),
                 b"41010".to_vec(),
@@ -212,7 +212,7 @@ async fn prefill_transfer_executor_registers_dp_rank_for_bootstrap_queries() {
             ])
             .expect("decode KV args should parse");
         state
-            .ingest_mooncake_bootstrap_frame(&vec![
+            .ingest_mooncake_bootstrap_frame(&[
                 b"99".to_vec(),
                 b"127.0.0.1".to_vec(),
                 b"41010".to_vec(),
@@ -485,16 +485,18 @@ async fn mooncake_bootstrap_zmq_listener_ingests_multipart_transfer_metadata() {
     })
     .await;
 
-    let state = observed_service
-        .state()
-        .lock()
-        .expect("state lock should be held");
-    let room = state
-        .transfer_room(81)
-        .expect("transfer room should be tracked");
-    assert_eq!(room.decode_prefix_len, Some(96));
-    assert_eq!(room.transfers["session-zmq"].endpoint, "10.0.0.11");
-    assert_eq!(room.transfers["session-zmq"].dst_kv_indices, vec![7, 8, 9]);
+    {
+        let state = observed_service
+            .state()
+            .lock()
+            .expect("state lock should be held");
+        let room = state
+            .transfer_room(81)
+            .expect("transfer room should be tracked");
+        assert_eq!(room.decode_prefix_len, Some(96));
+        assert_eq!(room.transfers["session-zmq"].endpoint, "10.0.0.11");
+        assert_eq!(room.transfers["session-zmq"].dst_kv_indices, vec![7, 8, 9]);
+    }
 
     shutdown_tx
         .send(())
@@ -540,24 +542,26 @@ async fn mooncake_bootstrap_zmq_endpoint_group_ingests_metadata_from_each_port()
     })
     .await;
 
-    let state = observed_service
-        .state()
-        .lock()
-        .expect("state lock should be held");
-    assert!(
-        state
-            .transfer_room(91)
-            .expect("first room should be tracked")
-            .transfers
-            .contains_key("first-port-session")
-    );
-    assert!(
-        state
-            .transfer_room(92)
-            .expect("second room should be tracked")
-            .transfers
-            .contains_key("second-port-session")
-    );
+    {
+        let state = observed_service
+            .state()
+            .lock()
+            .expect("state lock should be held");
+        assert!(
+            state
+                .transfer_room(91)
+                .expect("first room should be tracked")
+                .transfers
+                .contains_key("first-port-session")
+        );
+        assert!(
+            state
+                .transfer_room(92)
+                .expect("second room should be tracked")
+                .transfers
+                .contains_key("second-port-session")
+        );
+    }
 
     shutdown_tx
         .send(())
@@ -654,17 +658,19 @@ async fn decode_bootstrap_client_queries_route_and_sends_transfer_metadata() {
     })
     .await;
 
-    let state = observed_service
-        .state()
-        .lock()
-        .expect("state lock should be held");
-    let transfer = &state
-        .transfer_room(93)
-        .expect("room should be tracked")
-        .transfers["decode-client-session"];
-    assert_eq!(transfer.dst_kv_indices, vec![9, 10, 11]);
-    assert_eq!(transfer.dst_aux_index, Some(14));
-    assert_eq!(transfer.decode_prefix_len, Some(128));
+    {
+        let state = observed_service
+            .state()
+            .lock()
+            .expect("state lock should be held");
+        let transfer = &state
+            .transfer_room(93)
+            .expect("room should be tracked")
+            .transfers["decode-client-session"];
+        assert_eq!(transfer.dst_kv_indices, vec![9, 10, 11]);
+        assert_eq!(transfer.dst_aux_index, Some(14));
+        assert_eq!(transfer.decode_prefix_len, Some(128));
+    }
 
     shutdown_tx
         .send(())
@@ -718,19 +724,21 @@ async fn decode_bootstrap_client_sends_kv_args_registration() {
     })
     .await;
 
-    let state = observed_service
-        .state()
-        .lock()
-        .expect("state lock should be held");
-    let kv_args = state
-        .decode_kv_args("decode-kvargs-session")
-        .expect("decode KV args should be registered");
-    assert_eq!(kv_args.endpoint, "127.0.0.1");
-    assert_eq!(kv_args.dst_port, 41006);
-    assert_eq!(kv_args.dst_kv_ptrs, vec![0x1000, 0x2000]);
-    assert_eq!(kv_args.dst_state_data_ptrs, vec![vec![0x4000, 0x5000]]);
-    assert_eq!(kv_args.dst_tp_rank, 1);
-    assert_eq!(kv_args.dst_attn_tp_size, 2);
+    {
+        let state = observed_service
+            .state()
+            .lock()
+            .expect("state lock should be held");
+        let kv_args = state
+            .decode_kv_args("decode-kvargs-session")
+            .expect("decode KV args should be registered");
+        assert_eq!(kv_args.endpoint, "127.0.0.1");
+        assert_eq!(kv_args.dst_port, 41006);
+        assert_eq!(kv_args.dst_kv_ptrs, vec![0x1000, 0x2000]);
+        assert_eq!(kv_args.dst_state_data_ptrs, vec![vec![0x4000, 0x5000]]);
+        assert_eq!(kv_args.dst_tp_rank, 1);
+        assert_eq!(kv_args.dst_attn_tp_size, 2);
+    }
 
     shutdown_tx
         .send(())
@@ -832,18 +840,20 @@ async fn decode_worker_publishes_bootstrap_metadata_to_prefill_zmq_route() {
     })
     .await;
 
-    let state = observed_service
-        .state()
-        .lock()
-        .expect("state lock should be held");
-    let transfer = &state
-        .transfer_room(95)
-        .expect("room should be tracked")
-        .transfers["decode-worker-session"];
-    assert_eq!(transfer.endpoint, "127.0.0.1");
-    assert_eq!(transfer.dst_port, 41007);
-    assert_eq!(transfer.dst_kv_indices, vec![0, 1, 2]);
-    assert_eq!(transfer.decode_prefix_len, Some(3));
+    {
+        let state = observed_service
+            .state()
+            .lock()
+            .expect("state lock should be held");
+        let transfer = &state
+            .transfer_room(95)
+            .expect("room should be tracked")
+            .transfers["decode-worker-session"];
+        assert_eq!(transfer.endpoint, "127.0.0.1");
+        assert_eq!(transfer.dst_port, 41007);
+        assert_eq!(transfer.dst_kv_indices, vec![0, 1, 2]);
+        assert_eq!(transfer.decode_prefix_len, Some(3));
+    }
 
     shutdown_tx
         .send(())
@@ -948,29 +958,31 @@ async fn decode_worker_registers_kv_args_before_transfer_metadata() {
     })
     .await;
 
-    let state = observed_service
-        .state()
-        .lock()
-        .expect("state lock should be held");
-    let kv_args = state
-        .decode_kv_args("decode-kvargs-session")
-        .expect("decode KV args should be registered before metadata is consumed");
-    assert_eq!(kv_args.dst_kv_ptrs, vec![0x9000]);
-    assert_eq!(kv_args.dst_kv_item_len, 128);
-    let layouts = state
-        .remote_kv_layouts_for_room(96)
-        .expect("remote layout should include decode KV args and metadata");
-    assert_eq!(
-        layouts,
-        vec![(
-            "decode-kvargs-session".to_string(),
-            MooncakeRemoteKvLayout {
-                dst_kv_ptrs: vec![0x9000],
-                dst_kv_indices: vec![0, 1],
-                dst_kv_item_len: 128,
-            }
-        )]
-    );
+    {
+        let state = observed_service
+            .state()
+            .lock()
+            .expect("state lock should be held");
+        let kv_args = state
+            .decode_kv_args("decode-kvargs-session")
+            .expect("decode KV args should be registered before metadata is consumed");
+        assert_eq!(kv_args.dst_kv_ptrs, vec![0x9000]);
+        assert_eq!(kv_args.dst_kv_item_len, 128);
+        let layouts = state
+            .remote_kv_layouts_for_room(96)
+            .expect("remote layout should include decode KV args and metadata");
+        assert_eq!(
+            layouts,
+            vec![(
+                "decode-kvargs-session".to_string(),
+                MooncakeRemoteKvLayout {
+                    dst_kv_ptrs: vec![0x9000],
+                    dst_kv_indices: vec![0, 1],
+                    dst_kv_item_len: 128,
+                }
+            )]
+        );
+    }
 
     shutdown_tx
         .send(())
@@ -1080,31 +1092,33 @@ async fn decode_worker_reuses_kv_args_registration_for_multiple_rooms() {
     })
     .await;
 
-    let state = observed_service
-        .state()
-        .lock()
-        .expect("state lock should be held");
-    assert_eq!(
-        state.decode_kv_args_registration_count(),
-        1,
-        "decode KVArgs should be registered once per session/bootstrap endpoint"
-    );
-    assert_eq!(
-        state
-            .transfer_room(97)
-            .expect("first room should be tracked")
-            .transfers
-            .len(),
-        1
-    );
-    assert_eq!(
-        state
-            .transfer_room(98)
-            .expect("second room should be tracked")
-            .transfers
-            .len(),
-        1
-    );
+    {
+        let state = observed_service
+            .state()
+            .lock()
+            .expect("state lock should be held");
+        assert_eq!(
+            state.decode_kv_args_registration_count(),
+            1,
+            "decode KVArgs should be registered once per session/bootstrap endpoint"
+        );
+        assert_eq!(
+            state
+                .transfer_room(97)
+                .expect("first room should be tracked")
+                .transfers
+                .len(),
+            1
+        );
+        assert_eq!(
+            state
+                .transfer_room(98)
+                .expect("second room should be tracked")
+                .transfers
+                .len(),
+            1
+        );
+    }
 
     shutdown_tx
         .send(())

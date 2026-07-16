@@ -250,14 +250,14 @@ impl KvBlockPrefixIndex {
             matched.matched_blocks as f32 / block_hashes.len() as f32
         };
 
-        if match_rate > config.cache_threshold && !matched.workers.is_empty() {
-            if let Some(worker) = candidates
+        if match_rate > config.cache_threshold
+            && !matched.workers.is_empty()
+            && let Some(worker) = candidates
                 .iter()
                 .filter(|candidate| matched.workers.contains(&candidate.id))
                 .min_by_key(|candidate| candidate.active_load)
-            {
-                return Some(worker.id.clone());
-            }
+        {
+            return Some(worker.id.clone());
         }
 
         min_load_worker(candidates)

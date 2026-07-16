@@ -146,7 +146,7 @@ fn pd_workers_forward_weight_updates_to_prefill_and_decode_workers() {
 fn router_runtime_streams_pd_worker_outputs_from_prefill_then_decode() {
     let workers = PdModelWorkers::new(PrefillOnlyWorker::default(), DecodeOnlyWorker::default());
     let scheduler = Scheduler::new(workers);
-    let engine = Engine::new(ByteTokenizer::default(), scheduler);
+    let engine = Engine::new(ByteTokenizer, scheduler);
     let mut runtime = RouterRuntime::new(engine);
 
     let responses = runtime

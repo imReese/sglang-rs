@@ -115,7 +115,7 @@ impl Tokenizer for HfTokenizer {
 #[derive(Clone, Debug)]
 pub enum RuntimeTokenizer {
     Byte(ByteTokenizer),
-    Hf(HfTokenizer),
+    Hf(Box<HfTokenizer>),
 }
 
 impl RuntimeTokenizer {
@@ -156,9 +156,9 @@ impl RuntimeTokenizer {
         }
 
         if resolve_tokenizer_json(&resolved_model_path).is_some() {
-            return Ok(Self::Hf(HfTokenizer::from_tokenizer_path(
+            return Ok(Self::Hf(Box::new(HfTokenizer::from_tokenizer_path(
                 resolved_model_path,
-            )?));
+            )?)));
         }
 
         Ok(Self::Byte(ByteTokenizer))
@@ -167,9 +167,9 @@ impl RuntimeTokenizer {
     fn from_model_source(model_path: &str) -> Result<Self, TokenizerError> {
         let resolved_model_path = resolve_model_path(Path::new(model_path));
         if resolve_tokenizer_json(&resolved_model_path).is_some() {
-            return Ok(Self::Hf(HfTokenizer::from_tokenizer_path(
+            return Ok(Self::Hf(Box::new(HfTokenizer::from_tokenizer_path(
                 resolved_model_path,
-            )?));
+            )?)));
         }
 
         if !looks_like_hf_model_id(model_path) {
@@ -177,7 +177,9 @@ impl RuntimeTokenizer {
         }
 
         match download_hf_tokenizer_json(model_path) {
-            Ok(tokenizer_json) => Ok(Self::Hf(HfTokenizer::from_tokenizer_path(tokenizer_json)?)),
+            Ok(tokenizer_json) => Ok(Self::Hf(Box::new(HfTokenizer::from_tokenizer_path(
+                tokenizer_json,
+            )?))),
             Err(_) => Ok(Self::Byte(ByteTokenizer)),
         }
     }
@@ -185,14 +187,16 @@ impl RuntimeTokenizer {
     fn from_tokenizer_source(tokenizer_path: &str) -> Result<Self, TokenizerError> {
         let path = Path::new(tokenizer_path);
         if resolve_tokenizer_json(path).is_some() {
-            return Ok(Self::Hf(HfTokenizer::from_tokenizer_path(path)?));
+            return Ok(Self::Hf(Box::new(HfTokenizer::from_tokenizer_path(path)?)));
         }
         if is_local_tokenizer_path(path) && !looks_like_hf_model_id(tokenizer_path) {
-            return Ok(Self::Hf(HfTokenizer::from_tokenizer_path(path)?));
+            return Ok(Self::Hf(Box::new(HfTokenizer::from_tokenizer_path(path)?)));
         }
         if looks_like_hf_model_id(tokenizer_path) {
             let tokenizer_json = download_hf_tokenizer_json(tokenizer_path)?;
-            return Ok(Self::Hf(HfTokenizer::from_tokenizer_path(tokenizer_json)?));
+            return Ok(Self::Hf(Box::new(HfTokenizer::from_tokenizer_path(
+                tokenizer_json,
+            )?)));
         }
 
         Ok(Self::Byte(ByteTokenizer))

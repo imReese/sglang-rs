@@ -147,7 +147,7 @@ fn write_minimal_safetensors_file(path: &Path) {
 }
 
 fn write_safetensors_weight_values(path: &Path, values: &[f32]) {
-    let byte_len = values.len() * std::mem::size_of::<f32>();
+    let byte_len = std::mem::size_of_val(values);
     let header = format!(
         r#"{{"model.embed_tokens.weight":{{"dtype":"F32","shape":[{}],"data_offsets":[0,{}]}}}}"#,
         values.len(),

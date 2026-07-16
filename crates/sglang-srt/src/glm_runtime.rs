@@ -1095,6 +1095,12 @@ pub struct GlmMoeDsaF32CachedForwardModel {
     transfer_pages: GlmMoeDsaF32TransferPageStore,
 }
 
+struct GlmMoeDsaF32KvAttentionBatch<'a> {
+    positions: &'a [usize],
+    out_cache_pages: &'a [CachePageId],
+    sequence_cache_pages: &'a [CachePageId],
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct GlmMoeDsaF32TransferPageStore {
     token_slot_size_bytes: usize,
@@ -1710,14 +1716,14 @@ impl GlmMoeDsaF32TensorParallelRuntime {
         positions: &[usize],
         residuals: Option<&[Vec<f32>]>,
     ) -> Result<Vec<GlmMoeDsaF32LayerOutput>, GlmMoeDsaF32KernelError> {
-        if let Some(residuals) = residuals {
-            if residuals.len() != hidden_states.len() {
-                return Err(GlmMoeDsaF32KernelError::TokenCountMismatch {
-                    tensor_name: format!("model.layers.{layer_id}.input_layernorm.weight"),
-                    expected: hidden_states.len(),
-                    actual: residuals.len(),
-                });
-            }
+        if let Some(residuals) = residuals
+            && residuals.len() != hidden_states.len()
+        {
+            return Err(GlmMoeDsaF32KernelError::TokenCountMismatch {
+                tensor_name: format!("model.layers.{layer_id}.input_layernorm.weight"),
+                expected: hidden_states.len(),
+                actual: residuals.len(),
+            });
         }
 
         let mut attention_input = Vec::with_capacity(hidden_states.len());
@@ -1745,20 +1751,18 @@ impl GlmMoeDsaF32TensorParallelRuntime {
         &self,
         layer_id: usize,
         hidden_states: &[Vec<f32>],
-        positions: &[usize],
-        out_cache_pages: &[CachePageId],
-        sequence_cache_pages: &[CachePageId],
+        batch: GlmMoeDsaF32KvAttentionBatch<'_>,
         kv_cache: &mut GlmMoeDsaF32KvPageStore,
         residuals: Option<&[Vec<f32>]>,
     ) -> Result<Vec<GlmMoeDsaF32LayerOutput>, GlmMoeDsaF32KernelError> {
-        if let Some(residuals) = residuals {
-            if residuals.len() != hidden_states.len() {
-                return Err(GlmMoeDsaF32KernelError::TokenCountMismatch {
-                    tensor_name: format!("model.layers.{layer_id}.input_layernorm.weight"),
-                    expected: hidden_states.len(),
-                    actual: residuals.len(),
-                });
-            }
+        if let Some(residuals) = residuals
+            && residuals.len() != hidden_states.len()
+        {
+            return Err(GlmMoeDsaF32KernelError::TokenCountMismatch {
+                tensor_name: format!("model.layers.{layer_id}.input_layernorm.weight"),
+                expected: hidden_states.len(),
+                actual: residuals.len(),
+            });
         }
 
         let mut attention_input = Vec::with_capacity(hidden_states.len());
@@ -1774,9 +1778,9 @@ impl GlmMoeDsaF32TensorParallelRuntime {
         let attention_output = self.attention_output_with_kv_cache(
             layer_id,
             &attention_input,
-            positions,
-            out_cache_pages,
-            sequence_cache_pages,
+            batch.positions,
+            batch.out_cache_pages,
+            batch.sequence_cache_pages,
             kv_cache,
         )?;
         attention_output
@@ -2074,9 +2078,11 @@ impl GlmMoeDsaF32TensorParallelRuntime {
             let layer_output = self.transformer_layer_output_with_kv_cache(
                 layer_id,
                 &hidden_states,
-                positions,
-                out_cache_pages,
-                sequence_cache_pages,
+                GlmMoeDsaF32KvAttentionBatch {
+                    positions,
+                    out_cache_pages,
+                    sequence_cache_pages,
+                },
                 kv_cache,
                 residuals.as_deref(),
             )?;
@@ -2124,7 +2130,7 @@ impl GlmMoeDsaF32TensorParallelRuntime {
     ) -> Result<Vec<f32>, GlmMoeDsaF32KernelError> {
         let mut logits = Vec::<Option<f32>>::new();
         for rank in &self.ranks {
-            for (token_id, logit) in rank.lm_head_partial_logits(&hidden)? {
+            for (token_id, logit) in rank.lm_head_partial_logits(hidden)? {
                 if logits.len() <= token_id {
                     logits.resize(token_id + 1, None);
                 }
@@ -2344,7 +2350,7 @@ impl GlmMoeDsaF32TensorParallelRuntime {
                 actual: positions.len(),
             });
         }
-        if shape.qk_rope_head_dim % 2 != 0 {
+        if !shape.qk_rope_head_dim.is_multiple_of(2) {
             return Err(GlmMoeDsaF32KernelError::HiddenSizeMismatch {
                 tensor_name: format!("model.layers.{layer_id}.self_attn.rotary_emb"),
                 expected: shape.qk_rope_head_dim + 1,

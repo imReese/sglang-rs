@@ -712,7 +712,7 @@ where
         let tokens = generated.into_tokens();
         let mut outputs = Vec::with_capacity(requests.len());
 
-        for (mut request, generated_token) in requests.into_iter().zip(tokens.into_iter()) {
+        for (mut request, generated_token) in requests.into_iter().zip(tokens) {
             if forward_mode == ForwardMode::Prefill {
                 self.stage_prefill_cache_pages(&request)?;
             }
@@ -870,12 +870,9 @@ fn remove_request_from_queue(
     queue: &mut VecDeque<ScheduledRequest>,
     request_id: &RequestId,
 ) -> Option<ScheduledRequest> {
-    let Some(index) = queue
+    let index = queue
         .iter()
-        .position(|request| request.request_id() == request_id)
-    else {
-        return None;
-    };
+        .position(|request| request.request_id() == request_id)?;
 
     queue.remove(index)
 }

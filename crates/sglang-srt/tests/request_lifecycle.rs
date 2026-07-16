@@ -41,7 +41,7 @@ impl ModelWorker for TwoStepTextWorker {
 
 #[test]
 fn generation_request_runs_through_tokenizer_scheduler_worker_and_detokenizer() {
-    let tokenizer = ByteTokenizer::default();
+    let tokenizer = ByteTokenizer;
     let scheduler = Scheduler::new(EchoWorker::default());
     let mut engine = Engine::new(tokenizer, scheduler);
 
@@ -70,7 +70,7 @@ fn generation_request_runs_through_tokenizer_scheduler_worker_and_detokenizer() 
 
 #[test]
 fn generation_request_drives_decode_until_the_request_finishes() {
-    let tokenizer = ByteTokenizer::default();
+    let tokenizer = ByteTokenizer;
     let scheduler = Scheduler::new(TwoStepTextWorker::default());
     let mut engine = Engine::new(tokenizer, scheduler);
 
@@ -93,7 +93,7 @@ fn generation_request_drives_decode_until_the_request_finishes() {
 
 #[test]
 fn tokenized_generation_request_bypasses_tokenizer_for_router_generate_rpc() {
-    let tokenizer = ByteTokenizer::default();
+    let tokenizer = ByteTokenizer;
     let scheduler = Scheduler::new(EchoWorker::default());
     let mut engine = Engine::new(tokenizer, scheduler);
 

@@ -480,7 +480,7 @@ fn record_batch_outputs(
         .collect::<Vec<_>>();
     let mut requeued = Vec::new();
 
-    for (index, output) in active_indices.into_iter().zip(outputs.into_iter()) {
+    for (index, output) in active_indices.into_iter().zip(outputs) {
         if !output.finished {
             requeued.push(index);
         }
