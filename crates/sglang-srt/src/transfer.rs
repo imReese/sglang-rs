@@ -1506,6 +1506,14 @@ where
         self.worker.fail_request(request)
     }
 
+    fn shutdown(&mut self) -> Result<(), WorkerExecutionError> {
+        self.transfer_executor.shutdown().map_err(|error| {
+            WorkerExecutionError::Runtime(format!("KV transfer backend shutdown failed: {error}"))
+        })?;
+        self.registry = DecodeBootstrapRegistry::default();
+        self.worker.shutdown()
+    }
+
     fn update_weights_from_disk(
         &mut self,
         request: &WorkerWeightUpdateRequest,

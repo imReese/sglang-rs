@@ -873,6 +873,10 @@ impl<T, W> RouterRuntime<T, W>
 where
     W: WorkerExecutor,
 {
+    pub fn shutdown(&mut self) -> Result<usize, RouterRuntimeError> {
+        Ok(self.engine.shutdown()?)
+    }
+
     pub fn poll_transfers(&mut self) -> Result<RouterTransferPollResponse, RouterRuntimeError> {
         let summary = self.engine.poll_transfers()?;
         Ok(RouterTransferPollResponse {

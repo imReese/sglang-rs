@@ -38,6 +38,12 @@ pub fn resolve_link_plan(
     explicit_home: Option<PathBuf>,
 ) -> Result<MooncakeLinkPlan, MooncakeLinkError> {
     let candidates = candidate_build_dirs(explicit_build_dir, explicit_home);
+    if candidates.is_empty() {
+        return Err(MooncakeLinkError {
+            message: "Mooncake native link artifacts require an explicit MOONCAKE_BUILD_DIR or MOONCAKE_HOME; personal checkout paths are not searched"
+                .to_string(),
+        });
+    }
     let mut missing_reports = Vec::new();
 
     for build_dir in candidates.iter() {
@@ -76,18 +82,6 @@ fn candidate_build_dirs(
         return dirs;
     }
 
-    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
-        push_unique(&mut dirs, home.join("Code/kvcache-ai/Mooncake/build"));
-        push_unique(
-            &mut dirs,
-            home.join("workspace/code/kvcache-ai/Mooncake/build"),
-        );
-    }
-
-    push_unique(
-        &mut dirs,
-        PathBuf::from("/home/reese/workspace/code/kvcache-ai/Mooncake/build"),
-    );
     dirs
 }
 

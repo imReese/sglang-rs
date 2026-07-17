@@ -17,6 +17,7 @@ use sglang_srt::transfer::{
     execute_kv_cache_transfer_plan,
 };
 use sglang_srt::types::{DisaggregatedParams, RequestId, SamplingParams};
+use sglang_srt::worker::FallibleModelWorker;
 use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
 
 #[derive(Default)]
@@ -148,6 +149,20 @@ fn explicit_cancel_and_shutdown_are_observable() {
 }
 
 #[test]
+fn transfer_worker_shutdown_clears_sessions_and_stops_backend() {
+    let mut worker = sglang_srt::transfer::KvTransferModelWorker::new(
+        FinishedWorker,
+        registry_with_session(9),
+        RecordingBackend::default(),
+    );
+
+    worker.shutdown().expect("worker shutdown should succeed");
+
+    assert!(worker.registry().is_empty());
+    assert!(worker.transfer_executor().shutdown);
+}
+
+#[test]
 fn mooncake_registers_nexus_descriptor_and_unregisters_on_shutdown() {
     let state = Arc::new(Mutex::new(MooncakeState::default()));
     let io = RecordingMooncakeIo {
@@ -184,6 +199,41 @@ fn mooncake_registers_nexus_descriptor_and_unregisters_on_shutdown() {
     assert_eq!(state.freed, 1);
     assert_eq!(state.unregistered, 1);
     assert_eq!(registry.get(10).expect("session").status(), KvPoll::Success);
+}
+
+#[test]
+fn mooncake_shutdown_frees_pending_batch_before_memory_unregister() {
+    let state = Arc::new(Mutex::new(MooncakeState::default()));
+    let io = RecordingMooncakeIo {
+        state: state.clone(),
+    };
+    let memory = transferable_memory();
+    let layout = MooncakeKvCacheLayout {
+        source_base_addr: memory.regions()[0].base_addr,
+        page_size_bytes: memory.page_size_bytes(),
+        target_base_offset: 0,
+    };
+    let mut backend = MooncakeKvCacheTransferExecutor::new(
+        io.clone(),
+        layout,
+        MooncakeTransferTarget { target_id: 3 },
+    )
+    .with_memory_registrar(io);
+    backend
+        .register(memory)
+        .expect("descriptor should register");
+
+    let mut registry = registry_with_session(11);
+    execute_kv_cache_transfer_plan(&mut registry, &mut backend, &simple_plan(11))
+        .expect("Mooncake submit should succeed");
+    backend
+        .shutdown()
+        .expect("Mooncake shutdown should cancel pending transfer");
+
+    let state = state.lock().expect("state lock");
+    assert_eq!(state.submitted, 1);
+    assert_eq!(state.freed, 1);
+    assert_eq!(state.unregistered, 1);
 }
 
 fn simple_plan(room: u64) -> KvCacheTransferPlan {

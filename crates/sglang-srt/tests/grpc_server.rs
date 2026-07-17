@@ -2,6 +2,8 @@
 
 use std::fs;
 use std::net::{SocketAddr, TcpListener};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -16,7 +18,41 @@ use sglang_srt::proto::sglang::runtime::v1::{
     GetModelInfoRequest, GetServerInfoRequest, HealthCheckRequest, RequestOptions, SamplingParams,
     TextGenerateRequest,
 };
-use sglang_srt::server::test_support::build_reference_grpc_router_service;
+use sglang_srt::server::test_support::{
+    build_reference_grpc_router_service, build_reference_pd_grpc_router_service,
+};
+use sglang_srt::transfer::{
+    DecodeBootstrapRegistry, KvCacheTransferError, KvCacheTransferSpan, KvTransferBackend,
+    KvTransferPoll, TransferableKvCacheMemory,
+};
+use sglang_srt::types::BootstrapRoom;
+
+struct ShutdownRecordingBackend {
+    shutdown: Arc<AtomicBool>,
+}
+
+impl KvTransferBackend for ShutdownRecordingBackend {
+    fn register(&mut self, _memory: TransferableKvCacheMemory) -> Result<(), KvCacheTransferError> {
+        Ok(())
+    }
+
+    fn submit(&mut self, _span: &KvCacheTransferSpan) -> Result<(), KvCacheTransferError> {
+        Ok(())
+    }
+
+    fn poll(&mut self) -> Result<KvTransferPoll, KvCacheTransferError> {
+        Ok(KvTransferPoll::default())
+    }
+
+    fn cancel(&mut self, _bootstrap_room: BootstrapRoom) -> Result<(), KvCacheTransferError> {
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> Result<(), KvCacheTransferError> {
+        self.shutdown.store(true, Ordering::Release);
+        Ok(())
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn grpc_server_accepts_generated_client_requests() {
@@ -80,6 +116,54 @@ async fn grpc_server_accepts_generated_client_requests() {
         .await
         .expect("server task should join")
         .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graceful_grpc_shutdown_stops_transfer_backend() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--grpc-mode",
+    ])
+    .expect("args should parse");
+    let backend_shutdown = Arc::new(AtomicBool::new(false));
+    let service = build_reference_pd_grpc_router_service(
+        &args,
+        DecodeBootstrapRegistry::default(),
+        ShutdownRecordingBackend {
+            shutdown: Arc::clone(&backend_shutdown),
+        },
+    );
+    let addr = unused_local_addr();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        serve_grpc_router_with_shutdown(addr, service, true, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let mut client = connect_with_retry(addr).await;
+    let health = client
+        .health_check(HealthCheckRequest {})
+        .await
+        .expect("health check should execute")
+        .into_inner();
+    assert!(health.healthy);
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+
+    assert!(backend_shutdown.load(Ordering::Acquire));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

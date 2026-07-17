@@ -704,6 +704,12 @@ impl<W> Scheduler<W>
 where
     W: WorkerExecutor,
 {
+    pub fn shutdown(&mut self) -> Result<usize, WorkerExecutionError> {
+        let aborted_requests = self.abort_all_requests();
+        self.worker.shutdown()?;
+        Ok(aborted_requests)
+    }
+
     pub fn dispatch_prefill_batch(
         &mut self,
         max_batch_size: usize,

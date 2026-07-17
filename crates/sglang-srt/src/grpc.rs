@@ -130,6 +130,7 @@ impl<T, W> Clone for GrpcRouterService<T, W> {
 pub enum GrpcServeError {
     Reflection(tonic_reflection::server::Error),
     Transport(tonic::transport::Error),
+    RuntimeShutdown(String),
 }
 
 impl fmt::Display for GrpcServeError {
@@ -137,6 +138,9 @@ impl fmt::Display for GrpcServeError {
         match self {
             Self::Reflection(error) => write!(formatter, "gRPC reflection error: {error}"),
             Self::Transport(error) => write!(formatter, "gRPC transport error: {error}"),
+            Self::RuntimeShutdown(error) => {
+                write!(formatter, "gRPC runtime shutdown error: {error}")
+            }
         }
     }
 }
@@ -275,9 +279,10 @@ where
     W: WorkerExecutor + Send + 'static,
     F: Future<Output = ()> + Send + 'static,
 {
+    let runtime = Arc::clone(service.runtime());
     let sglang_service = SglangServiceServer::new(service);
 
-    if enable_reflection {
+    let serve_result = if enable_reflection {
         let reflection_service = tonic_reflection::server::Builder::configure()
             .register_encoded_file_descriptor_set(SGLANG_RUNTIME_FILE_DESCRIPTOR_SET)
             .build_v1()?;
@@ -286,17 +291,24 @@ where
             .add_service(sglang_service)
             .add_service(reflection_service)
             .serve_with_shutdown(addr, shutdown)
-            .await?;
-
-        return Ok(());
-    }
-
-    tonic::transport::Server::builder()
-        .add_service(sglang_service)
-        .serve_with_shutdown(addr, shutdown)
-        .await?;
-
-    Ok(())
+            .await
+    } else {
+        tonic::transport::Server::builder()
+            .add_service(sglang_service)
+            .serve_with_shutdown(addr, shutdown)
+            .await
+    };
+    let shutdown_result = runtime
+        .lock()
+        .map_err(|_| GrpcServeError::RuntimeShutdown("runtime mutex poisoned".to_string()))
+        .and_then(|mut runtime| {
+            runtime
+                .shutdown()
+                .map(|_| ())
+                .map_err(|error| GrpcServeError::RuntimeShutdown(error.to_string()))
+        });
+    serve_result.map_err(GrpcServeError::from)?;
+    shutdown_result
 }
 
 fn router_runtime_error_to_status(error: RouterRuntimeError) -> Status {

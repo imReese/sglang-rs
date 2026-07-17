@@ -268,12 +268,16 @@ where
 #[derive(Debug)]
 pub enum HttpServeError {
     Io(std::io::Error),
+    RuntimeShutdown(String),
 }
 
 impl fmt::Display for HttpServeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "http server error: {error}"),
+            Self::RuntimeShutdown(error) => {
+                write!(formatter, "http runtime shutdown error: {error}")
+            }
         }
     }
 }
@@ -308,10 +312,22 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, service.into_router())
+    let runtime = Arc::clone(service.runtime());
+    let serve_result = axum::serve(listener, service.into_router())
         .with_graceful_shutdown(shutdown)
-        .await?;
-    Ok(())
+        .await
+        .map_err(HttpServeError::from);
+    let shutdown_result = runtime
+        .lock()
+        .map_err(|_| HttpServeError::RuntimeShutdown("runtime mutex poisoned".to_string()))
+        .and_then(|mut runtime| {
+            runtime
+                .shutdown()
+                .map(|_| ())
+                .map_err(|error| HttpServeError::RuntimeShutdown(error.to_string()))
+        });
+    serve_result?;
+    shutdown_result
 }
 
 async fn health() -> Json<Value> {

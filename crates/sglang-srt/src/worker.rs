@@ -153,6 +153,10 @@ pub trait FallibleModelWorker {
         self.complete_request(request);
     }
 
+    fn shutdown(&mut self) -> Result<(), WorkerExecutionError> {
+        Ok(())
+    }
+
     fn update_weights_from_disk(
         &mut self,
         _request: &WorkerWeightUpdateRequest,
@@ -179,6 +183,8 @@ pub trait WorkerExecutor {
     fn complete_request(&mut self, request: &ScheduledRequest);
 
     fn fail_request(&mut self, request: &ScheduledRequest);
+
+    fn shutdown(&mut self) -> Result<(), WorkerExecutionError>;
 
     fn update_weights_from_disk(
         &mut self,
@@ -226,6 +232,10 @@ where
 
     fn fail_request(&mut self, request: &ScheduledRequest) {
         FallibleModelWorker::fail_request(self, request)
+    }
+
+    fn shutdown(&mut self) -> Result<(), WorkerExecutionError> {
+        FallibleModelWorker::shutdown(self)
     }
 
     fn update_weights_from_disk(
@@ -292,5 +302,12 @@ where
     ) -> Result<(), WorkerExecutionError> {
         self.prefill.update_weights_from_disk(request)?;
         self.decode.update_weights_from_disk(request)
+    }
+
+    fn shutdown(&mut self) -> Result<(), WorkerExecutionError> {
+        let prefill_result = self.prefill.shutdown();
+        let decode_result = self.decode.shutdown();
+        prefill_result?;
+        decode_result
     }
 }

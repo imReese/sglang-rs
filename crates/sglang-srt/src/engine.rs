@@ -103,6 +103,10 @@ impl<T, W> Engine<T, W>
 where
     W: WorkerExecutor,
 {
+    pub fn shutdown(&mut self) -> Result<usize, RuntimeError> {
+        Ok(self.scheduler.shutdown()?)
+    }
+
     pub fn poll_transfers(&mut self) -> Result<KvTransferPollSummary, RuntimeError> {
         Ok(self.scheduler.poll_transfers()?)
     }

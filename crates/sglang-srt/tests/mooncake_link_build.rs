@@ -103,6 +103,17 @@ fn mooncake_link_uses_explicit_home_without_scanning_default_roots() {
     );
 }
 
+#[test]
+fn mooncake_link_requires_explicit_discovery_configuration() {
+    let error = mooncake_link::resolve_link_plan(None, None)
+        .expect_err("Mooncake build discovery should not scan developer checkouts");
+
+    let message = error.to_string();
+    assert!(message.contains("MOONCAKE_BUILD_DIR"), "{message}");
+    assert!(message.contains("MOONCAKE_HOME"), "{message}");
+    assert!(!message.contains("reese"), "{message}");
+}
+
 fn touch(path: &Path) {
     fs::create_dir_all(path.parent().expect("test file has parent"))
         .expect("artifact parent should be created");

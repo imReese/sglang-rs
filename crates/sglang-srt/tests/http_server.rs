@@ -34,12 +34,12 @@ use sglang_srt::server::{
 };
 use sglang_srt::tokenizer::ByteTokenizer;
 use sglang_srt::transfer::{
-    DecodeBootstrapRegistry, KvCacheMemoryLocation, KvTransferBackend, MooncakeBatchId,
-    MooncakeBatchReleaser, MooncakeBufferEntry, MooncakeError, MooncakeKvCacheLayout,
-    MooncakeKvCacheTransferExecutor, MooncakeMemoryRegistrar, MooncakeTransferRequest,
-    MooncakeTransferStatus, MooncakeTransferStatusCode, MooncakeTransferStatusReader,
-    MooncakeTransferSubmitter, MooncakeTransferTarget, TransferableKvCacheMemory,
-    TransferableKvCacheRegion,
+    DecodeBootstrapRegistry, KvCacheMemoryLocation, KvCacheTransferError, KvCacheTransferSpan,
+    KvTransferBackend, KvTransferPoll, MooncakeBatchId, MooncakeBatchReleaser, MooncakeBufferEntry,
+    MooncakeError, MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeMemoryRegistrar,
+    MooncakeTransferRequest, MooncakeTransferStatus, MooncakeTransferStatusCode,
+    MooncakeTransferStatusReader, MooncakeTransferSubmitter, MooncakeTransferTarget,
+    TransferableKvCacheMemory, TransferableKvCacheRegion,
 };
 use sglang_srt::types::{BootstrapRoom, RequestId, SamplingParams as RuntimeSamplingParams};
 use sglang_srt::worker::{
@@ -59,6 +59,33 @@ impl ModelWorker for HttpTwoStepWorker {
 
         BatchGeneratedTokens::from_batch(batch, vec![token])
             .expect("output shape should match batch")
+    }
+}
+
+struct ShutdownRecordingBackend {
+    shutdown: Arc<AtomicBool>,
+}
+
+impl KvTransferBackend for ShutdownRecordingBackend {
+    fn register(&mut self, _memory: TransferableKvCacheMemory) -> Result<(), KvCacheTransferError> {
+        Ok(())
+    }
+
+    fn submit(&mut self, _span: &KvCacheTransferSpan) -> Result<(), KvCacheTransferError> {
+        Ok(())
+    }
+
+    fn poll(&mut self) -> Result<KvTransferPoll, KvCacheTransferError> {
+        Ok(KvTransferPoll::default())
+    }
+
+    fn cancel(&mut self, _bootstrap_room: BootstrapRoom) -> Result<(), KvCacheTransferError> {
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> Result<(), KvCacheTransferError> {
+        self.shutdown.store(true, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -166,6 +193,48 @@ async fn http_server_accepts_model_and_generate_requests() {
         .await
         .expect("server task should join")
         .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graceful_http_shutdown_stops_transfer_backend() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .expect("args should parse");
+    let backend_shutdown = Arc::new(AtomicBool::new(false));
+    let service = build_reference_pd_http_router_service(
+        &args,
+        DecodeBootstrapRegistry::default(),
+        ShutdownRecordingBackend {
+            shutdown: Arc::clone(&backend_shutdown),
+        },
+    );
+    let addr = unused_local_addr();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let health = get_json_with_retry(addr, "/health").await;
+    assert_eq!(health["healthy"], true);
+    shutdown_tx
+        .send(())
+        .expect("server should still be running");
+    server
+        .await
+        .expect("server task should join")
+        .expect("server should stop cleanly");
+
+    assert!(backend_shutdown.load(Ordering::Acquire));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
