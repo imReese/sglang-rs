@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::scheduler::{ForwardMode, ScheduleBatch, ScheduledOutput, ScheduledRequest};
-use crate::transfer::{KvCacheTransferError, MooncakeTransferPollSummary};
+use crate::transfer::{KvCacheTransferError, KvTransferPollSummary};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GeneratedToken {
@@ -143,8 +143,8 @@ pub trait FallibleModelWorker {
         Ok(DecodeRequestState::Ready)
     }
 
-    fn poll_transfers(&mut self) -> Result<MooncakeTransferPollSummary, KvCacheTransferError> {
-        Ok(MooncakeTransferPollSummary::default())
+    fn poll_transfers(&mut self) -> Result<KvTransferPollSummary, KvCacheTransferError> {
+        Ok(KvTransferPollSummary::default())
     }
 
     fn complete_request(&mut self, _request: &ScheduledRequest) {}
@@ -174,7 +174,7 @@ pub trait WorkerExecutor {
         request: &ScheduledRequest,
     ) -> Result<DecodeRequestState, WorkerExecutionError>;
 
-    fn poll_transfers(&mut self) -> Result<MooncakeTransferPollSummary, KvCacheTransferError>;
+    fn poll_transfers(&mut self) -> Result<KvTransferPollSummary, KvCacheTransferError>;
 
     fn complete_request(&mut self, request: &ScheduledRequest);
 
@@ -216,7 +216,7 @@ where
         FallibleModelWorker::decode_request_state(self, request)
     }
 
-    fn poll_transfers(&mut self) -> Result<MooncakeTransferPollSummary, KvCacheTransferError> {
+    fn poll_transfers(&mut self) -> Result<KvTransferPollSummary, KvCacheTransferError> {
         FallibleModelWorker::poll_transfers(self)
     }
 

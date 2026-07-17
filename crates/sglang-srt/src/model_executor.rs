@@ -1,4 +1,5 @@
 use crate::cache::CachePageId;
+use crate::runtime_kv_cache::{ModelExecutionResources, RuntimeKvCache};
 use crate::scheduler::{ForwardMode, ScheduleBatch, ScheduledRequest};
 use crate::transfer::{
     KvCacheMemoryProvider, KvCacheModelLayout, KvCacheTransferError, TransferableKvCacheMemory,
@@ -261,6 +262,14 @@ pub trait ForwardModel {
         &mut self,
         batch: &ModelWorkerBatch,
     ) -> Result<ModelForwardOutput, ModelForwardError>;
+
+    fn forward_with_resources(
+        &mut self,
+        batch: &ModelWorkerBatch,
+        _resources: ModelExecutionResources<'_>,
+    ) -> Result<ModelForwardOutput, ModelForwardError> {
+        self.forward(batch)
+    }
 
     fn complete_request(&mut self, _request_id: &RequestId) {}
 
@@ -945,7 +954,7 @@ pub struct ModelRunner<M, S = LogitSampler<SystemRandomSource>> {
     model: M,
     sampler: S,
     kv_cache_layout: Option<KvCacheModelLayout>,
-    transferable_kv_cache_memory: Option<TransferableKvCacheMemory>,
+    runtime_kv_cache: Option<RuntimeKvCache>,
 }
 
 impl<M> ModelRunner<M, LogitSampler<SystemRandomSource>> {
@@ -964,7 +973,7 @@ impl<M, S> ModelRunner<M, S> {
             model,
             sampler,
             kv_cache_layout: None,
-            transferable_kv_cache_memory: None,
+            runtime_kv_cache: None,
         }
     }
 
@@ -977,7 +986,7 @@ impl<M, S> ModelRunner<M, S> {
             model,
             sampler,
             kv_cache_layout,
-            transferable_kv_cache_memory: None,
+            runtime_kv_cache: None,
         }
     }
 
@@ -993,17 +1002,22 @@ impl<M, S> ModelRunner<M, S> {
         self.kv_cache_layout
     }
 
-    pub fn install_transferable_kv_cache_memory(
+    pub(crate) fn install_runtime_kv_cache(
         &mut self,
-        memory: TransferableKvCacheMemory,
+        kv_cache: RuntimeKvCache,
     ) -> Result<(), KvCacheTransferError> {
         if self.kv_cache_layout.is_none() {
             return Err(KvCacheTransferError::Runtime(
-                "cannot install transferable KV memory for a model without KV cache geometry"
+                "cannot install a runtime KV cache for a model without KV cache geometry"
                     .to_string(),
             ));
         }
-        self.transferable_kv_cache_memory = Some(memory);
+        if self.runtime_kv_cache.is_some() {
+            return Err(KvCacheTransferError::Runtime(
+                "ModelRunner already owns a runtime KV cache allocation".to_string(),
+            ));
+        }
+        self.runtime_kv_cache = Some(kv_cache);
         Ok(())
     }
 
@@ -1017,12 +1031,11 @@ impl<M, S> ModelRunner<M, S> {
                 "model execution definition does not declare KV cache geometry".to_string(),
             ));
         }
-        let memory = self
-            .transferable_kv_cache_memory
-            .as_ref()
-            .ok_or_else(|| KvCacheTransferError::Runtime(format!(
+        let memory = self.transferable_kv_cache_memory().map_err(|_| {
+            KvCacheTransferError::Runtime(format!(
                 "runtime backend did not allocate transferable KV memory for {slot_capacity} slots with page size {page_size}"
-            )))?;
+            ))
+        })?;
         if page_size == 0 || slot_capacity == 0 || !slot_capacity.is_multiple_of(page_size) {
             return Err(KvCacheTransferError::Runtime(format!(
                 "scheduler KV geometry requires non-zero page-aligned capacity, found {slot_capacity} slots with page size {page_size}"
@@ -1069,11 +1082,14 @@ impl<M, S> KvCacheMemoryProvider for ModelRunner<M, S> {
     type Error = KvCacheTransferError;
 
     fn transferable_kv_cache_memory(&self) -> Result<TransferableKvCacheMemory, Self::Error> {
-        self.transferable_kv_cache_memory.clone().ok_or_else(|| {
-            KvCacheTransferError::Runtime(
-                "ModelRunner does not own registered transferable KV cache memory".to_string(),
-            )
-        })
+        self.runtime_kv_cache
+            .as_ref()
+            .ok_or_else(|| {
+                KvCacheTransferError::Runtime(
+                    "ModelRunner does not own a runtime KV cache allocation".to_string(),
+                )
+            })?
+            .transferable_kv_cache_memory()
     }
 }
 
@@ -1087,9 +1103,14 @@ where
         batch: &ScheduleBatch,
     ) -> Result<BatchGeneratedTokens, WorkerExecutionError> {
         let worker_batch = ModelWorkerBatch::from_schedule_batch(batch);
+        let resources = self
+            .runtime_kv_cache
+            .as_mut()
+            .map(RuntimeKvCache::execution_resources)
+            .unwrap_or_else(ModelExecutionResources::without_kv_cache);
         let forward_output = self
             .model
-            .forward(&worker_batch)
+            .forward_with_resources(&worker_batch, resources)
             .map_err(|error| WorkerExecutionError::Runtime(error.to_string()))?;
         let token_ids = self
             .sampler
@@ -1132,6 +1153,12 @@ where
         &mut self,
         request: &WorkerWeightUpdateRequest,
     ) -> Result<(), WorkerExecutionError> {
+        if self.runtime_kv_cache.is_some() {
+            return Err(WorkerExecutionError::Runtime(
+                "update_weights_from_disk requires a runtime restart while ModelRunner owns active KV cache memory"
+                    .to_string(),
+            ));
+        }
         self.model
             .update_weights_from_disk(request)
             .map_err(|error| WorkerExecutionError::Runtime(error.to_string()))

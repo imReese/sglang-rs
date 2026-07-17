@@ -8,8 +8,8 @@ use sglang_srt::tokenizer::ByteTokenizer;
 use sglang_srt::transfer::{
     DecodeBootstrapMetadataPublishSummary, DecodeBootstrapPublisher, DecodeBootstrapRegistry,
     DecodeBootstrapSession, FakeKvCacheTransferExecutor, KvCacheMemoryLocation,
-    KvCacheTransferError, KvCacheTransferExecutor, KvCacheTransferPlan, KvCacheTransferPlanError,
-    KvCacheTransferSpan, KvPoll, KvTransferModelWorker, LocalSnapshotTransferPdModelWorkers,
+    KvCacheTransferError, KvCacheTransferPlan, KvCacheTransferPlanError, KvCacheTransferSpan,
+    KvPoll, KvTransferBackend, KvTransferModelWorker, LocalSnapshotTransferPdModelWorkers,
     MooncakeBatchId, MooncakeBatchReleaser, MooncakeError, MooncakeKvCacheLayout,
     MooncakeKvCacheMemoryExt, MooncakeKvCacheTransferExecutor, MooncakeMemoryLocationExt,
     MooncakeMemoryRegistrar, MooncakeOpcode, MooncakeRemoteKvLayout, MooncakeSessionTargetResolver,
@@ -2360,7 +2360,7 @@ impl DecodeBootstrapPublisher for RecordingDecodeBootstrapPublisher {
     }
 }
 
-impl KvCacheTransferExecutor for RecordingTransferExecutor {
+impl KvTransferBackend for RecordingTransferExecutor {
     fn transfer_span(&mut self, span: &KvCacheTransferSpan) -> Result<(), KvCacheTransferError> {
         self.seen_rooms.push(span.bootstrap_room());
         if self.fail_room == Some(span.bootstrap_room()) {

@@ -17,9 +17,9 @@ use zeromq::{PullSocket, PushSocket, Socket, SocketRecv, SocketSend, ZmqMessage}
 
 use crate::transfer::{
     DecodeBootstrapMetadataPublishSummary, DecodeBootstrapPublisher, DecodeBootstrapRegistry,
-    KvCacheTransferError, KvCacheTransferExecutor, KvCacheTransferPlan, KvCacheTransferSpan,
-    KvPoll, MooncakeBatchReleaser, MooncakeKvCacheTransferExecutor, MooncakeRemoteKvLayout,
-    MooncakeTransferPollSummary, MooncakeTransferStatusReader, MooncakeTransferSubmitter,
+    KvCacheTransferError, KvCacheTransferPlan, KvCacheTransferSpan, KvPoll, KvTransferBackend,
+    KvTransferPollSummary, MooncakeBatchReleaser, MooncakeKvCacheTransferExecutor,
+    MooncakeRemoteKvLayout, MooncakeTransferStatusReader, MooncakeTransferSubmitter,
     MooncakeTransferTargetResolver,
 };
 use crate::types::BootstrapRoom;
@@ -117,7 +117,7 @@ impl<E> MooncakeBootstrapKvCacheTransferExecutor<E> {
     }
 }
 
-impl<S, R> KvCacheTransferExecutor
+impl<S, R> KvTransferBackend
     for MooncakeBootstrapKvCacheTransferExecutor<MooncakeKvCacheTransferExecutor<S, R>>
 where
     S: MooncakeTransferSubmitter + MooncakeTransferStatusReader + MooncakeBatchReleaser,
@@ -143,7 +143,7 @@ where
     fn poll_transfers(
         &mut self,
         registry: &mut DecodeBootstrapRegistry,
-    ) -> Result<MooncakeTransferPollSummary, KvCacheTransferError> {
+    ) -> Result<KvTransferPollSummary, KvCacheTransferError> {
         self.inner.poll_transfers(registry)
     }
 }

@@ -10,22 +10,20 @@ use crate::cuda_attention::{
     CudaBf16PagedAttentionExecutor, CudaPagedAttentionError, CudaPagedAttentionForward,
     CudaPagedAttentionMetadata,
 };
-use crate::cuda_kv_cache::{
-    CudaKvSlotScatterLaunch, CudaKvStorage, CudaKvStorageError, allocate_cuda_kv_cache,
-};
-use crate::kv_cache::KvCachePool;
+use crate::cuda_kv_cache::{CudaKvSlotScatterLaunch, CudaKvStorage, CudaKvStorageError};
+use crate::kv_cache::PagedKvCacheLayout;
 use crate::model_artifacts::{
     LocalModelArtifacts, ModelArtifactError, SafetensorsTensorDecodeError,
 };
 use crate::model_executor::{
-    ForwardModel, KvCacheAllocationConfig, ModelForwardError, ModelForwardOutput, ModelWorkerBatch,
+    ForwardModel, ModelForwardError, ModelForwardOutput, ModelWorkerBatch,
     validate_model_worker_batch,
 };
 use crate::models::{
     AttentionArchitecture, DenseDecoderExecutionPlan, DenseDecoderLayerWeightNames,
     FeedForwardArchitecture, ModelDefinition, ModelExecutionArchitecture,
 };
-use crate::transfer::{KvCacheDtype, KvCacheRuntimeLayout, TransferableKvCacheMemory};
+use crate::runtime_kv_cache::ModelExecutionResources;
 
 const BF16_BYTES: usize = 2;
 
@@ -112,8 +110,6 @@ pub(crate) struct CudaBf16DenseDecoder {
     kernels: CudaBf16DenseKernels,
     attention: CudaBf16PagedAttentionExecutor,
     kv_copy: CudaKvPairCopyKernels,
-    kv_cache: KvCachePool<CudaKvStorage>,
-    transferable_kv_cache_memory: TransferableKvCacheMemory,
     token_embeddings: CudaBf16Matrix,
     final_norm: CudaDeviceAllocation,
     lm_head: Option<CudaBf16Matrix>,
@@ -126,7 +122,6 @@ impl fmt::Debug for CudaBf16DenseDecoder {
             .debug_struct("CudaBf16DenseDecoder")
             .field("device", self.backend.device())
             .field("shape", &self.shape)
-            .field("slot_count", &self.kv_cache.layout().slot_count())
             .finish_non_exhaustive()
     }
 }
@@ -136,7 +131,6 @@ impl CudaBf16DenseDecoder {
         definition: &ModelDefinition,
         artifacts: &LocalModelArtifacts,
         backend: CudaBackend,
-        config: KvCacheAllocationConfig,
     ) -> Result<Self, CudaDenseDecoderError> {
         let plan = definition.dense_decoder().cloned().ok_or_else(|| {
             CudaDenseDecoderError::Unsupported(
@@ -144,33 +138,6 @@ impl CudaBf16DenseDecoder {
             )
         })?;
         let shape = CudaDenseDecoderShape::from_definition(definition, &plan)?;
-        validate_cache_config(config)?;
-        let model_layout = definition.kv_cache_layout().ok_or_else(|| {
-            CudaDenseDecoderError::Unsupported(
-                "model definition has no paged KV cache geometry".to_string(),
-            )
-        })?;
-        let bytes_per_token = model_layout
-            .token_size_bytes(KvCacheDtype::Bfloat16)
-            .map_err(|error| CudaDenseDecoderError::Shape(error.to_string()))?;
-        let page_size_bytes = config
-            .page_size
-            .checked_mul(bytes_per_token)
-            .ok_or_else(|| CudaDenseDecoderError::Shape("KV page size overflowed".to_string()))?;
-        let kv_runtime_layout = KvCacheRuntimeLayout {
-            dtype: KvCacheDtype::Bfloat16,
-            page_size: config.page_size,
-            num_layers: model_layout.num_layers,
-            kv_heads: model_layout.kv_heads,
-            head_dim: model_layout.head_dim,
-            kv_tensors_per_token: model_layout.kv_tensors_per_token,
-            bytes_per_token,
-            page_size_bytes,
-        };
-        let page_count = config.slot_capacity / config.page_size;
-        let kv_cache = allocate_cuda_kv_cache(backend.context(), kv_runtime_layout, page_count)?;
-        let transferable_kv_cache_memory =
-            kv_cache.storage().transferable_memory(kv_cache.layout())?;
         let compute_capability = backend.device().compute_capability;
         let blas = CudaBlas::load(backend.context())?;
         let kernels = CudaBf16DenseKernels::compile(backend.context(), compute_capability)?;
@@ -220,8 +187,6 @@ impl CudaBf16DenseDecoder {
             kernels,
             attention,
             kv_copy,
-            kv_cache,
-            transferable_kv_cache_memory,
             token_embeddings,
             final_norm,
             lm_head,
@@ -239,13 +204,11 @@ impl CudaBf16DenseDecoder {
         capability
     }
 
-    pub(crate) fn transferable_kv_cache_memory(&self) -> &TransferableKvCacheMemory {
-        &self.transferable_kv_cache_memory
-    }
-
     fn forward_batch(
         &mut self,
         batch: &ModelWorkerBatch,
+        kv_layout: PagedKvCacheLayout,
+        kv_storage: &mut CudaKvStorage,
     ) -> Result<ModelForwardOutput, CudaDenseDecoderError> {
         validate_model_worker_batch(batch)
             .map_err(|error| CudaDenseDecoderError::Shape(error.to_string()))?;
@@ -255,8 +218,7 @@ impl CudaBf16DenseDecoder {
                 "forward batch contains no input tokens".to_string(),
             ));
         }
-        let metadata =
-            CudaPagedAttentionMetadata::from_model_worker_batch(batch, self.kv_cache.layout())?;
+        let metadata = CudaPagedAttentionMetadata::from_model_worker_batch(batch, kv_layout)?;
         let device_metadata = metadata.upload(self.backend.context())?;
         let token_ids = upload_u32(self.backend.context(), batch.input_ids())?;
         let positions =
@@ -266,10 +228,7 @@ impl CudaBf16DenseDecoder {
             .iter()
             .map(|slot| slot.as_usize())
             .collect::<Vec<_>>();
-        let output_slot_map = self
-            .kv_cache
-            .storage()
-            .upload_slot_map(self.kv_cache.layout(), &output_slots)?;
+        let output_slot_map = kv_storage.upload_slot_map(kv_layout, &output_slots)?;
 
         let mut hidden = allocate_bf16(
             self.backend.context(),
@@ -285,14 +244,16 @@ impl CudaBf16DenseDecoder {
         )?;
 
         for layer_index in 0..self.layers.len() {
-            hidden = self.forward_layer(
+            hidden = self.forward_layer(CudaDenseLayerForward {
                 layer_index,
                 row_count,
                 hidden,
-                &positions,
-                &output_slot_map,
-                &device_metadata,
-            )?;
+                positions: &positions,
+                output_slot_map: &output_slot_map,
+                metadata: &device_metadata,
+                kv_layout,
+                kv_storage,
+            })?;
         }
 
         let normalized =
@@ -349,13 +310,18 @@ impl CudaBf16DenseDecoder {
 
     fn forward_layer(
         &mut self,
-        layer_index: usize,
-        row_count: usize,
-        hidden: CudaDeviceAllocation,
-        positions: &CudaDeviceAllocation,
-        output_slot_map: &crate::cuda_kv_cache::CudaKvCacheSlotMap,
-        metadata: &crate::cuda_attention::CudaPagedAttentionDeviceMetadata,
+        launch: CudaDenseLayerForward<'_>,
     ) -> Result<CudaDeviceAllocation, CudaDenseDecoderError> {
+        let CudaDenseLayerForward {
+            layer_index,
+            row_count,
+            hidden,
+            positions,
+            output_slot_map,
+            metadata,
+            kv_layout,
+            kv_storage,
+        } = launch;
         let layer = &self.layers[layer_index];
         let normalized = rms_norm(
             &self.kernels,
@@ -451,8 +417,7 @@ impl CudaBf16DenseDecoder {
             self.plan.rope_theta,
         )?;
         let kv_row_bytes = checked_product(self.shape.kv_size, BF16_BYTES, "KV row bytes")?;
-        let kv_layout = self.kv_cache.layout();
-        self.kv_cache.storage_mut().write_kv_slots_from_device(
+        kv_storage.write_kv_slots_from_device(
             kv_layout,
             CudaKvSlotScatterLaunch {
                 kernels: &mut self.kv_copy,
@@ -472,8 +437,8 @@ impl CudaBf16DenseDecoder {
             checked_product(row_count, self.shape.query_size, "attention output")?,
         )?;
         self.attention.forward(CudaPagedAttentionForward {
-            kv_layout: self.kv_cache.layout(),
-            kv_storage: self.kv_cache.storage(),
+            kv_layout,
+            kv_storage,
             layer_index,
             metadata,
             queries: &query,
@@ -574,12 +539,40 @@ impl CudaBf16DenseDecoder {
     }
 }
 
+struct CudaDenseLayerForward<'a> {
+    layer_index: usize,
+    row_count: usize,
+    hidden: CudaDeviceAllocation,
+    positions: &'a CudaDeviceAllocation,
+    output_slot_map: &'a crate::cuda_kv_cache::CudaKvCacheSlotMap,
+    metadata: &'a crate::cuda_attention::CudaPagedAttentionDeviceMetadata,
+    kv_layout: PagedKvCacheLayout,
+    kv_storage: &'a mut CudaKvStorage,
+}
+
 impl ForwardModel for CudaBf16DenseDecoder {
     fn forward(
         &mut self,
         batch: &ModelWorkerBatch,
     ) -> Result<ModelForwardOutput, ModelForwardError> {
-        self.forward_batch(batch)
+        Err(ModelForwardError::Runtime(format!(
+            "CUDA dense decoder requires ModelRunner-owned KV cache resources for a batch of {} requests",
+            batch.request_ids().len()
+        )))
+    }
+
+    fn forward_with_resources(
+        &mut self,
+        batch: &ModelWorkerBatch,
+        resources: ModelExecutionResources<'_>,
+    ) -> Result<ModelForwardOutput, ModelForwardError> {
+        let (kv_layout, kv_storage) = resources.cuda_kv_cache().ok_or_else(|| {
+            ModelForwardError::Runtime(
+                "CUDA dense decoder requires an active CUDA KV cache owned by ModelRunner"
+                    .to_string(),
+            )
+        })?;
+        self.forward_batch(batch, kv_layout, kv_storage)
             .map_err(|error| ModelForwardError::Runtime(error.to_string()))
     }
 }
@@ -777,26 +770,6 @@ impl CudaBf16Matrix {
             columns,
         })
     }
-}
-
-fn validate_cache_config(config: KvCacheAllocationConfig) -> Result<(), CudaDenseDecoderError> {
-    if config.slot_capacity == 0 {
-        return Err(CudaDenseDecoderError::Shape(
-            "KV cache slot capacity must be non-zero".to_string(),
-        ));
-    }
-    if config.page_size == 0 {
-        return Err(CudaDenseDecoderError::Shape(
-            "KV cache page size must be non-zero".to_string(),
-        ));
-    }
-    if !config.slot_capacity.is_multiple_of(config.page_size) {
-        return Err(CudaDenseDecoderError::Shape(format!(
-            "KV cache slot capacity {} must be divisible by page size {}",
-            config.slot_capacity, config.page_size
-        )));
-    }
-    Ok(())
 }
 
 fn linear(
@@ -1003,23 +976,5 @@ mod tests {
             .map(|chunk| f32::from_bits((u16::from_ne_bytes([chunk[0], chunk[1]]) as u32) << 16))
             .collect::<Vec<_>>();
         assert_eq!(decoded, values);
-    }
-
-    #[test]
-    fn cache_config_requires_scheduler_aligned_capacity() {
-        assert!(
-            validate_cache_config(KvCacheAllocationConfig {
-                slot_capacity: 512,
-                page_size: 16,
-            })
-            .is_ok()
-        );
-        assert!(
-            validate_cache_config(KvCacheAllocationConfig {
-                slot_capacity: 511,
-                page_size: 16,
-            })
-            .is_err()
-        );
     }
 }

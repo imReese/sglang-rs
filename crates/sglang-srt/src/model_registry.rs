@@ -16,7 +16,8 @@ use crate::models::{
     DEEPSEEK_V4_ADAPTER, EMBEDDING_LM_ADAPTER, GLM_MOE_DSA_ADAPTER, ModelAdapter,
     ModelAdapterError, ModelDefinition, QWEN2_ADAPTER, QWEN3_5_ADAPTER, QWEN3_ADAPTER,
 };
-use crate::transfer::{KvCacheModelLayout, TransferableKvCacheMemory};
+use crate::runtime_kv_cache::{ModelExecutionResources, RuntimeKvCache};
+use crate::transfer::KvCacheModelLayout;
 use crate::worker::WorkerWeightUpdateRequest;
 
 static MODEL_ADAPTERS: [&'static dyn ModelAdapter; 6] = [
@@ -259,8 +260,8 @@ impl BootstrapForwardModel {
         self.registered.definition.cache_architecture()
     }
 
-    pub(crate) fn transferable_kv_cache_memory(&self) -> Option<TransferableKvCacheMemory> {
-        self.registered.runtime.transferable_kv_cache_memory()
+    pub(crate) fn take_runtime_kv_cache(&mut self) -> Option<RuntimeKvCache> {
+        self.registered.runtime.take_runtime_kv_cache()
     }
 
     fn reload_backend(&self) -> RuntimeBackend {
@@ -280,6 +281,16 @@ impl ForwardModel for BootstrapForwardModel {
         self.registered.runtime.forward(batch)
     }
 
+    fn forward_with_resources(
+        &mut self,
+        batch: &ModelWorkerBatch,
+        resources: ModelExecutionResources<'_>,
+    ) -> Result<ModelForwardOutput, ModelForwardError> {
+        self.registered
+            .runtime
+            .forward_with_resources(batch, resources)
+    }
+
     fn complete_request(&mut self, request_id: &crate::types::RequestId) {
         self.registered.runtime.complete_request(request_id);
     }
@@ -288,7 +299,7 @@ impl ForwardModel for BootstrapForwardModel {
         &mut self,
         request: &WorkerWeightUpdateRequest,
     ) -> Result<(), ModelForwardError> {
-        if self.transferable_kv_cache_memory().is_some() {
+        if self.registered.runtime.has_runtime_kv_cache() {
             return Err(ModelForwardError::Runtime(
                 "update_weights_from_disk requires a runtime restart when the model owns transferable KV memory; replacing a registered allocation in place is unsupported"
                     .to_string(),

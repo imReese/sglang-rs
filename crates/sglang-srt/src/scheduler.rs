@@ -4,7 +4,7 @@ use std::fmt;
 use crate::cache::{
     CacheAllocationError, CachePageAllocator, CachePageId, PrefixMatch, RadixCache,
 };
-use crate::transfer::{KvCacheTransferError, MooncakeTransferPollSummary};
+use crate::transfer::{KvCacheTransferError, KvTransferPollSummary};
 use crate::types::{DisaggregatedParams, FAKE_BOOTSTRAP_HOST, RequestId, SamplingParams};
 use crate::worker::{DecodeRequestState, GeneratedToken, WorkerExecutionError, WorkerExecutor};
 
@@ -891,7 +891,7 @@ where
             .ok_or(SchedulerError::EmptyQueue)
     }
 
-    pub fn poll_transfers(&mut self) -> Result<MooncakeTransferPollSummary, KvCacheTransferError> {
+    pub fn poll_transfers(&mut self) -> Result<KvTransferPollSummary, KvCacheTransferError> {
         match self.worker.poll_transfers() {
             Ok(summary) => {
                 self.reconcile_pending_prefix_cache_inserts()?;

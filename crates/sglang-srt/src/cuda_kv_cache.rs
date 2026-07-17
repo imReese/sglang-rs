@@ -1,5 +1,9 @@
 use std::fmt;
 
+use nexus_transfer::{
+    KvCacheMemoryLocation, KvCacheMemoryProvider, TransferableKvCacheMemory,
+    TransferableKvCacheMemoryError, TransferableKvCacheRegion,
+};
 use sglang_kernel::cuda::{CudaContext, CudaDeviceAllocation, CudaError};
 use sglang_kernel::cuda_kv_kernels::{
     CudaKvPairCopyError, CudaKvPairCopyKernels, CudaKvPairCopyLayout, CudaKvPairCopyPlan,
@@ -9,10 +13,7 @@ use sglang_kernel::cuda_kv_kernels::{
 use crate::kv_cache::{
     KvCachePool, KvCachePoolError, KvCacheStorage, PagedKvCacheLayout, PagedKvCacheLayoutError,
 };
-use crate::transfer::{
-    KvCacheMemoryLocation, KvCacheMemoryProvider, KvCacheRuntimeLayout, KvCacheTransferError,
-    TransferableKvCacheMemory, TransferableKvCacheRegion,
-};
+use crate::transfer::KvCacheRuntimeLayout;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CudaKvStorageError {
@@ -33,7 +34,7 @@ pub enum CudaKvStorageError {
     SizeOverflow,
     Cuda(CudaError),
     CudaKvCopy(CudaKvPairCopyError),
-    Transfer(KvCacheTransferError),
+    Descriptor(TransferableKvCacheMemoryError),
 }
 
 impl fmt::Display for CudaKvStorageError {
@@ -59,8 +60,8 @@ impl fmt::Display for CudaKvStorageError {
             Self::SizeOverflow => formatter.write_str("CUDA KV storage size overflowed"),
             Self::Cuda(error) => write!(formatter, "CUDA KV storage operation failed: {error}"),
             Self::CudaKvCopy(error) => write!(formatter, "CUDA KV device copy failed: {error}"),
-            Self::Transfer(error) => {
-                write!(formatter, "CUDA KV transfer layout failed: {error}")
+            Self::Descriptor(error) => {
+                write!(formatter, "invalid NexusKV CUDA memory descriptor: {error}")
             }
         }
     }
@@ -92,9 +93,9 @@ impl From<CudaKvPairCopyError> for CudaKvStorageError {
     }
 }
 
-impl From<KvCacheTransferError> for CudaKvStorageError {
-    fn from(value: KvCacheTransferError) -> Self {
-        Self::Transfer(value)
+impl From<TransferableKvCacheMemoryError> for CudaKvStorageError {
+    fn from(value: TransferableKvCacheMemoryError) -> Self {
+        Self::Descriptor(value)
     }
 }
 
@@ -167,15 +168,21 @@ pub struct CudaKvSlotGatherLaunch<'a> {
 pub struct CudaKvStorage {
     context: CudaContext,
     allocation: CudaDeviceAllocation,
+    page_size_bytes: usize,
 }
 
 impl CudaKvStorage {
-    pub fn allocate(context: &CudaContext, byte_len: usize) -> Result<Self, CudaKvStorageError> {
+    pub fn allocate(
+        context: &CudaContext,
+        byte_len: usize,
+        page_size_bytes: usize,
+    ) -> Result<Self, CudaKvStorageError> {
         let mut allocation = context.allocate(byte_len)?;
         allocation.fill(0)?;
         Ok(Self {
             context: context.clone(),
             allocation,
+            page_size_bytes,
         })
     }
 
@@ -400,33 +407,17 @@ impl CudaKvStorage {
         })
     }
 
-    pub fn transferable_memory(
-        &self,
-        layout: PagedKvCacheLayout,
-    ) -> Result<TransferableKvCacheMemory, CudaKvStorageError> {
-        self.validate_layout(layout)?;
-        let device_ptr = self.allocation.device_ptr_at(0, layout.total_byte_len())?;
-        let base_addr =
-            usize::try_from(device_ptr).map_err(|_| CudaKvStorageError::SizeOverflow)?;
-        Ok(TransferableKvCacheMemory::new(
-            vec![TransferableKvCacheRegion {
-                base_addr,
-                byte_len: self.allocation.byte_len(),
-                page_size_bytes: layout.runtime().page_size_bytes,
-            }],
-            layout.runtime().page_size_bytes,
-            KvCacheMemoryLocation::Cuda {
-                device_id: self.allocation.device_ordinal(),
-            },
-        )
-        .map_err(KvCacheTransferError::from)?)
-    }
-
     pub fn validate_layout(&self, layout: PagedKvCacheLayout) -> Result<(), CudaKvStorageError> {
         let actual = self.allocation.byte_len();
         let expected = layout.total_byte_len();
         if actual != expected {
             return Err(CudaKvStorageError::StorageSizeMismatch { expected, actual });
+        }
+        if self.page_size_bytes != layout.runtime().page_size_bytes {
+            return Err(CudaKvStorageError::PageBufferSizeMismatch {
+                expected: layout.runtime().page_size_bytes,
+                actual: self.page_size_bytes,
+            });
         }
         Ok(())
     }
@@ -449,8 +440,6 @@ impl CudaKvStorage {
 }
 
 impl KvCacheStorage for CudaKvStorage {
-    type Error = CudaKvStorageError;
-
     fn byte_len(&self) -> usize {
         self.allocation.byte_len()
     }
@@ -461,28 +450,41 @@ impl KvCacheStorage for CudaKvStorage {
     }
 }
 
+impl KvCacheMemoryProvider for CudaKvStorage {
+    type Error = CudaKvStorageError;
+
+    fn transferable_kv_cache_memory(&self) -> Result<TransferableKvCacheMemory, Self::Error> {
+        let device_ptr = self
+            .allocation
+            .device_ptr_at(0, self.allocation.byte_len())?;
+        let base_addr =
+            usize::try_from(device_ptr).map_err(|_| CudaKvStorageError::SizeOverflow)?;
+        Ok(TransferableKvCacheMemory::new(
+            vec![TransferableKvCacheRegion {
+                base_addr,
+                byte_len: self.allocation.byte_len(),
+                page_size_bytes: self.page_size_bytes,
+            }],
+            self.page_size_bytes,
+            KvCacheMemoryLocation::Cuda {
+                device_id: self.allocation.device_ordinal(),
+            },
+        )?)
+    }
+}
+
 pub fn allocate_cuda_kv_cache(
     context: &CudaContext,
     runtime: KvCacheRuntimeLayout,
     page_count: usize,
 ) -> Result<KvCachePool<CudaKvStorage>, CudaKvStorageError> {
     let layout = PagedKvCacheLayout::new(runtime, page_count)?;
-    let storage = CudaKvStorage::allocate(context, layout.total_byte_len())?;
+    let storage = CudaKvStorage::allocate(
+        context,
+        layout.total_byte_len(),
+        layout.runtime().page_size_bytes,
+    )?;
     Ok(KvCachePool::new(layout, storage)?)
-}
-
-impl KvCacheMemoryProvider for KvCachePool<CudaKvStorage> {
-    type Error = KvCacheTransferError;
-
-    fn transferable_kv_cache_memory(&self) -> Result<TransferableKvCacheMemory, Self::Error> {
-        self.storage()
-            .transferable_memory(self.layout())
-            .map_err(|error| {
-                KvCacheTransferError::Runtime(format!(
-                    "CUDA KV storage is not transferable: {error}"
-                ))
-            })
-    }
 }
 
 fn kv_pair_copy_plan(

@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::scheduler::{ScheduledOutput, ScheduledRequest, Scheduler, SchedulerError};
 use crate::tokenizer::{ChatTemplateInput, Tokenizer, TokenizerError};
-use crate::transfer::{KvCacheTransferError, MooncakeTransferPollSummary};
+use crate::transfer::{KvCacheTransferError, KvTransferPollSummary};
 use crate::types::{
     GenerateOutput, GenerateRequest, RequestId, TokenGenerateOutput, TokenGenerateRequest,
 };
@@ -103,7 +103,7 @@ impl<T, W> Engine<T, W>
 where
     W: WorkerExecutor,
 {
-    pub fn poll_transfers(&mut self) -> Result<MooncakeTransferPollSummary, RuntimeError> {
+    pub fn poll_transfers(&mut self) -> Result<KvTransferPollSummary, RuntimeError> {
         Ok(self.scheduler.poll_transfers()?)
     }
 

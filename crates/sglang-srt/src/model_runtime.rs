@@ -4,6 +4,7 @@ use crate::backend::{InitializedRuntimeBackend, RuntimeBackend, RuntimeCapabilit
 use crate::cpu_hybrid::CpuReferenceHybridDecoder;
 use crate::cpu_reference::CpuReferenceDenseDecoder;
 use crate::cuda_dense_decoder::CudaBf16DenseDecoder;
+use crate::cuda_kv_cache::allocate_cuda_kv_cache;
 use crate::cuda_runtime::CudaEmbeddingLmModel;
 use crate::model_artifacts::LocalModelArtifacts;
 use crate::model_executor::{
@@ -11,16 +12,13 @@ use crate::model_executor::{
     ModelForwardOutput, ModelWorkerBatch,
 };
 use crate::models::{ModelDefinition, ModelExecutionArchitecture};
-use crate::transfer::TransferableKvCacheMemory;
+use crate::runtime_kv_cache::{ModelExecutionResources, RuntimeKvCache};
+use crate::transfer::{KvCacheDtype, KvCacheRuntimeLayout};
 use crate::worker::WorkerWeightUpdateRequest;
 
 pub(crate) trait ModelExecutor: ForwardModel + fmt::Debug + Send {
     fn runtime_capability(&self) -> RuntimeCapability;
     fn execution_dtype(&self) -> RuntimeDtype;
-
-    fn transferable_kv_cache_memory(&self) -> Option<&TransferableKvCacheMemory> {
-        None
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,10 +55,6 @@ impl ModelExecutor for CudaBf16DenseDecoder {
     fn execution_dtype(&self) -> RuntimeDtype {
         RuntimeDtype::Bf16
     }
-
-    fn transferable_kv_cache_memory(&self) -> Option<&TransferableKvCacheMemory> {
-        Some(CudaBf16DenseDecoder::transferable_kv_cache_memory(self))
-    }
 }
 
 impl ModelExecutor for CpuReferenceDenseDecoder {
@@ -88,6 +82,7 @@ pub(crate) struct LoadedModelRuntime {
     runtime_backend: RuntimeBackend,
     executor: Box<dyn ModelExecutor>,
     config: ModelRuntimeConfig,
+    runtime_kv_cache: Option<RuntimeKvCache>,
 }
 
 impl LoadedModelRuntime {
@@ -99,7 +94,8 @@ impl LoadedModelRuntime {
     ) -> Result<Self, ModelRuntimeLoadError> {
         validate_runtime_support(definition, &backend, config.tensor_parallel_size)?;
         let runtime_backend = backend.runtime_backend();
-        let executor = load_executor(definition, artifacts, backend, config)?;
+        let runtime_kv_cache = allocate_runtime_kv_cache(definition, &backend, config.kv_cache)?;
+        let executor = load_executor(definition, artifacts, backend)?;
         let capability = executor.runtime_capability();
         let execution_dtype = executor.execution_dtype();
         if !definition.supported_dtypes().contains(&execution_dtype) {
@@ -118,6 +114,7 @@ impl LoadedModelRuntime {
             runtime_backend,
             executor,
             config,
+            runtime_kv_cache,
         })
     }
 
@@ -137,8 +134,12 @@ impl LoadedModelRuntime {
         self.config
     }
 
-    pub(crate) fn transferable_kv_cache_memory(&self) -> Option<TransferableKvCacheMemory> {
-        self.executor.transferable_kv_cache_memory().cloned()
+    pub(crate) fn take_runtime_kv_cache(&mut self) -> Option<RuntimeKvCache> {
+        self.runtime_kv_cache.take()
+    }
+
+    pub(crate) fn has_runtime_kv_cache(&self) -> bool {
+        self.runtime_kv_cache.is_some()
     }
 }
 
@@ -147,7 +148,20 @@ impl ForwardModel for LoadedModelRuntime {
         &mut self,
         batch: &ModelWorkerBatch,
     ) -> Result<ModelForwardOutput, ModelForwardError> {
-        self.executor.forward(batch)
+        let resources = self
+            .runtime_kv_cache
+            .as_mut()
+            .map(RuntimeKvCache::execution_resources)
+            .unwrap_or_else(ModelExecutionResources::without_kv_cache);
+        self.executor.forward_with_resources(batch, resources)
+    }
+
+    fn forward_with_resources(
+        &mut self,
+        batch: &ModelWorkerBatch,
+        resources: ModelExecutionResources<'_>,
+    ) -> Result<ModelForwardOutput, ModelForwardError> {
+        self.executor.forward_with_resources(batch, resources)
     }
 
     fn complete_request(&mut self, request_id: &crate::types::RequestId) {
@@ -265,7 +279,6 @@ fn load_executor(
     definition: &ModelDefinition,
     artifacts: &LocalModelArtifacts,
     backend: InitializedRuntimeBackend,
-    config: ModelRuntimeConfig,
 ) -> Result<Box<dyn ModelExecutor>, ModelRuntimeLoadError> {
     match definition.execution() {
         ModelExecutionArchitecture::Embedding => load_embedding_executor(artifacts, backend),
@@ -291,12 +304,7 @@ fn load_executor(
                 )]))
             }
             InitializedRuntimeBackend::Cuda(backend) if definition.dense_decoder().is_some() => {
-                let kv_cache = config.kv_cache.ok_or_else(|| {
-                    ModelRuntimeLoadError::MissingCapabilities(vec![
-                        "runtime KV cache allocation configuration".to_string(),
-                    ])
-                })?;
-                CudaBf16DenseDecoder::load(definition, artifacts, backend, kv_cache)
+                CudaBf16DenseDecoder::load(definition, artifacts, backend)
                     .map(|model| Box::new(model) as Box<dyn ModelExecutor>)
                     .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))
             }
@@ -315,6 +323,72 @@ fn load_executor(
             }
         },
     }
+}
+
+fn allocate_runtime_kv_cache(
+    definition: &ModelDefinition,
+    backend: &InitializedRuntimeBackend,
+    config: Option<KvCacheAllocationConfig>,
+) -> Result<Option<RuntimeKvCache>, ModelRuntimeLoadError> {
+    let InitializedRuntimeBackend::Cuda(backend) = backend else {
+        return Ok(None);
+    };
+    if definition.dense_decoder().is_none() {
+        return Ok(None);
+    }
+
+    let config = config.ok_or_else(|| {
+        ModelRuntimeLoadError::MissingCapabilities(vec![
+            "runtime KV cache allocation configuration".to_string(),
+        ])
+    })?;
+    validate_cache_config(config)?;
+    let model_layout = definition.kv_cache_layout().ok_or_else(|| {
+        ModelRuntimeLoadError::MissingCapabilities(vec![
+            "model paged KV cache geometry".to_string(),
+        ])
+    })?;
+    let bytes_per_token = model_layout
+        .token_size_bytes(KvCacheDtype::Bfloat16)
+        .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?;
+    let page_size_bytes = config
+        .page_size
+        .checked_mul(bytes_per_token)
+        .ok_or_else(|| ModelRuntimeLoadError::Load("KV page size overflowed".to_string()))?;
+    let runtime_layout = KvCacheRuntimeLayout {
+        dtype: KvCacheDtype::Bfloat16,
+        page_size: config.page_size,
+        num_layers: model_layout.num_layers,
+        kv_heads: model_layout.kv_heads,
+        head_dim: model_layout.head_dim,
+        kv_tensors_per_token: model_layout.kv_tensors_per_token,
+        bytes_per_token,
+        page_size_bytes,
+    };
+    let page_count = config.slot_capacity / config.page_size;
+    let pool = allocate_cuda_kv_cache(backend.context(), runtime_layout, page_count)
+        .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?;
+    Ok(Some(RuntimeKvCache::cuda(pool)))
+}
+
+fn validate_cache_config(config: KvCacheAllocationConfig) -> Result<(), ModelRuntimeLoadError> {
+    if config.slot_capacity == 0 {
+        return Err(ModelRuntimeLoadError::MissingCapabilities(vec![
+            "non-zero KV cache slot capacity".to_string(),
+        ]));
+    }
+    if config.page_size == 0 {
+        return Err(ModelRuntimeLoadError::MissingCapabilities(vec![
+            "non-zero KV cache page size".to_string(),
+        ]));
+    }
+    if !config.slot_capacity.is_multiple_of(config.page_size) {
+        return Err(ModelRuntimeLoadError::MissingCapabilities(vec![format!(
+            "KV cache slot capacity {} divisible by page size {}",
+            config.slot_capacity, config.page_size
+        )]));
+    }
+    Ok(())
 }
 
 fn format_dtypes(dtypes: &[RuntimeDtype]) -> String {

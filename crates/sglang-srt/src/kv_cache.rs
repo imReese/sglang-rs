@@ -1,6 +1,8 @@
 use std::fmt;
 use std::ops::Range;
 
+use nexus_transfer::{KvCacheMemoryProvider, TransferableKvCacheMemory};
+
 use crate::transfer::KvCacheRuntimeLayout;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -399,9 +401,7 @@ impl PagedKvCacheLayout {
     }
 }
 
-pub trait KvCacheStorage {
-    type Error;
-
+pub trait KvCacheStorage: KvCacheMemoryProvider {
     fn byte_len(&self) -> usize;
     fn clear(&mut self) -> Result<(), Self::Error>;
 }
@@ -460,5 +460,16 @@ where
 
     pub fn into_storage(self) -> S {
         self.storage
+    }
+}
+
+impl<S> KvCacheMemoryProvider for KvCachePool<S>
+where
+    S: KvCacheStorage,
+{
+    type Error = S::Error;
+
+    fn transferable_kv_cache_memory(&self) -> Result<TransferableKvCacheMemory, Self::Error> {
+        self.storage.transferable_kv_cache_memory()
     }
 }

@@ -37,11 +37,11 @@ use crate::transfer::MooncakeTransferTarget;
 use crate::transfer::UnlinkedMooncakeTransferEngine;
 use crate::transfer::{
     DecodeBootstrapPublisher, DecodeBootstrapRegistry, DisaggregationMode,
-    FakeKvCacheTransferExecutor, KvCacheMemoryProvider, KvCacheTransferExecutor,
-    KvTransferModelWorker, MooncakeBatchReleaser, MooncakeError, MooncakeKvCacheLayout,
-    MooncakeKvCacheMemoryExt, MooncakeKvCacheTransferExecutor, MooncakeTransferStatusReader,
-    MooncakeTransferSubmitter, MooncakeTransferTargetResolver, PdConfig, PdConfigError,
-    TransferBackend, TransferableKvCacheMemory,
+    FakeKvCacheTransferExecutor, KvCacheMemoryProvider, KvTransferBackend, KvTransferModelWorker,
+    MooncakeBatchReleaser, MooncakeError, MooncakeKvCacheLayout, MooncakeKvCacheMemoryExt,
+    MooncakeKvCacheTransferExecutor, MooncakeTransferStatusReader, MooncakeTransferSubmitter,
+    MooncakeTransferTargetResolver, PdConfig, PdConfigError, TransferBackend,
+    TransferableKvCacheMemory,
 };
 #[cfg(feature = "mooncake-link")]
 use crate::transfer::{
@@ -153,7 +153,7 @@ pub mod test_support {
         transfer_executor: E,
     ) -> ReferencePdHttpRouterService<E>
     where
-        E: KvCacheTransferExecutor,
+        E: KvTransferBackend,
     {
         let worker = KvTransferModelWorker::new(
             ModelRunner::new(CpuReferenceModel),
@@ -198,7 +198,7 @@ pub mod test_support {
         transfer_executor: E,
     ) -> ReferencePdGrpcRouterService<E>
     where
-        E: KvCacheTransferExecutor,
+        E: KvTransferBackend,
     {
         let worker = KvTransferModelWorker::new(
             ModelRunner::new(CpuReferenceModel),
@@ -284,14 +284,14 @@ fn bootstrap_forward_model_for_launch(
 }
 
 fn bootstrap_model_runner(
-    model: BootstrapForwardModel,
+    mut model: BootstrapForwardModel,
 ) -> Result<ModelRunner<BootstrapForwardModel>, ServerLaunchError> {
     let kv_cache_layout = model.kv_cache_layout();
-    let transferable_memory = model.transferable_kv_cache_memory();
+    let runtime_kv_cache = model.take_runtime_kv_cache();
     let mut runner = ModelRunner::new_with_kv_cache_layout(model, kv_cache_layout);
-    if let Some(memory) = transferable_memory {
+    if let Some(kv_cache) = runtime_kv_cache {
         runner
-            .install_transferable_kv_cache_memory(memory)
+            .install_runtime_kv_cache(kv_cache)
             .map_err(|error| ServerLaunchError::KvCacheTransfer(error.to_string()))?;
     }
     Ok(runner)
@@ -956,7 +956,7 @@ pub fn build_bootstrap_pd_http_router_service<E>(
     transfer_executor: E,
 ) -> BootstrapPdHttpRouterService<E>
 where
-    E: KvCacheTransferExecutor,
+    E: KvTransferBackend,
 {
     try_build_bootstrap_pd_http_router_service(args, registry, transfer_executor)
         .expect("bootstrap tokenizer should load")
@@ -968,7 +968,7 @@ pub fn try_build_bootstrap_pd_http_router_service<E>(
     transfer_executor: E,
 ) -> Result<BootstrapPdHttpRouterService<E>, ServerLaunchError>
 where
-    E: KvCacheTransferExecutor,
+    E: KvTransferBackend,
 {
     try_build_bootstrap_pd_http_router_service_with_decode_publisher(
         args,
@@ -987,7 +987,7 @@ pub fn try_build_bootstrap_pd_http_router_service_with_decode_publisher<E, P>(
     decode_side_bootstrap_only: bool,
 ) -> Result<BootstrapPdHttpRouterService<E, P>, ServerLaunchError>
 where
-    E: KvCacheTransferExecutor,
+    E: KvTransferBackend,
     P: DecodeBootstrapPublisher,
 {
     validate_local_model_artifacts_if_present(args)?;
@@ -1011,7 +1011,7 @@ fn try_build_bootstrap_pd_http_router_service_from_model_with_decode_publisher<E
     decode_side_bootstrap_only: bool,
 ) -> Result<BootstrapPdHttpRouterService<E, P>, ServerLaunchError>
 where
-    E: KvCacheTransferExecutor,
+    E: KvTransferBackend,
     P: DecodeBootstrapPublisher,
 {
     validate_kv_only_transfer_model(&model)?;
@@ -1034,7 +1034,7 @@ fn try_build_bootstrap_pd_http_router_service_from_runner_with_decode_publisher<
     decode_side_bootstrap_only: bool,
 ) -> Result<BootstrapPdHttpRouterService<E, P>, ServerLaunchError>
 where
-    E: KvCacheTransferExecutor,
+    E: KvTransferBackend,
     P: DecodeBootstrapPublisher,
 {
     let mut worker = KvTransferModelWorker::new(model_runner, registry, transfer_executor)
@@ -1509,7 +1509,7 @@ pub fn build_bootstrap_pd_grpc_router_service<E>(
     transfer_executor: E,
 ) -> BootstrapPdGrpcRouterService<E>
 where
-    E: KvCacheTransferExecutor,
+    E: KvTransferBackend,
 {
     try_build_bootstrap_pd_grpc_router_service(args, registry, transfer_executor)
         .expect("bootstrap tokenizer should load")
@@ -1521,7 +1521,7 @@ pub fn try_build_bootstrap_pd_grpc_router_service<E>(
     transfer_executor: E,
 ) -> Result<BootstrapPdGrpcRouterService<E>, ServerLaunchError>
 where
-    E: KvCacheTransferExecutor,
+    E: KvTransferBackend,
 {
     try_build_bootstrap_pd_grpc_router_service_with_decode_publisher(
         args,
@@ -1540,7 +1540,7 @@ pub fn try_build_bootstrap_pd_grpc_router_service_with_decode_publisher<E, P>(
     decode_side_bootstrap_only: bool,
 ) -> Result<BootstrapPdGrpcRouterService<E, P>, ServerLaunchError>
 where
-    E: KvCacheTransferExecutor,
+    E: KvTransferBackend,
     P: DecodeBootstrapPublisher,
 {
     validate_local_model_artifacts_if_present(args)?;
@@ -1564,7 +1564,7 @@ fn try_build_bootstrap_pd_grpc_router_service_from_model_with_decode_publisher<E
     decode_side_bootstrap_only: bool,
 ) -> Result<BootstrapPdGrpcRouterService<E, P>, ServerLaunchError>
 where
-    E: KvCacheTransferExecutor,
+    E: KvTransferBackend,
     P: DecodeBootstrapPublisher,
 {
     validate_kv_only_transfer_model(&model)?;
@@ -1587,7 +1587,7 @@ fn try_build_bootstrap_pd_grpc_router_service_from_runner_with_decode_publisher<
     decode_side_bootstrap_only: bool,
 ) -> Result<BootstrapPdGrpcRouterService<E, P>, ServerLaunchError>
 where
-    E: KvCacheTransferExecutor,
+    E: KvTransferBackend,
     P: DecodeBootstrapPublisher,
 {
     let mut worker = KvTransferModelWorker::new(model_runner, registry, transfer_executor)

@@ -1,19 +1,48 @@
 use sglang_srt::kv_cache::{
     KvCachePool, KvCachePoolError, KvCacheStorage, PagedKvCacheLayout, PagedKvCacheLayoutError,
 };
-use sglang_srt::transfer::{KvCacheDtype, KvCacheRuntimeLayout};
+use sglang_srt::transfer::{
+    KvCacheDtype, KvCacheMemoryLocation, KvCacheMemoryProvider, KvCacheRuntimeLayout,
+    TransferableKvCacheMemory, TransferableKvCacheRegion,
+};
 
-struct ByteStorage(Vec<u8>);
+struct ByteStorage {
+    bytes: Vec<u8>,
+    descriptor: TransferableKvCacheMemory,
+}
 
-impl KvCacheStorage for ByteStorage {
+impl ByteStorage {
+    fn new(byte_len: usize, page_size_bytes: usize, fill: u8) -> Self {
+        let bytes = vec![fill; byte_len];
+        let descriptor = TransferableKvCacheMemory::new(
+            vec![TransferableKvCacheRegion {
+                base_addr: bytes.as_ptr() as usize,
+                byte_len,
+                page_size_bytes,
+            }],
+            page_size_bytes,
+            KvCacheMemoryLocation::Cpu { numa_node: 0 },
+        )
+        .expect("test storage must produce a valid NexusKV descriptor");
+        Self { bytes, descriptor }
+    }
+}
+
+impl KvCacheMemoryProvider for ByteStorage {
     type Error = std::convert::Infallible;
 
+    fn transferable_kv_cache_memory(&self) -> Result<TransferableKvCacheMemory, Self::Error> {
+        Ok(self.descriptor.clone())
+    }
+}
+
+impl KvCacheStorage for ByteStorage {
     fn byte_len(&self) -> usize {
-        self.0.len()
+        self.bytes.len()
     }
 
     fn clear(&mut self) -> Result<(), Self::Error> {
-        self.0.fill(0);
+        self.bytes.fill(0);
         Ok(())
     }
 }
@@ -179,19 +208,23 @@ fn page_major_layout_validates_scheduler_slot_maps_before_cuda_upload() {
 #[test]
 fn pool_owns_backend_storage_without_knowing_its_platform() {
     let layout = PagedKvCacheLayout::new(runtime_layout(), 1).expect("layout should be valid");
-    let storage = ByteStorage(vec![7; layout.total_byte_len()]);
+    let storage = ByteStorage::new(layout.total_byte_len(), layout.runtime().page_size_bytes, 7);
     let mut pool = KvCachePool::new(layout, storage).expect("storage capacity should match");
 
     pool.clear().expect("byte storage clear is infallible");
 
     assert_eq!(pool.layout(), layout);
-    assert!(pool.storage().0.iter().all(|byte| *byte == 0));
+    assert!(pool.storage().bytes.iter().all(|byte| *byte == 0));
+    let descriptor = pool
+        .transferable_kv_cache_memory()
+        .expect("the common pool must forward its storage's NexusKV contract");
+    assert_eq!(descriptor, pool.storage().descriptor);
 }
 
 #[test]
 fn pool_rejects_storage_with_the_wrong_capacity() {
     let layout = PagedKvCacheLayout::new(runtime_layout(), 1).expect("layout should be valid");
-    let storage = ByteStorage(vec![0; layout.total_byte_len() - 1]);
+    let storage = ByteStorage::new(layout.total_byte_len() - 1, 1, 0);
 
     assert!(matches!(
         KvCachePool::new(layout, storage),

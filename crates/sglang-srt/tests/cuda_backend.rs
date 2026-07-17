@@ -519,7 +519,7 @@ fn cuda_kv_kernels_scatter_and_gather_batched_physical_slots() {
 
     let transferable_before = kv_cache
         .storage()
-        .transferable_memory(layout)
+        .transferable_kv_cache_memory()
         .expect("KV pool should expose its Mooncake memory before model writes");
     kv_cache
         .storage_mut()
@@ -716,7 +716,7 @@ fn cuda_bf16_paged_attention_reads_mooncake_registered_physical_kv_slots() {
 
     let transferable = kv_cache
         .storage()
-        .transferable_memory(kv_layout)
+        .transferable_kv_cache_memory()
         .expect("attention KV pool should expose Mooncake memory");
     assert_eq!(
         transferable.regions()[0].base_addr,

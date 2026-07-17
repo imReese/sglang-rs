@@ -27,6 +27,7 @@ pub mod pd_bootstrap;
 mod profile;
 pub mod proto;
 pub mod router;
+pub mod runtime_kv_cache;
 pub mod scheduler;
 pub mod server;
 mod serving_metrics;

@@ -1393,8 +1393,8 @@ where
         self.decode.decode_request_state(request)
     }
 
-    fn poll_transfers(&mut self) -> Result<MooncakeTransferPollSummary, KvCacheTransferError> {
-        Ok(MooncakeTransferPollSummary::default())
+    fn poll_transfers(&mut self) -> Result<KvTransferPollSummary, KvCacheTransferError> {
+        Ok(KvTransferPollSummary::default())
     }
 
     fn complete_request(&mut self, request: &ScheduledRequest) {
@@ -1472,7 +1472,7 @@ impl DecodeBootstrapPublisher for NoopDecodeBootstrapPublisher {
     }
 }
 
-pub trait KvCacheTransferExecutor {
+pub trait KvTransferBackend {
     fn transfer_span(&mut self, span: &KvCacheTransferSpan) -> Result<(), KvCacheTransferError>;
 
     fn completes_inline(&self) -> bool {
@@ -1482,8 +1482,8 @@ pub trait KvCacheTransferExecutor {
     fn poll_transfers(
         &mut self,
         _registry: &mut DecodeBootstrapRegistry,
-    ) -> Result<MooncakeTransferPollSummary, KvCacheTransferError> {
-        Ok(MooncakeTransferPollSummary::default())
+    ) -> Result<KvTransferPollSummary, KvCacheTransferError> {
+        Ok(KvTransferPollSummary::default())
     }
 
     fn cancel_transfer_room(
@@ -1505,7 +1505,7 @@ impl FakeKvCacheTransferExecutor {
     }
 }
 
-impl KvCacheTransferExecutor for FakeKvCacheTransferExecutor {
+impl KvTransferBackend for FakeKvCacheTransferExecutor {
     fn transfer_span(&mut self, span: &KvCacheTransferSpan) -> Result<(), KvCacheTransferError> {
         self.transferred_rooms.push(span.bootstrap_room());
         Ok(())
@@ -1518,7 +1518,7 @@ pub fn execute_kv_cache_transfer_plan<E>(
     plan: &KvCacheTransferPlan,
 ) -> Result<KvCacheTransferSummary, KvCacheTransferError>
 where
-    E: KvCacheTransferExecutor,
+    E: KvTransferBackend,
 {
     let mut summary = KvCacheTransferSummary::default();
 
@@ -1699,7 +1699,7 @@ impl<W, E, P> KvTransferModelWorker<W, E, P> {
 impl<W, E, P> FallibleModelWorker for KvTransferModelWorker<W, E, P>
 where
     W: FallibleModelWorker,
-    E: KvCacheTransferExecutor,
+    E: KvTransferBackend,
     P: DecodeBootstrapPublisher,
 {
     fn try_generate_batch(
@@ -1784,7 +1784,7 @@ where
         }
     }
 
-    fn poll_transfers(&mut self) -> Result<MooncakeTransferPollSummary, KvCacheTransferError> {
+    fn poll_transfers(&mut self) -> Result<KvTransferPollSummary, KvCacheTransferError> {
         self.transfer_executor.poll_transfers(&mut self.registry)
     }
 
@@ -2606,14 +2606,14 @@ impl MooncakeSubmittedBatch {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MooncakeTransferPollSummary {
+pub struct KvTransferPollSummary {
     completed_batches: usize,
     pending_batches: usize,
     completed_descriptor_checksums: Vec<String>,
     pending_descriptor_checksums: Vec<String>,
 }
 
-impl MooncakeTransferPollSummary {
+impl KvTransferPollSummary {
     pub fn completed_batches(&self) -> usize {
         self.completed_batches
     }
@@ -2635,11 +2635,11 @@ pub fn poll_mooncake_transfer_batches<R>(
     registry: &mut DecodeBootstrapRegistry,
     reader: &mut R,
     submitted_batches: &[MooncakeSubmittedBatch],
-) -> Result<MooncakeTransferPollSummary, KvCacheTransferError>
+) -> Result<KvTransferPollSummary, KvCacheTransferError>
 where
     R: MooncakeTransferStatusReader,
 {
-    let mut summary = MooncakeTransferPollSummary::default();
+    let mut summary = KvTransferPollSummary::default();
 
     for batch in submitted_batches {
         let mut completed_tasks = 0;
@@ -2954,9 +2954,9 @@ where
     pub fn poll_submitted_transfers(
         &mut self,
         registry: &mut DecodeBootstrapRegistry,
-    ) -> Result<MooncakeTransferPollSummary, KvCacheTransferError> {
+    ) -> Result<KvTransferPollSummary, KvCacheTransferError> {
         let submitted_transfers = self.submitted_transfers.clone();
-        let mut summary = MooncakeTransferPollSummary::default();
+        let mut summary = KvTransferPollSummary::default();
         let mut pending_transfers = Vec::new();
         let mut first_error = None;
 
@@ -3010,7 +3010,7 @@ where
     }
 }
 
-impl<S, R> KvCacheTransferExecutor for MooncakeKvCacheTransferExecutor<S, R>
+impl<S, R> KvTransferBackend for MooncakeKvCacheTransferExecutor<S, R>
 where
     S: MooncakeTransferSubmitter + MooncakeTransferStatusReader + MooncakeBatchReleaser,
     R: MooncakeTransferTargetResolver,
@@ -3064,7 +3064,7 @@ where
     fn poll_transfers(
         &mut self,
         registry: &mut DecodeBootstrapRegistry,
-    ) -> Result<MooncakeTransferPollSummary, KvCacheTransferError> {
+    ) -> Result<KvTransferPollSummary, KvCacheTransferError> {
         self.poll_submitted_transfers(registry)
     }
 
