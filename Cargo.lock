@@ -2729,6 +2729,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
+name = "nexus-transfer"
+version = "0.1.0"
+source = "git+https://github.com/imReese/NexusKV.git?rev=c7bdc6891672c051491813b17a08700b217bee3e#c7bdc6891672c051491813b17a08700b217bee3e"
+
+[[package]]
 name = "no_std_io2"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4317,6 +4322,7 @@ dependencies = [
  "hf-hub",
  "minijinja",
  "minijinja-contrib",
+ "nexus-transfer",
  "prost",
  "protoc-bin-vendored",
  "rand 0.10.1",

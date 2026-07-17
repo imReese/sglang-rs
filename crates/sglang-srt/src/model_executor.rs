@@ -1,6 +1,8 @@
 use crate::cache::CachePageId;
 use crate::scheduler::{ForwardMode, ScheduleBatch, ScheduledRequest};
-use crate::transfer::{KvCacheModelLayout, KvCacheTransferError, TransferableKvCacheMemory};
+use crate::transfer::{
+    KvCacheMemoryProvider, KvCacheModelLayout, KvCacheTransferError, TransferableKvCacheMemory,
+};
 use crate::types::{DisaggregatedParams, RequestId};
 use rand::RngExt as _;
 use std::fmt;
@@ -945,7 +947,7 @@ impl<M, S> ModelRunner<M, S> {
         Ok(())
     }
 
-    pub fn reserve_mooncake_kv_cache_slots(
+    pub fn reserve_transferable_kv_cache_slots(
         &mut self,
         slot_capacity: usize,
         page_size: usize,
@@ -962,10 +964,12 @@ impl<M, S> ModelRunner<M, S> {
         }
         Ok(())
     }
+}
 
-    pub fn mooncake_kv_cache_memory(
-        &self,
-    ) -> Result<TransferableKvCacheMemory, KvCacheTransferError> {
+impl<M, S> KvCacheMemoryProvider for ModelRunner<M, S> {
+    type Error = KvCacheTransferError;
+
+    fn transferable_kv_cache_memory(&self) -> Result<TransferableKvCacheMemory, Self::Error> {
         self.transferable_kv_cache_memory.clone().ok_or_else(|| {
             KvCacheTransferError::Runtime(
                 "ModelRunner does not own registered transferable KV cache memory".to_string(),

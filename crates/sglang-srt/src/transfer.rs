@@ -10,6 +10,11 @@ use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 
+pub use nexus_transfer::{
+    KvCacheMemoryLocation, KvCacheMemoryProvider, TransferableKvCacheMemory,
+    TransferableKvCacheMemoryError, TransferableKvCacheRegion,
+};
+
 use crate::cache::CachePageId;
 use crate::cli::{ServerArgs, ZmqPortRange};
 use crate::model_artifacts::{HfModelConfig, resolve_model_path};
@@ -1543,6 +1548,12 @@ impl From<DecodeBootstrapRegistryError> for KvCacheTransferError {
     }
 }
 
+impl From<TransferableKvCacheMemoryError> for KvCacheTransferError {
+    fn from(value: TransferableKvCacheMemoryError) -> Self {
+        Self::Runtime(value.to_string())
+    }
+}
+
 impl fmt::Display for KvCacheTransferError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1997,27 +2008,12 @@ pub struct MooncakeRemoteKvLayout {
     pub dst_kv_item_len: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TransferableKvCacheRegion {
-    pub base_addr: usize,
-    pub byte_len: usize,
-    pub page_size_bytes: usize,
+pub trait MooncakeMemoryLocationExt {
+    fn mooncake_memory_location_label(self) -> Result<String, MooncakeError>;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum KvCacheMemoryLocation {
-    Cpu { numa_node: usize },
-    Cuda { device_id: usize },
-    Rocm { device_id: usize },
-    Metal { device_id: usize },
-    Musa { device_id: usize },
-    Xpu { device_id: usize },
-    Npu { device_id: usize },
-    Hpu { device_id: usize },
-}
-
-impl KvCacheMemoryLocation {
-    pub fn mooncake_label(self) -> Result<String, MooncakeError> {
+impl MooncakeMemoryLocationExt for KvCacheMemoryLocation {
+    fn mooncake_memory_location_label(self) -> Result<String, MooncakeError> {
         let label = match self {
             Self::Cpu { numa_node } => format!("cpu:{numa_node}"),
             Self::Cuda { device_id } => format!("cuda:{device_id}"),
@@ -2032,104 +2028,32 @@ impl KvCacheMemoryLocation {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TransferableKvCacheMemory {
-    regions: Vec<TransferableKvCacheRegion>,
-    page_size_bytes: usize,
-    location: KvCacheMemoryLocation,
+pub trait MooncakeKvCacheMemoryExt {
+    fn mooncake_prefill_layout(&self, target_base_offset: u64) -> MooncakeKvCacheLayout;
+
+    fn mooncake_decode_remote_layout(&self, dst_kv_indices: &[i32]) -> MooncakeRemoteKvLayout;
 }
 
-impl TransferableKvCacheMemory {
-    pub fn new(
-        regions: Vec<TransferableKvCacheRegion>,
-        page_size_bytes: usize,
-        location: KvCacheMemoryLocation,
-    ) -> Result<Self, KvCacheTransferError> {
-        if page_size_bytes == 0 {
-            return Err(KvCacheTransferError::Runtime(
-                "transferable KV memory page size must be non-zero".to_string(),
-            ));
-        }
-        if regions.is_empty() {
-            return Err(KvCacheTransferError::Runtime(
-                "transferable KV memory must expose at least one region".to_string(),
-            ));
-        }
-        if !page_size_bytes.is_multiple_of(regions.len()) {
-            return Err(KvCacheTransferError::Runtime(format!(
-                "transferable KV memory page size {page_size_bytes} must be divisible by {} regions",
-                regions.len()
-            )));
-        }
-        let region_page_size_bytes = page_size_bytes / regions.len();
-
-        for region in &regions {
-            if region.base_addr == 0 {
-                return Err(KvCacheTransferError::Runtime(
-                    "transferable KV memory base address must be non-zero".to_string(),
-                ));
-            }
-            if region.byte_len == 0 {
-                return Err(KvCacheTransferError::Runtime(
-                    "transferable KV memory region length must be non-zero".to_string(),
-                ));
-            }
-            if region.page_size_bytes != region_page_size_bytes {
-                return Err(KvCacheTransferError::Runtime(format!(
-                    "transferable KV region page size {} does not match per-region page size {region_page_size_bytes}",
-                    region.page_size_bytes,
-                )));
-            }
-            if region.byte_len % region.page_size_bytes != 0 {
-                return Err(KvCacheTransferError::Runtime(format!(
-                    "transferable KV memory region length {} must be a multiple of page size {}",
-                    region.byte_len, region.page_size_bytes
-                )));
-            }
-        }
-
-        Ok(Self {
-            regions,
-            page_size_bytes,
-            location,
-        })
-    }
-
-    pub fn regions(&self) -> &[TransferableKvCacheRegion] {
-        &self.regions
-    }
-
-    pub fn page_size_bytes(&self) -> usize {
-        self.page_size_bytes
-    }
-
-    pub fn location(&self) -> KvCacheMemoryLocation {
-        self.location
-    }
-
-    pub fn prefill_layout(&self, target_base_offset: u64) -> MooncakeKvCacheLayout {
+impl MooncakeKvCacheMemoryExt for TransferableKvCacheMemory {
+    fn mooncake_prefill_layout(&self, target_base_offset: u64) -> MooncakeKvCacheLayout {
         MooncakeKvCacheLayout {
-            source_base_addr: self.regions[0].base_addr,
-            page_size_bytes: self.page_size_bytes,
+            source_base_addr: self.regions()[0].base_addr,
+            page_size_bytes: self.page_size_bytes(),
             target_base_offset,
         }
     }
 
-    pub fn decode_remote_layout(&self, dst_kv_indices: &[i32]) -> MooncakeRemoteKvLayout {
+    fn mooncake_decode_remote_layout(&self, dst_kv_indices: &[i32]) -> MooncakeRemoteKvLayout {
         MooncakeRemoteKvLayout {
             dst_kv_ptrs: self
-                .regions
+                .regions()
                 .iter()
                 .map(|region| region.base_addr as u64)
                 .collect(),
             dst_kv_indices: dst_kv_indices.to_vec(),
-            dst_kv_item_len: self.page_size_bytes / self.regions.len(),
+            dst_kv_item_len: self.page_size_bytes() / self.regions().len(),
         }
     }
-}
-
-pub trait MooncakeKvCacheMemoryProvider {
-    fn mooncake_kv_cache_memory(&self) -> Result<TransferableKvCacheMemory, KvCacheTransferError>;
 }
 
 pub trait MooncakeMemoryRegistrar: Send + 'static {
@@ -2173,7 +2097,7 @@ where
                 length: region.byte_len,
             })
             .collect::<Vec<_>>();
-        let location = memory.location().mooncake_label()?;
+        let location = memory.location().mooncake_memory_location_label()?;
         registrar.register_memory_batch(&mut buffers, &location)?;
 
         Ok(Self {

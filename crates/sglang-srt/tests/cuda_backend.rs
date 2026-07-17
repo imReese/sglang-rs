@@ -10,7 +10,8 @@ use sglang_srt::cuda_kv_cache::{CudaKvCachePool, CudaKvSlotGatherLaunch, CudaKvS
 use sglang_srt::model_executor::ModelWorkerBatch;
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::transfer::{
-    KvCacheDtype, KvCacheMemoryLocation, KvCacheRuntimeLayout, MooncakeKvCacheMemoryProvider,
+    KvCacheDtype, KvCacheMemoryLocation, KvCacheMemoryProvider, KvCacheRuntimeLayout,
+    MooncakeKvCacheMemoryExt,
 };
 #[cfg(feature = "mooncake-link")]
 use sglang_srt::transfer::{
@@ -272,7 +273,7 @@ fn cuda_backend_round_trips_page_major_device_kv_memory() {
         kv_cache.allocation().device_ptr() + tensor.byte_offset as u64
     );
     let transferable = kv_cache
-        .mooncake_kv_cache_memory()
+        .transferable_kv_cache_memory()
         .expect("CUDA KV cache should expose Mooncake memory");
 
     assert_eq!(transferable.regions().len(), 1);
@@ -283,7 +284,9 @@ fn cuda_backend_round_trips_page_major_device_kv_memory() {
     );
     assert_eq!(transferable.regions()[0].byte_len, 2 * 1024 * 1024);
     assert_eq!(
-        transferable.decode_remote_layout(&[3]).dst_kv_item_len,
+        transferable
+            .mooncake_decode_remote_layout(&[3])
+            .dst_kv_item_len,
         131_072
     );
     let memory_after = backend
@@ -735,7 +738,7 @@ fn cuda_mooncake_registers_real_cuda_kv_memory() {
     let kv_cache = CudaKvCachePool::allocate(backend.context(), cuda_test_layout(), 16)
         .expect("CUDA KV cache should allocate a page-major device pool");
     let transferable = kv_cache
-        .mooncake_kv_cache_memory()
+        .transferable_kv_cache_memory()
         .expect("CUDA KV cache should expose Mooncake memory");
     let engine = SharedLinkedMooncakeTransferEngine::new(&MooncakeTransferEngineConfig {
         metadata_server: "P2PHANDSHAKE".to_string(),

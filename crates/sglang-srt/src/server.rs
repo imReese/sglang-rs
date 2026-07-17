@@ -37,10 +37,11 @@ use crate::transfer::MooncakeTransferTarget;
 use crate::transfer::UnlinkedMooncakeTransferEngine;
 use crate::transfer::{
     DecodeBootstrapPublisher, DecodeBootstrapRegistry, DisaggregationMode,
-    FakeKvCacheTransferExecutor, KvCacheTransferExecutor, KvTransferModelWorker,
-    MooncakeBatchReleaser, MooncakeError, MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor,
-    MooncakeTransferStatusReader, MooncakeTransferSubmitter, MooncakeTransferTargetResolver,
-    PdConfig, PdConfigError, TransferBackend, TransferableKvCacheMemory,
+    FakeKvCacheTransferExecutor, KvCacheMemoryProvider, KvCacheTransferExecutor,
+    KvTransferModelWorker, MooncakeBatchReleaser, MooncakeError, MooncakeKvCacheLayout,
+    MooncakeKvCacheMemoryExt, MooncakeKvCacheTransferExecutor, MooncakeTransferStatusReader,
+    MooncakeTransferSubmitter, MooncakeTransferTargetResolver, PdConfig, PdConfigError,
+    TransferBackend, TransferableKvCacheMemory,
 };
 #[cfg(feature = "mooncake-link")]
 use crate::transfer::{
@@ -1134,7 +1135,7 @@ fn launch_mooncake_prefill_kv_layout(
     model_runner: &ModelRunner<BootstrapForwardModel>,
 ) -> Result<MooncakeKvCacheLayout, ServerLaunchError> {
     validate_kv_only_transfer_model(model_runner.model())?;
-    Ok(mooncake_kv_memory_from_model_runner(model_runner)?.prefill_layout(0))
+    Ok(mooncake_kv_memory_from_model_runner(model_runner)?.mooncake_prefill_layout(0))
 }
 
 #[cfg(not(feature = "mooncake-link"))]
@@ -1142,14 +1143,14 @@ fn launch_mooncake_decode_kv_layout(
     model_runner: &ModelRunner<BootstrapForwardModel>,
 ) -> Result<MooncakeKvCacheLayout, ServerLaunchError> {
     validate_kv_only_transfer_model(model_runner.model())?;
-    Ok(mooncake_kv_memory_from_model_runner(model_runner)?.prefill_layout(0))
+    Ok(mooncake_kv_memory_from_model_runner(model_runner)?.mooncake_prefill_layout(0))
 }
 
 fn mooncake_kv_memory_from_model_runner(
     model_runner: &ModelRunner<BootstrapForwardModel>,
 ) -> Result<TransferableKvCacheMemory, ServerLaunchError> {
     model_runner
-        .mooncake_kv_cache_memory()
+        .transferable_kv_cache_memory()
         .map_err(|error| ServerLaunchError::KvCacheTransfer(error.to_string()))
 }
 
@@ -1175,7 +1176,7 @@ fn prepare_linked_mooncake_kv_memory(
             missing: mismatch.missing,
         })?;
     model_runner
-        .reserve_mooncake_kv_cache_slots(slot_capacity, page_size)
+        .reserve_transferable_kv_cache_slots(slot_capacity, page_size)
         .map_err(|error| ServerLaunchError::KvCacheTransfer(error.to_string()))?;
     let memory = mooncake_kv_memory_from_model_runner(model_runner)?;
     RegisteredMooncakeKvCacheMemory::register(engine.clone(), memory).map_err(Into::into)
@@ -1332,7 +1333,7 @@ fn try_build_launch_mooncake_prefill_http_router_service(
         args.num_reserved_decode_tokens,
         args.page_size,
     )?;
-    let kv_cache_layout = kv_registration.memory().prefill_layout(0);
+    let kv_cache_layout = kv_registration.memory().mooncake_prefill_layout(0);
     let target_resolver = MooncakeSessionTargetResolver::new(engine.clone(), Vec::new());
     let transfer_executor = MooncakeKvCacheTransferExecutor::with_target_resolver(
         engine,
@@ -1380,7 +1381,7 @@ fn try_build_launch_mooncake_decode_http_router_service(
         args.page_size,
     )?;
     let target_resolver = MooncakeSessionTargetResolver::new(engine.clone(), Vec::new());
-    let kv_cache_layout = kv_registration.memory().prefill_layout(0);
+    let kv_cache_layout = kv_registration.memory().mooncake_prefill_layout(0);
     let transfer_executor = MooncakeKvCacheTransferExecutor::with_target_resolver(
         engine,
         kv_cache_layout,
@@ -1427,7 +1428,7 @@ fn try_build_launch_mooncake_prefill_grpc_router_service(
         args.num_reserved_decode_tokens,
         args.page_size,
     )?;
-    let kv_cache_layout = kv_registration.memory().prefill_layout(0);
+    let kv_cache_layout = kv_registration.memory().mooncake_prefill_layout(0);
     let target_resolver = MooncakeSessionTargetResolver::new(engine.clone(), Vec::new());
     let transfer_executor = MooncakeKvCacheTransferExecutor::with_target_resolver(
         engine,
@@ -1475,7 +1476,7 @@ fn try_build_launch_mooncake_decode_grpc_router_service(
         args.page_size,
     )?;
     let target_resolver = MooncakeSessionTargetResolver::new(engine.clone(), Vec::new());
-    let kv_cache_layout = kv_registration.memory().prefill_layout(0);
+    let kv_cache_layout = kv_registration.memory().mooncake_prefill_layout(0);
     let transfer_executor = MooncakeKvCacheTransferExecutor::with_target_resolver(
         engine,
         kv_cache_layout,

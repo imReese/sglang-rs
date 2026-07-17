@@ -6,6 +6,10 @@ use sglang_srt::model_executor::{
 use sglang_srt::scheduler::{
     ForwardMode, ScheduleBatch, ScheduledRequest, Scheduler, SchedulerError,
 };
+use sglang_srt::transfer::{
+    KvCacheMemoryLocation, KvCacheMemoryProvider, KvCacheModelLayout, TransferableKvCacheMemory,
+    TransferableKvCacheRegion,
+};
 use sglang_srt::types::{DisaggregatedParams, FAKE_BOOTSTRAP_HOST, RequestId, SamplingParams};
 use sglang_srt::worker::{
     BatchGeneratedTokens, GeneratedToken, ModelWorker, WorkerExecutor, WorkerWeightUpdateRequest,
@@ -13,6 +17,42 @@ use sglang_srt::worker::{
 
 #[derive(Default)]
 struct NoopWorker;
+
+#[test]
+fn model_runner_owns_memory_through_the_shared_kv_provider_contract() {
+    let mut runner = ModelRunner::new_with_kv_cache_layout(
+        RecordingForwardModel::default(),
+        Some(KvCacheModelLayout::multi_tensor(2, 1, 8, 2)),
+    );
+    let missing = runner
+        .transferable_kv_cache_memory()
+        .expect_err("a runtime allocation must be installed before transfer");
+    assert!(missing.to_string().contains("does not own"), "{missing}");
+
+    let memory = TransferableKvCacheMemory::new(
+        vec![TransferableKvCacheRegion {
+            base_addr: 0x1000,
+            byte_len: 4096,
+            page_size_bytes: 128,
+        }],
+        128,
+        KvCacheMemoryLocation::Cpu { numa_node: 0 },
+    )
+    .expect("valid runtime memory contract");
+    runner
+        .install_transferable_kv_cache_memory(memory.clone())
+        .expect("runner declares KV geometry");
+
+    assert_eq!(
+        runner
+            .transferable_kv_cache_memory()
+            .expect("installed memory must be visible"),
+        memory
+    );
+    runner
+        .reserve_transferable_kv_cache_slots(32, 128)
+        .expect("installed transferable memory satisfies the lifecycle precondition");
+}
 
 impl ModelWorker for NoopWorker {
     fn generate_batch(&mut self, batch: &ScheduleBatch) -> BatchGeneratedTokens {

@@ -8,8 +8,8 @@ use sglang_kernel::cuda_kv_kernels::{
 };
 
 use crate::transfer::{
-    KvCacheMemoryLocation, KvCacheRuntimeLayout, KvCacheTransferError,
-    MooncakeKvCacheMemoryProvider, TransferableKvCacheMemory, TransferableKvCacheRegion,
+    KvCacheMemoryLocation, KvCacheMemoryProvider, KvCacheRuntimeLayout, KvCacheTransferError,
+    TransferableKvCacheMemory, TransferableKvCacheRegion,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -782,7 +782,8 @@ impl CudaKvCachePool {
             KvCacheMemoryLocation::Cuda {
                 device_id: self.allocation.device_ordinal(),
             },
-        )?)
+        )
+        .map_err(KvCacheTransferError::from)?)
     }
 
     fn validate_slot_map(&self, slot_map: &CudaKvCacheSlotMap) -> Result<(), CudaKvCachePoolError> {
@@ -796,8 +797,10 @@ impl CudaKvCachePool {
     }
 }
 
-impl MooncakeKvCacheMemoryProvider for CudaKvCachePool {
-    fn mooncake_kv_cache_memory(&self) -> Result<TransferableKvCacheMemory, KvCacheTransferError> {
+impl KvCacheMemoryProvider for CudaKvCachePool {
+    type Error = KvCacheTransferError;
+
+    fn transferable_kv_cache_memory(&self) -> Result<TransferableKvCacheMemory, Self::Error> {
         self.transferable_memory().map_err(|error| {
             KvCacheTransferError::Runtime(format!(
                 "CUDA KV cache pool is not transferable: {error}"

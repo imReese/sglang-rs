@@ -11,12 +11,12 @@ use sglang_srt::transfer::{
     KvCacheTransferError, KvCacheTransferExecutor, KvCacheTransferPlan, KvCacheTransferPlanError,
     KvCacheTransferSpan, KvPoll, KvTransferModelWorker, LocalSnapshotTransferPdModelWorkers,
     MooncakeBatchId, MooncakeBatchReleaser, MooncakeError, MooncakeKvCacheLayout,
-    MooncakeKvCacheTransferExecutor, MooncakeMemoryRegistrar, MooncakeOpcode,
-    MooncakeRemoteKvLayout, MooncakeSessionTargetResolver, MooncakeSubmittedBatch,
-    MooncakeTransferRequest, MooncakeTransferStatus, MooncakeTransferStatusCode,
-    MooncakeTransferStatusReader, MooncakeTransferSubmitter, MooncakeTransferTarget,
-    MooncakeTransferTargetResolver, RegisteredMooncakeKvCacheMemory, TransferableKvCacheMemory,
-    TransferableKvCacheRegion, build_mooncake_kv_transfer_requests,
+    MooncakeKvCacheMemoryExt, MooncakeKvCacheTransferExecutor, MooncakeMemoryLocationExt,
+    MooncakeMemoryRegistrar, MooncakeOpcode, MooncakeRemoteKvLayout, MooncakeSessionTargetResolver,
+    MooncakeSubmittedBatch, MooncakeTransferRequest, MooncakeTransferStatus,
+    MooncakeTransferStatusCode, MooncakeTransferStatusReader, MooncakeTransferSubmitter,
+    MooncakeTransferTarget, MooncakeTransferTargetResolver, RegisteredMooncakeKvCacheMemory,
+    TransferableKvCacheMemory, TransferableKvCacheRegion, build_mooncake_kv_transfer_requests,
     build_mooncake_remote_kv_transfer_requests, execute_kv_cache_transfer_plan,
     is_decode_request_kv_ready, poll_mooncake_transfer_batches,
 };
@@ -1451,7 +1451,7 @@ fn transferable_kv_memory_builds_prefill_and_decode_mooncake_layouts() {
     .expect("memory should be valid");
 
     assert_eq!(
-        memory.prefill_layout(0x200),
+        memory.mooncake_prefill_layout(0x200),
         MooncakeKvCacheLayout {
             source_base_addr: 0x1000,
             page_size_bytes: 128,
@@ -1459,7 +1459,7 @@ fn transferable_kv_memory_builds_prefill_and_decode_mooncake_layouts() {
         }
     );
     assert_eq!(
-        memory.decode_remote_layout(&[4, 5]),
+        memory.mooncake_decode_remote_layout(&[4, 5]),
         MooncakeRemoteKvLayout {
             dst_kv_ptrs: vec![0x1000],
             dst_kv_indices: vec![4, 5],
@@ -1489,7 +1489,7 @@ fn transferable_kv_memory_supports_uniform_multi_region_decode_layout() {
     .expect("uniform split KV regions should be valid");
 
     assert_eq!(
-        memory.decode_remote_layout(&[7, 8]),
+        memory.mooncake_decode_remote_layout(&[7, 8]),
         MooncakeRemoteKvLayout {
             dst_kv_ptrs: vec![0x1000, 0x3000],
             dst_kv_indices: vec![7, 8],
@@ -1521,24 +1521,24 @@ fn transferable_kv_memory_rejects_zero_base_address() {
 fn mooncake_memory_location_uses_native_backend_prefixes_and_rejects_unknown_abis() {
     assert_eq!(
         KvCacheMemoryLocation::Rocm { device_id: 2 }
-            .mooncake_label()
+            .mooncake_memory_location_label()
             .expect("ROCm has a Mooncake HIP location ABI"),
         "hip:2"
     );
     assert_eq!(
         KvCacheMemoryLocation::Musa { device_id: 4 }
-            .mooncake_label()
+            .mooncake_memory_location_label()
             .expect("MUSA has a Mooncake location ABI"),
         "musa:4"
     );
     assert_eq!(
         KvCacheMemoryLocation::Npu { device_id: 1 }
-            .mooncake_label()
+            .mooncake_memory_location_label()
             .expect("Ascend has a Mooncake NPU location ABI"),
         "npu:1"
     );
     assert_eq!(
-        KvCacheMemoryLocation::Metal { device_id: 0 }.mooncake_label(),
+        KvCacheMemoryLocation::Metal { device_id: 0 }.mooncake_memory_location_label(),
         Err(MooncakeError::UnsupportedMemoryLocation(
             KvCacheMemoryLocation::Metal { device_id: 0 }
         ))
@@ -1563,7 +1563,7 @@ fn mooncake_registration_uses_runtime_memory_location_and_unregisters_before_mod
         memory,
     )
     .expect("memory registration should succeed");
-    let layout = registration.memory().prefill_layout(0);
+    let layout = registration.memory().mooncake_prefill_layout(0);
     let executor = MooncakeKvCacheTransferExecutor::new(
         RecordingMooncakeSubmitter::default(),
         layout,

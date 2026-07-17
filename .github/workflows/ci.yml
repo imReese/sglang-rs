@@ -23,9 +23,17 @@ env:
 
 jobs:
   rust:
-    name: Ubuntu / fmt, clippy, test
-    runs-on: ubuntu-latest
+    name: ${{ matrix.name }} / fmt, clippy, test
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu
+            runner: ubuntu-latest
+          - name: macOS
+            runner: macos-latest
 
     steps:
       - name: Check out source
