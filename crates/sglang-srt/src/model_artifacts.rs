@@ -4,6 +4,8 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use serde::de::DeserializeOwned;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalModelArtifacts {
     model_path: PathBuf,
@@ -57,9 +59,10 @@ impl LocalModelArtifacts {
 
     pub fn validate_routed_expert_checkpoint_coverage(
         &self,
+        topology: &CheckpointTopology,
     ) -> Result<RoutedExpertCheckpointCoverage, ModelArtifactError> {
         let groups = self.safetensors.routed_expert_weight_groups()?;
-        self.validate_routed_expert_checkpoint_coverage_for_groups(&groups)
+        self.validate_routed_expert_checkpoint_coverage_for_groups(topology, &groups)
     }
 
     pub fn routed_expert_weight_catalog(
@@ -74,19 +77,13 @@ impl LocalModelArtifacts {
 
     fn validate_routed_expert_checkpoint_coverage_for_groups(
         &self,
+        topology: &CheckpointTopology,
         groups: &[SafetensorsRoutedExpertWeightGroup],
     ) -> Result<RoutedExpertCheckpointCoverage, ModelArtifactError> {
-        let Some(expected_group_count) = self.config.expected_routed_expert_group_count() else {
-            return Ok(RoutedExpertCheckpointCoverage {
-                expected_group_count: 0,
-                actual_group_count: 0,
-                expected_weight_count: 0,
-                actual_weight_count: 0,
-            });
-        };
-        let expected_weight_count = self
-            .config
-            .expected_routed_expert_weight_count()
+        let expected_coordinates = topology.routed_expert_coordinates();
+        let expected_group_count = expected_coordinates.len();
+        let expected_weight_count = expected_group_count
+            .checked_mul(topology.routed_expert_weights_per_group())
             .ok_or_else(|| {
                 invalid_safetensors_data(
                     &self.model_path,
@@ -111,23 +108,11 @@ impl LocalModelArtifacts {
             ));
         }
 
-        let n_routed_experts = self.config.n_routed_experts.ok_or_else(|| {
-            invalid_safetensors_data(
-                &self.model_path,
-                "expected routed expert count is missing from model config",
-            )
-        })?;
-        let expected_coordinates: BTreeSet<(usize, usize)> = self
-            .config
-            .moe_layer_ids()
-            .into_iter()
-            .flat_map(|layer_id| (0..n_routed_experts).map(move |expert_id| (layer_id, expert_id)))
-            .collect();
         let actual_coordinates: BTreeSet<(usize, usize)> = groups
             .iter()
             .map(|group| (group.layer_id, group.expert_id))
             .collect();
-        if actual_coordinates != expected_coordinates {
+        if actual_coordinates != *expected_coordinates {
             let missing = expected_coordinates
                 .difference(&actual_coordinates)
                 .next()
@@ -137,7 +122,7 @@ impl LocalModelArtifacts {
                     )
                 });
             let unexpected = actual_coordinates
-                .difference(&expected_coordinates)
+                .difference(expected_coordinates)
                 .next()
                 .map(|(layer_id, expert_id)| {
                     format!("unexpected routed expert group layer {layer_id} expert {expert_id}")
@@ -160,6 +145,39 @@ impl LocalModelArtifacts {
             expected_weight_count,
             actual_weight_count,
         })
+    }
+
+    pub fn validate_checkpoint_topology(
+        &self,
+        topology: &CheckpointTopology,
+    ) -> Result<(), ModelArtifactError> {
+        for tensor in topology.required_tensors() {
+            let metadata = self
+                .safetensors
+                .tensor_metadata(tensor.name())?
+                .ok_or_else(|| {
+                    invalid_safetensors_data(
+                        &self.model_path,
+                        format!("missing checkpoint tensor {}", tensor.name()),
+                    )
+                })?;
+            if let Some(expected_shape) = tensor.expected_shape()
+                && metadata.shape != expected_shape
+            {
+                return Err(invalid_safetensors_data(
+                    &self.model_path,
+                    format!(
+                        "checkpoint tensor {} shape {:?} does not match expected {:?}",
+                        tensor.name(),
+                        metadata.shape,
+                        expected_shape
+                    ),
+                ));
+            }
+        }
+
+        self.validate_routed_expert_checkpoint_coverage(topology)?;
+        Ok(())
     }
 }
 
@@ -238,9 +256,77 @@ pub struct RoutedExpertCheckpointCoverage {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointTensorRequirement {
+    name: String,
+    expected_shape: Option<Vec<usize>>,
+}
+
+impl CheckpointTensorRequirement {
+    pub fn present(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            expected_shape: None,
+        }
+    }
+
+    pub fn with_shape(name: impl Into<String>, expected_shape: impl Into<Vec<usize>>) -> Self {
+        Self {
+            name: name.into(),
+            expected_shape: Some(expected_shape.into()),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn expected_shape(&self) -> Option<&[usize]> {
+        self.expected_shape.as_deref()
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CheckpointTopology {
+    required_tensors: Vec<CheckpointTensorRequirement>,
+    routed_expert_coordinates: BTreeSet<(usize, usize)>,
+    routed_expert_weights_per_group: usize,
+}
+
+impl CheckpointTopology {
+    pub fn new(required_tensors: Vec<CheckpointTensorRequirement>) -> Self {
+        Self {
+            required_tensors,
+            routed_expert_coordinates: BTreeSet::new(),
+            routed_expert_weights_per_group: 0,
+        }
+    }
+
+    pub fn with_routed_experts(
+        mut self,
+        coordinates: impl IntoIterator<Item = (usize, usize)>,
+        weights_per_group: usize,
+    ) -> Self {
+        self.routed_expert_coordinates = coordinates.into_iter().collect();
+        self.routed_expert_weights_per_group = weights_per_group;
+        self
+    }
+
+    pub fn required_tensors(&self) -> &[CheckpointTensorRequirement] {
+        &self.required_tensors
+    }
+
+    pub fn routed_expert_coordinates(&self) -> &BTreeSet<(usize, usize)> {
+        &self.routed_expert_coordinates
+    }
+
+    pub fn routed_expert_weights_per_group(&self) -> usize {
+        self.routed_expert_weights_per_group
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalModelCheckpointCatalog {
     model_path: PathBuf,
-    config: HfModelConfig,
     safetensors: SafetensorsManifest,
     layer_tensors: SafetensorsLayerTensorCatalog,
     quantized_linears: SafetensorsQuantizedLinearWeightCatalog,
@@ -259,7 +345,6 @@ impl LocalModelCheckpointCatalog {
 
         Ok(Self {
             model_path: artifacts.model_path().to_path_buf(),
-            config: artifacts.config().clone(),
             safetensors: artifacts.safetensors().clone(),
             layer_tensors,
             quantized_linears,
@@ -275,10 +360,6 @@ impl LocalModelCheckpointCatalog {
         &self.model_path
     }
 
-    pub fn config(&self) -> &HfModelConfig {
-        &self.config
-    }
-
     pub fn safetensors(&self) -> &SafetensorsManifest {
         &self.safetensors
     }
@@ -292,78 +373,30 @@ impl LocalModelCheckpointCatalog {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct HfConfigFloat(f64);
-
-impl HfConfigFloat {
-    pub fn new(value: f64) -> Self {
-        Self(value)
-    }
-
-    pub fn get(self) -> f64 {
-        self.0
-    }
-}
-
-impl PartialEq for HfConfigFloat {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.to_bits() == other.0.to_bits()
-    }
-}
-
-impl Eq for HfConfigFloat {}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HfModelConfig {
+    raw_document: serde_json::Value,
     pub model_type: Option<String>,
-    pub text_model_type: Option<String>,
     pub architectures: Vec<String>,
     pub eos_token_ids: Vec<u32>,
-    pub vocab_size: Option<usize>,
-    pub max_position_embeddings: Option<usize>,
-    pub num_hidden_layers: Option<usize>,
-    pub hidden_size: Option<usize>,
-    pub intermediate_size: Option<usize>,
-    pub moe_intermediate_size: Option<usize>,
-    pub n_routed_experts: Option<usize>,
-    pub n_shared_experts: Option<usize>,
-    pub num_experts_per_tok: Option<usize>,
-    pub norm_topk_prob: Option<bool>,
-    pub routed_scaling_factor: Option<HfConfigFloat>,
-    pub first_k_dense_replace: Option<usize>,
-    pub moe_layer_freq: Option<usize>,
-    pub hc_mult: Option<usize>,
-    pub hc_sinkhorn_iters: Option<usize>,
-    pub hidden_act: Option<String>,
-    pub attention_bias: Option<bool>,
-    pub rms_norm_eps: Option<HfConfigFloat>,
-    pub rope_theta: Option<HfConfigFloat>,
-    pub rope_scaling: Option<serde_json::Value>,
-    pub use_sliding_window: Option<bool>,
-    pub sliding_window: Option<usize>,
-    pub hc_eps: Option<HfConfigFloat>,
-    pub tie_word_embeddings: Option<bool>,
-    pub num_attention_heads: Option<usize>,
-    pub original_num_attention_heads: Option<usize>,
-    pub num_key_value_heads: Option<usize>,
-    pub head_dim: Option<usize>,
-    pub qk_nope_head_dim: Option<usize>,
-    pub qk_rope_head_dim: Option<usize>,
-    pub v_head_dim: Option<usize>,
-    pub layer_types: Vec<String>,
-    pub full_attention_interval: Option<usize>,
-    pub attn_output_gate: Option<bool>,
-    pub partial_rotary_factor: Option<HfConfigFloat>,
-    pub linear_conv_kernel_dim: Option<usize>,
-    pub linear_key_head_dim: Option<usize>,
-    pub linear_value_head_dim: Option<usize>,
-    pub linear_num_key_heads: Option<usize>,
-    pub linear_num_value_heads: Option<usize>,
-    pub output_gate_type: Option<String>,
-    pub mamba_ssm_dtype: Option<String>,
+}
+
+impl Default for HfModelConfig {
+    fn default() -> Self {
+        Self {
+            raw_document: serde_json::Value::Object(serde_json::Map::new()),
+            model_type: None,
+            architectures: Vec::new(),
+            eos_token_ids: Vec::new(),
+        }
+    }
 }
 
 impl HfModelConfig {
+    pub fn from_json_value(value: serde_json::Value) -> Result<Self, ModelArtifactError> {
+        Self::from_document(value, Path::new("<in-memory-config>"))
+    }
+
     pub fn from_model_path(path: impl AsRef<Path>) -> Result<Self, ModelArtifactError> {
         let path = path.as_ref();
         let model_path = resolve_model_path(path);
@@ -403,123 +436,40 @@ impl HfModelConfig {
                 message: error.to_string(),
             })?;
 
+        Self::from_document(value, config_path)
+    }
+
+    fn from_document(
+        value: serde_json::Value,
+        config_path: &Path,
+    ) -> Result<Self, ModelArtifactError> {
         let text = value
             .get("text_config")
             .filter(|value| value.is_object())
             .unwrap_or(&value);
 
-        let rope_parameters = text.get("rope_parameters").filter(|value| !value.is_null());
-        let rope_theta = read_f64_field(text, "rope_theta", config_path)?.or(rope_parameters
-            .map(|parameters| read_f64_field(parameters, "rope_theta", config_path))
-            .transpose()?
-            .flatten());
-        let rope_scaling = text
-            .get("rope_scaling")
-            .filter(|value| !value.is_null())
-            .or(rope_parameters)
-            .cloned();
-        let partial_rotary_factor =
-            read_f64_field(text, "partial_rotary_factor", config_path)?.or(rope_parameters
-                .map(|parameters| read_f64_field(parameters, "partial_rotary_factor", config_path))
-                .transpose()?
-                .flatten());
-
         Ok(Self {
+            raw_document: value.clone(),
             model_type: read_string_field(&value, "model_type"),
-            text_model_type: read_string_field(text, "model_type"),
             architectures: read_string_array_field(&value, "architectures"),
             eos_token_ids: read_u32_or_array_field(text, "eos_token_id", config_path)?,
-            vocab_size: read_usize_field(text, "vocab_size", config_path)?,
-            max_position_embeddings: read_usize_field(
-                text,
-                "max_position_embeddings",
-                config_path,
-            )?,
-            num_hidden_layers: read_usize_field(text, "num_hidden_layers", config_path)?,
-            hidden_size: read_usize_field(text, "hidden_size", config_path)?,
-            intermediate_size: read_usize_field(text, "intermediate_size", config_path)?,
-            moe_intermediate_size: read_usize_field(text, "moe_intermediate_size", config_path)?,
-            n_routed_experts: read_usize_field(text, "n_routed_experts", config_path)?,
-            n_shared_experts: read_usize_field(text, "n_shared_experts", config_path)?,
-            num_experts_per_tok: read_usize_field(text, "num_experts_per_tok", config_path)?,
-            norm_topk_prob: read_bool_field(text, "norm_topk_prob", config_path)?,
-            routed_scaling_factor: read_f64_field(text, "routed_scaling_factor", config_path)?,
-            first_k_dense_replace: read_usize_field(text, "first_k_dense_replace", config_path)?,
-            moe_layer_freq: read_usize_field(text, "moe_layer_freq", config_path)?,
-            hc_mult: read_usize_field(text, "hc_mult", config_path)?,
-            hc_sinkhorn_iters: read_usize_field(text, "hc_sinkhorn_iters", config_path)?,
-            hidden_act: read_string_field(text, "hidden_act"),
-            attention_bias: read_bool_field(text, "attention_bias", config_path)?,
-            rms_norm_eps: read_f64_field(text, "rms_norm_eps", config_path)?,
-            rope_theta,
-            rope_scaling,
-            use_sliding_window: read_bool_field(text, "use_sliding_window", config_path)?,
-            sliding_window: read_usize_field(text, "sliding_window", config_path)?,
-            hc_eps: read_f64_field(text, "hc_eps", config_path)?,
-            tie_word_embeddings: read_bool_field(text, "tie_word_embeddings", config_path)?
-                .or(read_bool_field(&value, "tie_word_embeddings", config_path)?),
-            num_attention_heads: read_usize_field(text, "num_attention_heads", config_path)?,
-            original_num_attention_heads: read_usize_field(
-                text,
-                "original_num_attention_heads",
-                config_path,
-            )?,
-            num_key_value_heads: read_usize_field(text, "num_key_value_heads", config_path)?,
-            head_dim: read_usize_field(text, "head_dim", config_path)?,
-            qk_nope_head_dim: read_usize_field(text, "qk_nope_head_dim", config_path)?,
-            qk_rope_head_dim: read_usize_field(text, "qk_rope_head_dim", config_path)?,
-            v_head_dim: read_usize_field(text, "v_head_dim", config_path)?,
-            layer_types: read_string_array_field(text, "layer_types"),
-            full_attention_interval: read_usize_field(
-                text,
-                "full_attention_interval",
-                config_path,
-            )?,
-            attn_output_gate: read_bool_field(text, "attn_output_gate", config_path)?,
-            partial_rotary_factor,
-            linear_conv_kernel_dim: read_usize_field(text, "linear_conv_kernel_dim", config_path)?,
-            linear_key_head_dim: read_usize_field(text, "linear_key_head_dim", config_path)?,
-            linear_value_head_dim: read_usize_field(text, "linear_value_head_dim", config_path)?,
-            linear_num_key_heads: read_usize_field(text, "linear_num_key_heads", config_path)?,
-            linear_num_value_heads: read_usize_field(text, "linear_num_value_heads", config_path)?,
-            output_gate_type: read_string_field(text, "output_gate_type"),
-            mamba_ssm_dtype: read_string_field(text, "mamba_ssm_dtype"),
         })
     }
 
-    pub fn is_moe_layer(&self, layer_id: usize) -> bool {
-        let Some(num_hidden_layers) = self.num_hidden_layers else {
-            return false;
-        };
-        if layer_id >= num_hidden_layers || self.n_routed_experts.is_none() {
-            return false;
-        }
-
-        let first_k_dense_replace = self.first_k_dense_replace.unwrap_or(0);
-        let moe_layer_freq = self.moe_layer_freq.unwrap_or(1);
-        moe_layer_freq > 0
-            && layer_id >= first_k_dense_replace
-            && layer_id.is_multiple_of(moe_layer_freq)
+    pub fn raw_document(&self) -> &serde_json::Value {
+        &self.raw_document
     }
 
-    pub fn moe_layer_ids(&self) -> Vec<usize> {
-        let Some(num_hidden_layers) = self.num_hidden_layers else {
-            return Vec::new();
-        };
-
-        (0..num_hidden_layers)
-            .filter(|layer_id| self.is_moe_layer(*layer_id))
-            .collect()
+    pub(crate) fn text_document(&self) -> &serde_json::Value {
+        self.raw_document
+            .get("text_config")
+            .filter(|value| value.is_object())
+            .unwrap_or(&self.raw_document)
     }
 
-    pub fn expected_routed_expert_group_count(&self) -> Option<usize> {
-        self.moe_layer_ids()
-            .len()
-            .checked_mul(self.n_routed_experts?)
-    }
-
-    pub fn expected_routed_expert_weight_count(&self) -> Option<usize> {
-        self.expected_routed_expert_group_count()?.checked_mul(3)
+    pub(crate) fn parse_text_config<T: DeserializeOwned>(&self) -> Result<T, String> {
+        serde_path_to_error::deserialize(self.text_document().clone())
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -1173,7 +1123,6 @@ impl SafetensorsRoutedExpertWeightCatalog {
             .routed_expert_weight_groups()?
             .into_iter()
             .collect::<Vec<_>>();
-        artifacts.validate_routed_expert_checkpoint_coverage_for_groups(&groups)?;
         let groups = groups
             .into_iter()
             .map(|group| ((group.layer_id, group.expert_id), group))
@@ -1766,31 +1715,6 @@ pub(crate) fn hf_hub_api_builder_from_env() -> hf_hub::api::sync::ApiBuilder {
     builder.with_progress(false)
 }
 
-fn read_usize_field(
-    value: &serde_json::Value,
-    field: &'static str,
-    config_path: &Path,
-) -> Result<Option<usize>, ModelArtifactError> {
-    let Some(raw) = value.get(field) else {
-        return Ok(None);
-    };
-    if raw.is_null() {
-        return Ok(None);
-    }
-    let Some(value) = raw.as_u64() else {
-        return Err(ModelArtifactError::InvalidModelConfig {
-            path: config_path.to_path_buf(),
-            message: format!("field {field} must be an unsigned integer"),
-        });
-    };
-    usize::try_from(value)
-        .map(Some)
-        .map_err(|_| ModelArtifactError::InvalidModelConfig {
-            path: config_path.to_path_buf(),
-            message: format!("field {field} does not fit in usize"),
-        })
-}
-
 fn read_u32_or_array_field(
     value: &serde_json::Value,
     field: &'static str,
@@ -1829,51 +1753,6 @@ fn read_u32_value(
         path: config_path.to_path_buf(),
         message: format!("field {field} does not fit in u32"),
     })
-}
-
-fn read_f64_field(
-    value: &serde_json::Value,
-    field: &'static str,
-    config_path: &Path,
-) -> Result<Option<HfConfigFloat>, ModelArtifactError> {
-    let Some(raw) = value.get(field) else {
-        return Ok(None);
-    };
-    if raw.is_null() {
-        return Ok(None);
-    }
-    let Some(value) = raw.as_f64() else {
-        return Err(ModelArtifactError::InvalidModelConfig {
-            path: config_path.to_path_buf(),
-            message: format!("field {field} must be a finite number"),
-        });
-    };
-    if !value.is_finite() {
-        return Err(ModelArtifactError::InvalidModelConfig {
-            path: config_path.to_path_buf(),
-            message: format!("field {field} must be a finite number"),
-        });
-    }
-    Ok(Some(HfConfigFloat(value)))
-}
-
-fn read_bool_field(
-    value: &serde_json::Value,
-    field: &'static str,
-    config_path: &Path,
-) -> Result<Option<bool>, ModelArtifactError> {
-    let Some(raw) = value.get(field) else {
-        return Ok(None);
-    };
-    if raw.is_null() {
-        return Ok(None);
-    }
-    raw.as_bool()
-        .map(Some)
-        .ok_or_else(|| ModelArtifactError::InvalidModelConfig {
-            path: config_path.to_path_buf(),
-            message: format!("field {field} must be a boolean"),
-        })
 }
 
 fn parse_tensor_metadata(

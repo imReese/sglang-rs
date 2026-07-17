@@ -9,7 +9,10 @@ use std::path::Path;
 
 use crate::backend::{RuntimeDtype, RuntimeRequirements};
 use crate::kv_cache::KvCacheModelLayout;
-use crate::model_artifacts::{HfModelConfig, LocalModelArtifacts, ModelArtifactError};
+use crate::model_artifacts::{
+    CheckpointTensorRequirement, CheckpointTopology, HfModelConfig, LocalModelArtifacts,
+    ModelArtifactError,
+};
 
 pub(crate) use deepseek::DEEPSEEK_V4_ADAPTER;
 pub(crate) use glm::GLM_MOE_DSA_ADAPTER;
@@ -339,12 +342,16 @@ impl ModelExecutionArchitecture {
 pub struct ModelDefinition {
     architecture: &'static str,
     model_type: Option<String>,
+    vocab_size: Option<usize>,
+    max_context_length: Option<usize>,
+    eos_token_ids: Vec<u32>,
     execution: ModelExecutionArchitecture,
     supported_dtypes: Vec<RuntimeDtype>,
     kv_cache_layout: Option<KvCacheModelLayout>,
     cache_architecture: ModelCacheArchitecture,
     dense_decoder: Option<DenseDecoderExecutionPlan>,
     hybrid_decoder: Option<HybridDecoderExecutionPlan>,
+    checkpoint_topology: CheckpointTopology,
 }
 
 impl ModelDefinition {
@@ -359,6 +366,9 @@ impl ModelDefinition {
         Self {
             architecture,
             model_type: config.model_type.clone(),
+            vocab_size: None,
+            max_context_length: None,
+            eos_token_ids: config.eos_token_ids.clone(),
             execution,
             supported_dtypes,
             kv_cache_layout,
@@ -369,7 +379,23 @@ impl ModelDefinition {
             },
             dense_decoder: None,
             hybrid_decoder: None,
+            checkpoint_topology: CheckpointTopology::default(),
         }
+    }
+
+    pub(crate) fn with_serving_metadata(
+        mut self,
+        vocab_size: usize,
+        max_context_length: usize,
+    ) -> Self {
+        self.vocab_size = Some(vocab_size);
+        self.max_context_length = Some(max_context_length);
+        self
+    }
+
+    pub(crate) fn with_checkpoint_topology(mut self, topology: CheckpointTopology) -> Self {
+        self.checkpoint_topology = topology;
+        self
     }
 
     pub(crate) fn with_dense_decoder(mut self, plan: DenseDecoderExecutionPlan) -> Self {
@@ -399,6 +425,29 @@ impl ModelDefinition {
 
     pub fn model_type(&self) -> Option<&str> {
         self.model_type.as_deref()
+    }
+
+    pub fn vocab_size(&self) -> Option<usize> {
+        self.vocab_size
+    }
+
+    pub fn max_context_length(&self) -> Option<usize> {
+        self.max_context_length
+    }
+
+    pub fn eos_token_ids(&self) -> &[u32] {
+        &self.eos_token_ids
+    }
+
+    pub fn checkpoint_topology(&self) -> &CheckpointTopology {
+        &self.checkpoint_topology
+    }
+
+    pub(crate) fn validate_checkpoint(
+        &self,
+        artifacts: &LocalModelArtifacts,
+    ) -> Result<(), ModelArtifactError> {
+        artifacts.validate_checkpoint_topology(&self.checkpoint_topology)
     }
 
     pub fn execution(&self) -> ModelExecutionArchitecture {
@@ -708,6 +757,238 @@ impl ModelDefinition {
     }
 }
 
+pub(crate) fn dense_decoder_checkpoint_topology(
+    architecture: &'static str,
+    execution: ModelExecutionArchitecture,
+    plan: &DenseDecoderExecutionPlan,
+) -> Result<CheckpointTopology, ModelAdapterError> {
+    let ModelExecutionArchitecture::Transformer {
+        attention:
+            AttentionArchitecture::MultiHead {
+                num_attention_heads,
+                num_key_value_heads,
+                head_dim,
+            },
+        feed_forward: FeedForwardArchitecture::Dense { intermediate_size },
+    } = execution
+    else {
+        return Err(ModelAdapterError::invalid(
+            architecture,
+            "dense decoder checkpoint topology requires multi-head attention and dense feed-forward components",
+        ));
+    };
+    let query_size = num_attention_heads.checked_mul(head_dim).ok_or_else(|| {
+        ModelAdapterError::invalid(architecture, "query projection size overflowed")
+    })?;
+    let kv_size = num_key_value_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| ModelAdapterError::invalid(architecture, "KV projection size overflowed"))?;
+    if plan.weights.layers.is_empty() {
+        return Err(ModelAdapterError::invalid(
+            architecture,
+            "dense decoder checkpoint topology has no layers",
+        ));
+    }
+
+    let mut tensors = vec![
+        CheckpointTensorRequirement::with_shape(
+            &plan.weights.token_embeddings,
+            [plan.vocab_size, plan.hidden_size],
+        ),
+        CheckpointTensorRequirement::with_shape(&plan.weights.final_norm, [plan.hidden_size]),
+    ];
+    if let Some(lm_head) = &plan.weights.lm_head {
+        tensors.push(CheckpointTensorRequirement::with_shape(
+            lm_head,
+            [plan.vocab_size, plan.hidden_size],
+        ));
+    }
+    for layer in &plan.weights.layers {
+        tensors.extend([
+            CheckpointTensorRequirement::with_shape(&layer.input_norm, [plan.hidden_size]),
+            CheckpointTensorRequirement::with_shape(
+                &layer.query_weight,
+                [query_size, plan.hidden_size],
+            ),
+            CheckpointTensorRequirement::with_shape(&layer.key_weight, [kv_size, plan.hidden_size]),
+            CheckpointTensorRequirement::with_shape(
+                &layer.value_weight,
+                [kv_size, plan.hidden_size],
+            ),
+            CheckpointTensorRequirement::with_shape(
+                &layer.output_weight,
+                [plan.hidden_size, query_size],
+            ),
+            CheckpointTensorRequirement::with_shape(&layer.post_attention_norm, [plan.hidden_size]),
+            CheckpointTensorRequirement::with_shape(
+                &layer.gate_weight,
+                [intermediate_size, plan.hidden_size],
+            ),
+            CheckpointTensorRequirement::with_shape(
+                &layer.up_weight,
+                [intermediate_size, plan.hidden_size],
+            ),
+            CheckpointTensorRequirement::with_shape(
+                &layer.down_weight,
+                [plan.hidden_size, intermediate_size],
+            ),
+        ]);
+        for (name, shape) in [
+            (layer.query_bias.as_ref(), vec![query_size]),
+            (layer.query_norm.as_ref(), vec![head_dim]),
+            (layer.key_bias.as_ref(), vec![kv_size]),
+            (layer.key_norm.as_ref(), vec![head_dim]),
+            (layer.value_bias.as_ref(), vec![kv_size]),
+            (layer.output_bias.as_ref(), vec![plan.hidden_size]),
+        ] {
+            if let Some(name) = name {
+                tensors.push(CheckpointTensorRequirement::with_shape(name, shape));
+            }
+        }
+    }
+    Ok(CheckpointTopology::new(tensors))
+}
+
+pub(crate) fn hybrid_decoder_checkpoint_topology(
+    architecture: &'static str,
+    plan: &HybridDecoderExecutionPlan,
+) -> Result<CheckpointTopology, ModelAdapterError> {
+    if plan.weights.layers.is_empty() {
+        return Err(ModelAdapterError::invalid(
+            architecture,
+            "hybrid decoder checkpoint topology has no layers",
+        ));
+    }
+    let query_size = plan
+        .num_attention_heads
+        .checked_mul(plan.attention_head_dim)
+        .ok_or_else(|| {
+            ModelAdapterError::invalid(architecture, "query projection size overflowed")
+        })?;
+    let projected_query_size = query_size
+        .checked_mul(if plan.attention_output_gate { 2 } else { 1 })
+        .ok_or_else(|| {
+            ModelAdapterError::invalid(architecture, "gated query projection size overflowed")
+        })?;
+    let kv_size = plan
+        .num_key_value_heads
+        .checked_mul(plan.attention_head_dim)
+        .ok_or_else(|| ModelAdapterError::invalid(architecture, "KV projection size overflowed"))?;
+    let linear_key_size = plan
+        .linear_num_key_heads
+        .checked_mul(plan.linear_key_head_dim)
+        .ok_or_else(|| ModelAdapterError::invalid(architecture, "linear key size overflowed"))?;
+    let linear_value_size = plan
+        .linear_num_value_heads
+        .checked_mul(plan.linear_value_head_dim)
+        .ok_or_else(|| ModelAdapterError::invalid(architecture, "linear value size overflowed"))?;
+    let conv_dim = linear_key_size
+        .checked_mul(2)
+        .and_then(|size| size.checked_add(linear_value_size))
+        .ok_or_else(|| {
+            ModelAdapterError::invalid(architecture, "linear convolution size overflowed")
+        })?;
+
+    let mut tensors = vec![
+        CheckpointTensorRequirement::with_shape(
+            &plan.weights.token_embeddings,
+            [plan.vocab_size, plan.hidden_size],
+        ),
+        CheckpointTensorRequirement::with_shape(&plan.weights.final_norm, [plan.hidden_size]),
+    ];
+    if let Some(lm_head) = &plan.weights.lm_head {
+        tensors.push(CheckpointTensorRequirement::with_shape(
+            lm_head,
+            [plan.vocab_size, plan.hidden_size],
+        ));
+    }
+    for layer in &plan.weights.layers {
+        tensors.extend([
+            CheckpointTensorRequirement::with_shape(&layer.input_norm, [plan.hidden_size]),
+            CheckpointTensorRequirement::with_shape(&layer.post_attention_norm, [plan.hidden_size]),
+            CheckpointTensorRequirement::with_shape(
+                &layer.feed_forward.gate_weight,
+                [plan.intermediate_size, plan.hidden_size],
+            ),
+            CheckpointTensorRequirement::with_shape(
+                &layer.feed_forward.up_weight,
+                [plan.intermediate_size, plan.hidden_size],
+            ),
+            CheckpointTensorRequirement::with_shape(
+                &layer.feed_forward.down_weight,
+                [plan.hidden_size, plan.intermediate_size],
+            ),
+        ]);
+        match &layer.mixer {
+            HybridDecoderLayerKind::FullAttention { weights, .. } => tensors.extend([
+                CheckpointTensorRequirement::with_shape(
+                    &weights.query_weight,
+                    [projected_query_size, plan.hidden_size],
+                ),
+                CheckpointTensorRequirement::with_shape(
+                    &weights.query_norm,
+                    [plan.attention_head_dim],
+                ),
+                CheckpointTensorRequirement::with_shape(
+                    &weights.key_weight,
+                    [kv_size, plan.hidden_size],
+                ),
+                CheckpointTensorRequirement::with_shape(
+                    &weights.key_norm,
+                    [plan.attention_head_dim],
+                ),
+                CheckpointTensorRequirement::with_shape(
+                    &weights.value_weight,
+                    [kv_size, plan.hidden_size],
+                ),
+                CheckpointTensorRequirement::with_shape(
+                    &weights.output_weight,
+                    [plan.hidden_size, query_size],
+                ),
+            ]),
+            HybridDecoderLayerKind::GatedDeltaNet { weights, .. } => tensors.extend([
+                CheckpointTensorRequirement::with_shape(
+                    &weights.a_log,
+                    [plan.linear_num_value_heads],
+                ),
+                CheckpointTensorRequirement::with_shape(
+                    &weights.conv1d_weight,
+                    [conv_dim, 1, plan.linear_conv_kernel_dim],
+                ),
+                CheckpointTensorRequirement::with_shape(
+                    &weights.dt_bias,
+                    [plan.linear_num_value_heads],
+                ),
+                CheckpointTensorRequirement::with_shape(
+                    &weights.in_proj_a_weight,
+                    [plan.linear_num_value_heads, plan.hidden_size],
+                ),
+                CheckpointTensorRequirement::with_shape(
+                    &weights.in_proj_b_weight,
+                    [plan.linear_num_value_heads, plan.hidden_size],
+                ),
+                CheckpointTensorRequirement::with_shape(
+                    &weights.in_proj_qkv_weight,
+                    [conv_dim, plan.hidden_size],
+                ),
+                CheckpointTensorRequirement::with_shape(
+                    &weights.in_proj_z_weight,
+                    [linear_value_size, plan.hidden_size],
+                ),
+                CheckpointTensorRequirement::with_shape(
+                    &weights.norm_weight,
+                    [plan.linear_value_head_dim],
+                ),
+                CheckpointTensorRequirement::with_shape(
+                    &weights.output_weight,
+                    [plan.hidden_size, linear_value_size],
+                ),
+            ]),
+        }
+    }
+    Ok(CheckpointTopology::new(tensors))
+}
+
 fn require_optional_tensor_shape(
     artifacts: &LocalModelArtifacts,
     tensor_name: Option<&str>,
@@ -763,11 +1044,6 @@ pub(crate) trait ModelAdapter: Sync {
         model_path: &Path,
         config: &HfModelConfig,
     ) -> Result<ModelDefinition, ModelAdapterError>;
-
-    fn validate_checkpoint(
-        &self,
-        artifacts: &LocalModelArtifacts,
-    ) -> Result<(), ModelArtifactError>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

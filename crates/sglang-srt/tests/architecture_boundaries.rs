@@ -43,6 +43,19 @@ fn transfer_and_artifact_primitives_do_not_rederive_model_specific_layouts() {
             "generic model artifacts contain {model_name}"
         );
     }
+    for adapter_owned_field in [
+        "first_k_dense_replace",
+        "moe_layer_freq",
+        "n_routed_experts",
+        "qk_nope_head_dim",
+        "linear_conv_kernel_dim",
+        "layer_types",
+    ] {
+        assert!(
+            !artifacts.contains(adapter_owned_field),
+            "generic model artifacts contain adapter config field {adapter_owned_field}"
+        );
+    }
 }
 
 #[test]

@@ -91,8 +91,10 @@ impl ModelRegistry {
         artifacts: &LocalModelArtifacts,
     ) -> Result<(), ModelRegistryError> {
         let resolved = self.resolve(artifacts.model_path(), artifacts.config())?;
-        resolved.build_definition(artifacts.model_path(), artifacts.config())?;
-        resolved.validate_checkpoint(artifacts)
+        let definition = resolved.build_definition(artifacts.model_path(), artifacts.config())?;
+        definition
+            .validate_checkpoint(artifacts)
+            .map_err(ModelRegistryError::from)
     }
 
     fn load(
@@ -121,7 +123,7 @@ impl ModelRegistry {
                     error,
                 )
             })?;
-        resolved.validate_checkpoint(artifacts)?;
+        definition.validate_checkpoint(artifacts)?;
         let runtime_backend = backend.runtime_backend();
         let runtime = LoadedModelRuntime::load(&definition, artifacts, backend, runtime_config)
             .map_err(|error| {
@@ -165,15 +167,6 @@ impl ResolvedModelAdapter {
         self.adapter
             .build_definition(model_path, config)
             .map_err(|error| adapter_error(model_path, self.architecture, error))
-    }
-
-    fn validate_checkpoint(
-        self,
-        artifacts: &LocalModelArtifacts,
-    ) -> Result<(), ModelRegistryError> {
-        self.adapter
-            .validate_checkpoint(artifacts)
-            .map_err(ModelRegistryError::from)
     }
 }
 
@@ -491,102 +484,108 @@ fn runtime_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_artifacts::HfConfigFloat;
     use crate::models::{
         AttentionArchitecture, FeedForwardArchitecture, ModelExecutionArchitecture,
     };
+    use serde_json::json;
 
     fn mla_moe_config(architecture: &str, model_type: &str) -> HfModelConfig {
-        HfModelConfig {
-            model_type: Some(model_type.to_string()),
-            architectures: vec![architecture.to_string()],
-            num_hidden_layers: Some(4),
-            num_attention_heads: Some(16),
-            qk_nope_head_dim: Some(128),
-            qk_rope_head_dim: Some(64),
-            v_head_dim: Some(128),
-            n_routed_experts: Some(32),
-            n_shared_experts: Some(1),
-            num_experts_per_tok: Some(4),
-            moe_intermediate_size: Some(256),
-            ..HfModelConfig::default()
-        }
+        HfModelConfig::from_json_value(json!({
+            "model_type": model_type,
+            "architectures": [architecture],
+            "vocab_size": 32_000,
+            "max_position_embeddings": 32_768,
+            "num_hidden_layers": 4,
+            "hidden_size": 1024,
+            "num_attention_heads": 16,
+            "qk_nope_head_dim": 128,
+            "qk_rope_head_dim": 64,
+            "v_head_dim": 128,
+            "n_routed_experts": 32,
+            "n_shared_experts": 1,
+            "num_experts_per_tok": 4,
+            "moe_intermediate_size": 256,
+            "hc_mult": 1
+        }))
+        .expect("valid MLA/MoE config")
     }
 
     fn qwen_config() -> HfModelConfig {
-        HfModelConfig {
-            model_type: Some("qwen2".to_string()),
-            architectures: vec!["Qwen2ForCausalLM".to_string()],
-            vocab_size: Some(32_000),
-            max_position_embeddings: Some(32_768),
-            num_hidden_layers: Some(4),
-            hidden_size: Some(1024),
-            intermediate_size: Some(4096),
-            num_attention_heads: Some(16),
-            num_key_value_heads: Some(4),
-            hidden_act: Some("silu".to_string()),
-            rms_norm_eps: Some(HfConfigFloat::new(1e-6)),
-            rope_theta: Some(HfConfigFloat::new(1_000_000.0)),
-            tie_word_embeddings: Some(false),
-            ..HfModelConfig::default()
-        }
+        HfModelConfig::from_json_value(json!({
+            "model_type": "qwen2",
+            "architectures": ["Qwen2ForCausalLM"],
+            "vocab_size": 32_000,
+            "max_position_embeddings": 32_768,
+            "num_hidden_layers": 4,
+            "hidden_size": 1024,
+            "intermediate_size": 4096,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "hidden_act": "silu",
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1_000_000.0,
+            "tie_word_embeddings": false
+        }))
+        .expect("valid Qwen2 config")
     }
 
     fn qwen3_config() -> HfModelConfig {
-        HfModelConfig {
-            model_type: Some("qwen3".to_string()),
-            architectures: vec!["Qwen3ForCausalLM".to_string()],
-            vocab_size: Some(151_936),
-            max_position_embeddings: Some(40_960),
-            num_hidden_layers: Some(28),
-            hidden_size: Some(1024),
-            intermediate_size: Some(3072),
-            num_attention_heads: Some(16),
-            num_key_value_heads: Some(8),
-            head_dim: Some(128),
-            hidden_act: Some("silu".to_string()),
-            attention_bias: Some(false),
-            rms_norm_eps: Some(HfConfigFloat::new(1e-6)),
-            rope_theta: Some(HfConfigFloat::new(1_000_000.0)),
-            tie_word_embeddings: Some(true),
-            ..HfModelConfig::default()
-        }
+        HfModelConfig::from_json_value(json!({
+            "model_type": "qwen3",
+            "architectures": ["Qwen3ForCausalLM"],
+            "vocab_size": 151_936,
+            "max_position_embeddings": 40_960,
+            "num_hidden_layers": 28,
+            "hidden_size": 1024,
+            "intermediate_size": 3072,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "hidden_act": "silu",
+            "attention_bias": false,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 1_000_000.0,
+            "tie_word_embeddings": true
+        }))
+        .expect("valid Qwen3 config")
     }
 
     fn qwen3_5_config() -> HfModelConfig {
-        HfModelConfig {
-            model_type: Some("qwen3_5".to_string()),
-            text_model_type: Some("qwen3_5_text".to_string()),
-            architectures: vec!["Qwen3_5ForConditionalGeneration".to_string()],
-            vocab_size: Some(248_320),
-            max_position_embeddings: Some(262_144),
-            num_hidden_layers: Some(4),
-            hidden_size: Some(1024),
-            intermediate_size: Some(3584),
-            num_attention_heads: Some(8),
-            num_key_value_heads: Some(2),
-            head_dim: Some(256),
-            hidden_act: Some("silu".to_string()),
-            attention_bias: Some(false),
-            rms_norm_eps: Some(HfConfigFloat::new(1e-6)),
-            rope_theta: Some(HfConfigFloat::new(10_000_000.0)),
-            partial_rotary_factor: Some(HfConfigFloat::new(0.25)),
-            attn_output_gate: Some(true),
-            linear_conv_kernel_dim: Some(4),
-            linear_key_head_dim: Some(128),
-            linear_value_head_dim: Some(128),
-            linear_num_key_heads: Some(16),
-            linear_num_value_heads: Some(16),
-            layer_types: vec![
-                "linear_attention".to_string(),
-                "linear_attention".to_string(),
-                "linear_attention".to_string(),
-                "full_attention".to_string(),
-            ],
-            mamba_ssm_dtype: Some("float32".to_string()),
-            tie_word_embeddings: Some(true),
-            ..HfModelConfig::default()
-        }
+        HfModelConfig::from_json_value(json!({
+            "model_type": "qwen3_5",
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "text_config": {
+                "model_type": "qwen3_5_text",
+                "vocab_size": 248_320,
+                "max_position_embeddings": 262_144,
+                "num_hidden_layers": 4,
+                "hidden_size": 1024,
+                "intermediate_size": 3584,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 2,
+                "head_dim": 256,
+                "hidden_act": "silu",
+                "attention_bias": false,
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 10_000_000.0,
+                "partial_rotary_factor": 0.25,
+                "attn_output_gate": true,
+                "linear_conv_kernel_dim": 4,
+                "linear_key_head_dim": 128,
+                "linear_value_head_dim": 128,
+                "linear_num_key_heads": 16,
+                "linear_num_value_heads": 16,
+                "layer_types": [
+                    "linear_attention",
+                    "linear_attention",
+                    "linear_attention",
+                    "full_attention"
+                ],
+                "mamba_ssm_dtype": "float32",
+                "tie_word_embeddings": true
+            }
+        }))
+        .expect("valid Qwen3.5 config")
     }
 
     #[test]
@@ -766,11 +765,31 @@ mod tests {
     }
 
     #[test]
+    fn adapter_typed_config_errors_fail_definition_build() {
+        let config = HfModelConfig::from_json_value(json!({
+            "architectures": ["Qwen3ForCausalLM"],
+            "model_type": "qwen3",
+            "num_hidden_layers": "not-an-integer"
+        }))
+        .expect("routing config should preserve the raw document");
+
+        let error = ModelRegistry
+            .definition(Path::new("/models/invalid-qwen"), &config)
+            .expect_err("typed Qwen config parsing must fail before runtime startup");
+
+        assert!(matches!(
+            error,
+            ModelRegistryError::InvalidAdapterConfig { .. }
+        ));
+        assert!(error.to_string().contains("num_hidden_layers"));
+    }
+
+    #[test]
     fn registry_reports_truly_unsupported_architectures() {
-        let config = HfModelConfig {
-            architectures: vec!["SglangEmbeddingLmForCausalLM".to_string()],
-            ..HfModelConfig::default()
-        };
+        let config = HfModelConfig::from_json_value(json!({
+            "architectures": ["SglangEmbeddingLmForCausalLM"]
+        }))
+        .expect("valid unsupported architecture config");
 
         let error = ModelRegistry
             .resolve(Path::new("/models/unknown"), &config)

@@ -8,7 +8,7 @@ use sglang_srt::model_artifacts::{HfModelConfig, LocalModelArtifacts, ModelArtif
 use sglang_srt::model_registry::ModelRegistry;
 
 #[test]
-fn hf_config_reads_architecture_and_decoder_geometry() {
+fn hf_config_keeps_routing_fields_and_raw_model_document() {
     let model_dir = temp_model_dir("config");
     write_json(
         &model_dir.join("config.json"),
@@ -26,8 +26,12 @@ fn hf_config_reads_architecture_and_decoder_geometry() {
     let config = HfModelConfig::from_model_path(&model_dir).expect("config should load");
 
     assert_eq!(config.architectures, vec!["Qwen3ForCausalLM"]);
-    assert_eq!(config.num_hidden_layers, Some(2));
-    assert_eq!(config.num_key_value_heads, Some(1));
+    assert_eq!(config.model_type.as_deref(), Some("qwen3"));
+    assert_eq!(config.raw_document()["num_hidden_layers"].as_u64(), Some(2));
+    assert_eq!(
+        config.raw_document()["num_key_value_heads"].as_u64(),
+        Some(1)
+    );
 }
 
 #[test]

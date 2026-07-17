@@ -7,6 +7,8 @@ use crate::cache::{KvBlockPrefixIndex, KvCacheWorkerId, KvCacheWorkerSnapshot};
 use crate::cli::ServerArgs;
 use crate::engine::{Engine, RuntimeError};
 use crate::model_artifacts::{HfModelConfig, LocalModelArtifacts, RoutedExpertCheckpointCoverage};
+use crate::model_registry::ModelRegistry;
+use crate::models::ModelDefinition;
 use crate::scheduler::SchedulerError;
 use crate::tokenizer::{ChatTemplateInput, IncrementalDecoder, Tokenizer, TokenizerError};
 use crate::types::{
@@ -630,10 +632,18 @@ impl RouterGetModelInfoResponse {
         };
 
         if let Ok(config) = HfModelConfig::from_model_path(&args.model_path) {
-            response.apply_model_config(config);
+            response.apply_model_config(&config);
+            if let Ok(definition) =
+                ModelRegistry.definition(std::path::Path::new(&args.model_path), &config)
+            {
+                response.apply_model_definition(&definition);
+            }
         }
         if let Ok(artifacts) = LocalModelArtifacts::from_model_path(&args.model_path)
-            && let Ok(coverage) = artifacts.validate_routed_expert_checkpoint_coverage()
+            && let Ok(definition) =
+                ModelRegistry.definition(artifacts.model_path(), artifacts.config())
+            && let Ok(coverage) = artifacts
+                .validate_routed_expert_checkpoint_coverage(definition.checkpoint_topology())
         {
             response.apply_routed_expert_checkpoint_coverage(coverage);
         }
@@ -675,28 +685,38 @@ impl RouterGetModelInfoResponse {
             max_total_tokens: 0,
         };
 
-        response.apply_model_config(artifacts.config().clone());
-        if let Ok(coverage) = artifacts.validate_routed_expert_checkpoint_coverage() {
-            response.apply_routed_expert_checkpoint_coverage(coverage);
+        response.apply_model_config(artifacts.config());
+        if let Ok(definition) = ModelRegistry.definition(artifacts.model_path(), artifacts.config())
+        {
+            response.apply_model_definition(&definition);
+            if let Ok(coverage) = artifacts
+                .validate_routed_expert_checkpoint_coverage(definition.checkpoint_topology())
+            {
+                response.apply_routed_expert_checkpoint_coverage(coverage);
+            }
         }
 
         response
     }
 
-    fn apply_model_config(&mut self, config: HfModelConfig) {
-        if let Some(model_type) = config.model_type {
-            self.model_type = model_type;
+    fn apply_model_config(&mut self, config: &HfModelConfig) {
+        if let Some(model_type) = &config.model_type {
+            self.model_type.clone_from(model_type);
         }
-        self.architectures = config.architectures;
+        self.architectures.clone_from(&config.architectures);
         self.eos_token_ids = config
             .eos_token_ids
-            .into_iter()
+            .iter()
+            .copied()
             .filter_map(u32_to_i32)
             .collect();
-        if let Some(vocab_size) = config.vocab_size.and_then(usize_to_i32) {
+    }
+
+    fn apply_model_definition(&mut self, definition: &ModelDefinition) {
+        if let Some(vocab_size) = definition.vocab_size().and_then(usize_to_i32) {
             self.vocab_size = vocab_size;
         }
-        if let Some(max_context_length) = config.max_position_embeddings.and_then(usize_to_i32) {
+        if let Some(max_context_length) = definition.max_context_length().and_then(usize_to_i32) {
             self.max_context_length = max_context_length;
             self.max_req_input_len = max_context_length;
         }

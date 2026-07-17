@@ -1,21 +1,54 @@
 use std::path::Path;
 
+use serde::Deserialize;
+
 use crate::backend::RuntimeDtype;
 use crate::kv_cache::KvCacheModelLayout;
-use crate::model_artifacts::{HfModelConfig, LocalModelArtifacts, ModelArtifactError};
+use crate::model_artifacts::HfModelConfig;
 
 use super::{
     AttentionArchitecture, DenseDecoderActivation, DenseFeedForwardWeightNames,
     FeedForwardArchitecture, GatedDeltaNetWeightNames, HybridDecoderExecutionPlan,
     HybridDecoderLayerKind, HybridDecoderLayerWeightNames, HybridDecoderWeightNames,
     HybridFullAttentionWeightNames, ModelAdapter, ModelAdapterError, ModelDefinition,
-    ModelExecutionArchitecture, required_usize,
+    ModelExecutionArchitecture, hybrid_decoder_checkpoint_topology, required_usize,
 };
 
 pub(crate) const QWEN3_5_ARCHITECTURE: &str = "Qwen3_5ForConditionalGeneration";
 pub(crate) static QWEN3_5_ADAPTER: Qwen3_5Adapter = Qwen3_5Adapter;
 
 pub(crate) struct Qwen3_5Adapter;
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct Qwen3_5TextConfig {
+    model_type: Option<String>,
+    vocab_size: Option<usize>,
+    max_position_embeddings: Option<usize>,
+    num_hidden_layers: Option<usize>,
+    hidden_size: Option<usize>,
+    intermediate_size: Option<usize>,
+    num_attention_heads: Option<usize>,
+    num_key_value_heads: Option<usize>,
+    head_dim: Option<usize>,
+    hidden_act: Option<String>,
+    attention_bias: Option<bool>,
+    rms_norm_eps: Option<f64>,
+    rope_theta: Option<f64>,
+    rope_scaling: Option<serde_json::Value>,
+    rope_parameters: Option<serde_json::Value>,
+    partial_rotary_factor: Option<f64>,
+    tie_word_embeddings: Option<bool>,
+    layer_types: Vec<String>,
+    full_attention_interval: Option<usize>,
+    attn_output_gate: Option<bool>,
+    linear_conv_kernel_dim: Option<usize>,
+    linear_key_head_dim: Option<usize>,
+    linear_value_head_dim: Option<usize>,
+    linear_num_key_heads: Option<usize>,
+    linear_num_value_heads: Option<usize>,
+    output_gate_type: Option<String>,
+    mamba_ssm_dtype: Option<String>,
+}
 
 impl ModelAdapter for Qwen3_5Adapter {
     fn architectures(&self) -> &'static [&'static str] {
@@ -29,28 +62,21 @@ impl ModelAdapter for Qwen3_5Adapter {
     ) -> Result<ModelDefinition, ModelAdapterError> {
         build_definition(config)
     }
-
-    fn validate_checkpoint(
-        &self,
-        artifacts: &LocalModelArtifacts,
-    ) -> Result<(), ModelArtifactError> {
-        let definition = build_definition(artifacts.config()).map_err(|error| {
-            ModelArtifactError::InvalidSafetensorsData {
-                path: artifacts.model_path().to_path_buf(),
-                message: error.to_string(),
-            }
-        })?;
-        definition.validate_hybrid_decoder_checkpoint(artifacts)
-    }
 }
 
-fn build_definition(config: &HfModelConfig) -> Result<ModelDefinition, ModelAdapterError> {
-    if config.text_model_type.as_deref() != Some("qwen3_5_text") {
+fn build_definition(hf_config: &HfModelConfig) -> Result<ModelDefinition, ModelAdapterError> {
+    let config: Qwen3_5TextConfig = hf_config.parse_text_config().map_err(|error| {
+        ModelAdapterError::invalid(
+            QWEN3_5_ARCHITECTURE,
+            format!("invalid Qwen3.5 hybrid config document: {error}"),
+        )
+    })?;
+    if config.model_type.as_deref() != Some("qwen3_5_text") {
         return Err(ModelAdapterError::invalid(
             QWEN3_5_ARCHITECTURE,
             format!(
                 "text_config.model_type must be qwen3_5_text; found {:?}. Qwen3.5 MoE and non-text backbones are not implemented",
-                config.text_model_type
+                config.model_type
             ),
         ));
     }
@@ -101,7 +127,7 @@ fn build_definition(config: &HfModelConfig) -> Result<ModelDefinition, ModelAdap
         ));
     }
 
-    validate_rope(config)?;
+    validate_rope(&config)?;
 
     let vocab_size = required_usize(QWEN3_5_ARCHITECTURE, "vocab_size", config.vocab_size)?;
     let num_layers = required_usize(
@@ -167,7 +193,7 @@ fn build_definition(config: &HfModelConfig) -> Result<ModelDefinition, ModelAdap
     let rms_norm_eps = required_positive_float(config.rms_norm_eps, "rms_norm_eps")?;
     let rope_theta = config
         .rope_theta
-        .map(|value| value.get())
+        .or_else(|| rope_parameter(&config, "rope_theta"))
         .unwrap_or(10_000.0);
     if !rope_theta.is_finite() || rope_theta <= 0.0 {
         return Err(ModelAdapterError::invalid(
@@ -177,7 +203,7 @@ fn build_definition(config: &HfModelConfig) -> Result<ModelDefinition, ModelAdap
     }
     let partial_rotary_factor = config
         .partial_rotary_factor
-        .map(|value| value.get())
+        .or_else(|| rope_parameter(&config, "partial_rotary_factor"))
         .unwrap_or(0.25);
     if !partial_rotary_factor.is_finite()
         || partial_rotary_factor <= 0.0
@@ -202,7 +228,7 @@ fn build_definition(config: &HfModelConfig) -> Result<ModelDefinition, ModelAdap
         ));
     }
 
-    let layer_types = resolve_layer_types(config, num_layers)?;
+    let layer_types = resolve_layer_types(&config, num_layers)?;
     let full_attention_layer_count = layer_types
         .iter()
         .filter(|layer_type| **layer_type == "full_attention")
@@ -228,11 +254,18 @@ fn build_definition(config: &HfModelConfig) -> Result<ModelDefinition, ModelAdap
         feed_forward: FeedForwardArchitecture::Dense { intermediate_size },
     };
     let weights = weight_names(&layer_types, config.tie_word_embeddings == Some(true));
+    let max_position_embeddings = config.max_position_embeddings.unwrap_or(32_768);
+    if max_position_embeddings == 0 {
+        return Err(ModelAdapterError::invalid(
+            QWEN3_5_ARCHITECTURE,
+            "max_position_embeddings must be non-zero",
+        ));
+    }
     let plan = HybridDecoderExecutionPlan {
         vocab_size,
         hidden_size,
         intermediate_size,
-        max_position_embeddings: config.max_position_embeddings.unwrap_or(32_768),
+        max_position_embeddings,
         rms_norm_eps,
         rope_theta: rope_theta as f32,
         rotary_dim,
@@ -248,10 +281,11 @@ fn build_definition(config: &HfModelConfig) -> Result<ModelDefinition, ModelAdap
         activation: DenseDecoderActivation::Silu,
         weights,
     };
+    let topology = hybrid_decoder_checkpoint_topology(QWEN3_5_ARCHITECTURE, &plan)?;
 
     Ok(ModelDefinition::new(
         QWEN3_5_ARCHITECTURE,
-        config,
+        hf_config,
         execution,
         vec![RuntimeDtype::F32, RuntimeDtype::Fp16, RuntimeDtype::Bf16],
         Some(KvCacheModelLayout::multi_tensor(
@@ -261,11 +295,13 @@ fn build_definition(config: &HfModelConfig) -> Result<ModelDefinition, ModelAdap
             2,
         )),
     )
+    .with_serving_metadata(vocab_size, max_position_embeddings)
+    .with_checkpoint_topology(topology)
     .with_hybrid_decoder(plan))
 }
 
 fn resolve_layer_types(
-    config: &HfModelConfig,
+    config: &Qwen3_5TextConfig,
     num_layers: usize,
 ) -> Result<Vec<&str>, ModelAdapterError> {
     let layer_types: Vec<&str> = if config.layer_types.is_empty() {
@@ -307,13 +343,9 @@ fn resolve_layer_types(
     Ok(layer_types)
 }
 
-fn required_positive_float(
-    value: Option<crate::model_artifacts::HfConfigFloat>,
-    field: &str,
-) -> Result<f32, ModelAdapterError> {
-    let value = value
-        .ok_or_else(|| ModelAdapterError::missing_field(QWEN3_5_ARCHITECTURE, field))?
-        .get();
+fn required_positive_float(value: Option<f64>, field: &str) -> Result<f32, ModelAdapterError> {
+    let value =
+        value.ok_or_else(|| ModelAdapterError::missing_field(QWEN3_5_ARCHITECTURE, field))?;
     if !value.is_finite() || value <= 0.0 {
         return Err(ModelAdapterError::invalid(
             QWEN3_5_ARCHITECTURE,
@@ -323,8 +355,20 @@ fn required_positive_float(
     Ok(value as f32)
 }
 
-fn validate_rope(config: &HfModelConfig) -> Result<(), ModelAdapterError> {
-    let Some(parameters) = config.rope_scaling.as_ref() else {
+fn rope_parameter(config: &Qwen3_5TextConfig, field: &str) -> Option<f64> {
+    config
+        .rope_parameters
+        .as_ref()
+        .and_then(|parameters| parameters.get(field))
+        .and_then(serde_json::Value::as_f64)
+}
+
+fn validate_rope(config: &Qwen3_5TextConfig) -> Result<(), ModelAdapterError> {
+    let Some(parameters) = config
+        .rope_scaling
+        .as_ref()
+        .or(config.rope_parameters.as_ref())
+    else {
         return Ok(());
     };
     let parameters = parameters.as_object().ok_or_else(|| {

@@ -1,13 +1,16 @@
 use std::path::Path;
 
+use serde::Deserialize;
+
 use crate::backend::RuntimeDtype;
 use crate::kv_cache::KvCacheModelLayout;
-use crate::model_artifacts::{HfModelConfig, LocalModelArtifacts, ModelArtifactError};
+use crate::model_artifacts::HfModelConfig;
 
 use super::{
     AttentionArchitecture, DenseDecoderActivation, DenseDecoderExecutionPlan,
     DenseDecoderLayerWeightNames, DenseDecoderWeightNames, FeedForwardArchitecture, ModelAdapter,
-    ModelAdapterError, ModelDefinition, ModelExecutionArchitecture, required_usize,
+    ModelAdapterError, ModelDefinition, ModelExecutionArchitecture,
+    dense_decoder_checkpoint_topology, required_usize,
 };
 
 pub(crate) const QWEN2_ARCHITECTURE: &str = "Qwen2ForCausalLM";
@@ -17,6 +20,28 @@ pub(crate) static QWEN3_ADAPTER: Qwen3Adapter = Qwen3Adapter;
 
 pub(crate) struct Qwen2Adapter;
 pub(crate) struct Qwen3Adapter;
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct QwenDenseConfig {
+    vocab_size: Option<usize>,
+    max_position_embeddings: Option<usize>,
+    num_hidden_layers: Option<usize>,
+    hidden_size: Option<usize>,
+    intermediate_size: Option<usize>,
+    num_attention_heads: Option<usize>,
+    original_num_attention_heads: Option<usize>,
+    num_key_value_heads: Option<usize>,
+    head_dim: Option<usize>,
+    hidden_act: Option<String>,
+    attention_bias: Option<bool>,
+    rms_norm_eps: Option<f64>,
+    rope_theta: Option<f64>,
+    rope_scaling: Option<serde_json::Value>,
+    rope_parameters: Option<serde_json::Value>,
+    use_sliding_window: Option<bool>,
+    sliding_window: Option<usize>,
+    tie_word_embeddings: Option<bool>,
+}
 
 impl ModelAdapter for Qwen2Adapter {
     fn architectures(&self) -> &'static [&'static str] {
@@ -29,19 +54,6 @@ impl ModelAdapter for Qwen2Adapter {
         config: &HfModelConfig,
     ) -> Result<ModelDefinition, ModelAdapterError> {
         build_qwen2_definition(config)
-    }
-
-    fn validate_checkpoint(
-        &self,
-        artifacts: &LocalModelArtifacts,
-    ) -> Result<(), ModelArtifactError> {
-        let definition = build_qwen2_definition(artifacts.config()).map_err(|error| {
-            ModelArtifactError::InvalidSafetensorsData {
-                path: artifacts.model_path().to_path_buf(),
-                message: error.to_string(),
-            }
-        })?;
-        definition.validate_dense_decoder_checkpoint(artifacts)
     }
 }
 
@@ -57,34 +69,41 @@ impl ModelAdapter for Qwen3Adapter {
     ) -> Result<ModelDefinition, ModelAdapterError> {
         build_qwen3_definition(config)
     }
-
-    fn validate_checkpoint(
-        &self,
-        artifacts: &LocalModelArtifacts,
-    ) -> Result<(), ModelArtifactError> {
-        let definition = build_qwen3_definition(artifacts.config()).map_err(|error| {
-            ModelArtifactError::InvalidSafetensorsData {
-                path: artifacts.model_path().to_path_buf(),
-                message: error.to_string(),
-            }
-        })?;
-        definition.validate_dense_decoder_checkpoint(artifacts)
-    }
 }
 
 fn build_qwen2_definition(config: &HfModelConfig) -> Result<ModelDefinition, ModelAdapterError> {
-    build_qwen_definition(config, QWEN2_ARCHITECTURE, qwen2_weight_names)
+    let typed = parse_qwen_config(config, QWEN2_ARCHITECTURE)?;
+    build_qwen_definition(config, &typed, QWEN2_ARCHITECTURE, qwen2_weight_names)
 }
 
 fn build_qwen3_definition(config: &HfModelConfig) -> Result<ModelDefinition, ModelAdapterError> {
-    let attention_bias = config.attention_bias.unwrap_or(false);
-    build_qwen_definition(config, QWEN3_ARCHITECTURE, |num_layers, tied_embeddings| {
-        qwen3_weight_names(num_layers, tied_embeddings, attention_bias)
+    let typed = parse_qwen_config(config, QWEN3_ARCHITECTURE)?;
+    let attention_bias = typed.attention_bias.unwrap_or(false);
+    build_qwen_definition(
+        config,
+        &typed,
+        QWEN3_ARCHITECTURE,
+        |num_layers, tied_embeddings| {
+            qwen3_weight_names(num_layers, tied_embeddings, attention_bias)
+        },
+    )
+}
+
+fn parse_qwen_config(
+    config: &HfModelConfig,
+    architecture: &'static str,
+) -> Result<QwenDenseConfig, ModelAdapterError> {
+    config.parse_text_config().map_err(|error| {
+        ModelAdapterError::invalid(
+            architecture,
+            format!("invalid Qwen dense config document: {error}"),
+        )
     })
 }
 
 fn build_qwen_definition(
-    config: &HfModelConfig,
+    hf_config: &HfModelConfig,
+    config: &QwenDenseConfig,
     architecture: &'static str,
     weight_names: impl FnOnce(usize, bool) -> DenseDecoderWeightNames,
 ) -> Result<ModelDefinition, ModelAdapterError> {
@@ -163,7 +182,7 @@ fn build_qwen_definition(
     let rms_norm_eps = config
         .rms_norm_eps
         .ok_or_else(|| ModelAdapterError::missing_field(architecture, "rms_norm_eps"))?
-        .get() as f32;
+        as f32;
     if !rms_norm_eps.is_finite() || rms_norm_eps < 0.0 {
         return Err(ModelAdapterError::invalid(
             architecture,
@@ -172,7 +191,7 @@ fn build_qwen_definition(
     }
     let rope_theta = config
         .rope_theta
-        .map(|theta| theta.get())
+        .or_else(|| rope_parameter(config, "rope_theta"))
         .unwrap_or(1_000_000.0) as f32;
     if !rope_theta.is_finite() || rope_theta <= 0.0 {
         return Err(ModelAdapterError::invalid(
@@ -205,10 +224,11 @@ fn build_qwen_definition(
         activation: DenseDecoderActivation::Silu,
         weights: weight_names(num_layers, config.tie_word_embeddings == Some(true)),
     };
+    let topology = dense_decoder_checkpoint_topology(architecture, execution, &plan)?;
 
     Ok(ModelDefinition::new(
         architecture,
-        config,
+        hf_config,
         execution,
         vec![RuntimeDtype::F32, RuntimeDtype::Fp16, RuntimeDtype::Bf16],
         Some(KvCacheModelLayout::multi_tensor(
@@ -218,14 +238,28 @@ fn build_qwen_definition(
             2,
         )),
     )
+    .with_serving_metadata(vocab_size, max_position_embeddings)
+    .with_checkpoint_topology(topology)
     .with_dense_decoder(plan))
+}
+
+fn rope_parameter(config: &QwenDenseConfig, field: &str) -> Option<f64> {
+    config
+        .rope_parameters
+        .as_ref()
+        .and_then(|parameters| parameters.get(field))
+        .and_then(serde_json::Value::as_f64)
 }
 
 fn validate_default_rope(
     architecture: &'static str,
-    config: &HfModelConfig,
+    config: &QwenDenseConfig,
 ) -> Result<(), ModelAdapterError> {
-    let Some(rope_scaling) = config.rope_scaling.as_ref() else {
+    let Some(rope_scaling) = config
+        .rope_scaling
+        .as_ref()
+        .or(config.rope_parameters.as_ref())
+    else {
         return Ok(());
     };
     let Some(parameters) = rope_scaling.as_object() else {
@@ -327,6 +361,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::model_artifacts::LocalModelArtifacts;
 
     #[test]
     fn qwen_adapter_validates_dense_decoder_weight_names_and_shapes() {
@@ -335,7 +370,8 @@ mod tests {
         let artifacts =
             LocalModelArtifacts::from_model_path(&model_dir).expect("Qwen artifacts should load");
 
-        QWEN2_ADAPTER
+        build_qwen2_definition(artifacts.config())
+            .expect("Qwen definition should build")
             .validate_checkpoint(&artifacts)
             .expect("complete Qwen dense decoder checkpoint should validate");
 
@@ -349,7 +385,8 @@ mod tests {
         let artifacts =
             LocalModelArtifacts::from_model_path(&model_dir).expect("Qwen artifacts should load");
 
-        let error = QWEN2_ADAPTER
+        let error = build_qwen2_definition(artifacts.config())
+            .expect("Qwen definition should build")
             .validate_checkpoint(&artifacts)
             .expect_err("missing Qwen projection must fail checkpoint validation");
         assert!(error.to_string().contains("mlp.down_proj.weight"));

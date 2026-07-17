@@ -386,10 +386,16 @@ fn bootstrap_grpc_router_service_reports_local_moe_checkpoint_coverage() {
         model_dir.join("config.json"),
         r#"{
   "model_type": "deepseek_v4",
+  "architectures": ["DeepseekV4ForCausalLM"],
+  "vocab_size": 1,
+  "max_position_embeddings": 32,
   "num_hidden_layers": 1,
   "hidden_size": 1,
+  "num_attention_heads": 1,
   "hc_mult": 1,
   "n_routed_experts": 1,
+  "num_experts_per_tok": 1,
+  "moe_intermediate_size": 1,
   "first_k_dense_replace": 0,
   "moe_layer_freq": 1,
   "num_key_value_heads": 1,
@@ -1522,9 +1528,19 @@ fn word_level_tokenizer_json() -> &'static str {
 fn deepseek_v4_model_config_json() -> &'static str {
     r#"{
   "model_type": "deepseek_v4",
+  "architectures": ["DeepseekV4ForCausalLM"],
   "vocab_size": 129280,
   "max_position_embeddings": 163840,
-  "num_hidden_layers": 43
+  "num_hidden_layers": 43,
+  "hidden_size": 1024,
+  "num_attention_heads": 16,
+  "qk_nope_head_dim": 128,
+  "qk_rope_head_dim": 64,
+  "v_head_dim": 128,
+  "n_routed_experts": 32,
+  "num_experts_per_tok": 4,
+  "moe_intermediate_size": 256,
+  "hc_mult": 1
 }"#
 }
 
@@ -1534,6 +1550,8 @@ fn write_complete_deepseek_v4_checkpoint(model_dir: &std::path::Path) {
         r#"{
   "architectures": ["DeepseekV4ForCausalLM"],
   "model_type": "deepseek_v4",
+  "vocab_size": 1,
+  "max_position_embeddings": 32,
   "num_hidden_layers": 1,
   "hidden_size": 1,
   "num_attention_heads": 1,
