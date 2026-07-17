@@ -5,7 +5,6 @@
 //! a `grpc://` worker, not only register it.
 
 use std::fs;
-use std::mem::size_of_val;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -104,40 +103,31 @@ fn unique_model_dir(name: &str) -> std::path::PathBuf {
     ))
 }
 
-fn write_embedding_lm_artifacts_with_weight_values(model_dir: &std::path::Path, values: &[f32]) {
-    assert_eq!(
-        values.len(),
-        3,
-        "embedding LM fixture uses a 3-token vocabulary"
-    );
+fn write_qwen3_artifacts_with_embedding_values(model_dir: &std::path::Path, values: &[f32]) {
+    assert!(values.len() <= 6, "Qwen3 embedding fixture has six values");
     fs::create_dir_all(model_dir).expect("model directory should be created");
     fs::write(
         model_dir.join("config.json"),
         r#"{
-  "architectures": ["SglangEmbeddingLmForCausalLM"],
-  "model_type": "sglang_embedding_lm",
+  "architectures": ["Qwen3ForCausalLM"],
+  "model_type": "qwen3",
   "vocab_size": 3,
-  "hidden_size": 1,
+  "num_hidden_layers": 1,
+  "hidden_size": 2,
+  "intermediate_size": 2,
+  "num_attention_heads": 1,
+  "num_key_value_heads": 1,
+  "head_dim": 2,
+  "hidden_act": "silu",
+  "attention_bias": false,
+  "rms_norm_eps": 0.000001,
+  "rope_theta": 1000000.0,
+  "max_position_embeddings": 32,
+  "tie_word_embeddings": false,
   "eos_token_id": [2, 3]
 }"#,
     )
     .expect("config should be written");
-    let byte_len = size_of_val(values);
-    let header = format!(
-        r#"{{"model.embed_tokens.weight":{{"dtype":"F32","shape":[3,1],"data_offsets":[0,{byte_len}]}},"lm_head.weight":{{"dtype":"F32","shape":[3,1],"data_offsets":[{byte_len},{}]}}}}"#,
-        byte_len * 2
-    );
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(header.as_bytes());
-    for value in values {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    for _ in values {
-        bytes.extend_from_slice(&0.0_f32.to_le_bytes());
-    }
-    fs::write(model_dir.join("model.safetensors"), bytes)
-        .expect("safetensors shard should be written");
     fs::write(
         model_dir.join("tokenizer.json"),
         r#"{
@@ -157,6 +147,95 @@ fn write_embedding_lm_artifacts_with_weight_values(model_dir: &std::path::Path, 
 }"#,
     )
     .expect("tokenizer should be written");
+
+    let mut token_embeddings = vec![0.0_f32; 6];
+    token_embeddings[..values.len()].copy_from_slice(values);
+    let descriptors: Vec<(&str, Vec<usize>, Vec<f32>)> = vec![
+        ("model.embed_tokens.weight", vec![3, 2], token_embeddings),
+        ("model.norm.weight", vec![2], vec![1.0; 2]),
+        (
+            "lm_head.weight",
+            vec![3, 2],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0],
+        ),
+        (
+            "model.layers.0.self_attn.q_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.self_attn.q_norm.weight",
+            vec![2],
+            vec![1.0; 2],
+        ),
+        (
+            "model.layers.0.self_attn.k_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.self_attn.k_norm.weight",
+            vec![2],
+            vec![1.0; 2],
+        ),
+        (
+            "model.layers.0.self_attn.v_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.self_attn.o_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.input_layernorm.weight",
+            vec![2],
+            vec![1.0; 2],
+        ),
+        (
+            "model.layers.0.post_attention_layernorm.weight",
+            vec![2],
+            vec![1.0; 2],
+        ),
+        (
+            "model.layers.0.mlp.gate_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.mlp.up_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.mlp.down_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+    ];
+    let mut payload = Vec::new();
+    let mut fields = Vec::new();
+    for (name, shape, values) in descriptors {
+        let start = payload.len();
+        payload.extend(values.into_iter().flat_map(f32::to_le_bytes));
+        let shape = shape
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        fields.push(format!(
+            r#""{name}":{{"dtype":"F32","shape":[{shape}],"data_offsets":[{start},{}]}}"#,
+            payload.len()
+        ));
+    }
+    let header = format!("{{{}}}", fields.join(","));
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(header.as_bytes());
+    bytes.extend_from_slice(&payload);
+    fs::write(model_dir.join("model.safetensors"), bytes)
+        .expect("safetensors shard should be written");
 }
 
 // Protocol tests serve the explicit reference builder; launch tests use the production alias.
@@ -461,7 +540,7 @@ async fn router_update_weight_version_reaches_real_rust_srt_grpc_worker() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn router_get_weights_by_name_reaches_real_rust_srt_grpc_worker() {
     let model_dir = unique_model_dir("get-weights");
-    write_embedding_lm_artifacts_with_weight_values(&model_dir, &[1.5, 2.5, 3.5]);
+    write_qwen3_artifacts_with_embedding_values(&model_dir, &[1.5, 2.5, 3.5]);
     let addr = unused_local_addr();
     let args = ServerArgs::parse_from([
         "serve",

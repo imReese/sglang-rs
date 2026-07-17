@@ -1,5 +1,4 @@
 mod deepseek;
-mod embedding;
 mod glm;
 mod mla_moe_weights;
 mod qwen;
@@ -13,7 +12,6 @@ use crate::kv_cache::KvCacheModelLayout;
 use crate::model_artifacts::{HfModelConfig, LocalModelArtifacts, ModelArtifactError};
 
 pub(crate) use deepseek::DEEPSEEK_V4_ADAPTER;
-pub(crate) use embedding::EMBEDDING_LM_ADAPTER;
 pub(crate) use glm::GLM_MOE_DSA_ADAPTER;
 pub(crate) use qwen::{QWEN2_ADAPTER, QWEN3_ADAPTER};
 pub(crate) use qwen3_5::QWEN3_5_ADAPTER;
@@ -309,7 +307,6 @@ impl fmt::Display for FeedForwardFamily {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModelExecutionArchitecture {
-    Embedding,
     Transformer {
         attention: AttentionArchitecture,
         feed_forward: FeedForwardArchitecture,
@@ -319,24 +316,18 @@ pub enum ModelExecutionArchitecture {
 impl ModelExecutionArchitecture {
     pub fn attention_family(self) -> AttentionFamily {
         match self {
-            Self::Embedding => AttentionFamily::None,
             Self::Transformer { attention, .. } => attention.family(),
         }
     }
 
     pub fn feed_forward_family(self) -> FeedForwardFamily {
         match self {
-            Self::Embedding => FeedForwardFamily::None,
             Self::Transformer { feed_forward, .. } => feed_forward.family(),
         }
     }
 
     fn validate_tensor_parallel(self, tensor_parallel_size: usize) -> Result<(), String> {
         match self {
-            Self::Embedding if tensor_parallel_size != 1 => Err(
-                "embedding reference execution supports tensor parallel size 1 only".to_string(),
-            ),
-            Self::Embedding => Ok(()),
             Self::Transformer { attention, .. } => {
                 attention.validate_tensor_parallel(tensor_parallel_size)
             }

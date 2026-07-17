@@ -14,14 +14,13 @@ use crate::model_runtime::{
     LoadedModelRuntime, ModelRuntimeConfig, ModelRuntimeLoadError, validate_runtime_support,
 };
 use crate::models::{
-    DEEPSEEK_V4_ADAPTER, EMBEDDING_LM_ADAPTER, GLM_MOE_DSA_ADAPTER, ModelAdapter,
-    ModelAdapterError, ModelDefinition, QWEN2_ADAPTER, QWEN3_5_ADAPTER, QWEN3_ADAPTER,
+    DEEPSEEK_V4_ADAPTER, GLM_MOE_DSA_ADAPTER, ModelAdapter, ModelAdapterError, ModelDefinition,
+    QWEN2_ADAPTER, QWEN3_5_ADAPTER, QWEN3_ADAPTER,
 };
 use crate::runtime_kv_cache::{ModelExecutionResources, RuntimeKvCache};
 use crate::worker::WorkerWeightUpdateRequest;
 
-static MODEL_ADAPTERS: [&'static dyn ModelAdapter; 6] = [
-    &EMBEDDING_LM_ADAPTER,
+static MODEL_ADAPTERS: [&'static dyn ModelAdapter; 5] = [
     &DEEPSEEK_V4_ADAPTER,
     &GLM_MOE_DSA_ADAPTER,
     &QWEN2_ADAPTER,
@@ -769,7 +768,7 @@ mod tests {
     #[test]
     fn registry_reports_truly_unsupported_architectures() {
         let config = HfModelConfig {
-            architectures: vec!["UnknownForCausalLM".to_string()],
+            architectures: vec!["SglangEmbeddingLmForCausalLM".to_string()],
             ..HfModelConfig::default()
         };
 
@@ -780,7 +779,12 @@ mod tests {
         assert!(matches!(
             error,
             ModelRegistryError::UnsupportedArchitectures { requested, .. }
-                if requested == ["UnknownForCausalLM"]
+                if requested == ["SglangEmbeddingLmForCausalLM"]
         ));
+        assert!(
+            !ModelRegistry
+                .supported_architectures()
+                .contains(&"SglangEmbeddingLmForCausalLM")
+        );
     }
 }

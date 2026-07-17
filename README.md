@@ -96,8 +96,8 @@ This repository currently contains the first `sglang-srt` runtime crate and the
   GPU host it performs real device discovery, compute-capability queries,
   primary-context management, memory accounting, and RAII `cuMemAlloc_v2` /
   `cuMemFree_v2` device allocation. Checked host/device copies and dynamically
-  loaded cuBLAS provide F32 embedding inference and BF16 row-major GEMM without
-  requiring a CUDA SDK at Rust compile time. Dynamically compiled BF16 paged
+  loaded cuBLAS provides BF16 row-major GEMM for the shared dense decoder
+  without requiring a CUDA SDK at Rust compile time. Dynamically compiled BF16 paged
   attention consumes scheduler request metadata and reads GQA K/V rows directly
   from physical slots in the page-major CUDA KV pool.
 - `backend`: runtime capability contracts for compute capability, supported
@@ -220,8 +220,8 @@ This repository currently contains the first `sglang-srt` runtime crate and the
 - `types`: generation request and response types.
 
 The implementation is intentionally small while the architecture is being
-carved out. A CUDA/cuBLAS executor now runs the weight-backed embedding LM used
-for end-to-end protocol validation. BF16 GEMM and GQA paged-attention primitives
+carved out. Qwen2 and Qwen3 use the shared dense decoder with F32 CPU reference
+execution and BF16 CUDA execution. BF16 GEMM and GQA paged-attention primitives
 are implemented, while MoE CUDA kernels and a production GLM/DeepSeek CUDA
 executor are not implemented yet. PD support
 covers the scheduler/router execution split, bootstrap metadata propagation,
@@ -389,8 +389,8 @@ Run a local centralized CPU-reference smoke with a tiny real safetensors model:
 ./scripts/run_cpu_reference_smoke.sh
 ```
 
-The smoke builds `sglang-rs`, creates a temporary CPU embedding LM checkpoint,
-starts one centralized reference server, sends an OpenAI completions request,
-verifies the model-generated `world` token, and then shuts the server down. CPU
-reference execution is not used to claim P/D transfer support. Use
-`KEEP_RUNNING=1` to leave the service running after the request.
+The smoke builds `sglang-rs`, creates a complete one-layer Qwen3 Transformer
+checkpoint, starts one centralized reference server, sends an OpenAI
+completions request, verifies the model-generated `world` token, and then shuts
+the server down. CPU reference execution is not used to claim P/D transfer
+support. Use `KEEP_RUNNING=1` to leave the service running after the request.

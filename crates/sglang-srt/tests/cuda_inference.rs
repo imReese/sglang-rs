@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
-use sglang_srt::backend::{ComputeCapability, CudaBackend};
+use sglang_srt::backend::CudaBackend;
 use sglang_srt::cli::ServerArgs;
 use sglang_srt::http::serve_http_router_with_shutdown;
 use sglang_srt::server::build_bootstrap_http_router_service;
@@ -16,61 +16,6 @@ fn cuda_test_device_ordinal() -> usize {
         .unwrap_or_else(|_| "0".to_string())
         .parse()
         .expect("SGLANG_CUDA_TEST_DEVICE must be a CUDA device ordinal")
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires a CUDA device, NVIDIA driver, and cuBLAS"]
-async fn cuda_auto_selects_cublas_for_weight_backed_http_inference() {
-    let device_ordinal = cuda_test_device_ordinal();
-    let backend = CudaBackend::initialize(device_ordinal).expect("CUDA backend should initialize");
-    let ComputeCapability::Cuda(_) = backend.capabilities().compute_capability else {
-        panic!("CUDA backend must report CUDA compute capability");
-    };
-    drop(backend);
-
-    let model_dir = temp_model_dir("cuda-cublas-http");
-    write_embedding_lm_artifacts(&model_dir);
-    let mut args = ServerArgs::parse_from([
-        "serve",
-        "--model-path",
-        model_dir.to_str().expect("temp model path should be utf-8"),
-        "--host",
-        "127.0.0.1",
-        "--port",
-        "0",
-    ])
-    .expect("server args should parse");
-    args.base_gpu_id = device_ordinal;
-    let service = build_bootstrap_http_router_service(&args);
-    let addr = unused_local_addr();
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server = tokio::spawn(async move {
-        serve_http_router_with_shutdown(addr, service, async move {
-            let _ = shutdown_rx.await;
-        })
-        .await
-    });
-
-    let generated = post_json_with_retry(
-        addr,
-        "/generate",
-        r#"{"text":"hello","sampling_params":{"max_new_tokens":1}}"#,
-    )
-    .await;
-
-    assert_eq!(generated["output_ids"], serde_json::json!([2]));
-    assert_eq!(generated["text"], "world");
-    assert_eq!(generated["usage"]["prompt_tokens"], 1);
-    assert_eq!(generated["usage"]["completion_tokens"], 1);
-
-    shutdown_tx
-        .send(())
-        .expect("CUDA HTTP server should still be running");
-    server
-        .await
-        .expect("CUDA HTTP server task should join")
-        .expect("CUDA HTTP server should stop cleanly");
-    fs::remove_dir_all(model_dir).expect("temp model directory should be removed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -133,42 +78,6 @@ async fn cuda_qwen3_uses_the_shared_dense_decoder_and_runtime_kv_pool() {
         .expect("CUDA Qwen3 HTTP server task should join")
         .expect("CUDA Qwen3 HTTP server should stop cleanly");
     fs::remove_dir_all(model_dir).expect("temp model directory should be removed");
-}
-
-fn write_embedding_lm_artifacts(model_dir: &Path) {
-    fs::create_dir_all(model_dir).expect("temp model directory should be created");
-    fs::write(
-        model_dir.join("config.json"),
-        r#"{
-  "architectures": ["SglangEmbeddingLmForCausalLM"],
-  "model_type": "sglang_embedding_lm",
-  "vocab_size": 3,
-  "hidden_size": 2
-}"#,
-    )
-    .expect("model config should be written");
-    fs::write(
-        model_dir.join("tokenizer.json"),
-        word_level_tokenizer_json(),
-    )
-    .expect("tokenizer should be written");
-
-    let token_embeddings = [0.0_f32, 0.0, 1.0, 0.0, 0.0, 1.0];
-    let lm_head = [0.0_f32, 0.0, 1.0, 0.0, 2.0, 0.0];
-    let payload = token_embeddings
-        .into_iter()
-        .chain(lm_head)
-        .flat_map(f32::to_le_bytes)
-        .collect::<Vec<_>>();
-    write_safetensors_file(
-        &model_dir.join("model.safetensors"),
-        &[
-            ("model.embed_tokens.weight", "F32", &[3, 2], [0, 24]),
-            ("lm_head.weight", "F32", &[3, 2], [24, 48]),
-        ],
-        &payload,
-    )
-    .expect("model weights should be written");
 }
 
 fn write_qwen3_dense_artifacts(model_dir: &Path) {

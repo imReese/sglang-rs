@@ -49,8 +49,9 @@ fn cpu_reference_smoke_script_runs_real_centralized_generation() {
 
     let content =
         std::fs::read_to_string(&script).expect("CPU reference smoke script should exist");
-    assert!(content.contains("SglangEmbeddingLmForCausalLM"));
-    assert!(content.contains("sglang_embedding_lm"));
+    assert!(content.contains("Qwen3ForCausalLM"));
+    assert!(content.contains("model.layers.0.self_attn.q_proj.weight"));
+    assert!(content.contains("model.layers.0.mlp.down_proj.weight"));
     assert!(content.contains("/v1/completions"));
     assert!(content.contains("text != \"world\""));
     assert!(!content.contains("/v1/chat/completions"));

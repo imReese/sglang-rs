@@ -61,10 +61,21 @@ from pathlib import Path
 model_dir = Path(sys.argv[1])
 model_dir.mkdir(parents=True, exist_ok=True)
 (model_dir / "config.json").write_text(json.dumps({
-    "architectures": ["SglangEmbeddingLmForCausalLM"],
-    "model_type": "sglang_embedding_lm",
+    "architectures": ["Qwen3ForCausalLM"],
+    "model_type": "qwen3",
     "vocab_size": 3,
+    "num_hidden_layers": 1,
     "hidden_size": 2,
+    "intermediate_size": 2,
+    "num_attention_heads": 1,
+    "num_key_value_heads": 1,
+    "head_dim": 2,
+    "hidden_act": "silu",
+    "attention_bias": False,
+    "rms_norm_eps": 0.000001,
+    "rope_theta": 1000000.0,
+    "max_position_embeddings": 32,
+    "tie_word_embeddings": False,
     "eos_token_id": 2,
 }), encoding="utf-8")
 (model_dir / "tokenizer.json").write_text(json.dumps({
@@ -85,7 +96,19 @@ model_dir.mkdir(parents=True, exist_ok=True)
 
 tensors = [
     ("model.embed_tokens.weight", [3, 2], [0.0, 0.0, 1.0, 0.0, 0.0, 1.0]),
-    ("lm_head.weight", [3, 2], [0.0, 0.0, 0.25, 0.0, 1.0, 0.0]),
+    ("model.norm.weight", [2], [1.0, 1.0]),
+    ("lm_head.weight", [3, 2], [0.0, 0.0, 0.0, 1.0, 1.0, 0.0]),
+    ("model.layers.0.self_attn.q_proj.weight", [2, 2], [0.0] * 4),
+    ("model.layers.0.self_attn.q_norm.weight", [2], [1.0] * 2),
+    ("model.layers.0.self_attn.k_proj.weight", [2, 2], [0.0] * 4),
+    ("model.layers.0.self_attn.k_norm.weight", [2], [1.0] * 2),
+    ("model.layers.0.self_attn.v_proj.weight", [2, 2], [0.0] * 4),
+    ("model.layers.0.self_attn.o_proj.weight", [2, 2], [0.0] * 4),
+    ("model.layers.0.input_layernorm.weight", [2], [1.0] * 2),
+    ("model.layers.0.post_attention_layernorm.weight", [2], [1.0] * 2),
+    ("model.layers.0.mlp.gate_proj.weight", [2, 2], [0.0] * 4),
+    ("model.layers.0.mlp.up_proj.weight", [2, 2], [0.0] * 4),
+    ("model.layers.0.mlp.down_proj.weight", [2, 2], [0.0] * 4),
 ]
 payload = bytearray()
 metadata = {}

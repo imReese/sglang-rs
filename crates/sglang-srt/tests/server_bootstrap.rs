@@ -28,10 +28,10 @@ use sglang_srt::server::test_support::{
     try_build_reference_prefill_http_router_service,
 };
 use sglang_srt::server::{
-    ServerLaunchError, build_bootstrap_grpc_router_service, grpc_http_sidecar_listen_addr,
-    grpc_listen_addr, launch_grpc_server, launch_grpc_server_with_shutdown,
-    prefill_mooncake_zmq_endpoints, register_prefill_mooncake_routes_from_args,
-    try_build_bootstrap_grpc_router_service, try_build_bootstrap_prefill_http_router_service,
+    ServerLaunchError, grpc_http_sidecar_listen_addr, grpc_listen_addr, launch_grpc_server,
+    launch_grpc_server_with_shutdown, prefill_mooncake_zmq_endpoints,
+    register_prefill_mooncake_routes_from_args, try_build_bootstrap_grpc_router_service,
+    try_build_bootstrap_prefill_http_router_service,
 };
 use sglang_srt::tokenizer::TokenizerError;
 use sglang_srt::transfer::{
@@ -260,16 +260,7 @@ fn bootstrap_cuda_device_rejects_missing_model_without_fallback() {
 fn unsupported_accelerator_fails_before_cpu_weight_materialization() {
     let model_dir = temp_model_dir("unsupported-accelerator-fast-fail");
     fs::create_dir_all(&model_dir).expect("temp model directory should be created");
-    fs::write(
-        model_dir.join("config.json"),
-        r#"{
-  "architectures": ["SglangEmbeddingLmForCausalLM"],
-  "model_type": "sglang_embedding_lm",
-  "vocab_size": 3,
-  "hidden_size": 2
-}"#,
-    )
-    .expect("config should be written");
+    write_complete_qwen3_checkpoint(&model_dir);
     write_safetensors_file(
         &model_dir.join("model.safetensors"),
         &[("unrelated.weight", "U8", &[1], [0, 1])],
@@ -809,105 +800,6 @@ async fn bootstrap_grpc_router_service_generates_through_model_runner() {
             .await
             .is_none()
     );
-}
-
-#[tokio::test]
-async fn bootstrap_grpc_router_service_generates_from_local_fp8_safetensors_weights() {
-    let model_dir = temp_model_dir("server-weight-backed-forward");
-    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
-    fs::write(
-        model_dir.join("config.json"),
-        r#"{
-  "architectures": ["SglangEmbeddingLmForCausalLM"],
-  "model_type": "sglang_embedding_lm",
-  "vocab_size": 3,
-  "hidden_size": 2
-}"#,
-    )
-    .expect("config should be written");
-    fs::write(
-        model_dir.join("tokenizer.json"),
-        word_level_tokenizer_json(),
-    )
-    .expect("tokenizer should be written");
-    write_safetensors_file(
-        &model_dir.join("model.safetensors"),
-        &[
-            ("model.embed_tokens.weight", "F8_E4M3", &[3, 2], [0, 6]),
-            ("lm_head.weight", "F8_E4M3", &[3, 2], [6, 12]),
-            ("lm_head.weight_scale_inv", "F32", &[3], [12, 24]),
-        ],
-        [
-            0x00, 0x00, // [UNK]
-            0x38, 0x00, // hello
-            0x00, 0x38, // world
-            0x00, 0x00, // [UNK] logits
-            0x38, 0x00, // hello logits
-            0x30, 0x00, // world logits before scale
-        ]
-        .into_iter()
-        .chain([1.0_f32, 1.0, 4.0].into_iter().flat_map(f32::to_le_bytes))
-        .collect::<Vec<_>>()
-        .as_slice(),
-    )
-    .expect("weights should be written");
-    let args = ServerArgs::parse_from([
-        "serve",
-        "--model-path",
-        model_dir.to_str().expect("temp model dir should be utf-8"),
-        "--device",
-        "cpu",
-        "--grpc-mode",
-    ])
-    .expect("args should parse");
-    let service = build_bootstrap_grpc_router_service(&args);
-
-    let mut stream = service
-        .text_generate(Request::new(TextGenerateRequest {
-            text: "hello".to_string(),
-            sampling_params: Some(SamplingParams {
-                max_new_tokens: Some(1),
-                ..Default::default()
-            }),
-            options: Some(RequestOptions {
-                request_id: Some("bootstrap-weight-backed".to_string()),
-                stream: true,
-                data_parallel_rank: 0,
-                trace_headers: Default::default(),
-            }),
-            disaggregated_params: None,
-        }))
-        .await
-        .expect("text generate should execute")
-        .into_inner();
-
-    let chunk = tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
-        .await
-        .expect("token response")
-        .expect("token response should be ok");
-    let response = tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
-        .await
-        .expect("completion response")
-        .expect("completion response should be ok");
-
-    assert!(matches!(chunk.body, Some(Body::Chunk(_))));
-    assert_eq!(response.request_id, "bootstrap-weight-backed");
-    assert_eq!(
-        response.body,
-        Some(Body::Complete(
-            sglang_srt::proto::sglang::runtime::v1::GenerateComplete {
-                output_ids: vec![2],
-                text: "world".to_string(),
-                finish_reason: "stop".to_string(),
-                prompt_tokens: 1,
-                completion_tokens: 1,
-                cached_tokens: 0,
-                index: 0,
-            }
-        ))
-    );
-
-    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
 
 #[tokio::test]

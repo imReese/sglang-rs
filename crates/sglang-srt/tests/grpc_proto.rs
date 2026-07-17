@@ -108,62 +108,132 @@ fn unique_weight_update_model_dir() -> std::path::PathBuf {
 }
 
 fn write_minimal_generic_model_artifacts(model_dir: &Path) {
-    fs::create_dir_all(model_dir).expect("model directory should be created");
-    fs::write(
-        model_dir.join("config.json"),
-        r#"{
-  "architectures": ["SglangEmbeddingLmForCausalLM"],
-  "model_type": "sglang_embedding_lm",
-  "vocab_size": 1,
-  "hidden_size": 1,
-  "max_position_embeddings": 4096,
-  "eos_token_id": [2, 3]
-}"#,
-    )
-    .expect("config should be written");
-    write_minimal_safetensors_file(&model_dir.join("model.safetensors"));
+    write_qwen3_model_artifacts(model_dir, &[0.0, 0.0, 1.0, 0.0, 0.0, 1.0]);
 }
 
 fn write_minimal_generic_model_artifacts_with_weight_values(model_dir: &Path, values: &[f32]) {
+    assert!(values.len() <= 6, "Qwen3 embedding fixture has six values");
+    let mut token_embeddings = [0.0_f32; 6];
+    token_embeddings[..values.len()].copy_from_slice(values);
+    write_qwen3_model_artifacts(model_dir, &token_embeddings);
+}
+
+fn write_qwen3_model_artifacts(model_dir: &Path, token_embeddings: &[f32]) {
+    assert_eq!(token_embeddings.len(), 6);
     fs::create_dir_all(model_dir).expect("model directory should be created");
     fs::write(
         model_dir.join("config.json"),
         r#"{
-  "architectures": ["TinyForCausalLM"],
-  "model_type": "tiny",
-  "vocab_size": 128,
-  "max_position_embeddings": 4096,
+  "architectures": ["Qwen3ForCausalLM"],
+  "model_type": "qwen3",
+  "vocab_size": 3,
+  "num_hidden_layers": 1,
+  "hidden_size": 2,
+  "intermediate_size": 2,
+  "num_attention_heads": 1,
+  "num_key_value_heads": 1,
+  "head_dim": 2,
+  "hidden_act": "silu",
+  "attention_bias": false,
+  "rms_norm_eps": 0.000001,
+  "rope_theta": 1000000.0,
+  "max_position_embeddings": 32,
+  "tie_word_embeddings": false,
   "eos_token_id": [2, 3]
 }"#,
     )
     .expect("config should be written");
-    write_safetensors_weight_values(&model_dir.join("model.safetensors"), values);
-}
 
-fn write_minimal_safetensors_file(path: &Path) {
-    let header = br#"{"model.embed_tokens.weight":{"dtype":"F32","shape":[1,1],"data_offsets":[0,4]},"lm_head.weight":{"dtype":"F32","shape":[1,1],"data_offsets":[4,8]}}"#;
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(header);
-    bytes.extend_from_slice(&0.0f32.to_le_bytes());
-    bytes.extend_from_slice(&0.0f32.to_le_bytes());
-    fs::write(path, bytes).expect("safetensors shard should be written");
-}
-
-fn write_safetensors_weight_values(path: &Path, values: &[f32]) {
-    let byte_len = std::mem::size_of_val(values);
-    let header = format!(
-        r#"{{"model.embed_tokens.weight":{{"dtype":"F32","shape":[{}],"data_offsets":[0,{}]}}}}"#,
-        values.len(),
-        byte_len
-    );
+    let descriptors: Vec<(&str, Vec<usize>, Vec<f32>)> = vec![
+        (
+            "model.embed_tokens.weight",
+            vec![3, 2],
+            token_embeddings.to_vec(),
+        ),
+        ("model.norm.weight", vec![2], vec![1.0; 2]),
+        (
+            "lm_head.weight",
+            vec![3, 2],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0],
+        ),
+        (
+            "model.layers.0.self_attn.q_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.self_attn.q_norm.weight",
+            vec![2],
+            vec![1.0; 2],
+        ),
+        (
+            "model.layers.0.self_attn.k_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.self_attn.k_norm.weight",
+            vec![2],
+            vec![1.0; 2],
+        ),
+        (
+            "model.layers.0.self_attn.v_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.self_attn.o_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.input_layernorm.weight",
+            vec![2],
+            vec![1.0; 2],
+        ),
+        (
+            "model.layers.0.post_attention_layernorm.weight",
+            vec![2],
+            vec![1.0; 2],
+        ),
+        (
+            "model.layers.0.mlp.gate_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.mlp.up_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.mlp.down_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+    ];
+    let mut payload = Vec::new();
+    let mut fields = Vec::new();
+    for (name, shape, values) in descriptors {
+        let start = payload.len();
+        payload.extend(values.into_iter().flat_map(f32::to_le_bytes));
+        let shape = shape
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        fields.push(format!(
+            r#""{name}":{{"dtype":"F32","shape":[{shape}],"data_offsets":[{start},{}]}}"#,
+            payload.len()
+        ));
+    }
+    let header = format!("{{{}}}", fields.join(","));
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
     bytes.extend_from_slice(header.as_bytes());
-    for value in values {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    fs::write(path, bytes).expect("safetensors shard should be written");
+    bytes.extend_from_slice(&payload);
+    fs::write(model_dir.join("model.safetensors"), bytes)
+        .expect("safetensors shard should be written");
 }
 
 #[test]
@@ -1712,10 +1782,10 @@ async fn grpc_update_weights_from_disk_validates_artifacts_and_updates_model_inf
     assert_eq!(model_info.model_path, model_dir.to_string_lossy());
     assert_eq!(model_info.tokenizer_path, model_dir.to_string_lossy());
     assert_eq!(model_info.served_model_name, "tiny");
-    assert_eq!(model_info.model_type, "sglang_embedding_lm");
+    assert_eq!(model_info.model_type, "qwen3");
     assert_eq!(model_info.eos_token_ids, vec![2, 3]);
-    assert_eq!(model_info.vocab_size, 1);
-    assert_eq!(model_info.max_context_length, 4096);
+    assert_eq!(model_info.vocab_size, 3);
+    assert_eq!(model_info.max_context_length, 32);
     assert!(model_info.weight_version.starts_with("safetensors-sha256:"));
 
     fs::remove_dir_all(model_dir).expect("model temp directory should clean up");

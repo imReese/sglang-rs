@@ -3,10 +3,9 @@ use crate::cpu_hybrid::CpuReferenceHybridDecoder;
 use crate::cpu_reference::{CpuReferenceDenseDecoder, CpuReferenceKvCache};
 use crate::cuda_dense_decoder::CudaBf16DenseDecoder;
 use crate::cuda_kv_cache::allocate_cuda_kv_cache;
-use crate::cuda_runtime::CudaEmbeddingLmModel;
 use crate::kv_cache::{KvCacheDtype, KvCacheRuntimeLayout, PagedKvCacheLayout};
 use crate::model_artifacts::LocalModelArtifacts;
-use crate::model_executor::{CpuEmbeddingLmModel, KvCacheAllocationConfig};
+use crate::model_executor::KvCacheAllocationConfig;
 use crate::model_runtime::{ModelExecutor, ModelRuntimeConfig, ModelRuntimeLoadError};
 use crate::models::{ModelDefinition, ModelExecutionArchitecture};
 use crate::runtime_kv_cache::RuntimeKvCache;
@@ -57,26 +56,6 @@ impl InitializedRuntimeBackend {
     }
 }
 
-impl ModelExecutor for CpuEmbeddingLmModel {
-    fn runtime_capability(&self) -> RuntimeCapability {
-        RuntimeCapability::cpu_reference("cpu-embedding-lm", false)
-    }
-
-    fn execution_dtype(&self) -> RuntimeDtype {
-        RuntimeDtype::F32
-    }
-}
-
-impl ModelExecutor for CudaEmbeddingLmModel {
-    fn runtime_capability(&self) -> RuntimeCapability {
-        CudaEmbeddingLmModel::runtime_capability(self)
-    }
-
-    fn execution_dtype(&self) -> RuntimeDtype {
-        RuntimeDtype::F32
-    }
-}
-
 impl ModelExecutor for CudaBf16DenseDecoder {
     fn runtime_capability(&self) -> RuntimeCapability {
         CudaBf16DenseDecoder::runtime_capability(self)
@@ -113,21 +92,6 @@ fn create_cpu_model_runtime(
     config: ModelRuntimeConfig,
 ) -> Result<BackendModelRuntime, ModelRuntimeLoadError> {
     match definition.execution() {
-        ModelExecutionArchitecture::Embedding => {
-            let executor = CpuEmbeddingLmModel::from_local_model_artifacts(artifacts)
-                .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?
-                .map(|model| Box::new(model) as Box<dyn ModelExecutor>)
-                .ok_or_else(|| {
-                    ModelRuntimeLoadError::Load(
-                        "embedding model configuration was rejected after registry resolution"
-                            .to_string(),
-                    )
-                })?;
-            Ok(BackendModelRuntime {
-                executor,
-                active_kv_cache: None,
-            })
-        }
         ModelExecutionArchitecture::Transformer { .. } if definition.hybrid_decoder().is_some() => {
             let executor = Box::new(
                 CpuReferenceHybridDecoder::load(definition, artifacts)
@@ -192,21 +156,6 @@ fn create_cuda_model_runtime(
     config: ModelRuntimeConfig,
 ) -> Result<BackendModelRuntime, ModelRuntimeLoadError> {
     match definition.execution() {
-        ModelExecutionArchitecture::Embedding => {
-            let executor = CudaEmbeddingLmModel::from_local_model_artifacts(artifacts, backend)
-                .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?
-                .map(|model| Box::new(model) as Box<dyn ModelExecutor>)
-                .ok_or_else(|| {
-                    ModelRuntimeLoadError::Load(
-                        "embedding model configuration was rejected after registry resolution"
-                            .to_string(),
-                    )
-                })?;
-            Ok(BackendModelRuntime {
-                executor,
-                active_kv_cache: None,
-            })
-        }
         ModelExecutionArchitecture::Transformer { .. } if definition.dense_decoder().is_some() => {
             let active_kv_cache = allocate_cuda_active_kv_cache(
                 definition,
@@ -278,7 +227,6 @@ fn paged_kv_cache_layout(
 
 fn validate_cpu_model_runtime(definition: &ModelDefinition) -> Vec<String> {
     match definition.execution() {
-        ModelExecutionArchitecture::Embedding => Vec::new(),
         ModelExecutionArchitecture::Transformer { .. }
             if definition.dense_decoder().is_some() || definition.hybrid_decoder().is_some() =>
         {
@@ -303,27 +251,19 @@ fn validate_cuda_model_runtime(
     backend: &CudaBackend,
     tensor_parallel_size: usize,
 ) -> Vec<String> {
-    if matches!(
-        definition.execution(),
-        ModelExecutionArchitecture::Embedding
-    ) {
-        return Vec::new();
-    }
     let mut missing = Vec::new();
     let capability = backend.capabilities();
     if definition.dense_decoder().is_none() {
-        if let ModelExecutionArchitecture::Transformer {
+        let ModelExecutionArchitecture::Transformer {
             attention,
             feed_forward,
-        } = definition.execution()
-        {
-            missing.push(format!(
-                "{} {} decoder executor for cuda backend",
-                attention.family(),
-                feed_forward.family()
-            ));
-            missing.push("runtime-owned KV cache allocation".to_string());
-        }
+        } = definition.execution();
+        missing.push(format!(
+            "{} {} decoder executor for cuda backend",
+            attention.family(),
+            feed_forward.family()
+        ));
+        missing.push("runtime-owned KV cache allocation".to_string());
         return missing;
     }
     if tensor_parallel_size != 1 {

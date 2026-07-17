@@ -7,7 +7,6 @@ mod cpu_reference;
 pub mod cuda_attention;
 mod cuda_dense_decoder;
 pub mod cuda_kv_cache;
-pub mod cuda_runtime;
 pub mod engine;
 pub mod engine_info_bootstrap;
 pub mod grpc;
