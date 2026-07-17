@@ -43,7 +43,8 @@ use crate::transfer::{
     MooncakeTransferTargetResolver, PdConfig, PdConfigError, TransferBackend,
 };
 use crate::transfer_backend_factory::{
-    ProductionMooncakeTransferBackend, TransferBackendFactoryError, build_mooncake_transfer_backend,
+    ProductionTransferBackend, TransferBackendBuildContext, TransferBackendFactory,
+    TransferBackendFactoryError,
 };
 use crate::worker::WorkerExecutor;
 
@@ -362,6 +363,28 @@ pub type BootstrapPdGrpcRouterService<E, P = crate::transfer::NoopDecodeBootstra
         RuntimeTokenizer,
         KvTransferModelWorker<ModelRunner<BootstrapForwardModel>, E, P>,
     >;
+
+enum ProductionDecodeBootstrapPublisher {
+    Noop(crate::transfer::NoopDecodeBootstrapPublisher),
+    Mooncake(MooncakeDecodeBootstrapPublisher),
+}
+
+impl DecodeBootstrapPublisher for ProductionDecodeBootstrapPublisher {
+    fn publish_decode_bootstrap_metadata(
+        &mut self,
+        plan: &crate::transfer::KvCacheTransferPlan,
+    ) -> Result<crate::transfer::DecodeBootstrapMetadataPublishSummary, String> {
+        match self {
+            Self::Noop(publisher) => publisher.publish_decode_bootstrap_metadata(plan),
+            Self::Mooncake(publisher) => publisher.publish_decode_bootstrap_metadata(plan),
+        }
+    }
+}
+
+type ProductionPdHttpRouterService =
+    BootstrapPdHttpRouterService<ProductionTransferBackend, ProductionDecodeBootstrapPublisher>;
+type ProductionPdGrpcRouterService =
+    BootstrapPdGrpcRouterService<ProductionTransferBackend, ProductionDecodeBootstrapPublisher>;
 #[cfg(any(test, feature = "test-support"))]
 pub type BootstrapFakePdGrpcRouterService =
     BootstrapPdGrpcRouterService<FakeKvCacheTransferExecutor>;
@@ -389,6 +412,7 @@ pub enum ServerLaunchError {
     EngineInfoBootstrap(EngineInfoBootstrapServeError),
     PrefillBootstrap(PrefillBootstrapServeError),
     MooncakeTransfer(MooncakeError),
+    TransferBackendFactory(String),
     KvCacheTransfer(String),
     UnsupportedMooncakeKvMemory {
         model_path: String,
@@ -447,6 +471,9 @@ impl PartialEq for ServerLaunchError {
             (Self::Tokenizer(left), Self::Tokenizer(right)) => left == right,
             (Self::ModelArtifact(left), Self::ModelArtifact(right)) => left == right,
             (Self::ModelRegistry(left), Self::ModelRegistry(right)) => left == right,
+            (Self::TransferBackendFactory(left), Self::TransferBackendFactory(right)) => {
+                left == right
+            }
             (Self::KvCacheTransfer(left), Self::KvCacheTransfer(right)) => left == right,
             (
                 Self::UnsupportedMooncakeKvMemory {
@@ -532,6 +559,9 @@ impl fmt::Display for ServerLaunchError {
             Self::EngineInfoBootstrap(error) => write!(formatter, "{error}"),
             Self::PrefillBootstrap(error) => write!(formatter, "{error}"),
             Self::MooncakeTransfer(error) => write!(formatter, "{error}"),
+            Self::TransferBackendFactory(error) => {
+                write!(formatter, "transfer backend initialization error: {error}")
+            }
             Self::KvCacheTransfer(error) => write!(formatter, "KV cache transfer error: {error}"),
             Self::UnsupportedMooncakeKvMemory {
                 model_path,
@@ -605,6 +635,13 @@ impl From<MooncakeError> for ServerLaunchError {
 impl From<TransferBackendFactoryError> for ServerLaunchError {
     fn from(value: TransferBackendFactoryError) -> Self {
         match value {
+            error
+                @ (TransferBackendFactoryError::RoleMismatch { .. }
+                | TransferBackendFactoryError::UnsupportedRole(_)
+                | TransferBackendFactoryError::UnsupportedBackend { .. }
+                | TransferBackendFactoryError::MissingPrefillBootstrapService) => {
+                    Self::TransferBackendFactory(error.to_string())
+                }
             #[cfg(feature = "mooncake-link")]
             TransferBackendFactoryError::UnsupportedCacheArchitecture => {
                 Self::MissingRuntimeCapabilities {
@@ -1228,123 +1265,86 @@ where
     )
 }
 
-fn try_build_launch_mooncake_prefill_http_router_service(
+struct ProductionPdRuntimeBundle {
+    model_runner: ModelRunner<BootstrapForwardModel>,
+    transfer_backend: ProductionTransferBackend,
+    decode_bootstrap_publisher: ProductionDecodeBootstrapPublisher,
+    decode_side_bootstrap_only: bool,
+}
+
+fn try_build_launch_pd_runtime_bundle(
     args: &ServerArgs,
     pd_config: &PdConfig,
-    bootstrap_service: PrefillBootstrapService,
-) -> Result<
-    BootstrapPdHttpRouterService<
-        MooncakeBootstrapKvCacheTransferExecutor<ProductionMooncakeTransferBackend>,
-    >,
-    ServerLaunchError,
-> {
+    prefill_bootstrap_service: Option<PrefillBootstrapService>,
+) -> Result<ProductionPdRuntimeBundle, ServerLaunchError> {
     let mut model_runner = bootstrap_model_runner(bootstrap_forward_model_for_launch(args)?)?;
-    let transfer_backend = build_mooncake_transfer_backend(
+    let mut context = TransferBackendBuildContext::new(
         &mut model_runner,
         pd_config,
         prefill_mooncake_route_rank_ip(args),
         args.num_reserved_decode_tokens,
         args.page_size,
-    )?;
+    );
+    if let Some(service) = prefill_bootstrap_service {
+        context = context.with_prefill_bootstrap_service(service);
+    }
+    let transfer_backend = TransferBackendFactory::build(pd_config.mode, context)?;
+    let (decode_bootstrap_publisher, decode_side_bootstrap_only) = match pd_config.mode {
+        DisaggregationMode::Prefill => (
+            ProductionDecodeBootstrapPublisher::Noop(crate::transfer::NoopDecodeBootstrapPublisher),
+            false,
+        ),
+        DisaggregationMode::Decode => (
+            ProductionDecodeBootstrapPublisher::Mooncake(
+                launch_mooncake_decode_bootstrap_publisher(
+                    args,
+                    transfer_backend.layout,
+                    transfer_backend.local_endpoint,
+                ),
+            ),
+            true,
+        ),
+        DisaggregationMode::Null => {
+            return Err(ServerLaunchError::UnsupportedBootstrapPdRuntime {
+                mode: pd_config.mode,
+                transfer_backend: pd_config.transfer_backend,
+            });
+        }
+    };
+
+    Ok(ProductionPdRuntimeBundle {
+        model_runner,
+        transfer_backend: transfer_backend.backend,
+        decode_bootstrap_publisher,
+        decode_side_bootstrap_only,
+    })
+}
+
+fn try_build_launch_pd_http_router_service(
+    args: &ServerArgs,
+    bundle: ProductionPdRuntimeBundle,
+) -> Result<ProductionPdHttpRouterService, ServerLaunchError> {
     try_build_bootstrap_pd_http_router_service_from_runner_with_decode_publisher(
         args,
-        model_runner,
+        bundle.model_runner,
         DecodeBootstrapRegistry::default(),
-        MooncakeBootstrapKvCacheTransferExecutor::new(bootstrap_service, transfer_backend.backend),
-        crate::transfer::NoopDecodeBootstrapPublisher,
-        false,
+        bundle.transfer_backend,
+        bundle.decode_bootstrap_publisher,
+        bundle.decode_side_bootstrap_only,
     )
 }
 
-fn try_build_launch_mooncake_decode_http_router_service(
+fn try_build_launch_pd_grpc_router_service(
     args: &ServerArgs,
-    pd_config: &PdConfig,
-) -> Result<
-    BootstrapPdHttpRouterService<
-        ProductionMooncakeTransferBackend,
-        MooncakeDecodeBootstrapPublisher,
-    >,
-    ServerLaunchError,
-> {
-    let mut model_runner = bootstrap_model_runner(bootstrap_forward_model_for_launch(args)?)?;
-    let transfer_backend = build_mooncake_transfer_backend(
-        &mut model_runner,
-        pd_config,
-        prefill_mooncake_route_rank_ip(args),
-        args.num_reserved_decode_tokens,
-        args.page_size,
-    )?;
-    try_build_bootstrap_pd_http_router_service_from_runner_with_decode_publisher(
-        args,
-        model_runner,
-        DecodeBootstrapRegistry::default(),
-        transfer_backend.backend,
-        launch_mooncake_decode_bootstrap_publisher(
-            args,
-            transfer_backend.layout,
-            transfer_backend.local_endpoint,
-        ),
-        true,
-    )
-}
-
-fn try_build_launch_mooncake_prefill_grpc_router_service(
-    args: &ServerArgs,
-    pd_config: &PdConfig,
-    bootstrap_service: PrefillBootstrapService,
-) -> Result<
-    BootstrapPdGrpcRouterService<
-        MooncakeBootstrapKvCacheTransferExecutor<ProductionMooncakeTransferBackend>,
-    >,
-    ServerLaunchError,
-> {
-    let mut model_runner = bootstrap_model_runner(bootstrap_forward_model_for_launch(args)?)?;
-    let transfer_backend = build_mooncake_transfer_backend(
-        &mut model_runner,
-        pd_config,
-        prefill_mooncake_route_rank_ip(args),
-        args.num_reserved_decode_tokens,
-        args.page_size,
-    )?;
+    bundle: ProductionPdRuntimeBundle,
+) -> Result<ProductionPdGrpcRouterService, ServerLaunchError> {
     try_build_bootstrap_pd_grpc_router_service_from_runner_with_decode_publisher(
         args,
-        model_runner,
+        bundle.model_runner,
         DecodeBootstrapRegistry::default(),
-        MooncakeBootstrapKvCacheTransferExecutor::new(bootstrap_service, transfer_backend.backend),
-        crate::transfer::NoopDecodeBootstrapPublisher,
-        false,
-    )
-}
-
-fn try_build_launch_mooncake_decode_grpc_router_service(
-    args: &ServerArgs,
-    pd_config: &PdConfig,
-) -> Result<
-    BootstrapPdGrpcRouterService<
-        ProductionMooncakeTransferBackend,
-        MooncakeDecodeBootstrapPublisher,
-    >,
-    ServerLaunchError,
-> {
-    let mut model_runner = bootstrap_model_runner(bootstrap_forward_model_for_launch(args)?)?;
-    let transfer_backend = build_mooncake_transfer_backend(
-        &mut model_runner,
-        pd_config,
-        prefill_mooncake_route_rank_ip(args),
-        args.num_reserved_decode_tokens,
-        args.page_size,
-    )?;
-    try_build_bootstrap_pd_grpc_router_service_from_runner_with_decode_publisher(
-        args,
-        model_runner,
-        DecodeBootstrapRegistry::default(),
-        transfer_backend.backend,
-        launch_mooncake_decode_bootstrap_publisher(
-            args,
-            transfer_backend.layout,
-            transfer_backend.local_endpoint,
-        ),
-        true,
+        bundle.transfer_backend,
+        bundle.decode_bootstrap_publisher,
+        bundle.decode_side_bootstrap_only,
     )
 }
 
@@ -1551,11 +1551,12 @@ where
             let zmq_endpoints = prefill_mooncake_zmq_endpoints(&args);
             let bootstrap_service = PrefillBootstrapService::default();
             register_prefill_mooncake_routes_from_args(&bootstrap_service, &args)?;
-            let service = try_build_launch_mooncake_prefill_grpc_router_service(
+            let runtime_bundle = try_build_launch_pd_runtime_bundle(
                 &args,
                 &pd_config,
-                bootstrap_service.clone(),
+                Some(bootstrap_service.clone()),
             )?;
+            let service = try_build_launch_pd_grpc_router_service(&args, runtime_bundle)?;
             serve_prefill_grpc_and_bootstrap(
                 addr,
                 service,
@@ -1571,7 +1572,8 @@ where
             .await?;
         }
         DisaggregationMode::Decode if pd_config.transfer_backend == TransferBackend::Mooncake => {
-            let service = try_build_launch_mooncake_decode_grpc_router_service(&args, &pd_config)?;
+            let runtime_bundle = try_build_launch_pd_runtime_bundle(&args, &pd_config, None)?;
+            let service = try_build_launch_pd_grpc_router_service(&args, runtime_bundle)?;
             serve_grpc_and_sidecar(addr, service, sidecar_addr, args.enable_metrics, shutdown)
                 .await?;
         }
@@ -1619,12 +1621,13 @@ where
             let zmq_endpoints = prefill_mooncake_zmq_endpoints(&args);
             let bootstrap_service = PrefillBootstrapService::default();
             register_prefill_mooncake_routes_from_args(&bootstrap_service, &args)?;
-            let service = try_build_launch_mooncake_prefill_http_router_service(
+            let runtime_bundle = try_build_launch_pd_runtime_bundle(
                 &args,
                 &pd_config,
-                bootstrap_service.clone(),
-            )?
-            .with_engine_info_bootstrap_service(engine_info_service.clone());
+                Some(bootstrap_service.clone()),
+            )?;
+            let service = try_build_launch_pd_http_router_service(&args, runtime_bundle)?
+                .with_engine_info_bootstrap_service(engine_info_service.clone());
             serve_prefill_http_and_bootstrap(
                 addr,
                 service,
@@ -1640,7 +1643,8 @@ where
             .await?;
         }
         DisaggregationMode::Decode if pd_config.transfer_backend == TransferBackend::Mooncake => {
-            let service = try_build_launch_mooncake_decode_http_router_service(&args, &pd_config)?
+            let runtime_bundle = try_build_launch_pd_runtime_bundle(&args, &pd_config, None)?;
+            let service = try_build_launch_pd_http_router_service(&args, runtime_bundle)?
                 .with_engine_info_bootstrap_service(engine_info_service.clone());
             serve_http_and_engine_info_bootstrap(
                 addr,

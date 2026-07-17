@@ -19,13 +19,13 @@ fn server_reuses_transfer_factory_without_constructing_mooncake_infrastructure()
         "RegisteredMooncakeKvCacheMemory::register",
         "MooncakeSessionTargetResolver::new",
         "UnlinkedMooncakeTransferEngine",
+        "build_mooncake_transfer_backend(",
+        "ProductionMooncakeTransferBackend",
     ] {
         assert!(!source.contains(forbidden), "server contains {forbidden}");
     }
-    assert_eq!(
-        source.matches("build_mooncake_transfer_backend(").count(),
-        4
-    );
+    assert!(source.contains("TransferBackendFactory::build("));
+    assert!(source.contains("ProductionPdRuntimeBundle"));
 }
 
 #[test]
