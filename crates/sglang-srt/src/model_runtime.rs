@@ -262,6 +262,9 @@ pub(crate) fn validate_runtime_support(
     backend: &dyn InitializedRuntimeBackend,
     tensor_parallel_size: usize,
 ) -> Result<(), ModelRuntimeLoadError> {
+    validate_runtime_parallelism(tensor_parallel_size)
+        .map_err(|message| ModelRuntimeLoadError::MissingCapabilities(vec![message]))?;
+
     definition
         .validate_tensor_parallel(tensor_parallel_size)
         .map_err(|message| ModelRuntimeLoadError::MissingCapabilities(vec![message]))?;
@@ -291,6 +294,16 @@ pub(crate) fn validate_runtime_support(
         Ok(())
     } else {
         Err(ModelRuntimeLoadError::MissingCapabilities(missing))
+    }
+}
+
+pub(crate) fn validate_runtime_parallelism(tensor_parallel_size: usize) -> Result<(), String> {
+    match tensor_parallel_size {
+        0 => Err("tensor parallel size must be positive".to_string()),
+        1 => Ok(()),
+        requested => Err(format!(
+            "tensor parallel execution requires a WorkerGroup, rank lifecycle, and collective backend; the runtime currently supports tp_size=1 (requested {requested})"
+        )),
     }
 }
 

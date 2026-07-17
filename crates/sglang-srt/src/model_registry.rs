@@ -10,7 +10,8 @@ use crate::model_executor::{
     ForwardModel, KvCacheAllocationConfig, ModelForwardError, ModelForwardOutput, ModelWorkerBatch,
 };
 use crate::model_runtime::{
-    LoadedModelRuntime, ModelRuntimeConfig, ModelRuntimeLoadError, validate_runtime_support,
+    LoadedModelRuntime, ModelRuntimeConfig, ModelRuntimeLoadError, validate_runtime_parallelism,
+    validate_runtime_support,
 };
 use crate::models::{
     DEEPSEEK_V4_ADAPTER, GLM_MOE_DSA_ADAPTER, ModelAdapter, ModelAdapterError, ModelDefinition,
@@ -213,9 +214,15 @@ pub struct BootstrapForwardModel {
 
 impl BootstrapForwardModel {
     pub(crate) fn from_server_args(args: &ServerArgs) -> Result<Self, ModelRegistryError> {
-        let artifacts = LocalModelArtifacts::from_model_path(&args.model_path)?;
         let requested_backend = RuntimeBackend::parse(&args.device)
             .ok_or_else(|| ModelRegistryError::InvalidDevice(args.device.clone()))?;
+        validate_runtime_parallelism(args.tp_size).map_err(|message| {
+            ModelRegistryError::BackendInitialization {
+                requested: requested_backend,
+                message,
+            }
+        })?;
+        let artifacts = LocalModelArtifacts::from_model_path(&args.model_path)?;
         let ranks_per_node = args.tp_size.checked_div(args.nnodes).ok_or_else(|| {
             ModelRegistryError::BackendInitialization {
                 requested: requested_backend,

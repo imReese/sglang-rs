@@ -373,7 +373,7 @@ impl RuntimeCapability {
             compute_capability: ComputeCapability::Cuda(compute_capability),
             supported_dtypes,
             attention_backends: Vec::new(),
-            tensor_parallel: CapabilityStatus::Supported,
+            tensor_parallel: CapabilityStatus::Unsupported,
             kv_cache_memory_registration: if device.unified_addressing {
                 CapabilityStatus::Supported
             } else {

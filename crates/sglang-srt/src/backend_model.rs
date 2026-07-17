@@ -345,7 +345,7 @@ fn validate_cpu_model_runtime(definition: &ModelDefinition) -> Vec<String> {
 fn validate_cuda_model_runtime(
     definition: &ModelDefinition,
     backend: &CudaBackend,
-    tensor_parallel_size: usize,
+    _tensor_parallel_size: usize,
 ) -> Vec<String> {
     let mut missing = Vec::new();
     let capability = backend.capabilities();
@@ -361,11 +361,6 @@ fn validate_cuda_model_runtime(
         ));
         missing.push("runtime-owned KV cache allocation".to_string());
         return missing;
-    }
-    if tensor_parallel_size != 1 {
-        missing.push(format!(
-            "CUDA dense decoder tensor parallel size 1 (requested {tensor_parallel_size})"
-        ));
     }
     if !capability.supported_dtypes.contains(&RuntimeDtype::Bf16) {
         missing.push("CUDA BF16 compute capability 8.0 or newer".to_string());

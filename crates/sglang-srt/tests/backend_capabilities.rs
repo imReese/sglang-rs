@@ -49,7 +49,7 @@ fn cuda_capabilities_are_derived_from_compute_capability_not_gpu_product_name() 
     );
     assert!(sm100.supported_dtypes.contains(&RuntimeDtype::Fp8E4M3));
     assert!(sm100.supported_dtypes.contains(&RuntimeDtype::Fp8E5M2));
-    assert_eq!(sm100.tensor_parallel, CapabilityStatus::Supported);
+    assert_eq!(sm100.tensor_parallel, CapabilityStatus::Unsupported);
     assert_eq!(
         sm100.kv_cache_memory_registration,
         CapabilityStatus::Supported

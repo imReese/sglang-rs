@@ -257,6 +257,41 @@ fn bootstrap_cuda_device_rejects_missing_model_without_fallback() {
 }
 
 #[test]
+fn bootstrap_rejects_tensor_parallel_before_loading_model_artifacts() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "missing-model",
+        "--device",
+        "cuda",
+        "--tp-size",
+        "2",
+        "--grpc-mode",
+    ])
+    .expect("args should parse");
+
+    let error = match try_build_bootstrap_grpc_router_service(&args) {
+        Ok(_) => panic!("tensor parallel must fail before model artifacts are loaded"),
+        Err(error) => error,
+    };
+
+    assert!(
+        matches!(
+            error,
+            ServerLaunchError::ModelRegistry(ModelRegistryError::BackendInitialization {
+                requested: sglang_srt::backend::RuntimeBackend::Cuda,
+                ref message,
+            }) if message.contains("WorkerGroup")
+                && message.contains("rank lifecycle")
+                && message.contains("collective backend")
+                && message.contains("tp_size=1")
+                && message.contains("requested 2")
+        ),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
 fn unsupported_accelerator_fails_before_cpu_weight_materialization() {
     let model_dir = temp_model_dir("unsupported-accelerator-fast-fail");
     fs::create_dir_all(&model_dir).expect("temp model directory should be created");
