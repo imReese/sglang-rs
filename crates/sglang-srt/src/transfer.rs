@@ -132,10 +132,16 @@ impl KvCacheDtype {
 
     pub fn bytes_per_element(&self) -> Option<usize> {
         match self {
-            Self::Auto => None,
-            Self::Bfloat16 => Some(2),
+            Self::Auto | Self::Bfloat16 => Some(2),
             Self::Fp8E4M3 | Self::Fp8E5M2 => Some(1),
             Self::Fp4E2M1 => None,
+        }
+    }
+
+    pub fn runtime_storage_dtype(self) -> Self {
+        match self {
+            Self::Auto => Self::Bfloat16,
+            dtype => dtype,
         }
     }
 }
@@ -574,14 +580,15 @@ impl PdConfig {
             return Ok(None);
         };
 
-        let bytes_per_token = model_layout.token_size_bytes(self.kv_cache_dtype)?;
+        let runtime_dtype = self.kv_cache_dtype.runtime_storage_dtype();
+        let bytes_per_token = model_layout.token_size_bytes(runtime_dtype)?;
         let page_size_bytes = self
             .page_size
             .checked_mul(bytes_per_token)
             .ok_or(PdConfigError::KvCacheLayoutOverflow)?;
 
         Ok(Some(KvCacheRuntimeLayout {
-            dtype: self.kv_cache_dtype,
+            dtype: runtime_dtype,
             page_size: self.page_size,
             num_layers: model_layout.num_layers,
             kv_heads: model_layout.kv_heads,

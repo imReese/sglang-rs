@@ -50,8 +50,15 @@ fn model_runner_owns_memory_through_the_shared_kv_provider_contract() {
         memory
     );
     runner
-        .reserve_transferable_kv_cache_slots(32, 128)
+        .reserve_transferable_kv_cache_slots(128, 4)
         .expect("installed transferable memory satisfies the lifecycle precondition");
+    let mismatch = runner
+        .reserve_transferable_kv_cache_slots(124, 4)
+        .expect_err("scheduler and runtime page counts must match");
+    assert!(
+        mismatch.to_string().contains("allocation has 32 pages"),
+        "{mismatch}"
+    );
 }
 
 impl ModelWorker for NoopWorker {

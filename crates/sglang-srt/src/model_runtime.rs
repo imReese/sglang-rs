@@ -3,17 +3,30 @@ use std::fmt;
 use crate::backend::{InitializedRuntimeBackend, RuntimeBackend, RuntimeCapability, RuntimeDtype};
 use crate::cpu_hybrid::CpuReferenceHybridDecoder;
 use crate::cpu_reference::CpuReferenceDenseDecoder;
+use crate::cuda_dense_decoder::CudaBf16DenseDecoder;
 use crate::cuda_runtime::CudaEmbeddingLmModel;
 use crate::model_artifacts::LocalModelArtifacts;
 use crate::model_executor::{
-    CpuEmbeddingLmModel, ForwardModel, ModelForwardError, ModelForwardOutput, ModelWorkerBatch,
+    CpuEmbeddingLmModel, ForwardModel, KvCacheAllocationConfig, ModelForwardError,
+    ModelForwardOutput, ModelWorkerBatch,
 };
 use crate::models::{ModelDefinition, ModelExecutionArchitecture};
+use crate::transfer::TransferableKvCacheMemory;
 use crate::worker::WorkerWeightUpdateRequest;
 
 pub(crate) trait ModelExecutor: ForwardModel + fmt::Debug + Send {
     fn runtime_capability(&self) -> RuntimeCapability;
     fn execution_dtype(&self) -> RuntimeDtype;
+
+    fn transferable_kv_cache_memory(&self) -> Option<&TransferableKvCacheMemory> {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ModelRuntimeConfig {
+    pub(crate) tensor_parallel_size: usize,
+    pub(crate) kv_cache: Option<KvCacheAllocationConfig>,
 }
 
 impl ModelExecutor for CpuEmbeddingLmModel {
@@ -33,6 +46,20 @@ impl ModelExecutor for CudaEmbeddingLmModel {
 
     fn execution_dtype(&self) -> RuntimeDtype {
         RuntimeDtype::F32
+    }
+}
+
+impl ModelExecutor for CudaBf16DenseDecoder {
+    fn runtime_capability(&self) -> RuntimeCapability {
+        CudaBf16DenseDecoder::runtime_capability(self)
+    }
+
+    fn execution_dtype(&self) -> RuntimeDtype {
+        RuntimeDtype::Bf16
+    }
+
+    fn transferable_kv_cache_memory(&self) -> Option<&TransferableKvCacheMemory> {
+        Some(CudaBf16DenseDecoder::transferable_kv_cache_memory(self))
     }
 }
 
@@ -60,6 +87,7 @@ impl ModelExecutor for CpuReferenceHybridDecoder {
 pub(crate) struct LoadedModelRuntime {
     runtime_backend: RuntimeBackend,
     executor: Box<dyn ModelExecutor>,
+    config: ModelRuntimeConfig,
 }
 
 impl LoadedModelRuntime {
@@ -67,11 +95,11 @@ impl LoadedModelRuntime {
         definition: &ModelDefinition,
         artifacts: &LocalModelArtifacts,
         backend: InitializedRuntimeBackend,
-        tensor_parallel_size: usize,
+        config: ModelRuntimeConfig,
     ) -> Result<Self, ModelRuntimeLoadError> {
-        validate_runtime_support(definition, &backend, tensor_parallel_size)?;
+        validate_runtime_support(definition, &backend, config.tensor_parallel_size)?;
         let runtime_backend = backend.runtime_backend();
-        let executor = load_executor(definition, artifacts, backend)?;
+        let executor = load_executor(definition, artifacts, backend, config)?;
         let capability = executor.runtime_capability();
         let execution_dtype = executor.execution_dtype();
         if !definition.supported_dtypes().contains(&execution_dtype) {
@@ -82,13 +110,14 @@ impl LoadedModelRuntime {
         capability
             .validate_requirements(&definition.runtime_requirements(
                 execution_dtype,
-                tensor_parallel_size,
+                config.tensor_parallel_size,
                 None,
             ))
             .map_err(|mismatch| ModelRuntimeLoadError::MissingCapabilities(mismatch.missing))?;
         Ok(Self {
             runtime_backend,
             executor,
+            config,
         })
     }
 
@@ -102,6 +131,14 @@ impl LoadedModelRuntime {
 
     pub(crate) fn execution_dtype(&self) -> RuntimeDtype {
         self.executor.execution_dtype()
+    }
+
+    pub(crate) fn config(&self) -> ModelRuntimeConfig {
+        self.config
+    }
+
+    pub(crate) fn transferable_kv_cache_memory(&self) -> Option<TransferableKvCacheMemory> {
+        self.executor.transferable_kv_cache_memory().cloned()
     }
 }
 
@@ -177,7 +214,20 @@ pub(crate) fn validate_runtime_support(
                 )
             )
             && (definition.dense_decoder().is_some() || definition.hybrid_decoder().is_some());
-        if !has_cpu_reference_executor {
+        let has_cuda_dense_executor = matches!(backend, InitializedRuntimeBackend::Cuda(_))
+            && tensor_parallel_size == 1
+            && definition.dense_decoder().is_some()
+            && matches!(
+                (attention, feed_forward),
+                (
+                    crate::models::AttentionArchitecture::MultiHead { .. },
+                    crate::models::FeedForwardArchitecture::Dense { .. }
+                )
+            )
+            && backend_capabilities
+                .supported_dtypes
+                .contains(&RuntimeDtype::Bf16);
+        if !has_cpu_reference_executor && !has_cuda_dense_executor {
             missing.push(format!(
                 "{} {} decoder executor for {} backend",
                 attention.family(),
@@ -185,6 +235,22 @@ pub(crate) fn validate_runtime_support(
                 backend.runtime_backend()
             ));
             missing.push("runtime-owned KV cache allocation".to_string());
+        }
+        if matches!(backend, InitializedRuntimeBackend::Cuda(_))
+            && definition.dense_decoder().is_some()
+            && tensor_parallel_size != 1
+        {
+            missing.push(format!(
+                "CUDA dense decoder tensor parallel size 1 (requested {tensor_parallel_size})"
+            ));
+        }
+        if matches!(backend, InitializedRuntimeBackend::Cuda(_))
+            && definition.dense_decoder().is_some()
+            && !backend_capabilities
+                .supported_dtypes
+                .contains(&RuntimeDtype::Bf16)
+        {
+            missing.push("CUDA BF16 compute capability 8.0 or newer".to_string());
         }
     }
 
@@ -199,6 +265,7 @@ fn load_executor(
     definition: &ModelDefinition,
     artifacts: &LocalModelArtifacts,
     backend: InitializedRuntimeBackend,
+    config: ModelRuntimeConfig,
 ) -> Result<Box<dyn ModelExecutor>, ModelRuntimeLoadError> {
     match definition.execution() {
         ModelExecutionArchitecture::Embedding => load_embedding_executor(artifacts, backend),
@@ -222,6 +289,16 @@ fn load_executor(
                     attention.family(),
                     feed_forward.family()
                 )]))
+            }
+            InitializedRuntimeBackend::Cuda(backend) if definition.dense_decoder().is_some() => {
+                let kv_cache = config.kv_cache.ok_or_else(|| {
+                    ModelRuntimeLoadError::MissingCapabilities(vec![
+                        "runtime KV cache allocation configuration".to_string(),
+                    ])
+                })?;
+                CudaBf16DenseDecoder::load(definition, artifacts, backend, kv_cache)
+                    .map(|model| Box::new(model) as Box<dyn ModelExecutor>)
+                    .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))
             }
             InitializedRuntimeBackend::Cuda(_) => {
                 Err(ModelRuntimeLoadError::MissingCapabilities(vec![format!(

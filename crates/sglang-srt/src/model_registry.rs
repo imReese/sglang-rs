@@ -7,14 +7,16 @@ use crate::backend::{
 use crate::cli::ServerArgs;
 use crate::model_artifacts::{HfModelConfig, LocalModelArtifacts, ModelArtifactError};
 use crate::model_executor::{
-    ForwardModel, ModelForwardError, ModelForwardOutput, ModelWorkerBatch,
+    ForwardModel, KvCacheAllocationConfig, ModelForwardError, ModelForwardOutput, ModelWorkerBatch,
 };
-use crate::model_runtime::{LoadedModelRuntime, ModelRuntimeLoadError, validate_runtime_support};
+use crate::model_runtime::{
+    LoadedModelRuntime, ModelRuntimeConfig, ModelRuntimeLoadError, validate_runtime_support,
+};
 use crate::models::{
     DEEPSEEK_V4_ADAPTER, EMBEDDING_LM_ADAPTER, GLM_MOE_DSA_ADAPTER, ModelAdapter,
     ModelAdapterError, ModelDefinition, QWEN2_ADAPTER, QWEN3_5_ADAPTER, QWEN3_ADAPTER,
 };
-use crate::transfer::KvCacheModelLayout;
+use crate::transfer::{KvCacheModelLayout, TransferableKvCacheMemory};
 use crate::worker::WorkerWeightUpdateRequest;
 
 static MODEL_ADAPTERS: [&'static dyn ModelAdapter; 6] = [
@@ -97,7 +99,7 @@ impl ModelRegistry {
         self,
         artifacts: &LocalModelArtifacts,
         requested_backend: RuntimeBackend,
-        tensor_parallel_size: usize,
+        runtime_config: ModelRuntimeConfig,
     ) -> Result<RegisteredModel, ModelRegistryError> {
         let resolved = self.resolve(artifacts.model_path(), artifacts.config())?;
         let definition = resolved.build_definition(artifacts.model_path(), artifacts.config())?;
@@ -109,26 +111,26 @@ impl ModelRegistry {
                 }
             })?;
 
-        validate_runtime_support(&definition, &backend, tensor_parallel_size).map_err(|error| {
-            runtime_error(
-                artifacts,
-                definition.architecture(),
-                backend.runtime_backend(),
-                error,
-            )
-        })?;
+        validate_runtime_support(&definition, &backend, runtime_config.tensor_parallel_size)
+            .map_err(|error| {
+                runtime_error(
+                    artifacts,
+                    definition.architecture(),
+                    backend.runtime_backend(),
+                    error,
+                )
+            })?;
         resolved.validate_checkpoint(artifacts)?;
         let runtime_backend = backend.runtime_backend();
-        let runtime =
-            LoadedModelRuntime::load(&definition, artifacts, backend, tensor_parallel_size)
-                .map_err(|error| {
-                    runtime_error(artifacts, definition.architecture(), runtime_backend, error)
-                })?;
+        let runtime = LoadedModelRuntime::load(&definition, artifacts, backend, runtime_config)
+            .map_err(|error| {
+                runtime_error(artifacts, definition.architecture(), runtime_backend, error)
+            })?;
 
         Ok(RegisteredModel {
             model_path: artifacts.model_path().to_path_buf(),
             definition,
-            tensor_parallel_size,
+            tensor_parallel_size: runtime_config.tensor_parallel_size,
             runtime,
         })
     }
@@ -219,7 +221,17 @@ impl BootstrapForwardModel {
         let requested_backend = RuntimeBackend::parse(&args.device)
             .ok_or_else(|| ModelRegistryError::InvalidDevice(args.device.clone()))?;
         ModelRegistry
-            .load(&artifacts, requested_backend, args.tp_size)
+            .load(
+                &artifacts,
+                requested_backend,
+                ModelRuntimeConfig {
+                    tensor_parallel_size: args.tp_size,
+                    kv_cache: Some(KvCacheAllocationConfig {
+                        slot_capacity: args.num_reserved_decode_tokens,
+                        page_size: args.page_size,
+                    }),
+                },
+            )
             .map(|registered| Self { registered })
     }
 
@@ -247,12 +259,16 @@ impl BootstrapForwardModel {
         self.registered.definition.cache_architecture()
     }
 
+    pub(crate) fn transferable_kv_cache_memory(&self) -> Option<TransferableKvCacheMemory> {
+        self.registered.runtime.transferable_kv_cache_memory()
+    }
+
     fn reload_backend(&self) -> RuntimeBackend {
         self.registered.runtime_backend()
     }
 
-    fn reload_tp_size(&self) -> usize {
-        self.registered.tensor_parallel_size
+    fn reload_runtime_config(&self) -> ModelRuntimeConfig {
+        self.registered.runtime.config()
     }
 }
 
@@ -272,10 +288,20 @@ impl ForwardModel for BootstrapForwardModel {
         &mut self,
         request: &WorkerWeightUpdateRequest,
     ) -> Result<(), ModelForwardError> {
+        if self.transferable_kv_cache_memory().is_some() {
+            return Err(ModelForwardError::Runtime(
+                "update_weights_from_disk requires a runtime restart when the model owns transferable KV memory; replacing a registered allocation in place is unsupported"
+                    .to_string(),
+            ));
+        }
         let artifacts = LocalModelArtifacts::from_model_path(&request.model_path)
             .map_err(|error| ModelForwardError::Runtime(error.to_string()))?;
         let next = ModelRegistry
-            .load(&artifacts, self.reload_backend(), self.reload_tp_size())
+            .load(
+                &artifacts,
+                self.reload_backend(),
+                self.reload_runtime_config(),
+            )
             .map(|registered| Self { registered })
             .map_err(|error| ModelForwardError::Runtime(error.to_string()))?;
         *self = next;

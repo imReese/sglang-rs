@@ -37,6 +37,12 @@ pub struct ModelWorkerBatch {
     data_parallel_ranks: Vec<i32>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct KvCacheAllocationConfig {
+    pub(crate) slot_capacity: usize,
+    pub(crate) page_size: usize,
+}
+
 impl ModelWorkerBatch {
     pub fn from_schedule_batch(batch: &ScheduleBatch) -> Self {
         let mut worker_batch = Self {
@@ -194,6 +200,60 @@ impl ModelWorkerBatch {
         self.sequence_lengths
             .push(request.input_ids().len() + request.output_ids().len());
     }
+}
+
+pub(crate) fn validate_model_worker_batch(
+    batch: &ModelWorkerBatch,
+) -> Result<(), ModelForwardError> {
+    let request_count = batch.request_ids().len();
+    for (name, actual) in [
+        ("request_offsets", batch.request_offsets().len()),
+        ("input_token_counts", batch.input_token_counts().len()),
+        ("sequence_offsets", batch.sequence_offsets().len()),
+        ("sequence_token_counts", batch.sequence_token_counts().len()),
+    ] {
+        if actual != request_count {
+            return Err(ModelForwardError::Runtime(format!(
+                "batch field {name} has length {actual}, expected {request_count}"
+            )));
+        }
+    }
+    if batch.input_ids().len() != batch.positions().len()
+        || batch.input_ids().len() != batch.out_cache_pages().len()
+    {
+        return Err(ModelForwardError::Runtime(format!(
+            "dense decoder input/position/output-slot lengths differ: {}/{}/{}",
+            batch.input_ids().len(),
+            batch.positions().len(),
+            batch.out_cache_pages().len()
+        )));
+    }
+    if batch.sequence_token_ids().len() != batch.sequence_cache_pages().len() {
+        return Err(ModelForwardError::Runtime(format!(
+            "dense decoder sequence token/slot lengths differ: {}/{}",
+            batch.sequence_token_ids().len(),
+            batch.sequence_cache_pages().len()
+        )));
+    }
+    for request_index in 0..request_count {
+        let input_end = batch.request_offsets()[request_index]
+            .checked_add(batch.input_token_counts()[request_index])
+            .ok_or_else(|| {
+                ModelForwardError::Runtime("batch input range overflowed".to_string())
+            })?;
+        let sequence_end = batch.sequence_offsets()[request_index]
+            .checked_add(batch.sequence_token_counts()[request_index])
+            .ok_or_else(|| {
+                ModelForwardError::Runtime("batch sequence range overflowed".to_string())
+            })?;
+        if input_end > batch.input_ids().len() || sequence_end > batch.sequence_cache_pages().len()
+        {
+            return Err(ModelForwardError::Runtime(format!(
+                "dense decoder request {request_index} batch ranges exceed flattened storage"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub trait ForwardModel {
@@ -957,9 +1017,48 @@ impl<M, S> ModelRunner<M, S> {
                 "model execution definition does not declare KV cache geometry".to_string(),
             ));
         }
-        if self.transferable_kv_cache_memory.is_none() {
-            return Err(KvCacheTransferError::Runtime(format!(
+        let memory = self
+            .transferable_kv_cache_memory
+            .as_ref()
+            .ok_or_else(|| KvCacheTransferError::Runtime(format!(
                 "runtime backend did not allocate transferable KV memory for {slot_capacity} slots with page size {page_size}"
+            )))?;
+        if page_size == 0 || slot_capacity == 0 || !slot_capacity.is_multiple_of(page_size) {
+            return Err(KvCacheTransferError::Runtime(format!(
+                "scheduler KV geometry requires non-zero page-aligned capacity, found {slot_capacity} slots with page size {page_size}"
+            )));
+        }
+        let total_byte_len = memory.regions().iter().try_fold(0_usize, |total, region| {
+            total.checked_add(region.byte_len).ok_or_else(|| {
+                KvCacheTransferError::Runtime(
+                    "transferable KV memory byte length overflowed".to_string(),
+                )
+            })
+        })?;
+        if !total_byte_len.is_multiple_of(memory.page_size_bytes()) {
+            return Err(KvCacheTransferError::Runtime(format!(
+                "transferable KV memory length {total_byte_len} is not divisible by logical page size {}",
+                memory.page_size_bytes()
+            )));
+        }
+        let mut region_page_counts = memory
+            .regions()
+            .iter()
+            .map(|region| region.byte_len / region.page_size_bytes);
+        let first_region_page_count = region_page_counts.next().ok_or_else(|| {
+            KvCacheTransferError::Runtime("transferable KV memory has no regions".to_string())
+        })?;
+        if region_page_counts.any(|page_count| page_count != first_region_page_count) {
+            return Err(KvCacheTransferError::Runtime(
+                "transferable KV memory regions do not contain the same logical page count"
+                    .to_string(),
+            ));
+        }
+        let allocation_page_count = total_byte_len / memory.page_size_bytes();
+        let expected_page_count = slot_capacity / page_size;
+        if allocation_page_count != expected_page_count {
+            return Err(KvCacheTransferError::Runtime(format!(
+                "runtime KV allocation has {allocation_page_count} pages but scheduler requires {expected_page_count} pages for {slot_capacity} slots with page size {page_size}"
             )));
         }
         Ok(())

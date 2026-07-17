@@ -283,9 +283,18 @@ fn bootstrap_forward_model_for_launch(
     Ok(model)
 }
 
-fn bootstrap_model_runner(model: BootstrapForwardModel) -> ModelRunner<BootstrapForwardModel> {
+fn bootstrap_model_runner(
+    model: BootstrapForwardModel,
+) -> Result<ModelRunner<BootstrapForwardModel>, ServerLaunchError> {
     let kv_cache_layout = model.kv_cache_layout();
-    ModelRunner::new_with_kv_cache_layout(model, kv_cache_layout)
+    let transferable_memory = model.transferable_kv_cache_memory();
+    let mut runner = ModelRunner::new_with_kv_cache_layout(model, kv_cache_layout);
+    if let Some(memory) = transferable_memory {
+        runner
+            .install_transferable_kv_cache_memory(memory)
+            .map_err(|error| ServerLaunchError::KvCacheTransfer(error.to_string()))?;
+    }
+    Ok(runner)
 }
 
 fn model_prefix_cache_policy(model: &BootstrapForwardModel) -> PrefixCachePolicy {
@@ -843,7 +852,7 @@ fn try_build_bootstrap_grpc_router_service_from_model(
 ) -> Result<BootstrapGrpcRouterService, ServerLaunchError> {
     let prefix_cache_policy = model_prefix_cache_policy(&model);
     let scheduler = Scheduler::with_cache_resources_and_policy(
-        bootstrap_model_runner(model),
+        bootstrap_model_runner(model)?,
         RadixCache::default(),
         cache_page_allocator_from_server_args(args)?,
         prefix_cache_policy,
@@ -877,7 +886,7 @@ fn try_build_bootstrap_http_router_service_from_model(
 ) -> Result<BootstrapHttpRouterService, ServerLaunchError> {
     let prefix_cache_policy = model_prefix_cache_policy(&model);
     let scheduler = Scheduler::with_cache_resources_and_policy(
-        bootstrap_model_runner(model),
+        bootstrap_model_runner(model)?,
         RadixCache::default(),
         cache_page_allocator_from_server_args(args)?,
         prefix_cache_policy,
@@ -1008,7 +1017,7 @@ where
     validate_kv_only_transfer_model(&model)?;
     try_build_bootstrap_pd_http_router_service_from_runner_with_decode_publisher(
         args,
-        bootstrap_model_runner(model),
+        bootstrap_model_runner(model)?,
         registry,
         transfer_executor,
         decode_bootstrap_publisher,
@@ -1195,7 +1204,7 @@ fn try_build_launch_mooncake_prefill_http_router_service(
     >,
     ServerLaunchError,
 > {
-    let model_runner = bootstrap_model_runner(bootstrap_forward_model_for_launch(args)?);
+    let model_runner = bootstrap_model_runner(bootstrap_forward_model_for_launch(args)?)?;
     let transfer_executor = MooncakeKvCacheTransferExecutor::new(
         UnlinkedMooncakeTransferEngine,
         launch_mooncake_prefill_kv_layout(&model_runner)?,
@@ -1222,7 +1231,7 @@ fn try_build_launch_mooncake_decode_http_router_service(
     >,
     ServerLaunchError,
 > {
-    let model_runner = bootstrap_model_runner(bootstrap_forward_model_for_launch(args)?);
+    let model_runner = bootstrap_model_runner(bootstrap_forward_model_for_launch(args)?)?;
     let kv_cache_layout = launch_mooncake_decode_kv_layout(&model_runner)?;
     let transfer_executor = MooncakeKvCacheTransferExecutor::new(
         UnlinkedMooncakeTransferEngine,
@@ -1256,7 +1265,7 @@ fn try_build_launch_mooncake_prefill_grpc_router_service(
     >,
     ServerLaunchError,
 > {
-    let model_runner = bootstrap_model_runner(bootstrap_forward_model_for_launch(args)?);
+    let model_runner = bootstrap_model_runner(bootstrap_forward_model_for_launch(args)?)?;
     let transfer_executor = MooncakeKvCacheTransferExecutor::new(
         UnlinkedMooncakeTransferEngine,
         launch_mooncake_prefill_kv_layout(&model_runner)?,
@@ -1283,7 +1292,7 @@ fn try_build_launch_mooncake_decode_grpc_router_service(
     >,
     ServerLaunchError,
 > {
-    let model_runner = bootstrap_model_runner(bootstrap_forward_model_for_launch(args)?);
+    let model_runner = bootstrap_model_runner(bootstrap_forward_model_for_launch(args)?)?;
     let kv_cache_layout = launch_mooncake_decode_kv_layout(&model_runner)?;
     let transfer_executor = MooncakeKvCacheTransferExecutor::new(
         UnlinkedMooncakeTransferEngine,
@@ -1320,7 +1329,7 @@ fn try_build_launch_mooncake_prefill_http_router_service(
     >,
     ServerLaunchError,
 > {
-    let mut model_runner = bootstrap_model_runner(bootstrap_forward_model_for_launch(args)?);
+    let mut model_runner = bootstrap_model_runner(bootstrap_forward_model_for_launch(args)?)?;
     let engine_config = MooncakeTransferEngineConfig::from_pd_config_for_rank(
         prefill_mooncake_route_rank_ip(args),
         0,
@@ -1366,7 +1375,7 @@ fn try_build_launch_mooncake_decode_http_router_service(
     >,
     ServerLaunchError,
 > {
-    let mut model_runner = bootstrap_model_runner(bootstrap_forward_model_for_launch(args)?);
+    let mut model_runner = bootstrap_model_runner(bootstrap_forward_model_for_launch(args)?)?;
     let engine_config = MooncakeTransferEngineConfig::from_pd_config_for_rank(
         prefill_mooncake_route_rank_ip(args),
         0,
@@ -1415,7 +1424,7 @@ fn try_build_launch_mooncake_prefill_grpc_router_service(
     >,
     ServerLaunchError,
 > {
-    let mut model_runner = bootstrap_model_runner(bootstrap_forward_model_for_launch(args)?);
+    let mut model_runner = bootstrap_model_runner(bootstrap_forward_model_for_launch(args)?)?;
     let engine_config = MooncakeTransferEngineConfig::from_pd_config_for_rank(
         prefill_mooncake_route_rank_ip(args),
         0,
@@ -1461,7 +1470,7 @@ fn try_build_launch_mooncake_decode_grpc_router_service(
     >,
     ServerLaunchError,
 > {
-    let mut model_runner = bootstrap_model_runner(bootstrap_forward_model_for_launch(args)?);
+    let mut model_runner = bootstrap_model_runner(bootstrap_forward_model_for_launch(args)?)?;
     let engine_config = MooncakeTransferEngineConfig::from_pd_config_for_rank(
         prefill_mooncake_route_rank_ip(args),
         0,
@@ -1561,7 +1570,7 @@ where
     validate_kv_only_transfer_model(&model)?;
     try_build_bootstrap_pd_grpc_router_service_from_runner_with_decode_publisher(
         args,
-        bootstrap_model_runner(model),
+        bootstrap_model_runner(model)?,
         registry,
         transfer_executor,
         decode_bootstrap_publisher,

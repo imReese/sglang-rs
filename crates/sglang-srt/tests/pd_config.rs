@@ -230,6 +230,37 @@ fn pd_config_normalizes_kv_cache_dtype_for_mooncake_layout_bytes() {
 }
 
 #[test]
+fn pd_config_resolves_auto_to_the_implemented_bf16_runtime_layout() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--disaggregation-mode",
+        "decode",
+        "--kv-cache-num-layers",
+        "2",
+        "--kv-cache-kv-heads",
+        "1",
+        "--kv-cache-head-dim",
+        "8",
+        "--page-size",
+        "16",
+    ])
+    .expect("args should parse");
+
+    let config = PdConfig::from_server_args(&args).expect("pd config should normalize");
+    let layout = config
+        .kv_cache_runtime_layout()
+        .expect("auto runtime KV layout should calculate")
+        .expect("explicit KV geometry should produce a runtime layout");
+
+    assert_eq!(config.kv_cache_dtype, KvCacheDtype::Auto);
+    assert_eq!(layout.dtype, KvCacheDtype::Bfloat16);
+    assert_eq!(layout.bytes_per_token, 64);
+    assert_eq!(layout.page_size_bytes, 1_024);
+}
+
+#[test]
 fn pd_config_builds_mooncake_layout_from_model_kv_geometry() {
     let args = ServerArgs::parse_from([
         "serve",

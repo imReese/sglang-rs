@@ -64,6 +64,66 @@ async fn cuda_auto_selects_cublas_for_weight_backed_http_inference() {
     fs::remove_dir_all(model_dir).expect("temp model directory should be removed");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a CUDA device, NVIDIA driver, NVRTC, and cuBLAS with BF16 support"]
+async fn cuda_qwen3_uses_the_shared_dense_decoder_and_runtime_kv_pool() {
+    let backend = CudaBackend::initialize(0).expect("CUDA backend should initialize");
+    assert!(
+        backend
+            .capabilities()
+            .supported_dtypes
+            .contains(&sglang_srt::backend::RuntimeDtype::Bf16),
+        "CUDA acceptance device must support BF16"
+    );
+    drop(backend);
+
+    let model_dir = temp_model_dir("cuda-qwen3-dense-http");
+    write_qwen3_dense_artifacts(&model_dir);
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_dir.to_str().expect("temp model path should be utf-8"),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--page-size",
+        "4",
+        "--num-reserved-decode-tokens",
+        "32",
+    ])
+    .expect("server args should parse");
+    let service = build_bootstrap_http_router_service(&args);
+    let addr = unused_local_addr();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let generated = post_json_with_retry(
+        addr,
+        "/generate",
+        r#"{"text":"hello","sampling_params":{"max_new_tokens":2}}"#,
+    )
+    .await;
+
+    assert_eq!(generated["output_ids"], serde_json::json!([2, 1]));
+    assert_eq!(generated["usage"]["prompt_tokens"], 1);
+    assert_eq!(generated["usage"]["completion_tokens"], 2);
+
+    shutdown_tx
+        .send(())
+        .expect("CUDA Qwen3 HTTP server should still be running");
+    server
+        .await
+        .expect("CUDA Qwen3 HTTP server task should join")
+        .expect("CUDA Qwen3 HTTP server should stop cleanly");
+    fs::remove_dir_all(model_dir).expect("temp model directory should be removed");
+}
+
 fn write_embedding_lm_artifacts(model_dir: &Path) {
     fs::create_dir_all(model_dir).expect("temp model directory should be created");
     fs::write(
@@ -98,6 +158,90 @@ fn write_embedding_lm_artifacts(model_dir: &Path) {
         &payload,
     )
     .expect("model weights should be written");
+}
+
+fn write_qwen3_dense_artifacts(model_dir: &Path) {
+    fs::create_dir_all(model_dir).expect("temp model directory should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "architectures": ["Qwen3ForCausalLM"],
+  "model_type": "qwen3",
+  "vocab_size": 3,
+  "num_hidden_layers": 1,
+  "hidden_size": 2,
+  "intermediate_size": 2,
+  "num_attention_heads": 1,
+  "num_key_value_heads": 1,
+  "head_dim": 2,
+  "hidden_act": "silu",
+  "attention_bias": false,
+  "rms_norm_eps": 0.000001,
+  "rope_theta": 1000000.0,
+  "max_position_embeddings": 32,
+  "tie_word_embeddings": false
+}"#,
+    )
+    .expect("Qwen3 config should be written");
+    fs::write(
+        model_dir.join("tokenizer.json"),
+        word_level_tokenizer_json(),
+    )
+    .expect("Qwen3 tokenizer should be written");
+
+    let descriptors: Vec<(&str, &[usize], Vec<f32>)> = vec![
+        (
+            "model.embed_tokens.weight",
+            &[3, 2],
+            vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
+        ),
+        ("model.norm.weight", &[2], vec![1.0, 1.0]),
+        (
+            "lm_head.weight",
+            &[3, 2],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0],
+        ),
+        (
+            "model.layers.0.self_attn.q_proj.weight",
+            &[2, 2],
+            vec![0.0; 4],
+        ),
+        ("model.layers.0.self_attn.q_norm.weight", &[2], vec![1.0; 2]),
+        (
+            "model.layers.0.self_attn.k_proj.weight",
+            &[2, 2],
+            vec![0.0; 4],
+        ),
+        ("model.layers.0.self_attn.k_norm.weight", &[2], vec![1.0; 2]),
+        (
+            "model.layers.0.self_attn.v_proj.weight",
+            &[2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.self_attn.o_proj.weight",
+            &[2, 2],
+            vec![0.0; 4],
+        ),
+        ("model.layers.0.input_layernorm.weight", &[2], vec![1.0; 2]),
+        (
+            "model.layers.0.post_attention_layernorm.weight",
+            &[2],
+            vec![1.0; 2],
+        ),
+        ("model.layers.0.mlp.gate_proj.weight", &[2, 2], vec![0.0; 4]),
+        ("model.layers.0.mlp.up_proj.weight", &[2, 2], vec![0.0; 4]),
+        ("model.layers.0.mlp.down_proj.weight", &[2, 2], vec![0.0; 4]),
+    ];
+    let mut payload = Vec::new();
+    let mut tensors = Vec::new();
+    for (name, shape, values) in descriptors {
+        let start = payload.len();
+        payload.extend(values.into_iter().flat_map(f32::to_le_bytes));
+        tensors.push((name, "F32", shape, [start, payload.len()]));
+    }
+    write_safetensors_file(&model_dir.join("model.safetensors"), &tensors, &payload)
+        .expect("Qwen3 weights should be written");
 }
 
 fn write_safetensors_file(

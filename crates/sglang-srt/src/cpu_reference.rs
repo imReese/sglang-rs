@@ -11,6 +11,7 @@ use crate::cache::CachePageId;
 use crate::model_artifacts::{LocalModelArtifacts, ModelArtifactError};
 use crate::model_executor::{
     ForwardModel, ModelForwardError, ModelForwardOutput, ModelWorkerBatch,
+    validate_model_worker_batch,
 };
 use crate::models::{
     AttentionArchitecture, DenseDecoderActivation, DenseDecoderExecutionPlan,
@@ -297,57 +298,8 @@ fn forward_layer(
 pub(crate) fn validate_batch(
     batch: &ModelWorkerBatch,
 ) -> Result<(), CpuReferenceDenseDecoderError> {
-    let request_count = batch.request_ids().len();
-    for (name, actual) in [
-        ("request_offsets", batch.request_offsets().len()),
-        ("input_token_counts", batch.input_token_counts().len()),
-        ("sequence_offsets", batch.sequence_offsets().len()),
-        ("sequence_token_counts", batch.sequence_token_counts().len()),
-    ] {
-        if actual != request_count {
-            return Err(CpuReferenceDenseDecoderError::Execution(format!(
-                "batch field {name} has length {actual}, expected {request_count}"
-            )));
-        }
-    }
-    if batch.input_ids().len() != batch.positions().len()
-        || batch.input_ids().len() != batch.out_cache_pages().len()
-    {
-        return Err(CpuReferenceDenseDecoderError::Execution(format!(
-            "dense decoder input/position/output-slot lengths differ: {}/{}/{}",
-            batch.input_ids().len(),
-            batch.positions().len(),
-            batch.out_cache_pages().len()
-        )));
-    }
-    if batch.sequence_token_ids().len() != batch.sequence_cache_pages().len() {
-        return Err(CpuReferenceDenseDecoderError::Execution(format!(
-            "dense decoder sequence token/slot lengths differ: {}/{}",
-            batch.sequence_token_ids().len(),
-            batch.sequence_cache_pages().len()
-        )));
-    }
-    for request_index in 0..request_count {
-        let input_end = batch.request_offsets()[request_index]
-            .checked_add(batch.input_token_counts()[request_index])
-            .ok_or_else(|| {
-                CpuReferenceDenseDecoderError::Execution("batch input range overflowed".to_string())
-            })?;
-        let sequence_end = batch.sequence_offsets()[request_index]
-            .checked_add(batch.sequence_token_counts()[request_index])
-            .ok_or_else(|| {
-                CpuReferenceDenseDecoderError::Execution(
-                    "batch sequence range overflowed".to_string(),
-                )
-            })?;
-        if input_end > batch.input_ids().len() || sequence_end > batch.sequence_cache_pages().len()
-        {
-            return Err(CpuReferenceDenseDecoderError::Execution(format!(
-                "dense decoder request {request_index} batch ranges exceed flattened storage"
-            )));
-        }
-    }
-    Ok(())
+    validate_model_worker_batch(batch)
+        .map_err(|error| CpuReferenceDenseDecoderError::Execution(error.to_string()))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
