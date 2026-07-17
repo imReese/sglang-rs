@@ -6,7 +6,8 @@ use sglang_kernel::cuda_attention::{
     CudaBf16PagedAttentionLayout, CudaBf16PagedAttentionPlan, CudaBf16PagedAttentionPlanConfig,
 };
 
-use crate::cuda_kv_cache::{CudaKvCachePool, CudaKvCachePoolError, CudaKvCachePoolLayout};
+use crate::cuda_kv_cache::{CudaKvStorage, CudaKvStorageError};
+use crate::kv_cache::{PagedKvCacheLayout, PagedKvCacheLayoutError};
 use crate::model_executor::ModelWorkerBatch;
 use crate::transfer::KvCacheDtype;
 
@@ -63,7 +64,8 @@ pub enum CudaPagedAttentionError {
     },
     SizeOverflow,
     Cuda(CudaError),
-    KvCache(CudaKvCachePoolError),
+    KvLayout(PagedKvCacheLayoutError),
+    KvStorage(CudaKvStorageError),
     Kernel(CudaBf16PagedAttentionError),
 }
 
@@ -147,8 +149,11 @@ impl fmt::Display for CudaPagedAttentionError {
             ),
             Self::SizeOverflow => formatter.write_str("CUDA paged attention size overflowed"),
             Self::Cuda(error) => write!(formatter, "CUDA paged attention metadata failed: {error}"),
-            Self::KvCache(error) => {
-                write!(formatter, "CUDA paged attention KV cache failed: {error}")
+            Self::KvLayout(error) => {
+                write!(formatter, "CUDA paged attention KV layout failed: {error}")
+            }
+            Self::KvStorage(error) => {
+                write!(formatter, "CUDA paged attention KV storage failed: {error}")
             }
             Self::Kernel(error) => write!(formatter, "CUDA paged attention kernel failed: {error}"),
         }
@@ -163,9 +168,15 @@ impl From<CudaError> for CudaPagedAttentionError {
     }
 }
 
-impl From<CudaKvCachePoolError> for CudaPagedAttentionError {
-    fn from(value: CudaKvCachePoolError) -> Self {
-        Self::KvCache(value)
+impl From<CudaKvStorageError> for CudaPagedAttentionError {
+    fn from(value: CudaKvStorageError) -> Self {
+        Self::KvStorage(value)
+    }
+}
+
+impl From<PagedKvCacheLayoutError> for CudaPagedAttentionError {
+    fn from(value: PagedKvCacheLayoutError) -> Self {
+        Self::KvLayout(value)
     }
 }
 
@@ -186,7 +197,7 @@ pub struct CudaPagedAttentionMetadata {
 impl CudaPagedAttentionMetadata {
     pub fn from_model_worker_batch(
         batch: &ModelWorkerBatch,
-        pool_layout: CudaKvCachePoolLayout,
+        pool_layout: PagedKvCacheLayout,
     ) -> Result<Self, CudaPagedAttentionError> {
         let request_count = batch.request_ids().len();
         if request_count == 0 {
@@ -385,7 +396,8 @@ pub struct CudaBf16PagedAttentionExecutor {
 }
 
 pub struct CudaPagedAttentionForward<'a> {
-    pub kv_cache: &'a CudaKvCachePool,
+    pub kv_layout: PagedKvCacheLayout,
+    pub kv_storage: &'a CudaKvStorage,
     pub layer_index: usize,
     pub metadata: &'a CudaPagedAttentionDeviceMetadata,
     pub queries: &'a CudaDeviceAllocation,
@@ -407,7 +419,7 @@ impl CudaBf16PagedAttentionExecutor {
     }
 
     pub fn plan(
-        pool_layout: CudaKvCachePoolLayout,
+        pool_layout: PagedKvCacheLayout,
         layer_index: usize,
         metadata: &CudaPagedAttentionMetadata,
         query_head_count: usize,
@@ -429,7 +441,8 @@ impl CudaBf16PagedAttentionExecutor {
         forward: CudaPagedAttentionForward<'_>,
     ) -> Result<(), CudaPagedAttentionError> {
         let CudaPagedAttentionForward {
-            kv_cache,
+            kv_layout,
+            kv_storage,
             layer_index,
             metadata,
             queries,
@@ -439,8 +452,9 @@ impl CudaBf16PagedAttentionExecutor {
             output,
             output_offset,
         } = forward;
+        kv_storage.validate_layout(kv_layout)?;
         let plan = build_plan(
-            kv_cache.layout(),
+            kv_layout,
             layer_index,
             metadata.query_count,
             metadata.request_count,
@@ -461,7 +475,7 @@ impl CudaBf16PagedAttentionExecutor {
                 request_slot_offsets_offset: 0,
                 sequence_slots: &metadata.sequence_slots,
                 sequence_slots_offset: 0,
-                pool: kv_cache.allocation(),
+                pool: kv_storage.allocation(),
                 pool_offset: 0,
                 output,
                 output_offset,
@@ -472,7 +486,7 @@ impl CudaBf16PagedAttentionExecutor {
 }
 
 fn build_plan(
-    pool_layout: CudaKvCachePoolLayout,
+    pool_layout: PagedKvCacheLayout,
     layer_index: usize,
     query_count: usize,
     request_count: usize,

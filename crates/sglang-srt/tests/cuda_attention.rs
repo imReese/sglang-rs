@@ -2,7 +2,7 @@ use sglang_srt::cache::{CachePageAllocator, RadixCache};
 use sglang_srt::cuda_attention::{
     CudaBf16PagedAttentionExecutor, CudaPagedAttentionError, CudaPagedAttentionMetadata,
 };
-use sglang_srt::cuda_kv_cache::{CudaKvCachePoolError, CudaKvCachePoolLayout};
+use sglang_srt::kv_cache::{PagedKvCacheLayout, PagedKvCacheLayoutError};
 use sglang_srt::model_executor::ModelWorkerBatch;
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::transfer::{KvCacheDtype, KvCacheRuntimeLayout};
@@ -71,7 +71,7 @@ fn two_request_prefill_batch() -> ModelWorkerBatch {
 #[test]
 fn scheduler_batch_builds_causal_attention_metadata_over_physical_slots() {
     let batch = two_request_prefill_batch();
-    let pool_layout = CudaKvCachePoolLayout::new(runtime_layout(KvCacheDtype::Bfloat16), 2)
+    let pool_layout = PagedKvCacheLayout::new(runtime_layout(KvCacheDtype::Bfloat16), 2)
         .expect("BF16 KV pool layout should be valid");
 
     let metadata = CudaPagedAttentionMetadata::from_model_worker_batch(&batch, pool_layout)
@@ -93,15 +93,15 @@ fn scheduler_batch_builds_causal_attention_metadata_over_physical_slots() {
 }
 
 #[test]
-fn metadata_rejects_scheduler_slots_outside_the_cuda_pool() {
+fn metadata_rejects_scheduler_slots_outside_the_allocated_layout() {
     let batch = two_request_prefill_batch();
-    let too_small_pool = CudaKvCachePoolLayout::new(runtime_layout(KvCacheDtype::Bfloat16), 1)
+    let too_small_pool = PagedKvCacheLayout::new(runtime_layout(KvCacheDtype::Bfloat16), 1)
         .expect("small KV pool layout should still be structurally valid");
 
     assert_eq!(
         CudaPagedAttentionMetadata::from_model_worker_batch(&batch, too_small_pool),
-        Err(CudaPagedAttentionError::KvCache(
-            CudaKvCachePoolError::BatchSlotOutOfRange {
+        Err(CudaPagedAttentionError::KvLayout(
+            PagedKvCacheLayoutError::BatchSlotOutOfRange {
                 batch_index: 4,
                 slot_index: 4,
                 slot_count: 4,
@@ -113,11 +113,11 @@ fn metadata_rejects_scheduler_slots_outside_the_cuda_pool() {
 #[test]
 fn attention_plan_rejects_non_bf16_kv_without_cuda_fallback() {
     let batch = two_request_prefill_batch();
-    let bf16_pool = CudaKvCachePoolLayout::new(runtime_layout(KvCacheDtype::Bfloat16), 2)
+    let bf16_pool = PagedKvCacheLayout::new(runtime_layout(KvCacheDtype::Bfloat16), 2)
         .expect("BF16 KV pool layout should be valid");
     let metadata = CudaPagedAttentionMetadata::from_model_worker_batch(&batch, bf16_pool)
         .expect("metadata should validate");
-    let fp8_pool = CudaKvCachePoolLayout::new(runtime_layout(KvCacheDtype::Fp8E4M3), 2)
+    let fp8_pool = PagedKvCacheLayout::new(runtime_layout(KvCacheDtype::Fp8E4M3), 2)
         .expect("FP8 layout shape should be valid for capability validation");
 
     assert_eq!(

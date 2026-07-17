@@ -6,7 +6,9 @@ use sglang_srt::cache::{CachePageAllocator, RadixCache};
 use sglang_srt::cuda_attention::{
     CudaBf16PagedAttentionExecutor, CudaPagedAttentionForward, CudaPagedAttentionMetadata,
 };
-use sglang_srt::cuda_kv_cache::{CudaKvCachePool, CudaKvSlotGatherLaunch, CudaKvSlotScatterLaunch};
+use sglang_srt::cuda_kv_cache::{
+    CudaKvSlotGatherLaunch, CudaKvSlotScatterLaunch, allocate_cuda_kv_cache,
+};
 use sglang_srt::model_executor::ModelWorkerBatch;
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::transfer::{
@@ -249,28 +251,32 @@ fn cuda_backend_round_trips_page_major_device_kv_memory() {
         .context()
         .memory_info()
         .expect("CUDA memory info should be available");
-    let mut kv_cache = CudaKvCachePool::allocate(backend.context(), cuda_test_layout(), 16)
+    let mut kv_cache = allocate_cuda_kv_cache(backend.context(), cuda_test_layout(), 16)
         .expect("CUDA KV cache should allocate a page-major device pool");
+    let layout = kv_cache.layout();
     let pattern = (0..cuda_test_layout().page_size_bytes)
         .map(|offset| (offset % 251) as u8)
         .collect::<Vec<_>>();
     kv_cache
-        .write_page(3, &pattern)
+        .storage_mut()
+        .write_page(layout, 3, &pattern)
         .expect("page write should reach CUDA memory");
     let mut round_trip = vec![0; pattern.len()];
     kv_cache
-        .read_page(3, &mut round_trip)
+        .storage()
+        .read_page(layout, 3, &mut round_trip)
         .expect("page read should return CUDA memory");
     assert_eq!(round_trip, pattern);
 
     let tensor = kv_cache
-        .slot_location(1, 1, 63)
+        .storage()
+        .slot_location(layout, 1, 1, 63)
         .expect("community-style token slot should map into the pool");
     assert_eq!(tensor.byte_offset, 522_240);
     assert_eq!(tensor.byte_len, 2_048);
     assert_eq!(
         tensor.device_ptr,
-        kv_cache.allocation().device_ptr() + tensor.byte_offset as u64
+        kv_cache.storage().allocation().device_ptr() + tensor.byte_offset as u64
     );
     let transferable = kv_cache
         .transferable_kv_cache_memory()
@@ -440,9 +446,10 @@ fn cuda_runtime_kernels_execute_and_write_kv_slots() {
         .collect::<Vec<_>>();
     assert_f32_close(&bytes_f32(&silu_bytes), &expected_silu, 1.0e-4);
 
-    let mut kv_cache = CudaKvCachePool::allocate(backend.context(), cuda_test_layout(), 2)
+    let mut kv_cache = allocate_cuda_kv_cache(backend.context(), cuda_test_layout(), 2)
         .expect("CUDA KV cache should allocate");
-    let slot_byte_len = kv_cache.layout().bytes_per_token_per_tensor();
+    let layout = kv_cache.layout();
+    let slot_byte_len = layout.bytes_per_token_per_tensor();
     let pattern = (0..slot_byte_len)
         .map(|offset| (offset % 251) as u8)
         .collect::<Vec<_>>();
@@ -458,10 +465,12 @@ fn cuda_runtime_kernels_execute_and_write_kv_slots() {
         .copy_from_host(0, &pattern)
         .expect("KV slot should upload");
     kv_cache
-        .write_tensor_slot_from_device(1, 0, 7, &slot_source, 0)
+        .storage_mut()
+        .write_tensor_slot_from_device(layout, 1, 0, 7, &slot_source, 0)
         .expect("KV slot write should use device-to-device copy");
     kv_cache
-        .read_tensor_slot_to_device(1, 0, 7, &mut slot_destination, 0)
+        .storage()
+        .read_tensor_slot_to_device(layout, 1, 0, 7, &mut slot_destination, 0)
         .expect("KV slot read should use device-to-device copy");
     let mut round_trip = vec![0_u8; slot_byte_len];
     slot_destination
@@ -480,13 +489,15 @@ fn cuda_kv_kernels_scatter_and_gather_batched_physical_slots() {
     };
     let mut kernels = CudaKvPairCopyKernels::compile(backend.context(), compute_capability)
         .expect("NVRTC should compile dtype-independent KV copy kernels");
-    let mut kv_cache = CudaKvCachePool::allocate(backend.context(), cuda_test_layout(), 2)
+    let mut kv_cache = allocate_cuda_kv_cache(backend.context(), cuda_test_layout(), 2)
         .expect("CUDA KV cache should allocate two physical pages");
+    let layout = kv_cache.layout();
     let slots = [1_usize, 15, 16, 31];
     let slot_map = kv_cache
-        .upload_slot_map(&slots)
+        .storage()
+        .upload_slot_map(layout, &slots)
         .expect("scheduler physical slots should upload after validation");
-    let row_bytes = kv_cache.layout().bytes_per_token_per_tensor();
+    let row_bytes = layout.bytes_per_token_per_tensor();
     let key_stride = row_bytes + 37;
     let value_stride = row_bytes + 53;
     let (key_bytes, expected_keys) = strided_byte_rows(slots.len(), row_bytes, key_stride, 17);
@@ -507,24 +518,29 @@ fn cuda_kv_kernels_scatter_and_gather_batched_physical_slots() {
         .expect("value rows should upload");
 
     let transferable_before = kv_cache
-        .transferable_memory()
+        .storage()
+        .transferable_memory(layout)
         .expect("KV pool should expose its Mooncake memory before model writes");
     kv_cache
-        .write_kv_slots_from_device(CudaKvSlotScatterLaunch {
-            kernels: &mut kernels,
-            layer_index: 1,
-            slot_map: &slot_map,
-            keys: &keys,
-            keys_offset: 0,
-            key_row_stride_bytes: key_stride,
-            values: &values,
-            values_offset: 0,
-            value_row_stride_bytes: value_stride,
-        })
+        .storage_mut()
+        .write_kv_slots_from_device(
+            layout,
+            CudaKvSlotScatterLaunch {
+                kernels: &mut kernels,
+                layer_index: 1,
+                slot_map: &slot_map,
+                keys: &keys,
+                keys_offset: 0,
+                key_row_stride_bytes: key_stride,
+                values: &values,
+                values_offset: 0,
+                value_row_stride_bytes: value_stride,
+            },
+        )
         .expect("one CUDA launch should scatter batched K/V rows into physical slots");
     assert_eq!(
         transferable_before.regions()[0].base_addr,
-        kv_cache.allocation().device_ptr() as usize,
+        kv_cache.storage().allocation().device_ptr() as usize,
         "attention writes and Mooncake registration must use the same allocation"
     );
 
@@ -543,17 +559,21 @@ fn cuda_kv_kernels_scatter_and_gather_batched_physical_slots() {
     gathered_keys.fill(0).expect("key output should clear");
     gathered_values.fill(0).expect("value output should clear");
     kv_cache
-        .read_kv_slots_to_device(CudaKvSlotGatherLaunch {
-            kernels: &mut kernels,
-            layer_index: 1,
-            slot_map: &slot_map,
-            keys: &mut gathered_keys,
-            keys_offset: 0,
-            key_row_stride_bytes: gathered_key_stride,
-            values: &mut gathered_values,
-            values_offset: 0,
-            value_row_stride_bytes: gathered_value_stride,
-        })
+        .storage()
+        .read_kv_slots_to_device(
+            layout,
+            CudaKvSlotGatherLaunch {
+                kernels: &mut kernels,
+                layer_index: 1,
+                slot_map: &slot_map,
+                keys: &mut gathered_keys,
+                keys_offset: 0,
+                key_row_stride_bytes: gathered_key_stride,
+                values: &mut gathered_values,
+                values_offset: 0,
+                value_row_stride_bytes: gathered_value_stride,
+            },
+        )
         .expect("one CUDA launch should gather batched K/V rows from physical slots");
     let mut gathered_key_bytes = vec![0_u8; gathered_key_len];
     let mut gathered_value_bytes = vec![0_u8; gathered_value_len];
@@ -570,11 +590,11 @@ fn cuda_kv_kernels_scatter_and_gather_batched_physical_slots() {
         &expected_values,
     );
 
-    let layout = kv_cache.layout();
     for page_index in 0..layout.page_count() {
         let mut page = vec![0_u8; layout.runtime().page_size_bytes];
         kv_cache
-            .read_page(page_index, &mut page)
+            .storage()
+            .read_page(layout, page_index, &mut page)
             .expect("physical page should be readable for acceptance verification");
         let page_start = layout
             .page_byte_range(page_index)
@@ -612,12 +632,12 @@ fn cuda_bf16_paged_attention_reads_mooncake_registered_physical_kv_slots() {
     let mut attention =
         CudaBf16PagedAttentionExecutor::compile(backend.context(), compute_capability)
             .expect("NVRTC should compile BF16 paged attention");
-    let mut kv_cache = CudaKvCachePool::allocate(backend.context(), attention_test_layout(), 2)
+    let mut kv_cache = allocate_cuda_kv_cache(backend.context(), attention_test_layout(), 2)
         .expect("two physical KV pages should allocate");
+    let kv_layout = kv_cache.layout();
     let worker_batch = attention_test_batch();
-    let metadata =
-        CudaPagedAttentionMetadata::from_model_worker_batch(&worker_batch, kv_cache.layout())
-            .expect("scheduler batch should produce physical attention metadata");
+    let metadata = CudaPagedAttentionMetadata::from_model_worker_batch(&worker_batch, kv_layout)
+        .expect("scheduler batch should produce physical attention metadata");
     let device_metadata = metadata
         .upload(backend.context())
         .expect("attention metadata should upload");
@@ -627,7 +647,8 @@ fn cuda_bf16_paged_attention_reads_mooncake_registered_physical_kv_slots() {
         .map(|slot| *slot as usize)
         .collect::<Vec<_>>();
     let slot_map = kv_cache
-        .upload_slot_map(&physical_slots)
+        .storage()
+        .upload_slot_map(kv_layout, &physical_slots)
         .expect("physical KV slots should upload");
 
     let runtime = attention_test_layout();
@@ -655,19 +676,23 @@ fn cuda_bf16_paged_attention_reads_mooncake_registered_physical_kv_slots() {
     values
         .copy_from_host(0, &value_bytes)
         .expect("BF16 values should upload");
-    let row_bytes = kv_cache.layout().bytes_per_token_per_tensor();
+    let row_bytes = kv_layout.bytes_per_token_per_tensor();
     kv_cache
-        .write_kv_slots_from_device(CudaKvSlotScatterLaunch {
-            kernels: &mut kv_copy_kernels,
-            layer_index: 0,
-            slot_map: &slot_map,
-            keys: &keys,
-            keys_offset: 0,
-            key_row_stride_bytes: row_bytes,
-            values: &values,
-            values_offset: 0,
-            value_row_stride_bytes: row_bytes,
-        })
+        .storage_mut()
+        .write_kv_slots_from_device(
+            kv_layout,
+            CudaKvSlotScatterLaunch {
+                kernels: &mut kv_copy_kernels,
+                layer_index: 0,
+                slot_map: &slot_map,
+                keys: &keys,
+                keys_offset: 0,
+                key_row_stride_bytes: row_bytes,
+                values: &values,
+                values_offset: 0,
+                value_row_stride_bytes: row_bytes,
+            },
+        )
         .expect("KV scatter should write scheduler slots into the physical pool");
 
     let query_head_count = 4;
@@ -690,17 +715,19 @@ fn cuda_bf16_paged_attention_reads_mooncake_registered_physical_kv_slots() {
         .expect("BF16 queries should upload");
 
     let transferable = kv_cache
-        .transferable_memory()
+        .storage()
+        .transferable_memory(kv_layout)
         .expect("attention KV pool should expose Mooncake memory");
     assert_eq!(
         transferable.regions()[0].base_addr,
-        kv_cache.allocation().device_ptr() as usize,
+        kv_cache.storage().allocation().device_ptr() as usize,
         "attention and Mooncake must read and register the same CUDA allocation"
     );
     let scale = (runtime.head_dim as f32).sqrt().recip();
     attention
         .forward(CudaPagedAttentionForward {
-            kv_cache: &kv_cache,
+            kv_layout,
+            kv_storage: kv_cache.storage(),
             layer_index: 0,
             metadata: &device_metadata,
             queries: &queries,
@@ -735,7 +762,7 @@ fn cuda_bf16_paged_attention_reads_mooncake_registered_physical_kv_slots() {
 #[ignore = "requires a CUDA device, NVIDIA driver, and linked native Mooncake"]
 fn cuda_mooncake_registers_real_cuda_kv_memory() {
     let backend = CudaBackend::initialize(0).expect("CUDA backend should initialize");
-    let kv_cache = CudaKvCachePool::allocate(backend.context(), cuda_test_layout(), 16)
+    let kv_cache = allocate_cuda_kv_cache(backend.context(), cuda_test_layout(), 16)
         .expect("CUDA KV cache should allocate a page-major device pool");
     let transferable = kv_cache
         .transferable_kv_cache_memory()

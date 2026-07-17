@@ -1,5 +1,22 @@
-use sglang_srt::cuda_kv_cache::{CudaKvCachePoolError, CudaKvCachePoolLayout};
+use sglang_srt::kv_cache::{
+    KvCachePool, KvCachePoolError, KvCacheStorage, PagedKvCacheLayout, PagedKvCacheLayoutError,
+};
 use sglang_srt::transfer::{KvCacheDtype, KvCacheRuntimeLayout};
+
+struct ByteStorage(Vec<u8>);
+
+impl KvCacheStorage for ByteStorage {
+    type Error = std::convert::Infallible;
+
+    fn byte_len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn clear(&mut self) -> Result<(), Self::Error> {
+        self.0.fill(0);
+        Ok(())
+    }
+}
 
 fn runtime_layout() -> KvCacheRuntimeLayout {
     KvCacheRuntimeLayout {
@@ -16,7 +33,7 @@ fn runtime_layout() -> KvCacheRuntimeLayout {
 
 #[test]
 fn page_major_layout_matches_page_layer_tensor_token_order() {
-    let layout = CudaKvCachePoolLayout::new(runtime_layout(), 3).expect("layout should be valid");
+    let layout = PagedKvCacheLayout::new(runtime_layout(), 3).expect("layout should be valid");
 
     assert_eq!(layout.runtime(), runtime_layout());
     assert_eq!(layout.page_count(), 3);
@@ -36,39 +53,39 @@ fn page_major_layout_matches_page_layer_tensor_token_order() {
 
 #[test]
 fn page_major_layout_rejects_out_of_range_coordinates() {
-    let layout = CudaKvCachePoolLayout::new(runtime_layout(), 3).expect("layout should be valid");
+    let layout = PagedKvCacheLayout::new(runtime_layout(), 3).expect("layout should be valid");
 
     assert_eq!(
         layout.page_byte_range(3),
-        Err(CudaKvCachePoolError::PageOutOfRange {
+        Err(PagedKvCacheLayoutError::PageOutOfRange {
             page_index: 3,
             page_count: 3,
         })
     );
     assert_eq!(
         layout.tensor_token_byte_range(0, 2, 0, 0),
-        Err(CudaKvCachePoolError::LayerOutOfRange {
+        Err(PagedKvCacheLayoutError::LayerOutOfRange {
             layer_index: 2,
             layer_count: 2,
         })
     );
     assert_eq!(
         layout.tensor_token_byte_range(0, 0, 2, 0),
-        Err(CudaKvCachePoolError::TensorOutOfRange {
+        Err(PagedKvCacheLayoutError::TensorOutOfRange {
             tensor_index: 2,
             tensor_count: 2,
         })
     );
     assert_eq!(
         layout.tensor_token_byte_range(0, 0, 0, 4),
-        Err(CudaKvCachePoolError::TokenOutOfRange {
+        Err(PagedKvCacheLayoutError::TokenOutOfRange {
             token_index: 4,
             page_size: 4,
         })
     );
     assert_eq!(
         layout.tensor_slot_byte_range(0, 0, 12),
-        Err(CudaKvCachePoolError::SlotOutOfRange {
+        Err(PagedKvCacheLayoutError::SlotOutOfRange {
             slot_index: 12,
             slot_count: 12,
         })
@@ -80,8 +97,8 @@ fn page_major_layout_fails_fast_on_inconsistent_runtime_metadata() {
     let mut layout = runtime_layout();
     layout.page_size_bytes = 511;
     assert_eq!(
-        CudaKvCachePoolLayout::new(layout, 1),
-        Err(CudaKvCachePoolError::RuntimePageSizeMismatch {
+        PagedKvCacheLayout::new(layout, 1),
+        Err(PagedKvCacheLayoutError::RuntimePageSizeMismatch {
             expected: 512,
             actual: 511,
         })
@@ -91,8 +108,8 @@ fn page_major_layout_fails_fast_on_inconsistent_runtime_metadata() {
     layout.bytes_per_token = 129;
     layout.page_size_bytes = 516;
     assert_eq!(
-        CudaKvCachePoolLayout::new(layout, 1),
-        Err(CudaKvCachePoolError::UnevenLayerLayout {
+        PagedKvCacheLayout::new(layout, 1),
+        Err(PagedKvCacheLayoutError::UnevenLayerLayout {
             bytes_per_token: 129,
             num_layers: 2,
         })
@@ -102,52 +119,47 @@ fn page_major_layout_fails_fast_on_inconsistent_runtime_metadata() {
     layout.bytes_per_token = 130;
     layout.page_size_bytes = 520;
     assert_eq!(
-        CudaKvCachePoolLayout::new(layout, 1),
-        Err(CudaKvCachePoolError::UnevenTensorLayout {
+        PagedKvCacheLayout::new(layout, 1),
+        Err(PagedKvCacheLayoutError::UnevenTensorLayout {
             bytes_per_token_per_layer: 65,
             kv_tensors_per_token: 2,
         })
     );
 
     assert_eq!(
-        CudaKvCachePoolLayout::new(runtime_layout(), usize::MAX),
-        Err(CudaKvCachePoolError::SizeOverflow)
+        PagedKvCacheLayout::new(runtime_layout(), usize::MAX),
+        Err(PagedKvCacheLayoutError::SizeOverflow)
     );
 }
 
 #[test]
-fn page_major_layout_builds_dtype_independent_batched_kv_copy_plan() {
-    let layout = CudaKvCachePoolLayout::new(runtime_layout(), 3).expect("layout should be valid");
-    let plan = layout
-        .kv_pair_copy_plan(1, 3, 40, 48)
-        .expect("layer K/V pair should map into the physical pool");
+fn page_major_layout_describes_a_layer_kv_pair() {
+    let layout = PagedKvCacheLayout::new(runtime_layout(), 3).expect("layout should be valid");
+    let geometry = layout
+        .kv_pair_copy_geometry(1)
+        .expect("second layer should have a K/V pair");
 
-    assert_eq!(plan.row_count(), 3);
-    assert_eq!(plan.slot_count(), 12);
-    assert_eq!(plan.layout().page_size(), 4);
-    assert_eq!(plan.layout().page_stride_bytes(), 512);
-    assert_eq!(plan.layout().key_in_page_offset(), 256);
-    assert_eq!(plan.layout().value_in_page_offset(), 384);
-    assert_eq!(plan.layout().row_bytes(), 32);
-    assert_eq!(plan.key_row_stride_bytes(), 40);
-    assert_eq!(plan.value_row_stride_bytes(), 48);
-    assert_eq!(plan.pool_required_bytes(), layout.total_byte_len());
+    assert_eq!(geometry.page_size, 4);
+    assert_eq!(geometry.page_stride_bytes, 512);
+    assert_eq!(geometry.key_offset_bytes, 256);
+    assert_eq!(geometry.value_offset_bytes, 384);
+    assert_eq!(geometry.token_bytes, 32);
 }
 
 #[test]
 fn page_major_layout_validates_scheduler_slot_maps_before_cuda_upload() {
-    let layout = CudaKvCachePoolLayout::new(runtime_layout(), 3).expect("layout should be valid");
+    let layout = PagedKvCacheLayout::new(runtime_layout(), 3).expect("layout should be valid");
 
     layout
         .validate_slot_indices(&[0, 4, 11])
         .expect("physical slots spanning pages should validate");
     assert_eq!(
         layout.validate_slot_indices(&[]),
-        Err(CudaKvCachePoolError::EmptySlotMap)
+        Err(PagedKvCacheLayoutError::EmptySlotMap)
     );
     assert_eq!(
         layout.validate_slot_indices(&[0, 12, 1]),
-        Err(CudaKvCachePoolError::BatchSlotOutOfRange {
+        Err(PagedKvCacheLayoutError::BatchSlotOutOfRange {
             batch_index: 1,
             slot_index: 12,
             slot_count: 12,
@@ -156,10 +168,36 @@ fn page_major_layout_validates_scheduler_slot_maps_before_cuda_upload() {
 
     let mut single_tensor_runtime = runtime_layout();
     single_tensor_runtime.kv_tensors_per_token = 1;
-    let single_tensor_layout = CudaKvCachePoolLayout::new(single_tensor_runtime, 1)
+    let single_tensor_layout = PagedKvCacheLayout::new(single_tensor_runtime, 1)
         .expect("single-tensor metadata is valid but cannot hold a K/V pair");
     assert_eq!(
-        single_tensor_layout.kv_pair_copy_plan(0, 1, 64, 64),
-        Err(CudaKvCachePoolError::KvPairRequiresTwoTensors { tensor_count: 1 })
+        single_tensor_layout.kv_pair_copy_geometry(0),
+        Err(PagedKvCacheLayoutError::KvPairRequiresTwoTensors { tensor_count: 1 })
     );
+}
+
+#[test]
+fn pool_owns_backend_storage_without_knowing_its_platform() {
+    let layout = PagedKvCacheLayout::new(runtime_layout(), 1).expect("layout should be valid");
+    let storage = ByteStorage(vec![7; layout.total_byte_len()]);
+    let mut pool = KvCachePool::new(layout, storage).expect("storage capacity should match");
+
+    pool.clear().expect("byte storage clear is infallible");
+
+    assert_eq!(pool.layout(), layout);
+    assert!(pool.storage().0.iter().all(|byte| *byte == 0));
+}
+
+#[test]
+fn pool_rejects_storage_with_the_wrong_capacity() {
+    let layout = PagedKvCacheLayout::new(runtime_layout(), 1).expect("layout should be valid");
+    let storage = ByteStorage(vec![0; layout.total_byte_len() - 1]);
+
+    assert!(matches!(
+        KvCachePool::new(layout, storage),
+        Err(KvCachePoolError::StorageSizeMismatch {
+            expected: 512,
+            actual: 511,
+        })
+    ));
 }

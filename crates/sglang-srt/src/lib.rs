@@ -12,6 +12,7 @@ pub mod engine_info_bootstrap;
 pub mod grpc;
 pub mod grpc_sidecar;
 pub mod http;
+pub mod kv_cache;
 pub mod model_artifacts;
 pub mod model_executor;
 pub mod model_registry;
