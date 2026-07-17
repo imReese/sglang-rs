@@ -1,3 +1,4 @@
+use std::ffi::c_void;
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,10 +27,12 @@ use sglang_srt::router::{RouterProtocolError, RouterRuntime};
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::tokenizer::ByteTokenizer;
 use sglang_srt::transfer::{
-    DecodeBootstrapRegistry, DecodeBootstrapSession, KvTransferModelWorker, MooncakeBatchId,
-    MooncakeBatchReleaser, MooncakeError, MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor,
+    DecodeBootstrapRegistry, DecodeBootstrapSession, KvCacheMemoryLocation, KvTransferBackend,
+    KvTransferModelWorker, MooncakeBatchId, MooncakeBatchReleaser, MooncakeBufferEntry,
+    MooncakeError, MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeMemoryRegistrar,
     MooncakeTransferRequest, MooncakeTransferStatus, MooncakeTransferStatusCode,
     MooncakeTransferStatusReader, MooncakeTransferSubmitter, MooncakeTransferTarget,
+    TransferableKvCacheMemory, TransferableKvCacheRegion,
 };
 use sglang_srt::types::{
     BootstrapRoom, DisaggregatedParams as RuntimeDisaggregatedParams, RequestId,
@@ -1009,15 +1012,7 @@ async fn grpc_generate_can_poll_pd_transfer_before_decode() {
     let worker = KvTransferModelWorker::new(
         GrpcTwoStepWorker,
         grpc_registry_with_session("grpc-pd-poll", 31),
-        MooncakeKvCacheTransferExecutor::new(
-            RecordingMooncakeBackend::completed(),
-            MooncakeKvCacheLayout {
-                source_base_addr: 0x1000,
-                page_size_bytes: 64,
-                target_base_offset: 0,
-            },
-            MooncakeTransferTarget { target_id: 9 },
-        ),
+        registered_recording_mooncake_executor(0x1000, 9),
     );
     let service = GrpcRouterService::from_engine(Engine::new(
         ByteTokenizer,
@@ -1078,15 +1073,7 @@ async fn grpc_text_generate_can_poll_pd_transfer_before_decode() {
     let worker = KvTransferModelWorker::new(
         GrpcTwoStepWorker,
         grpc_registry_with_session("grpc-text-pd-poll", 32),
-        MooncakeKvCacheTransferExecutor::new(
-            RecordingMooncakeBackend::completed(),
-            MooncakeKvCacheLayout {
-                source_base_addr: 0x2000,
-                page_size_bytes: 64,
-                target_base_offset: 0,
-            },
-            MooncakeTransferTarget { target_id: 10 },
-        ),
+        registered_recording_mooncake_executor(0x2000, 10),
     );
     let service = GrpcRouterService::from_engine(Engine::new(
         ByteTokenizer,
@@ -1560,15 +1547,7 @@ async fn grpc_poll_transfers_advances_async_pd_batches() {
     let worker = KvTransferModelWorker::new(
         GrpcTwoStepWorker,
         grpc_registry_with_session("grpc-poll-control", 33),
-        MooncakeKvCacheTransferExecutor::new(
-            RecordingMooncakeBackend::completed(),
-            MooncakeKvCacheLayout {
-                source_base_addr: 0x3000,
-                page_size_bytes: 64,
-                target_base_offset: 0,
-            },
-            MooncakeTransferTarget { target_id: 11 },
-        ),
+        registered_recording_mooncake_executor(0x3000, 11),
     );
     let service = GrpcRouterService::from_engine(Engine::new(
         ByteTokenizer,
@@ -2084,6 +2063,51 @@ impl MooncakeBatchReleaser for RecordingMooncakeBackend {
         self.freed_batches.push(batch_id);
         Ok(())
     }
+}
+
+impl MooncakeMemoryRegistrar for RecordingMooncakeBackend {
+    fn register_memory_batch(
+        &mut self,
+        _buffers: &mut [MooncakeBufferEntry],
+        _location: &str,
+    ) -> Result<(), MooncakeError> {
+        Ok(())
+    }
+
+    fn unregister_memory_batch(&mut self, _addrs: &mut [*mut c_void]) -> Result<(), MooncakeError> {
+        Ok(())
+    }
+}
+
+fn registered_recording_mooncake_executor(
+    source_base_addr: usize,
+    target_id: i32,
+) -> MooncakeKvCacheTransferExecutor<RecordingMooncakeBackend> {
+    let mut executor = MooncakeKvCacheTransferExecutor::new(
+        RecordingMooncakeBackend::completed(),
+        MooncakeKvCacheLayout {
+            source_base_addr,
+            page_size_bytes: 64,
+            target_base_offset: 0,
+        },
+        MooncakeTransferTarget { target_id },
+    )
+    .with_memory_registrar(RecordingMooncakeBackend::default());
+    executor
+        .register(
+            TransferableKvCacheMemory::new(
+                vec![TransferableKvCacheRegion {
+                    base_addr: source_base_addr,
+                    byte_len: 64 * 3,
+                    page_size_bytes: 64,
+                }],
+                64,
+                KvCacheMemoryLocation::Cpu { numa_node: 0 },
+            )
+            .expect("test NexusKV descriptor should be valid"),
+        )
+        .expect("test Mooncake executor should register NexusKV memory");
+    executor
 }
 
 fn grpc_registry_with_session(

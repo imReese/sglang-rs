@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -8,6 +9,7 @@ use sglang_kernel::cpu::{
 
 use crate::backend::{RuntimeCapability, RuntimeDtype};
 use crate::cache::CachePageId;
+use crate::kv_cache::PagedKvCacheLayout;
 use crate::model_artifacts::{LocalModelArtifacts, ModelArtifactError};
 use crate::model_executor::{
     ForwardModel, ModelForwardError, ModelForwardOutput, ModelWorkerBatch,
@@ -18,6 +20,8 @@ use crate::models::{
     DenseDecoderLayerWeightNames, FeedForwardArchitecture, ModelDefinition,
     ModelExecutionArchitecture,
 };
+use crate::runtime_kv_cache::{ActiveKvCache, ModelExecutionResources};
+use crate::transfer::{KvCacheTransferError, TransferableKvCacheMemory};
 
 #[derive(Debug)]
 pub(crate) struct CpuReferenceDenseDecoder {
@@ -30,7 +34,6 @@ pub(crate) struct CpuReferenceDenseDecoder {
     final_norm: Vec<f32>,
     lm_head: Option<FloatMatrix>,
     layers: Vec<DenseDecoderLayerWeights>,
-    kv_cache: CpuReferenceKvCache,
 }
 
 impl CpuReferenceDenseDecoder {
@@ -94,8 +97,6 @@ impl CpuReferenceDenseDecoder {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let kv_cache = CpuReferenceKvCache::new(layers.len(), kv_size);
-
         Ok(Self {
             plan,
             query_head_count: num_attention_heads,
@@ -106,7 +107,6 @@ impl CpuReferenceDenseDecoder {
             final_norm,
             lm_head,
             layers,
-            kv_cache,
         })
     }
 
@@ -120,6 +120,7 @@ impl CpuReferenceDenseDecoder {
 
     fn forward_token(
         &mut self,
+        kv_cache: &mut CpuReferenceKvCache,
         token_id: u32,
         position: usize,
         output_slot: CachePageId,
@@ -142,7 +143,7 @@ impl CpuReferenceDenseDecoder {
         for layer_index in 0..self.layers.len() {
             hidden = forward_layer(
                 &self.layers[layer_index],
-                &mut self.kv_cache,
+                kv_cache,
                 &hidden,
                 DenseDecoderForwardContext {
                     layer_index,
@@ -179,8 +180,33 @@ impl CpuReferenceDenseDecoder {
 impl ForwardModel for CpuReferenceDenseDecoder {
     fn forward(
         &mut self,
-        batch: &ModelWorkerBatch,
+        _batch: &ModelWorkerBatch,
     ) -> Result<ModelForwardOutput, ModelForwardError> {
+        Err(ModelForwardError::Runtime(
+            "CPU reference dense decoder requires ModelRunner-owned active KV memory".to_string(),
+        ))
+    }
+
+    fn forward_with_resources(
+        &mut self,
+        batch: &ModelWorkerBatch,
+        resources: ModelExecutionResources<'_>,
+    ) -> Result<ModelForwardOutput, ModelForwardError> {
+        let kv_cache = resources
+            .active_kv_cache()
+            .ok_or_else(|| {
+                ModelForwardError::Runtime(
+                    "CPU reference dense decoder has no active KV allocation".to_string(),
+                )
+            })?
+            .as_any_mut()
+            .downcast_mut::<CpuReferenceKvCache>()
+            .ok_or_else(|| {
+                ModelForwardError::Runtime(
+                    "CPU reference dense decoder received a non-CPU active KV allocation"
+                        .to_string(),
+                )
+            })?;
         validate_batch(batch).map_err(model_forward_error)?;
         let mut logits = Vec::with_capacity(batch.request_ids().len());
         for request_index in 0..batch.request_ids().len() {
@@ -194,6 +220,7 @@ impl ForwardModel for CpuReferenceDenseDecoder {
             for input_index in input_offset..input_offset + input_count {
                 request_logits = Some(
                     self.forward_token(
+                        kv_cache,
                         batch.input_ids()[input_index],
                         batch.positions()[input_index],
                         batch.out_cache_pages()[input_index],
@@ -690,16 +717,27 @@ impl FloatMatrix {
 
 #[derive(Debug)]
 pub(crate) struct CpuReferenceKvCache {
+    layout: PagedKvCacheLayout,
     layers: Vec<HashMap<usize, KvSlot>>,
     kv_width: usize,
 }
 
 impl CpuReferenceKvCache {
-    pub(crate) fn new(layer_count: usize, kv_width: usize) -> Self {
-        Self {
-            layers: (0..layer_count).map(|_| HashMap::new()).collect(),
+    pub(crate) fn new(layout: PagedKvCacheLayout) -> Result<Self, CpuReferenceDenseDecoderError> {
+        let runtime = layout.runtime();
+        let kv_width = runtime
+            .kv_heads
+            .checked_mul(runtime.head_dim)
+            .ok_or_else(|| {
+                CpuReferenceDenseDecoderError::Unsupported(
+                    "CPU reference KV width overflowed".to_string(),
+                )
+            })?;
+        Ok(Self {
+            layout,
+            layers: (0..runtime.num_layers).map(|_| HashMap::new()).collect(),
             kv_width,
-        }
+        })
     }
 
     pub(crate) fn write(
@@ -752,6 +790,27 @@ impl CpuReferenceKvCache {
             values.extend_from_slice(&entry.value);
         }
         Ok((keys, values))
+    }
+}
+
+impl ActiveKvCache for CpuReferenceKvCache {
+    fn backend(&self) -> crate::backend::RuntimeBackend {
+        crate::backend::RuntimeBackend::Cpu
+    }
+
+    fn layout(&self) -> PagedKvCacheLayout {
+        self.layout
+    }
+
+    fn transferable_memory(&self) -> Result<TransferableKvCacheMemory, KvCacheTransferError> {
+        Err(KvCacheTransferError::Runtime(
+            "CPU reference active KV memory is not a production transfer or offload tier"
+                .to_string(),
+        ))
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 

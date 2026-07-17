@@ -3,7 +3,179 @@ use std::ops::Range;
 
 use nexus_transfer::{KvCacheMemoryProvider, TransferableKvCacheMemory};
 
-use crate::transfer::KvCacheRuntimeLayout;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KvCacheDtype {
+    Auto,
+    Float32,
+    Bfloat16,
+    Fp8E4M3,
+    Fp8E5M2,
+    Fp4E2M1,
+}
+
+impl KvCacheDtype {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "bf16" | "bfloat16" => Some(Self::Bfloat16),
+            "fp8_e4m3" => Some(Self::Fp8E4M3),
+            "fp8_e5m2" => Some(Self::Fp8E5M2),
+            "fp4_e2m1" => Some(Self::Fp4E2M1),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Float32 => "float32",
+            Self::Bfloat16 => "bfloat16",
+            Self::Fp8E4M3 => "fp8_e4m3",
+            Self::Fp8E5M2 => "fp8_e5m2",
+            Self::Fp4E2M1 => "fp4_e2m1",
+        }
+    }
+
+    pub fn bytes_per_element(self) -> Option<usize> {
+        match self {
+            Self::Auto | Self::Bfloat16 => Some(2),
+            Self::Float32 => Some(4),
+            Self::Fp8E4M3 | Self::Fp8E5M2 => Some(1),
+            Self::Fp4E2M1 => None,
+        }
+    }
+
+    pub fn runtime_storage_dtype(self) -> Self {
+        match self {
+            Self::Auto => Self::Bfloat16,
+            dtype => dtype,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KvCacheRuntimeLayout {
+    pub dtype: KvCacheDtype,
+    pub page_size: usize,
+    pub num_layers: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub kv_tensors_per_token: usize,
+    pub bytes_per_token: usize,
+    pub page_size_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KvCacheModelLayout {
+    pub num_layers: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub kv_tensors_per_token: usize,
+    pub bytes_per_token_per_layer: Option<usize>,
+}
+
+impl KvCacheModelLayout {
+    pub fn multi_tensor(
+        num_layers: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        kv_tensors_per_token: usize,
+    ) -> Self {
+        Self {
+            num_layers,
+            kv_heads,
+            head_dim,
+            kv_tensors_per_token,
+            bytes_per_token_per_layer: None,
+        }
+    }
+
+    pub fn packed_bytes_per_layer(num_layers: usize, bytes_per_token_per_layer: usize) -> Self {
+        Self {
+            num_layers,
+            kv_heads: 1,
+            head_dim: bytes_per_token_per_layer,
+            kv_tensors_per_token: 1,
+            bytes_per_token_per_layer: Some(bytes_per_token_per_layer),
+        }
+    }
+
+    pub fn elements_per_token(self) -> Option<usize> {
+        self.num_layers
+            .checked_mul(self.kv_tensors_per_token)
+            .and_then(|value| value.checked_mul(self.kv_heads))
+            .and_then(|value| value.checked_mul(self.head_dim))
+    }
+
+    pub fn token_size_bytes(self, dtype: KvCacheDtype) -> Result<usize, KvCacheLayoutError> {
+        if let Some(bytes_per_token_per_layer) = self.bytes_per_token_per_layer {
+            return self
+                .num_layers
+                .checked_mul(bytes_per_token_per_layer)
+                .ok_or(KvCacheLayoutError::SizeOverflow);
+        }
+
+        self.elements_per_token()
+            .ok_or(KvCacheLayoutError::SizeOverflow)?
+            .checked_mul(
+                dtype
+                    .bytes_per_element()
+                    .ok_or(KvCacheLayoutError::DtypeRequiresModelMetadata(dtype))?,
+            )
+            .ok_or(KvCacheLayoutError::SizeOverflow)
+    }
+
+    pub fn packed_mla(
+        num_layers: usize,
+        qk_nope_head_dim: usize,
+        qk_rope_head_dim: usize,
+    ) -> Result<Self, KvCacheLayoutError> {
+        if !qk_nope_head_dim.is_multiple_of(64) {
+            return Err(KvCacheLayoutError::InvalidPackedMlaNopeHeadDim(
+                qk_nope_head_dim,
+            ));
+        }
+        let bytes_per_token_per_layer = qk_nope_head_dim
+            .checked_add(
+                qk_rope_head_dim
+                    .checked_mul(2)
+                    .ok_or(KvCacheLayoutError::SizeOverflow)?,
+            )
+            .and_then(|value| value.checked_add(qk_nope_head_dim / 64))
+            .and_then(|value| value.checked_add(1))
+            .ok_or(KvCacheLayoutError::SizeOverflow)?;
+        Ok(Self::packed_bytes_per_layer(
+            num_layers,
+            bytes_per_token_per_layer,
+        ))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KvCacheLayoutError {
+    DtypeRequiresModelMetadata(KvCacheDtype),
+    InvalidPackedMlaNopeHeadDim(usize),
+    SizeOverflow,
+}
+
+impl fmt::Display for KvCacheLayoutError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DtypeRequiresModelMetadata(dtype) => write!(
+                formatter,
+                "KV cache dtype {} requires model metadata for byte width",
+                dtype.as_str()
+            ),
+            Self::InvalidPackedMlaNopeHeadDim(head_dim) => write!(
+                formatter,
+                "qk_nope_head_dim must be divisible by 64 for packed MLA KV layout: {head_dim}"
+            ),
+            Self::SizeOverflow => formatter.write_str("KV cache layout byte size overflowed"),
+        }
+    }
+}
+
+impl std::error::Error for KvCacheLayoutError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PagedKvCacheLayoutError {

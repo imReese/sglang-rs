@@ -566,12 +566,23 @@ impl ForwardModel for CudaBf16DenseDecoder {
         batch: &ModelWorkerBatch,
         resources: ModelExecutionResources<'_>,
     ) -> Result<ModelForwardOutput, ModelForwardError> {
-        let (kv_layout, kv_storage) = resources.cuda_kv_cache().ok_or_else(|| {
+        let active_kv_cache = resources.active_kv_cache().ok_or_else(|| {
             ModelForwardError::Runtime(
                 "CUDA dense decoder requires an active CUDA KV cache owned by ModelRunner"
                     .to_string(),
             )
         })?;
+        let kv_layout = active_kv_cache.layout();
+        let kv_pool = active_kv_cache
+            .as_any_mut()
+            .downcast_mut::<crate::kv_cache::KvCachePool<CudaKvStorage>>()
+            .ok_or_else(|| {
+                ModelForwardError::Runtime(
+                    "CUDA dense decoder received active KV memory from a non-CUDA backend"
+                        .to_string(),
+                )
+            })?;
+        let kv_storage = kv_pool.storage_mut();
         self.forward_batch(batch, kv_layout, kv_storage)
             .map_err(|error| ModelForwardError::Runtime(error.to_string()))
     }

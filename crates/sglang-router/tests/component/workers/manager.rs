@@ -169,16 +169,6 @@ async fn manager_does_not_register_unstartable_dummy_mooncake_srt_worker() {
         &bootstrap_addr.port().to_string(),
         "--disaggregation-zmq-ports",
         &format!("{}-{}", zmq_addr.port(), zmq_addr.port()),
-        "--kv-cache-dtype",
-        "bfloat16",
-        "--kv-cache-num-layers",
-        "78",
-        "--kv-cache-kv-heads",
-        "64",
-        "--kv-cache-head-dim",
-        "64",
-        "--page-size",
-        "64",
     ])
     .expect("gRPC SRT args should parse");
 

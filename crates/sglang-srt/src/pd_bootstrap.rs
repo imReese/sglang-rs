@@ -16,11 +16,11 @@ use serde_json::json;
 use zeromq::{PullSocket, PushSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
 use crate::transfer::{
-    DecodeBootstrapMetadataPublishSummary, DecodeBootstrapPublisher, DecodeBootstrapRegistry,
-    KvCacheTransferError, KvCacheTransferPlan, KvCacheTransferSpan, KvPoll, KvTransferBackend,
-    KvTransferPollSummary, MooncakeBatchReleaser, MooncakeKvCacheTransferExecutor,
-    MooncakeRemoteKvLayout, MooncakeTransferStatusReader, MooncakeTransferSubmitter,
-    MooncakeTransferTargetResolver,
+    DecodeBootstrapMetadataPublishSummary, DecodeBootstrapPublisher, KvCacheTransferError,
+    KvCacheTransferPlan, KvCacheTransferSpan, KvPoll, KvTransferBackend, KvTransferPoll,
+    MooncakeBatchReleaser, MooncakeKvCacheTransferExecutor, MooncakeRemoteKvLayout,
+    MooncakeTransferStatusReader, MooncakeTransferSubmitter, MooncakeTransferTargetResolver,
+    TransferableKvCacheMemory,
 };
 use crate::types::BootstrapRoom;
 
@@ -123,7 +123,11 @@ where
     S: MooncakeTransferSubmitter + MooncakeTransferStatusReader + MooncakeBatchReleaser,
     R: MooncakeTransferTargetResolver,
 {
-    fn transfer_span(
+    fn register(&mut self, memory: TransferableKvCacheMemory) -> Result<(), KvCacheTransferError> {
+        self.inner.register(memory)
+    }
+
+    fn submit(
         &mut self,
         span: &crate::transfer::KvCacheTransferSpan,
     ) -> Result<(), KvCacheTransferError> {
@@ -133,18 +137,19 @@ where
             self.inner
                 .insert_remote_kv_session_layout(span.bootstrap_room(), session_id, layout);
         }
-        self.inner.transfer_span(span)
+        self.inner.submit(span)
     }
 
-    fn completes_inline(&self) -> bool {
-        self.inner.completes_inline()
+    fn poll(&mut self) -> Result<KvTransferPoll, KvCacheTransferError> {
+        self.inner.poll()
     }
 
-    fn poll_transfers(
-        &mut self,
-        registry: &mut DecodeBootstrapRegistry,
-    ) -> Result<KvTransferPollSummary, KvCacheTransferError> {
-        self.inner.poll_transfers(registry)
+    fn cancel(&mut self, bootstrap_room: BootstrapRoom) -> Result<(), KvCacheTransferError> {
+        self.inner.cancel(bootstrap_room)
+    }
+
+    fn shutdown(&mut self) -> Result<(), KvCacheTransferError> {
+        self.inner.shutdown()
     }
 }
 

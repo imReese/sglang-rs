@@ -1,9 +1,10 @@
 use std::path::Path;
 
 use crate::backend::RuntimeDtype;
+use crate::kv_cache::KvCacheModelLayout;
 use crate::model_artifacts::{HfModelConfig, LocalModelArtifacts, ModelArtifactError};
-use crate::transfer::KvCacheModelLayout;
 
+use super::mla_moe_weights::validate_deepseek_checkpoint;
 use super::{
     AttentionArchitecture, FeedForwardArchitecture, ModelAdapter, ModelAdapterError,
     ModelDefinition, ModelExecutionArchitecture, required_usize,
@@ -31,8 +32,7 @@ impl ModelAdapter for DeepSeekV4Adapter {
         &self,
         artifacts: &LocalModelArtifacts,
     ) -> Result<(), ModelArtifactError> {
-        artifacts.checkpoint_catalog()?.deepseek_model_weights()?;
-        Ok(())
+        validate_deepseek_checkpoint(artifacts)
     }
 }
 

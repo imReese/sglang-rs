@@ -7,9 +7,9 @@ use sglang_kernel::cuda_attention::{
 };
 
 use crate::cuda_kv_cache::{CudaKvStorage, CudaKvStorageError};
+use crate::kv_cache::KvCacheDtype;
 use crate::kv_cache::{PagedKvCacheLayout, PagedKvCacheLayoutError};
 use crate::model_executor::ModelWorkerBatch;
-use crate::transfer::KvCacheDtype;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum CudaPagedAttentionError {

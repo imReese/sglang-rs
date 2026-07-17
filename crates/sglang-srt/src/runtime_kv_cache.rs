@@ -1,41 +1,48 @@
+use std::any::Any;
 use std::fmt;
 
 use nexus_transfer::{KvCacheMemoryProvider, TransferableKvCacheMemory};
 
-use crate::cuda_kv_cache::CudaKvStorage;
-use crate::kv_cache::{KvCachePool, PagedKvCacheLayout};
+use crate::backend::RuntimeBackend;
+use crate::kv_cache::PagedKvCacheLayout;
 use crate::transfer::KvCacheTransferError;
 
-pub(crate) enum RuntimeKvCache {
-    Cuda(KvCachePool<CudaKvStorage>),
+pub(crate) trait ActiveKvCache: Send {
+    fn backend(&self) -> RuntimeBackend;
+    fn layout(&self) -> PagedKvCacheLayout;
+    fn transferable_memory(&self) -> Result<TransferableKvCacheMemory, KvCacheTransferError>;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+pub(crate) struct RuntimeKvCache {
+    allocation: Box<dyn ActiveKvCache>,
 }
 
 impl RuntimeKvCache {
-    pub(crate) fn cuda(pool: KvCachePool<CudaKvStorage>) -> Self {
-        Self::Cuda(pool)
+    pub(crate) fn new(allocation: impl ActiveKvCache + 'static) -> Self {
+        Self {
+            allocation: Box::new(allocation),
+        }
     }
 
     pub(crate) fn execution_resources(&mut self) -> ModelExecutionResources<'_> {
-        match self {
-            Self::Cuda(pool) => ModelExecutionResources {
-                kv_cache: Some(RuntimeKvCacheView::Cuda {
-                    layout: pool.layout(),
-                    storage: pool.storage_mut(),
-                }),
-            },
+        ModelExecutionResources {
+            kv_cache: Some(self.allocation.as_mut()),
         }
+    }
+
+    pub(crate) fn layout(&self) -> PagedKvCacheLayout {
+        self.allocation.layout()
     }
 }
 
 impl fmt::Debug for RuntimeKvCache {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Cuda(pool) => formatter
-                .debug_struct("RuntimeKvCache")
-                .field("backend", &"cuda")
-                .field("layout", &pool.layout())
-                .finish_non_exhaustive(),
-        }
+        formatter
+            .debug_struct("RuntimeKvCache")
+            .field("backend", &self.allocation.backend())
+            .field("layout", &self.allocation.layout())
+            .finish_non_exhaustive()
     }
 }
 
@@ -43,18 +50,12 @@ impl KvCacheMemoryProvider for RuntimeKvCache {
     type Error = KvCacheTransferError;
 
     fn transferable_kv_cache_memory(&self) -> Result<TransferableKvCacheMemory, Self::Error> {
-        match self {
-            Self::Cuda(pool) => pool.transferable_kv_cache_memory().map_err(|error| {
-                KvCacheTransferError::Runtime(format!(
-                    "CUDA runtime KV memory cannot be described by NexusKV: {error}"
-                ))
-            }),
-        }
+        self.allocation.transferable_memory()
     }
 }
 
 pub struct ModelExecutionResources<'a> {
-    kv_cache: Option<RuntimeKvCacheView<'a>>,
+    kv_cache: Option<&'a mut dyn ActiveKvCache>,
 }
 
 impl<'a> ModelExecutionResources<'a> {
@@ -62,17 +63,7 @@ impl<'a> ModelExecutionResources<'a> {
         Self { kv_cache: None }
     }
 
-    pub(crate) fn cuda_kv_cache(self) -> Option<(PagedKvCacheLayout, &'a mut CudaKvStorage)> {
-        match self.kv_cache {
-            Some(RuntimeKvCacheView::Cuda { layout, storage }) => Some((layout, storage)),
-            None => None,
-        }
+    pub(crate) fn active_kv_cache(self) -> Option<&'a mut dyn ActiveKvCache> {
+        self.kv_cache
     }
-}
-
-enum RuntimeKvCacheView<'a> {
-    Cuda {
-        layout: PagedKvCacheLayout,
-        storage: &'a mut CudaKvStorage,
-    },
 }

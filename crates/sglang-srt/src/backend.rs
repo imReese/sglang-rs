@@ -145,6 +145,63 @@ pub struct CudaBackend {
     device: CudaDeviceInfo,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeDevicePlacement {
+    pub(crate) base_gpu_id: usize,
+    pub(crate) gpu_id_step: usize,
+    pub(crate) local_rank: usize,
+    pub(crate) tensor_parallel_rank: usize,
+}
+
+impl RuntimeDevicePlacement {
+    pub(crate) fn for_tensor_parallel_rank(
+        base_gpu_id: usize,
+        gpu_id_step: usize,
+        tensor_parallel_rank: usize,
+        tensor_parallel_size: usize,
+        node_count: usize,
+    ) -> Result<Self, String> {
+        if gpu_id_step == 0 {
+            return Err("gpu_id_step must be positive".to_string());
+        }
+        if tensor_parallel_size == 0 {
+            return Err("tensor parallel size must be positive".to_string());
+        }
+        if node_count == 0 || !tensor_parallel_size.is_multiple_of(node_count) {
+            return Err(format!(
+                "tensor parallel size {tensor_parallel_size} must be divisible by node count {node_count}"
+            ));
+        }
+        if tensor_parallel_rank >= tensor_parallel_size {
+            return Err(format!(
+                "tensor parallel rank {tensor_parallel_rank} must be smaller than tensor parallel size {tensor_parallel_size}"
+            ));
+        }
+        let ranks_per_node = tensor_parallel_size / node_count;
+        Ok(Self {
+            base_gpu_id,
+            gpu_id_step,
+            local_rank: tensor_parallel_rank % ranks_per_node,
+            tensor_parallel_rank,
+        })
+    }
+
+    pub(crate) fn device_ordinal(self) -> Result<usize, String> {
+        self.local_rank
+            .checked_mul(self.gpu_id_step)
+            .and_then(|rank_offset| self.base_gpu_id.checked_add(rank_offset))
+            .ok_or_else(|| {
+                format!(
+                    "device ordinal overflowed for base_gpu_id={}, gpu_id_step={}, local_rank={}, tp_rank={}",
+                    self.base_gpu_id,
+                    self.gpu_id_step,
+                    self.local_rank,
+                    self.tensor_parallel_rank
+                )
+            })
+    }
+}
+
 pub(crate) enum InitializedRuntimeBackend {
     CpuReference,
     Cuda(CudaBackend),
@@ -154,23 +211,30 @@ pub(crate) enum InitializedRuntimeBackend {
 impl InitializedRuntimeBackend {
     pub(crate) fn initialize(
         requested: RuntimeBackend,
+        placement: RuntimeDevicePlacement,
     ) -> Result<Self, RuntimeBackendInitializationError> {
+        let device_ordinal = placement
+            .device_ordinal()
+            .map_err(|message| RuntimeBackendInitializationError { requested, message })?;
         match requested {
             RuntimeBackend::Cpu => Ok(Self::CpuReference),
-            RuntimeBackend::Cuda => CudaBackend::initialize(0).map(Self::Cuda).map_err(|error| {
-                RuntimeBackendInitializationError {
-                    requested,
-                    message: error.to_string(),
-                }
-            }),
-            RuntimeBackend::Auto => CudaBackend::initialize(0).map(Self::Cuda).map_err(|error| {
-                RuntimeBackendInitializationError {
+            RuntimeBackend::Cuda => CudaBackend::initialize(device_ordinal)
+                .map(Self::Cuda)
+                .map_err(|error| RuntimeBackendInitializationError {
                     requested,
                     message: format!(
-                        "no executable production backend was detected; CUDA initialization failed: {error}; auto never falls back to the CPU reference backend"
+                        "failed to initialize CUDA device ordinal {device_ordinal} for local rank {} / TP rank {}: {error}",
+                        placement.local_rank, placement.tensor_parallel_rank
                     ),
-                }
-            }),
+                }),
+            RuntimeBackend::Auto => CudaBackend::initialize(device_ordinal)
+                .map(Self::Cuda)
+                .map_err(|error| RuntimeBackendInitializationError {
+                    requested,
+                    message: format!(
+                        "no executable production backend was detected for device ordinal {device_ordinal}; registered CUDA backend initialization failed: {error}; auto never falls back to the CPU reference backend"
+                    ),
+                }),
             backend => Ok(Self::Unavailable(backend)),
         }
     }
@@ -492,7 +556,6 @@ pub fn validate_runtime_backend(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransferBackendClass {
     Production,
-    Reference,
     Planned,
 }
 
@@ -511,11 +574,6 @@ impl TransferBackendCapability {
                 class: TransferBackendClass::Production,
                 linked_transport: cfg!(feature = "mooncake-link"),
             },
-            TransferBackend::Fake => Self {
-                backend,
-                class: TransferBackendClass::Reference,
-                linked_transport: false,
-            },
             TransferBackend::Nixl | TransferBackend::Ascend | TransferBackend::Mori => Self {
                 backend,
                 class: TransferBackendClass::Planned,
@@ -524,11 +582,43 @@ impl TransferBackendCapability {
         }
     }
 
-    pub fn is_reference_only(self) -> bool {
-        self.class == TransferBackendClass::Reference
-    }
-
     pub fn is_production(self) -> bool {
         self.class == TransferBackendClass::Production
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InitializedRuntimeBackend, RuntimeBackend, RuntimeDevicePlacement};
+
+    #[test]
+    fn device_placement_uses_base_step_and_local_tensor_parallel_rank() {
+        let placement = RuntimeDevicePlacement::for_tensor_parallel_rank(2, 3, 5, 8, 2)
+            .expect("placement should be valid");
+
+        assert_eq!(placement.local_rank, 1);
+        assert_eq!(placement.tensor_parallel_rank, 5);
+        assert_eq!(placement.device_ordinal().expect("ordinal"), 5);
+    }
+
+    #[test]
+    fn device_placement_rejects_invalid_distributed_geometry() {
+        assert!(RuntimeDevicePlacement::for_tensor_parallel_rank(0, 0, 0, 1, 1).is_err());
+        assert!(RuntimeDevicePlacement::for_tensor_parallel_rank(0, 1, 0, 3, 2).is_err());
+        assert!(RuntimeDevicePlacement::for_tensor_parallel_rank(0, 1, 4, 4, 1).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn auto_does_not_fall_back_to_cpu_reference_on_macos() {
+        let placement = RuntimeDevicePlacement::for_tensor_parallel_rank(0, 1, 0, 1, 1)
+            .expect("placement should be valid");
+        let error = match InitializedRuntimeBackend::initialize(RuntimeBackend::Auto, placement) {
+            Ok(_) => panic!("Mac has no registered production CUDA backend"),
+            Err(error) => error,
+        };
+
+        assert!(error.message.contains("auto never falls back"));
+        assert!(error.message.contains("device ordinal 0"));
     }
 }

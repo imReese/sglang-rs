@@ -3,8 +3,6 @@ use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
 use std::ffi::{NulError, c_char, c_int, c_void};
 use std::fmt;
-use std::fs;
-use std::path::Path;
 #[cfg(feature = "mooncake-link")]
 use std::sync::{Arc, Mutex};
 
@@ -17,8 +15,10 @@ pub use nexus_transfer::{
 
 use crate::cache::CachePageId;
 use crate::cli::{ServerArgs, ZmqPortRange};
-use crate::model_artifacts::{HfModelConfig, resolve_model_path};
-use crate::model_executor::{ModelRunner, ModelWorkerBatch};
+pub use crate::kv_cache::{KvCacheDtype, KvCacheModelLayout, KvCacheRuntimeLayout};
+#[cfg(any(test, feature = "test-support"))]
+use crate::model_executor::ModelRunner;
+use crate::model_executor::ModelWorkerBatch;
 use crate::scheduler::{ForwardMode, ScheduleBatch, ScheduledRequest};
 use crate::types::{BootstrapRoom, DisaggregatedParams, RequestId};
 use crate::worker::{
@@ -57,7 +57,6 @@ pub enum TransferBackend {
     Mooncake,
     Nixl,
     Ascend,
-    Fake,
     Mori,
 }
 
@@ -80,10 +79,6 @@ impl TransferBackend {
                 backend: Self::Ascend,
                 force_tcp_transport: false,
             }),
-            "fake" => Ok(ParsedTransferBackend {
-                backend: Self::Fake,
-                force_tcp_transport: false,
-            }),
             "mori" => Ok(ParsedTransferBackend {
                 backend: Self::Mori,
                 force_tcp_transport: false,
@@ -99,315 +94,6 @@ struct ParsedTransferBackend {
     force_tcp_transport: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum KvCacheDtype {
-    Auto,
-    Bfloat16,
-    Fp8E4M3,
-    Fp8E5M2,
-    Fp4E2M1,
-}
-
-impl KvCacheDtype {
-    fn parse(value: &str) -> Result<Self, PdConfigError> {
-        match value.to_ascii_lowercase().as_str() {
-            "auto" => Ok(Self::Auto),
-            "bf16" | "bfloat16" => Ok(Self::Bfloat16),
-            "fp8_e4m3" => Ok(Self::Fp8E4M3),
-            "fp8_e5m2" => Ok(Self::Fp8E5M2),
-            "fp4_e2m1" => Ok(Self::Fp4E2M1),
-            _ => Err(PdConfigError::InvalidKvCacheDtype(value.to_string())),
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Bfloat16 => "bfloat16",
-            Self::Fp8E4M3 => "fp8_e4m3",
-            Self::Fp8E5M2 => "fp8_e5m2",
-            Self::Fp4E2M1 => "fp4_e2m1",
-        }
-    }
-
-    pub fn bytes_per_element(&self) -> Option<usize> {
-        match self {
-            Self::Auto | Self::Bfloat16 => Some(2),
-            Self::Fp8E4M3 | Self::Fp8E5M2 => Some(1),
-            Self::Fp4E2M1 => None,
-        }
-    }
-
-    pub fn runtime_storage_dtype(self) -> Self {
-        match self {
-            Self::Auto => Self::Bfloat16,
-            dtype => dtype,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct KvCacheRuntimeLayout {
-    pub dtype: KvCacheDtype,
-    pub page_size: usize,
-    pub num_layers: usize,
-    pub kv_heads: usize,
-    pub head_dim: usize,
-    pub kv_tensors_per_token: usize,
-    pub bytes_per_token: usize,
-    pub page_size_bytes: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct KvCacheModelLayout {
-    pub num_layers: usize,
-    pub kv_heads: usize,
-    pub head_dim: usize,
-    pub kv_tensors_per_token: usize,
-    pub bytes_per_token_per_layer: Option<usize>,
-}
-
-impl KvCacheModelLayout {
-    pub fn multi_tensor(
-        num_layers: usize,
-        kv_heads: usize,
-        head_dim: usize,
-        kv_tensors_per_token: usize,
-    ) -> Self {
-        Self {
-            num_layers,
-            kv_heads,
-            head_dim,
-            kv_tensors_per_token,
-            bytes_per_token_per_layer: None,
-        }
-    }
-
-    pub fn packed_bytes_per_layer(num_layers: usize, bytes_per_token_per_layer: usize) -> Self {
-        Self {
-            num_layers,
-            kv_heads: 1,
-            head_dim: bytes_per_token_per_layer,
-            kv_tensors_per_token: 1,
-            bytes_per_token_per_layer: Some(bytes_per_token_per_layer),
-        }
-    }
-
-    pub fn elements_per_token(&self) -> Option<usize> {
-        self.num_layers
-            .checked_mul(self.kv_tensors_per_token)
-            .and_then(|value| value.checked_mul(self.kv_heads))
-            .and_then(|value| value.checked_mul(self.head_dim))
-    }
-
-    pub fn token_size_bytes(&self, dtype: KvCacheDtype) -> Result<usize, PdConfigError> {
-        if let Some(bytes_per_token_per_layer) = self.bytes_per_token_per_layer {
-            return self
-                .num_layers
-                .checked_mul(bytes_per_token_per_layer)
-                .ok_or(PdConfigError::KvCacheLayoutOverflow);
-        }
-
-        let elements_per_token = self
-            .elements_per_token()
-            .ok_or(PdConfigError::KvCacheLayoutOverflow)?;
-        let bytes_per_element = dtype
-            .bytes_per_element()
-            .ok_or(PdConfigError::KvCacheDtypeRequiresModelMetadata(dtype))?;
-
-        elements_per_token
-            .checked_mul(bytes_per_element)
-            .ok_or(PdConfigError::KvCacheLayoutOverflow)
-    }
-
-    fn from_model_path(model_path: &str) -> Result<Option<Self>, PdConfigError> {
-        let resolved_model_path = resolve_model_path(Path::new(model_path));
-        if let Some(layout) = Self::from_resolved_model_path(&resolved_model_path)? {
-            return Ok(Some(layout));
-        }
-
-        if !looks_like_hf_model_id(model_path) {
-            return Ok(None);
-        }
-
-        let config = HfModelConfig::from_model_path(model_path).map_err(|error| {
-            PdConfigError::InvalidModelConfig(format!(
-                "failed to load Hugging Face config for {model_path}: {error}"
-            ))
-        })?;
-        Self::from_hf_config(&config)
-    }
-
-    pub fn from_model_path_with_hf_cache(
-        model_path: &str,
-        hub_cache: impl AsRef<Path>,
-    ) -> Result<Option<Self>, PdConfigError> {
-        let model_path =
-            crate::model_artifacts::resolve_model_path_from_hf_cache(model_path, hub_cache)
-                .unwrap_or_else(|| Path::new(model_path).to_path_buf());
-        Self::from_resolved_model_path(&model_path)
-    }
-
-    pub fn from_hf_config(config: &HfModelConfig) -> Result<Option<Self>, PdConfigError> {
-        let Some(num_layers) = config.num_hidden_layers else {
-            return Ok(None);
-        };
-
-        if config.qk_nope_head_dim.is_some() || config.qk_rope_head_dim.is_some() {
-            let qk_nope_head_dim =
-                required_hf_config_usize(config.qk_nope_head_dim, "qk_nope_head_dim")?;
-            let qk_rope_head_dim =
-                required_hf_config_usize(config.qk_rope_head_dim, "qk_rope_head_dim")?;
-            return Self::packed_mla(num_layers, qk_nope_head_dim, qk_rope_head_dim).map(Some);
-        }
-
-        let num_attention_heads =
-            required_hf_config_usize(config.num_attention_heads, "num_attention_heads")?;
-        let kv_heads = config.num_key_value_heads.unwrap_or(num_attention_heads);
-        let head_dim = match config.head_dim {
-            Some(head_dim) => head_dim,
-            None => {
-                let hidden_size = required_hf_config_usize(config.hidden_size, "hidden_size")?;
-                if num_attention_heads == 0 || hidden_size % num_attention_heads != 0 {
-                    return Err(PdConfigError::InvalidModelConfig(format!(
-                        "hidden_size ({hidden_size}) must be divisible by num_attention_heads ({num_attention_heads})"
-                    )));
-                }
-                hidden_size / num_attention_heads
-            }
-        };
-
-        Ok(Some(Self::multi_tensor(num_layers, kv_heads, head_dim, 2)))
-    }
-
-    fn from_resolved_model_path(model_path: &Path) -> Result<Option<Self>, PdConfigError> {
-        if !model_path.is_dir() {
-            return Ok(None);
-        }
-
-        let config_path = model_path.join("config.json");
-        if !config_path.is_file() {
-            return Ok(None);
-        }
-
-        let config = fs::read_to_string(&config_path).map_err(|error| {
-            PdConfigError::InvalidModelConfig(format!(
-                "failed to read {}: {error}",
-                config_path.display()
-            ))
-        })?;
-        let config: serde_json::Value = serde_json::from_str(&config).map_err(|error| {
-            PdConfigError::InvalidModelConfig(format!(
-                "failed to parse {}: {error}",
-                config_path.display()
-            ))
-        })?;
-
-        Self::from_hf_config_value(&config)
-    }
-
-    fn from_hf_config_value(config: &serde_json::Value) -> Result<Option<Self>, PdConfigError> {
-        let Some(num_layers) = read_usize_field(config, "num_hidden_layers")? else {
-            return Ok(None);
-        };
-
-        if config.get("qk_nope_head_dim").is_some() || config.get("qk_rope_head_dim").is_some() {
-            let qk_nope_head_dim = required_usize_field(config, "qk_nope_head_dim")?;
-            let qk_rope_head_dim = required_usize_field(config, "qk_rope_head_dim")?;
-            return Self::packed_mla(num_layers, qk_nope_head_dim, qk_rope_head_dim).map(Some);
-        }
-
-        let num_attention_heads = required_usize_field(config, "num_attention_heads")?;
-        let kv_heads =
-            read_usize_field(config, "num_key_value_heads")?.unwrap_or(num_attention_heads);
-        let head_dim = match read_usize_field(config, "head_dim")? {
-            Some(head_dim) => head_dim,
-            None => {
-                let hidden_size = required_usize_field(config, "hidden_size")?;
-                if num_attention_heads == 0 || hidden_size % num_attention_heads != 0 {
-                    return Err(PdConfigError::InvalidModelConfig(format!(
-                        "hidden_size ({hidden_size}) must be divisible by num_attention_heads ({num_attention_heads})"
-                    )));
-                }
-                hidden_size / num_attention_heads
-            }
-        };
-
-        Ok(Some(Self::multi_tensor(num_layers, kv_heads, head_dim, 2)))
-    }
-
-    pub fn packed_mla(
-        num_layers: usize,
-        qk_nope_head_dim: usize,
-        qk_rope_head_dim: usize,
-    ) -> Result<Self, PdConfigError> {
-        if !qk_nope_head_dim.is_multiple_of(64) {
-            return Err(PdConfigError::InvalidModelConfig(format!(
-                "qk_nope_head_dim must be divisible by 64 for packed MLA KV layout: {qk_nope_head_dim}"
-            )));
-        }
-
-        let rope_bytes = qk_rope_head_dim
-            .checked_mul(2)
-            .ok_or(PdConfigError::KvCacheLayoutOverflow)?;
-        let scale_bytes = qk_nope_head_dim / 64;
-        let bytes_per_token_per_layer = qk_nope_head_dim
-            .checked_add(rope_bytes)
-            .and_then(|value| value.checked_add(scale_bytes))
-            .and_then(|value| value.checked_add(1))
-            .ok_or(PdConfigError::KvCacheLayoutOverflow)?;
-
-        Ok(Self::packed_bytes_per_layer(
-            num_layers,
-            bytes_per_token_per_layer,
-        ))
-    }
-}
-
-fn required_hf_config_usize(
-    value: Option<usize>,
-    field: &'static str,
-) -> Result<usize, PdConfigError> {
-    value
-        .ok_or_else(|| PdConfigError::InvalidModelConfig(format!("missing required field {field}")))
-}
-
-fn read_usize_field(
-    config: &serde_json::Value,
-    field: &'static str,
-) -> Result<Option<usize>, PdConfigError> {
-    let Some(value) = config.get(field) else {
-        return Ok(None);
-    };
-
-    let Some(value) = value.as_u64() else {
-        return Err(PdConfigError::InvalidModelConfig(format!(
-            "{field} must be an unsigned integer"
-        )));
-    };
-
-    usize::try_from(value).map(Some).map_err(|_| {
-        PdConfigError::InvalidModelConfig(format!(
-            "{field} is too large for this platform: {value}"
-        ))
-    })
-}
-
-fn looks_like_hf_model_id(model_path: &str) -> bool {
-    model_path.contains('/')
-        && !model_path.starts_with('/')
-        && !model_path.starts_with('-')
-        && !model_path.contains('\\')
-}
-
-fn required_usize_field(
-    config: &serde_json::Value,
-    field: &'static str,
-) -> Result<usize, PdConfigError> {
-    read_usize_field(config, field)?
-        .ok_or_else(|| PdConfigError::InvalidModelConfig(format!("missing required field {field}")))
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct PdConfig {
     pub mode: DisaggregationMode,
@@ -421,7 +107,6 @@ pub struct PdConfig {
     pub num_reserved_decode_tokens: usize,
     pub decode_polling_interval: usize,
     pub kv_cache_dtype: KvCacheDtype,
-    pub kv_cache_model_layout: Option<KvCacheModelLayout>,
     pub page_size: usize,
     pub base_gpu_id: usize,
     pub gpu_id_step: usize,
@@ -466,54 +151,10 @@ pub struct PdConfig {
 
 impl PdConfig {
     pub fn from_server_args(args: &ServerArgs) -> Result<Self, PdConfigError> {
-        let kv_cache_model_layout = Self::model_layout_from_server_args(args)?;
-        Self::from_server_args_with_model_layout(args, kv_cache_model_layout)
-    }
-
-    pub fn from_server_args_with_hf_cache(
-        args: &ServerArgs,
-        hub_cache: impl AsRef<Path>,
-    ) -> Result<Self, PdConfigError> {
-        let kv_cache_model_layout = match (
-            args.kv_cache_num_layers,
-            args.kv_cache_kv_heads,
-            args.kv_cache_head_dim,
-        ) {
-            (None, None, None) => {
-                KvCacheModelLayout::from_model_path_with_hf_cache(&args.model_path, hub_cache)?
-            }
-            (Some(num_layers), Some(kv_heads), Some(head_dim)) => Some(
-                KvCacheModelLayout::multi_tensor(num_layers, kv_heads, head_dim, 2),
-            ),
-            _ => return Err(PdConfigError::IncompleteKvCacheModelLayout),
-        };
-
-        Self::from_server_args_with_model_layout(args, kv_cache_model_layout)
-    }
-
-    fn model_layout_from_server_args(
-        args: &ServerArgs,
-    ) -> Result<Option<KvCacheModelLayout>, PdConfigError> {
-        match (
-            args.kv_cache_num_layers,
-            args.kv_cache_kv_heads,
-            args.kv_cache_head_dim,
-        ) {
-            (None, None, None) => KvCacheModelLayout::from_model_path(&args.model_path),
-            (Some(num_layers), Some(kv_heads), Some(head_dim)) => Ok(Some(
-                KvCacheModelLayout::multi_tensor(num_layers, kv_heads, head_dim, 2),
-            )),
-            _ => Err(PdConfigError::IncompleteKvCacheModelLayout),
-        }
-    }
-
-    fn from_server_args_with_model_layout(
-        args: &ServerArgs,
-        kv_cache_model_layout: Option<KvCacheModelLayout>,
-    ) -> Result<Self, PdConfigError> {
         let mode = DisaggregationMode::parse(&args.disaggregation_mode)?;
         let backend = TransferBackend::parse(&args.disaggregation_transfer_backend)?;
-        let kv_cache_dtype = KvCacheDtype::parse(&args.kv_cache_dtype)?;
+        let kv_cache_dtype = KvCacheDtype::parse(&args.kv_cache_dtype)
+            .ok_or_else(|| PdConfigError::InvalidKvCacheDtype(args.kv_cache_dtype.clone()))?;
 
         Ok(Self {
             mode,
@@ -531,7 +172,6 @@ impl PdConfig {
             num_reserved_decode_tokens: args.num_reserved_decode_tokens,
             decode_polling_interval: args.disaggregation_decode_polling_interval,
             kv_cache_dtype,
-            kv_cache_model_layout,
             page_size: args.page_size,
             base_gpu_id: args.base_gpu_id,
             gpu_id_step: args.gpu_id_step,
@@ -574,30 +214,6 @@ impl PdConfig {
             tool_call_parser: args.tool_call_parser.clone(),
         })
     }
-
-    pub fn kv_cache_runtime_layout(&self) -> Result<Option<KvCacheRuntimeLayout>, PdConfigError> {
-        let Some(model_layout) = self.kv_cache_model_layout else {
-            return Ok(None);
-        };
-
-        let runtime_dtype = self.kv_cache_dtype.runtime_storage_dtype();
-        let bytes_per_token = model_layout.token_size_bytes(runtime_dtype)?;
-        let page_size_bytes = self
-            .page_size
-            .checked_mul(bytes_per_token)
-            .ok_or(PdConfigError::KvCacheLayoutOverflow)?;
-
-        Ok(Some(KvCacheRuntimeLayout {
-            dtype: runtime_dtype,
-            page_size: self.page_size,
-            num_layers: model_layout.num_layers,
-            kv_heads: model_layout.kv_heads,
-            head_dim: model_layout.head_dim,
-            kv_tensors_per_token: model_layout.kv_tensors_per_token,
-            bytes_per_token,
-            page_size_bytes,
-        }))
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -605,11 +221,6 @@ pub enum PdConfigError {
     InvalidDisaggregationMode(String),
     InvalidTransferBackend(String),
     InvalidKvCacheDtype(String),
-    InvalidModelConfig(String),
-    IncompleteKvCacheModelLayout,
-    MissingMooncakeKvCacheModelLayout,
-    KvCacheDtypeRequiresModelMetadata(KvCacheDtype),
-    KvCacheLayoutOverflow,
 }
 
 impl fmt::Display for PdConfigError {
@@ -626,25 +237,6 @@ impl fmt::Display for PdConfigError {
             }
             Self::InvalidKvCacheDtype(dtype) => {
                 write!(formatter, "invalid kv cache dtype: {dtype}")
-            }
-            Self::InvalidModelConfig(message) => {
-                write!(formatter, "invalid model config: {message}")
-            }
-            Self::IncompleteKvCacheModelLayout => formatter
-                .write_str("kv cache model layout requires num layers, KV heads, and head dim"),
-            Self::MissingMooncakeKvCacheModelLayout => formatter.write_str(
-                "mooncake decode requires kv cache model layout; provide \
-                     --kv-cache-num-layers, --kv-cache-kv-heads, and --kv-cache-head-dim, \
-                     or use a local model path / Hugging Face cache snapshot with config.json metadata",
-            ),
-            Self::KvCacheDtypeRequiresModelMetadata(dtype) => {
-                write!(
-                    formatter,
-                    "kv cache dtype requires model metadata for byte width: {dtype:?}"
-                )
-            }
-            Self::KvCacheLayoutOverflow => {
-                formatter.write_str("kv cache layout byte size overflow")
             }
         }
     }
@@ -751,18 +343,6 @@ impl MooncakeTransferEngineConfig {
             },
             device_name: config.ib_device.clone().unwrap_or_default(),
         }
-    }
-
-    pub fn from_pd_config_for_rank(
-        hostname: impl Into<String>,
-        local_rank: usize,
-        config: &PdConfig,
-    ) -> Self {
-        Self::from_pd_config(
-            hostname,
-            config.base_gpu_id + local_rank * config.gpu_id_step,
-            config,
-        )
     }
 
     pub fn session_id(&self) -> &str {
@@ -1256,6 +836,7 @@ pub trait DecodeBootstrapPublisher {
     ) -> Result<DecodeBootstrapMetadataPublishSummary, String>;
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub trait KvCachePageSnapshotProvider {
     type Snapshot;
 
@@ -1265,6 +846,7 @@ pub trait KvCachePageSnapshotProvider {
     ) -> Result<Vec<Self::Snapshot>, KvCacheTransferError>;
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub trait KvCachePageSnapshotChecksum {
     fn update_content_checksum(&self, hasher: &mut Sha256);
 
@@ -1277,12 +859,14 @@ pub trait KvCachePageSnapshotChecksum {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl KvCachePageSnapshotChecksum for CachePageId {
     fn update_content_checksum(&self, hasher: &mut Sha256) {
         hasher.update((self.as_usize() as u64).to_le_bytes());
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub fn snapshot_content_checksum<S>(snapshots: &[S]) -> String
 where
     S: KvCachePageSnapshotChecksum,
@@ -1297,6 +881,7 @@ where
     hex_encode(&digest)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub trait KvCachePageSnapshotImporter {
     type Snapshot;
 
@@ -1306,6 +891,7 @@ pub trait KvCachePageSnapshotImporter {
     ) -> Result<(), KvCacheTransferError>;
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl<M, S> KvCachePageSnapshotProvider for ModelRunner<M, S>
 where
     M: KvCachePageSnapshotProvider,
@@ -1320,6 +906,7 @@ where
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl<M, S> KvCachePageSnapshotImporter for ModelRunner<M, S>
 where
     M: KvCachePageSnapshotImporter,
@@ -1334,12 +921,14 @@ where
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub struct LocalSnapshotTransferPdModelWorkers<P, D> {
     prefill: P,
     decode: D,
     last_transfer_summary: Option<KvCacheTransferSummary>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl<P, D> LocalSnapshotTransferPdModelWorkers<P, D> {
     pub fn new(prefill: P, decode: D) -> Self {
         Self {
@@ -1370,6 +959,7 @@ impl<P, D> LocalSnapshotTransferPdModelWorkers<P, D> {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl<P, D> FallibleModelWorker for LocalSnapshotTransferPdModelWorkers<P, D>
 where
     P: FallibleModelWorker + KvCachePageSnapshotProvider,
@@ -1411,6 +1001,7 @@ where
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl<P, D> LocalSnapshotTransferPdModelWorkers<P, D>
 where
     P: FallibleModelWorker + KvCachePageSnapshotProvider,
@@ -1472,42 +1063,141 @@ impl DecodeBootstrapPublisher for NoopDecodeBootstrapPublisher {
     }
 }
 
-pub trait KvTransferBackend {
-    fn transfer_span(&mut self, span: &KvCacheTransferSpan) -> Result<(), KvCacheTransferError>;
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KvTransferEventStatus {
+    Completed,
+    Failed(String),
+    Canceled,
+}
 
-    fn completes_inline(&self) -> bool {
-        true
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KvTransferCompletionEvent {
+    bootstrap_room: BootstrapRoom,
+    descriptor_checksum: String,
+    status: KvTransferEventStatus,
+}
+
+impl KvTransferCompletionEvent {
+    pub fn completed(bootstrap_room: BootstrapRoom, descriptor_checksum: String) -> Self {
+        Self {
+            bootstrap_room,
+            descriptor_checksum,
+            status: KvTransferEventStatus::Completed,
+        }
     }
 
-    fn poll_transfers(
-        &mut self,
-        _registry: &mut DecodeBootstrapRegistry,
-    ) -> Result<KvTransferPollSummary, KvCacheTransferError> {
-        Ok(KvTransferPollSummary::default())
+    pub fn failed(
+        bootstrap_room: BootstrapRoom,
+        descriptor_checksum: String,
+        message: String,
+    ) -> Self {
+        Self {
+            bootstrap_room,
+            descriptor_checksum,
+            status: KvTransferEventStatus::Failed(message),
+        }
     }
 
-    fn cancel_transfer_room(
-        &mut self,
-        _bootstrap_room: BootstrapRoom,
-    ) -> Result<(), KvCacheTransferError> {
-        Ok(())
+    pub fn canceled(bootstrap_room: BootstrapRoom, descriptor_checksum: String) -> Self {
+        Self {
+            bootstrap_room,
+            descriptor_checksum,
+            status: KvTransferEventStatus::Canceled,
+        }
+    }
+
+    pub fn bootstrap_room(&self) -> BootstrapRoom {
+        self.bootstrap_room
+    }
+
+    pub fn descriptor_checksum(&self) -> &str {
+        &self.descriptor_checksum
+    }
+
+    pub fn status(&self) -> &KvTransferEventStatus {
+        &self.status
     }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct FakeKvCacheTransferExecutor {
-    transferred_rooms: Vec<BootstrapRoom>,
+pub struct KvTransferPoll {
+    events: Vec<KvTransferCompletionEvent>,
+    pending_transfers: usize,
 }
 
+impl KvTransferPoll {
+    pub fn new(events: Vec<KvTransferCompletionEvent>, pending_transfers: usize) -> Self {
+        Self {
+            events,
+            pending_transfers,
+        }
+    }
+
+    pub fn events(&self) -> &[KvTransferCompletionEvent] {
+        &self.events
+    }
+
+    pub fn pending_transfers(&self) -> usize {
+        self.pending_transfers
+    }
+}
+
+pub trait KvTransferBackend {
+    fn register(&mut self, memory: TransferableKvCacheMemory) -> Result<(), KvCacheTransferError>;
+    fn submit(&mut self, span: &KvCacheTransferSpan) -> Result<(), KvCacheTransferError>;
+    fn poll(&mut self) -> Result<KvTransferPoll, KvCacheTransferError>;
+    fn cancel(&mut self, bootstrap_room: BootstrapRoom) -> Result<(), KvCacheTransferError>;
+    fn shutdown(&mut self) -> Result<(), KvCacheTransferError>;
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FakeKvCacheTransferExecutor {
+    registered_memory: Option<TransferableKvCacheMemory>,
+    transferred_rooms: Vec<BootstrapRoom>,
+    pending: Vec<(BootstrapRoom, String)>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
 impl FakeKvCacheTransferExecutor {
     pub fn transferred_rooms(&self) -> &[BootstrapRoom] {
         &self.transferred_rooms
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl KvTransferBackend for FakeKvCacheTransferExecutor {
-    fn transfer_span(&mut self, span: &KvCacheTransferSpan) -> Result<(), KvCacheTransferError> {
+    fn register(&mut self, memory: TransferableKvCacheMemory) -> Result<(), KvCacheTransferError> {
+        self.registered_memory = Some(memory);
+        Ok(())
+    }
+
+    fn submit(&mut self, span: &KvCacheTransferSpan) -> Result<(), KvCacheTransferError> {
         self.transferred_rooms.push(span.bootstrap_room());
+        self.pending
+            .push((span.bootstrap_room(), span.descriptor_checksum()));
+        Ok(())
+    }
+
+    fn poll(&mut self) -> Result<KvTransferPoll, KvCacheTransferError> {
+        Ok(KvTransferPoll {
+            events: self
+                .pending
+                .drain(..)
+                .map(|(room, checksum)| KvTransferCompletionEvent::completed(room, checksum))
+                .collect(),
+            pending_transfers: 0,
+        })
+    }
+
+    fn cancel(&mut self, bootstrap_room: BootstrapRoom) -> Result<(), KvCacheTransferError> {
+        self.pending.retain(|(room, _)| *room != bootstrap_room);
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> Result<(), KvCacheTransferError> {
+        self.pending.clear();
+        self.registered_memory = None;
         Ok(())
     }
 }
@@ -1530,12 +1220,9 @@ where
         }
 
         registry.update_status(span.bootstrap_room(), KvPoll::Transferring)?;
-        if let Err(error) = executor.transfer_span(span) {
+        if let Err(error) = executor.submit(span) {
             registry.update_status(span.bootstrap_room(), KvPoll::Failed)?;
             return Err(error);
-        }
-        if executor.completes_inline() {
-            registry.update_status(span.bootstrap_room(), KvPoll::Success)?;
         }
         summary.submitted_spans += 1;
     }
@@ -1675,6 +1362,7 @@ impl<W, E, P> KvTransferModelWorker<W, E, P> {
         self.last_transfer_summary.as_ref()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn export_kv_cache_pages(
         &self,
         cache_pages: &[CachePageId],
@@ -1685,6 +1373,7 @@ impl<W, E, P> KvTransferModelWorker<W, E, P> {
         self.worker.export_kv_cache_pages(cache_pages)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn import_kv_cache_pages(
         &mut self,
         snapshots: Vec<W::Snapshot>,
@@ -1785,7 +1474,8 @@ where
     }
 
     fn poll_transfers(&mut self) -> Result<KvTransferPollSummary, KvCacheTransferError> {
-        self.transfer_executor.poll_transfers(&mut self.registry)
+        let poll = self.transfer_executor.poll()?;
+        apply_transfer_completion_events(&mut self.registry, poll)
     }
 
     fn complete_request(&mut self, request: &ScheduledRequest) {
@@ -1793,7 +1483,7 @@ where
             self.registry.remove(disaggregated_params.bootstrap_room);
             let _ = self
                 .transfer_executor
-                .cancel_transfer_room(disaggregated_params.bootstrap_room);
+                .cancel(disaggregated_params.bootstrap_room);
         }
 
         self.worker.complete_request(request)
@@ -1809,7 +1499,7 @@ where
                 self.registry.remove(disaggregated_params.bootstrap_room);
                 let _ = self
                     .transfer_executor
-                    .cancel_transfer_room(disaggregated_params.bootstrap_room);
+                    .cancel(disaggregated_params.bootstrap_room);
             }
         }
 
@@ -1945,64 +1635,6 @@ pub struct MooncakeKvCacheLayout {
     pub target_base_offset: u64,
 }
 
-impl MooncakeKvCacheLayout {
-    pub fn from_pd_config(
-        source_base_addr: usize,
-        token_size_bytes: usize,
-        target_base_offset: u64,
-        config: &PdConfig,
-    ) -> Self {
-        Self {
-            source_base_addr,
-            page_size_bytes: config.page_size * token_size_bytes,
-            target_base_offset,
-        }
-    }
-
-    pub fn from_pd_config_kv_elements(
-        source_base_addr: usize,
-        kv_elements_per_token: usize,
-        target_base_offset: u64,
-        config: &PdConfig,
-    ) -> Result<Self, PdConfigError> {
-        let bytes_per_element = config.kv_cache_dtype.bytes_per_element().ok_or(
-            PdConfigError::KvCacheDtypeRequiresModelMetadata(config.kv_cache_dtype),
-        )?;
-        let token_size_bytes = kv_elements_per_token
-            .checked_mul(bytes_per_element)
-            .ok_or(PdConfigError::KvCacheLayoutOverflow)?;
-        let page_size_bytes = config
-            .page_size
-            .checked_mul(token_size_bytes)
-            .ok_or(PdConfigError::KvCacheLayoutOverflow)?;
-
-        Ok(Self {
-            source_base_addr,
-            page_size_bytes,
-            target_base_offset,
-        })
-    }
-
-    pub fn from_pd_config_model_layout(
-        source_base_addr: usize,
-        target_base_offset: u64,
-        config: &PdConfig,
-        model_layout: &KvCacheModelLayout,
-    ) -> Result<Self, PdConfigError> {
-        let token_size_bytes = model_layout.token_size_bytes(config.kv_cache_dtype)?;
-        let page_size_bytes = config
-            .page_size
-            .checked_mul(token_size_bytes)
-            .ok_or(PdConfigError::KvCacheLayoutOverflow)?;
-
-        Ok(Self {
-            source_base_addr,
-            page_size_bytes,
-            target_base_offset,
-        })
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MooncakeTransferTarget {
     pub target_id: i32,
@@ -2071,6 +1703,20 @@ pub trait MooncakeMemoryRegistrar: Send + 'static {
     ) -> Result<(), MooncakeError>;
 
     fn unregister_memory_batch(&mut self, addrs: &mut [*mut c_void]) -> Result<(), MooncakeError>;
+}
+
+impl MooncakeMemoryRegistrar for Box<dyn MooncakeMemoryRegistrar> {
+    fn register_memory_batch(
+        &mut self,
+        buffers: &mut [MooncakeBufferEntry],
+        location: &str,
+    ) -> Result<(), MooncakeError> {
+        self.as_mut().register_memory_batch(buffers, location)
+    }
+
+    fn unregister_memory_batch(&mut self, addrs: &mut [*mut c_void]) -> Result<(), MooncakeError> {
+        self.as_mut().unregister_memory_batch(addrs)
+    }
 }
 
 pub trait MooncakeMemoryRegistrationLease: Send {
@@ -2608,8 +2254,10 @@ impl MooncakeSubmittedBatch {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct KvTransferPollSummary {
     completed_batches: usize,
+    failed_batches: usize,
     pending_batches: usize,
     completed_descriptor_checksums: Vec<String>,
+    failed_descriptor_checksums: Vec<String>,
     pending_descriptor_checksums: Vec<String>,
 }
 
@@ -2622,6 +2270,10 @@ impl KvTransferPollSummary {
         self.pending_batches
     }
 
+    pub fn failed_batches(&self) -> usize {
+        self.failed_batches
+    }
+
     pub fn completed_descriptor_checksums(&self) -> &[String] {
         &self.completed_descriptor_checksums
     }
@@ -2629,73 +2281,82 @@ impl KvTransferPollSummary {
     pub fn pending_descriptor_checksums(&self) -> &[String] {
         &self.pending_descriptor_checksums
     }
+
+    pub fn failed_descriptor_checksums(&self) -> &[String] {
+        &self.failed_descriptor_checksums
+    }
 }
 
-pub fn poll_mooncake_transfer_batches<R>(
+pub fn apply_transfer_completion_events(
     registry: &mut DecodeBootstrapRegistry,
-    reader: &mut R,
-    submitted_batches: &[MooncakeSubmittedBatch],
-) -> Result<KvTransferPollSummary, KvCacheTransferError>
-where
-    R: MooncakeTransferStatusReader,
-{
-    let mut summary = KvTransferPollSummary::default();
-
-    for batch in submitted_batches {
-        let mut completed_tasks = 0;
-
-        for task_id in 0..batch.task_count() {
-            let status = reader
-                .transfer_status(batch.batch_id(), task_id)
-                .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
-            match MooncakeTransferStatusCode::try_from(status.status)? {
-                MooncakeTransferStatusCode::Completed => {
-                    completed_tasks += 1;
-                }
-                MooncakeTransferStatusCode::Waiting | MooncakeTransferStatusCode::Pending => {}
-                MooncakeTransferStatusCode::Invalid
-                | MooncakeTransferStatusCode::Canceled
-                | MooncakeTransferStatusCode::Timeout
-                | MooncakeTransferStatusCode::Failed => {
-                    registry.update_status(batch.bootstrap_room(), KvPoll::Failed)?;
-                    return Err(KvCacheTransferError::Runtime(format!(
-                        "Mooncake transfer batch {} task {task_id} failed with status {}",
-                        batch.batch_id(),
-                        status.status
-                    )));
+    poll: KvTransferPoll,
+) -> Result<KvTransferPollSummary, KvCacheTransferError> {
+    let mut summary = KvTransferPollSummary {
+        pending_batches: poll.pending_transfers,
+        ..KvTransferPollSummary::default()
+    };
+    for event in poll.events {
+        match event.status {
+            KvTransferEventStatus::Completed => {
+                registry.update_status(event.bootstrap_room, KvPoll::Success)?;
+                summary.completed_batches += 1;
+                if !event.descriptor_checksum.is_empty() {
+                    summary
+                        .completed_descriptor_checksums
+                        .push(event.descriptor_checksum);
                 }
             }
-        }
-
-        if completed_tasks == batch.task_count() {
-            registry.update_status(batch.bootstrap_room(), KvPoll::Success)?;
-            summary.completed_batches += 1;
-            if !batch.descriptor_checksum().is_empty() {
-                summary
-                    .completed_descriptor_checksums
-                    .push(batch.descriptor_checksum().to_string());
-            }
-        } else {
-            summary.pending_batches += 1;
-            if !batch.descriptor_checksum().is_empty() {
-                summary
-                    .pending_descriptor_checksums
-                    .push(batch.descriptor_checksum().to_string());
+            KvTransferEventStatus::Failed(_) | KvTransferEventStatus::Canceled => {
+                registry.update_status(event.bootstrap_room, KvPoll::Failed)?;
+                summary.failed_batches += 1;
+                if !event.descriptor_checksum.is_empty() {
+                    summary
+                        .failed_descriptor_checksums
+                        .push(event.descriptor_checksum);
+                }
             }
         }
     }
-
     Ok(summary)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub fn poll_mooncake_transfer_batches<R>(
+    reader: &mut R,
+    submitted_batches: &[MooncakeSubmittedBatch],
+) -> Result<KvTransferPoll, KvCacheTransferError>
+where
+    R: MooncakeTransferStatusReader,
+{
+    let mut poll = KvTransferPoll::default();
+    for batch in submitted_batches {
+        match poll_mooncake_submitted_batch(reader, batch)? {
+            MooncakePolledBatchState::Completed => {
+                poll.events.push(KvTransferCompletionEvent::completed(
+                    batch.bootstrap_room(),
+                    batch.descriptor_checksum().to_string(),
+                ))
+            }
+            MooncakePolledBatchState::Pending => poll.pending_transfers += 1,
+            MooncakePolledBatchState::Failed(message) => {
+                poll.events.push(KvTransferCompletionEvent::failed(
+                    batch.bootstrap_room(),
+                    batch.descriptor_checksum().to_string(),
+                    message,
+                ))
+            }
+        }
+    }
+    Ok(poll)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum MooncakePolledBatchState {
     Completed,
     Pending,
+    Failed(String),
 }
 
 fn poll_mooncake_submitted_batch<R>(
-    registry: &mut DecodeBootstrapRegistry,
     reader: &mut R,
     batch: &MooncakeSubmittedBatch,
 ) -> Result<MooncakePolledBatchState, KvCacheTransferError>
@@ -2717,8 +2378,7 @@ where
             | MooncakeTransferStatusCode::Canceled
             | MooncakeTransferStatusCode::Timeout
             | MooncakeTransferStatusCode::Failed => {
-                registry.update_status(batch.bootstrap_room(), KvPoll::Failed)?;
-                return Err(KvCacheTransferError::Runtime(format!(
+                return Ok(MooncakePolledBatchState::Failed(format!(
                     "Mooncake transfer batch {} task {task_id} failed with status {}",
                     batch.batch_id(),
                     status.status
@@ -2728,7 +2388,6 @@ where
     }
 
     if completed_tasks == batch.task_count() {
-        registry.update_status(batch.bootstrap_room(), KvPoll::Success)?;
         Ok(MooncakePolledBatchState::Completed)
     } else {
         Ok(MooncakePolledBatchState::Pending)
@@ -2737,6 +2396,7 @@ where
 
 pub struct MooncakeKvCacheTransferExecutor<S, R = FixedMooncakeTransferTargetResolver> {
     local_memory_registration: Option<Box<dyn MooncakeMemoryRegistrationLease>>,
+    memory_registrar: Option<Box<dyn MooncakeMemoryRegistrar>>,
     submitter: S,
     layout: MooncakeKvCacheLayout,
     target_resolver: R,
@@ -2781,6 +2441,7 @@ impl<S, R> MooncakeKvCacheTransferExecutor<S, R> {
     ) -> Self {
         Self {
             local_memory_registration: None,
+            memory_registrar: None,
             submitter,
             layout,
             target_resolver,
@@ -2806,6 +2467,7 @@ impl<S, R> MooncakeKvCacheTransferExecutor<S, R> {
 
         Self {
             local_memory_registration: None,
+            memory_registrar: None,
             submitter,
             layout,
             target_resolver,
@@ -2831,6 +2493,7 @@ impl<S, R> MooncakeKvCacheTransferExecutor<S, R> {
 
         Self {
             local_memory_registration: None,
+            memory_registrar: None,
             submitter,
             layout,
             target_resolver,
@@ -2867,6 +2530,14 @@ impl<S, R> MooncakeKvCacheTransferExecutor<S, R> {
 
         self.local_memory_registration = Some(Box::new(registration));
         Ok(self)
+    }
+
+    pub fn with_memory_registrar<M>(mut self, registrar: M) -> Self
+    where
+        M: MooncakeMemoryRegistrar,
+    {
+        self.memory_registrar = Some(Box::new(registrar));
+        self
     }
 
     pub fn has_local_memory_registration(&self) -> bool {
@@ -2951,46 +2622,35 @@ where
         Ok(())
     }
 
-    pub fn poll_submitted_transfers(
-        &mut self,
-        registry: &mut DecodeBootstrapRegistry,
-    ) -> Result<KvTransferPollSummary, KvCacheTransferError> {
+    pub fn poll_submitted_transfers(&mut self) -> Result<KvTransferPoll, KvCacheTransferError> {
         let submitted_transfers = self.submitted_transfers.clone();
-        let mut summary = KvTransferPollSummary::default();
+        let mut poll = KvTransferPoll::default();
         let mut pending_transfers = Vec::new();
-        let mut first_error = None;
 
         for transfer in submitted_transfers {
-            match poll_mooncake_submitted_batch(registry, &mut self.submitter, &transfer) {
-                Err(error) => {
-                    let release_error = self
-                        .submitter
-                        .free_batch(transfer.batch_id())
-                        .map_err(|error| KvCacheTransferError::Runtime(error.to_string()));
-                    first_error = Some(match release_error {
-                        Ok(()) => error,
-                        Err(release_error) => release_error,
-                    });
-                }
-                Ok(MooncakePolledBatchState::Completed) => {
+            match poll_mooncake_submitted_batch(&mut self.submitter, &transfer)? {
+                MooncakePolledBatchState::Completed => {
                     self.submitter
                         .free_batch(transfer.batch_id())
                         .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
-                    summary.completed_batches += 1;
-                    if !transfer.descriptor_checksum().is_empty() {
-                        summary
-                            .completed_descriptor_checksums
-                            .push(transfer.descriptor_checksum().to_string());
-                    }
+                    poll.events.push(KvTransferCompletionEvent::completed(
+                        transfer.bootstrap_room(),
+                        transfer.descriptor_checksum().to_string(),
+                    ));
                 }
-                Ok(MooncakePolledBatchState::Pending) => {
-                    if !transfer.descriptor_checksum().is_empty() {
-                        summary
-                            .pending_descriptor_checksums
-                            .push(transfer.descriptor_checksum().to_string());
-                    }
+                MooncakePolledBatchState::Pending => {
                     pending_transfers.push(transfer);
-                    summary.pending_batches += 1;
+                    poll.pending_transfers += 1;
+                }
+                MooncakePolledBatchState::Failed(message) => {
+                    self.submitter
+                        .free_batch(transfer.batch_id())
+                        .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
+                    poll.events.push(KvTransferCompletionEvent::failed(
+                        transfer.bootstrap_room(),
+                        transfer.descriptor_checksum().to_string(),
+                        message,
+                    ));
                 }
             }
         }
@@ -3002,11 +2662,7 @@ where
             .map(MooncakeSubmittedBatch::batch_id)
             .collect();
 
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-
-        Ok(summary)
+        Ok(poll)
     }
 }
 
@@ -3015,7 +2671,39 @@ where
     S: MooncakeTransferSubmitter + MooncakeTransferStatusReader + MooncakeBatchReleaser,
     R: MooncakeTransferTargetResolver,
 {
-    fn transfer_span(&mut self, span: &KvCacheTransferSpan) -> Result<(), KvCacheTransferError> {
+    fn register(&mut self, memory: TransferableKvCacheMemory) -> Result<(), KvCacheTransferError> {
+        if self.local_memory_registration.is_some() {
+            return Err(KvCacheTransferError::Runtime(
+                "Mooncake KV memory is already registered".to_string(),
+            ));
+        }
+        if memory.regions().len() != 1
+            || memory.regions()[0].base_addr != self.layout.source_base_addr
+            || memory.page_size_bytes() != self.layout.page_size_bytes
+        {
+            return Err(KvCacheTransferError::Runtime(
+                "NexusKV descriptor does not match the Mooncake executor source layout".to_string(),
+            ));
+        }
+        let registrar = self.memory_registrar.take().ok_or_else(|| {
+            KvCacheTransferError::Runtime(
+                "Mooncake backend has no memory registrar; construct it through the production transfer backend factory"
+                    .to_string(),
+            )
+        })?;
+        let registration = RegisteredMooncakeKvCacheMemory::register(registrar, memory)
+            .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
+        self.local_memory_registration = Some(Box::new(registration));
+        Ok(())
+    }
+
+    fn submit(&mut self, span: &KvCacheTransferSpan) -> Result<(), KvCacheTransferError> {
+        if self.local_memory_registration.is_none() {
+            return Err(KvCacheTransferError::Runtime(
+                "Mooncake backend must register ModelRunner-owned NexusKV memory before submit"
+                    .to_string(),
+            ));
+        }
         let mut requests = if let Some(remote_layouts) =
             self.remote_kv_layouts_by_room.get(&span.bootstrap_room())
         {
@@ -3057,22 +2745,29 @@ where
         Ok(())
     }
 
-    fn completes_inline(&self) -> bool {
-        false
+    fn poll(&mut self) -> Result<KvTransferPoll, KvCacheTransferError> {
+        self.poll_submitted_transfers()
     }
 
-    fn poll_transfers(
-        &mut self,
-        registry: &mut DecodeBootstrapRegistry,
-    ) -> Result<KvTransferPollSummary, KvCacheTransferError> {
-        self.poll_submitted_transfers(registry)
-    }
-
-    fn cancel_transfer_room(
-        &mut self,
-        bootstrap_room: BootstrapRoom,
-    ) -> Result<(), KvCacheTransferError> {
+    fn cancel(&mut self, bootstrap_room: BootstrapRoom) -> Result<(), KvCacheTransferError> {
         self.cancel_submitted_transfers_for_room(bootstrap_room)
+    }
+
+    fn shutdown(&mut self) -> Result<(), KvCacheTransferError> {
+        let rooms = self
+            .submitted_transfers
+            .iter()
+            .map(MooncakeSubmittedBatch::bootstrap_room)
+            .collect::<Vec<_>>();
+        for room in rooms {
+            self.cancel_submitted_transfers_for_room(room)?;
+        }
+        if let Some(mut registration) = self.local_memory_registration.take() {
+            registration
+                .unregister()
+                .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
+        }
+        Ok(())
     }
 }
 #[cfg(feature = "mooncake-link")]

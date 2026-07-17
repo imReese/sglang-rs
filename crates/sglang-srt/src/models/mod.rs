@@ -1,6 +1,7 @@
 mod deepseek;
 mod embedding;
 mod glm;
+mod mla_moe_weights;
 mod qwen;
 mod qwen3_5;
 
@@ -8,8 +9,8 @@ use std::fmt;
 use std::path::Path;
 
 use crate::backend::{RuntimeDtype, RuntimeRequirements};
+use crate::kv_cache::KvCacheModelLayout;
 use crate::model_artifacts::{HfModelConfig, LocalModelArtifacts, ModelArtifactError};
-use crate::transfer::KvCacheModelLayout;
 
 pub(crate) use deepseek::DEEPSEEK_V4_ADAPTER;
 pub(crate) use embedding::EMBEDDING_LM_ADAPTER;

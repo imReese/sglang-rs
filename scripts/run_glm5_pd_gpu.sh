@@ -106,10 +106,6 @@ append_optional_srt_args() {
     [[ -n "${MAX_TOTAL_TOKENS:-}" ]] && args_ref+=(--max-total-tokens "$MAX_TOTAL_TOKENS")
     [[ -n "${MEM_FRACTION_STATIC:-}" ]] && args_ref+=(--mem-fraction-static "$MEM_FRACTION_STATIC")
     [[ -n "${CHUNKED_PREFILL_SIZE:-}" ]] && args_ref+=(--chunked-prefill-size "$CHUNKED_PREFILL_SIZE")
-    [[ -n "${KV_CACHE_NUM_LAYERS:-}" ]] && args_ref+=(--kv-cache-num-layers "$KV_CACHE_NUM_LAYERS")
-    [[ -n "${KV_CACHE_KV_HEADS:-}" ]] && args_ref+=(--kv-cache-kv-heads "$KV_CACHE_KV_HEADS")
-    [[ -n "${KV_CACHE_HEAD_DIM:-}" ]] && args_ref+=(--kv-cache-head-dim "$KV_CACHE_HEAD_DIM")
-
     [[ "${ENABLE_DP_ATTENTION:-0}" == "1" ]] && args_ref+=(--enable-dp-attention)
     [[ "${ENABLE_DP_LM_HEAD:-0}" == "1" ]] && args_ref+=(--enable-dp-lm-head)
     [[ "${DISABLE_CUDA_GRAPH:-1}" == "1" ]] && args_ref+=(--disable-cuda-graph)

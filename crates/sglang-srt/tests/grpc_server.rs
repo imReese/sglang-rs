@@ -1,3 +1,5 @@
+#![cfg(feature = "test-support")]
+
 use std::fs;
 use std::net::{SocketAddr, TcpListener};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -29,16 +31,6 @@ async fn grpc_server_accepts_generated_client_requests() {
         "--port",
         "0",
         "--grpc-mode",
-        "--kv-cache-dtype",
-        "bfloat16",
-        "--kv-cache-num-layers",
-        "78",
-        "--kv-cache-kv-heads",
-        "64",
-        "--kv-cache-head-dim",
-        "64",
-        "--page-size",
-        "64",
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
@@ -73,37 +65,12 @@ async fn grpc_server_accepts_generated_client_requests() {
         .await
         .expect("server info should execute")
         .into_inner();
-    assert_eq!(
-        server_info.attributes.get("kv_cache.dtype"),
-        Some(&"bfloat16".to_string())
-    );
-    assert_eq!(
-        server_info.attributes.get("kv_cache.page_size"),
-        Some(&"64".to_string())
-    );
-    assert_eq!(
-        server_info.attributes.get("kv_cache.num_layers"),
-        Some(&"78".to_string())
-    );
-    assert_eq!(
-        server_info.attributes.get("kv_cache.kv_heads"),
-        Some(&"64".to_string())
-    );
-    assert_eq!(
-        server_info.attributes.get("kv_cache.head_dim"),
-        Some(&"64".to_string())
-    );
-    assert_eq!(
-        server_info.attributes.get("kv_cache.kv_tensors_per_token"),
-        Some(&"2".to_string())
-    );
-    assert_eq!(
-        server_info.attributes.get("kv_cache.bytes_per_token"),
-        Some(&(78 * 2 * 64 * 64 * 2).to_string())
-    );
-    assert_eq!(
-        server_info.attributes.get("kv_cache.page_size_bytes"),
-        Some(&(64 * 78 * 2 * 64 * 64 * 2).to_string())
+    assert!(
+        server_info
+            .attributes
+            .keys()
+            .all(|key| !key.starts_with("kv_cache.")),
+        "reference service without an active KV pool must not advertise KV geometry"
     );
 
     shutdown_tx

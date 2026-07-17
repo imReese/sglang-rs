@@ -3,6 +3,7 @@ use std::path::Path;
 use crate::model_artifacts::{HfModelConfig, LocalModelArtifacts, ModelArtifactError};
 
 use super::deepseek::build_mla_moe_definition;
+use super::mla_moe_weights::validate_glm_moe_dsa_checkpoint;
 use super::{ModelAdapter, ModelAdapterError, ModelDefinition};
 
 pub(crate) const GLM_MOE_DSA_ARCHITECTURE: &str = "GlmMoeDsaForCausalLM";
@@ -27,9 +28,6 @@ impl ModelAdapter for GlmMoeDsaAdapter {
         &self,
         artifacts: &LocalModelArtifacts,
     ) -> Result<(), ModelArtifactError> {
-        artifacts
-            .checkpoint_catalog()?
-            .glm_moe_dsa_model_weights()?;
-        Ok(())
+        validate_glm_moe_dsa_checkpoint(artifacts)
     }
 }

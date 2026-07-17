@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use crate::backend::RuntimeDtype;
+use crate::kv_cache::KvCacheModelLayout;
 use crate::model_artifacts::{HfModelConfig, LocalModelArtifacts, ModelArtifactError};
-use crate::transfer::KvCacheModelLayout;
 
 use super::{
     AttentionArchitecture, DenseDecoderActivation, DenseFeedForwardWeightNames,

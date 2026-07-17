@@ -23,9 +23,6 @@ pub struct ServerArgs {
     pub load_balance_method: String,
     pub device: String,
     pub kv_cache_dtype: String,
-    pub kv_cache_num_layers: Option<usize>,
-    pub kv_cache_kv_heads: Option<usize>,
-    pub kv_cache_head_dim: Option<usize>,
     pub page_size: usize,
     pub base_gpu_id: usize,
     pub gpu_id_step: usize,
@@ -114,6 +111,7 @@ pub enum CliParseError {
     InvalidLoadBalanceMethod(String),
     InvalidDevice(String),
     DeprecatedRuntimeBackendFlag,
+    RemovedKvCacheGeometryFlag(String),
     InvalidZmqPortRange(String),
 }
 
@@ -145,6 +143,10 @@ impl fmt::Display for CliParseError {
                     "--runtime-backend is not a community SGLang CLI flag; use --device instead"
                 )
             }
+            Self::RemovedKvCacheGeometryFlag(flag) => write!(
+                formatter,
+                "{flag} is not a community SGLang CLI flag; KV geometry is resolved by ModelRegistry from the model definition"
+            ),
             Self::InvalidZmqPortRange(value) => {
                 write!(formatter, "invalid --disaggregation-zmq-ports: {value}")
             }
@@ -226,23 +228,8 @@ impl ArgParser {
                 "--kv-cache-dtype" => {
                     self.parsed.kv_cache_dtype = self.take_value("--kv-cache-dtype")?;
                 }
-                "--kv-cache-num-layers" => {
-                    self.parsed.kv_cache_num_layers = Some(parse_usize(
-                        "--kv-cache-num-layers",
-                        self.take_value("--kv-cache-num-layers")?,
-                    )?);
-                }
-                "--kv-cache-kv-heads" => {
-                    self.parsed.kv_cache_kv_heads = Some(parse_usize(
-                        "--kv-cache-kv-heads",
-                        self.take_value("--kv-cache-kv-heads")?,
-                    )?);
-                }
-                "--kv-cache-head-dim" => {
-                    self.parsed.kv_cache_head_dim = Some(parse_usize(
-                        "--kv-cache-head-dim",
-                        self.take_value("--kv-cache-head-dim")?,
-                    )?);
+                "--kv-cache-num-layers" | "--kv-cache-kv-heads" | "--kv-cache-head-dim" => {
+                    return Err(CliParseError::RemovedKvCacheGeometryFlag(arg));
                 }
                 "--page-size" => {
                     self.parsed.page_size =
@@ -496,9 +483,6 @@ impl ArgParser {
             load_balance_method,
             device: self.parsed.device.clone(),
             kv_cache_dtype: self.parsed.kv_cache_dtype.clone(),
-            kv_cache_num_layers: self.parsed.kv_cache_num_layers,
-            kv_cache_kv_heads: self.parsed.kv_cache_kv_heads,
-            kv_cache_head_dim: self.parsed.kv_cache_head_dim,
             page_size: self.parsed.page_size,
             base_gpu_id: self.parsed.base_gpu_id,
             gpu_id_step: self.parsed.gpu_id_step,
@@ -609,9 +593,6 @@ struct PartialServerArgs {
     load_balance_method: String,
     device: String,
     kv_cache_dtype: String,
-    kv_cache_num_layers: Option<usize>,
-    kv_cache_kv_heads: Option<usize>,
-    kv_cache_head_dim: Option<usize>,
     page_size: usize,
     base_gpu_id: usize,
     gpu_id_step: usize,
@@ -679,9 +660,6 @@ impl Default for PartialServerArgs {
             load_balance_method: "auto".to_string(),
             device: "auto".to_string(),
             kv_cache_dtype: "auto".to_string(),
-            kv_cache_num_layers: None,
-            kv_cache_kv_heads: None,
-            kv_cache_head_dim: None,
             page_size: 1,
             base_gpu_id: 0,
             gpu_id_step: 1,

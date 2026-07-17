@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [features]
 default = []
 mooncake-link = []
+test-support = []
 
 [dependencies]
 axum = "0.8.9"

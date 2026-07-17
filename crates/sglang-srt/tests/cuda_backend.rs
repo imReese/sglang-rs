@@ -23,6 +23,13 @@ use sglang_srt::transfer::{
 use sglang_srt::types::{RequestId, SamplingParams};
 use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
 
+fn cuda_test_device_ordinal() -> usize {
+    std::env::var("SGLANG_CUDA_TEST_DEVICE")
+        .unwrap_or_else(|_| "0".to_string())
+        .parse()
+        .expect("SGLANG_CUDA_TEST_DEVICE must be a CUDA device ordinal")
+}
+
 fn cuda_test_layout() -> KvCacheRuntimeLayout {
     let page_size = 16;
     let num_layers = 2;
@@ -241,7 +248,8 @@ fn reference_paged_attention(
 #[test]
 #[ignore = "requires a CUDA device and NVIDIA driver"]
 fn cuda_backend_round_trips_page_major_device_kv_memory() {
-    let backend = CudaBackend::initialize(0).expect("CUDA backend should initialize");
+    let device_ordinal = cuda_test_device_ordinal();
+    let backend = CudaBackend::initialize(device_ordinal).expect("CUDA backend should initialize");
     let capability = backend.capabilities();
     let ComputeCapability::Cuda(_) = capability.compute_capability else {
         panic!("CUDA backend must report CUDA compute capability");
@@ -286,7 +294,9 @@ fn cuda_backend_round_trips_page_major_device_kv_memory() {
     assert_eq!(transferable.page_size_bytes(), 131_072);
     assert_eq!(
         transferable.location(),
-        KvCacheMemoryLocation::Cuda { device_id: 0 }
+        KvCacheMemoryLocation::Cuda {
+            device_id: device_ordinal
+        }
     );
     assert_eq!(transferable.regions()[0].byte_len, 2 * 1024 * 1024);
     assert_eq!(
@@ -311,7 +321,8 @@ fn cuda_backend_round_trips_page_major_device_kv_memory() {
 #[test]
 #[ignore = "requires a CUDA device, NVIDIA driver, and BF16-capable cuBLAS"]
 fn cuda_bf16_gemm_runs_transformer_linear_projection() {
-    let backend = CudaBackend::initialize(0).expect("CUDA backend should initialize");
+    let backend = CudaBackend::initialize(cuda_test_device_ordinal())
+        .expect("CUDA backend should initialize");
     let blas = CudaBlas::load(backend.context()).expect("cuBLAS should load");
     let input_values = [1.0_f32, 2.0, 3.0, -1.0, 0.5, 2.0];
     let weight_values = [
@@ -354,7 +365,8 @@ fn cuda_bf16_gemm_runs_transformer_linear_projection() {
 #[test]
 #[ignore = "requires a CUDA device, NVIDIA driver, and NVRTC"]
 fn cuda_runtime_kernels_execute_and_write_kv_slots() {
-    let backend = CudaBackend::initialize(0).expect("CUDA backend should initialize");
+    let backend = CudaBackend::initialize(cuda_test_device_ordinal())
+        .expect("CUDA backend should initialize");
     let capability = backend.capabilities();
     let ComputeCapability::Cuda(compute_capability) = capability.compute_capability else {
         panic!("CUDA backend must report CUDA compute capability");
@@ -482,7 +494,8 @@ fn cuda_runtime_kernels_execute_and_write_kv_slots() {
 #[test]
 #[ignore = "requires a CUDA device, NVIDIA driver, and NVRTC"]
 fn cuda_kv_kernels_scatter_and_gather_batched_physical_slots() {
-    let backend = CudaBackend::initialize(0).expect("CUDA backend should initialize");
+    let backend = CudaBackend::initialize(cuda_test_device_ordinal())
+        .expect("CUDA backend should initialize");
     let capability = backend.capabilities();
     let ComputeCapability::Cuda(compute_capability) = capability.compute_capability else {
         panic!("CUDA backend must report CUDA compute capability");
@@ -621,7 +634,8 @@ fn cuda_kv_kernels_scatter_and_gather_batched_physical_slots() {
 #[test]
 #[ignore = "requires a BF16-capable CUDA device, NVIDIA driver, and NVRTC"]
 fn cuda_bf16_paged_attention_reads_mooncake_registered_physical_kv_slots() {
-    let backend = CudaBackend::initialize(0).expect("CUDA backend should initialize");
+    let backend = CudaBackend::initialize(cuda_test_device_ordinal())
+        .expect("CUDA backend should initialize");
     let capability = backend.capabilities();
     let ComputeCapability::Cuda(compute_capability) = capability.compute_capability else {
         panic!("CUDA backend must report CUDA compute capability");
@@ -761,7 +775,8 @@ fn cuda_bf16_paged_attention_reads_mooncake_registered_physical_kv_slots() {
 #[test]
 #[ignore = "requires a CUDA device, NVIDIA driver, and linked native Mooncake"]
 fn cuda_mooncake_registers_real_cuda_kv_memory() {
-    let backend = CudaBackend::initialize(0).expect("CUDA backend should initialize");
+    let device_ordinal = cuda_test_device_ordinal();
+    let backend = CudaBackend::initialize(device_ordinal).expect("CUDA backend should initialize");
     let kv_cache = allocate_cuda_kv_cache(backend.context(), cuda_test_layout(), 16)
         .expect("CUDA KV cache should allocate a page-major device pool");
     let transferable = kv_cache
@@ -774,7 +789,7 @@ fn cuda_mooncake_registers_real_cuda_kv_memory() {
         rpc_port: 0,
         protocol: "tcp".to_string(),
         device_name: String::new(),
-        gpu_id: 0,
+        gpu_id: device_ordinal,
     })
     .expect("linked Mooncake engine should initialize");
     let mut registration = RegisteredMooncakeKvCacheMemory::register(engine, transferable)

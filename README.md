@@ -225,9 +225,10 @@ for end-to-end protocol validation. BF16 GEMM and GQA paged-attention primitives
 are implemented, while MoE CUDA kernels and a production GLM/DeepSeek CUDA
 executor are not implemented yet. PD support
 covers the scheduler/router execution split, bootstrap metadata propagation,
-bounded transfer polling, fake/local snapshot transfer paths, control-plane
-descriptor checksums, snapshot-content checksums, and the Mooncake-linked
-transfer-engine boundary with managed memory registration. The CUDA KV pool
+bounded transfer polling, backend-neutral completion events, and the
+Mooncake-linked transfer-engine boundary with managed memory registration.
+Fake transfer is compiled only for tests or the explicit `test-support`
+feature and cannot be selected by a production launch. The CUDA KV pool
 owns a contiguous allocation laid out as
 `page -> layer -> K/V tensor -> token`, matching SGLang's page-major layout.
 The pool exposes checked tensor locations for attention kernels, while
@@ -238,15 +239,14 @@ registered allocation; invalid slot maps fail before launch and are guarded
 again on the device. The BF16 paged-attention kernel uses FP32 online-softmax
 accumulation and reads that same allocation for variable-length prefill and
 decode metadata. It is not yet connected to a complete production GLM/DeepSeek
-CUDA executor, so those model/backend pairs still fail at startup instead of
-serving through the CPU reference path. The current complete GLM forward
-provider remains the explicitly selected CPU reference runtime.
+MLA/MoE executor, so those models fail at startup on both CPU and CUDA instead
+of serving through a reference or metadata-only path.
 
-`--device auto` follows the community CLI surface. It selects CUDA when a
-working NVIDIA driver and visible device are present, and selects the CPU
-reference backend only when CUDA is absent. A broken CUDA installation,
-missing cuBLAS, unsupported model/backend pair, or unsupported accelerator
-fails at startup instead of falling back to CPU execution.
+`--device auto` follows the community CLI surface. It probes registered
+production backends, currently CUDA, and never falls back to the CPU reference
+backend. A missing or broken CUDA installation, missing cuBLAS, unsupported
+model/backend pair, or unsupported accelerator fails at startup. CPU reference
+execution must be selected explicitly with `--device cpu`.
 Production launch also requires `--model-path` to resolve to a local directory
 or Hugging Face cache snapshot containing safetensors weights. The built-in
 `Space` reference model is available to tests only and is never served by the
@@ -262,16 +262,16 @@ geometry fails during service construction before a server port is bound.
 The scheduler allocates global token slots while the radix cache only reuses
 complete physical pages. PD bootstrap metadata and Mooncake transfer requests
 carry physical page indices, so a page is transferred exactly once even though
-the model executor addresses each token slot independently. The CPU reference
-GLM backing store and the CUDA KV pool expose the same physical-page geometry.
-Fake and local snapshot transfer remain reference-only backends and are never a
-fallback for a requested Mooncake deployment.
+the model executor addresses each token slot independently. CPU reference dense
+and hybrid decoders and the CUDA dense decoder use the same logical page
+contract, while each backend owns its physical allocation. Transfer consumes
+the NexusKV descriptor exposed by the active ModelRunner KV pool.
 
 ## Development
 
 GitHub Actions runs `Rust CI` for every pull request and push to `main` on a
 GitHub-hosted Ubuntu runner. It checks formatting, all workspace targets,
-Clippy with warnings denied, and the complete default-feature test suite. The
+Clippy with warnings denied, and the complete test-support suite. The
 workflow caches Cargo downloads but not `target`, so compiled artifacts remain
 on the disposable hosted runner rather than a developer machine or persistent
 CI cache. Production Rust source containing lint-suppression attributes such as
@@ -288,12 +288,13 @@ The first production runner is expected to be B200, but the workflow has no
 product label or product check; A100, H100, and later compatible CUDA devices
 run the same capability-gated tests.
 
-To include native Mooncake registration, set `MOONCAKE_BUILD_DIR` to the
-Mooncake build directory visible on that runner and select the `mooncake`
-manual input. `ENABLE_MOONCAKE_CI=true` enables the same test for automatic
-CUDA runs. Missing drivers, NVRTC, cuBLAS, compute capability, Mooncake build
-artifacts, or runner labels stop or queue the workflow explicitly; CI never
-substitutes the CPU reference backend or a fake transfer backend.
+To include native Mooncake registration and linked P/D network transfer, set
+`MOONCAKE_BUILD_DIR` to the Mooncake build directory visible on that runner and
+select the `mooncake` manual input. `ENABLE_MOONCAKE_CI=true` enables the same
+tests for automatic CUDA runs. Missing drivers, NVRTC, cuBLAS, compute
+capability, Mooncake build artifacts, or runner labels stop or queue the
+workflow explicitly; CI never substitutes the CPU reference backend or a fake
+transfer backend.
 
 Run all checks:
 
@@ -313,7 +314,7 @@ without requiring a CUDA driver:
 ```bash
 cargo test -p sglang-srt --test cache_allocator \
   --test scheduler_cache_allocation --test pd_transfer_plan \
-  --test glm_runtime --test cuda_kv_cache --test cuda_attention
+  --test architecture_boundaries --test kv_cache --test cuda_attention
 ```
 
 On a CUDA host, validate real page-major allocation, page write/read,
@@ -382,15 +383,14 @@ MUSA execution are not implemented yet. Requesting one of those devices fails
 at startup with the unavailable backend/capability instead of running the CPU
 reference model.
 
-Run a local process-level PD smoke with a tiny real safetensors model:
+Run a local centralized CPU-reference smoke with a tiny real safetensors model:
 
 ```bash
-./scripts/run_cpu_pd_smoke.sh
+./scripts/run_cpu_reference_smoke.sh
 ```
 
-The smoke builds `sglang-rs` and `sgl-router` in debug mode, creates a temporary
-CPU embedding LM checkpoint, starts prefill/decode workers plus the PD router,
-sends an OpenAI chat request, verifies the model-generated `world` token, and
-then shuts the stack down. Use `KEEP_RUNNING=1` to leave the services running
-after the request. Set `TRANSPORT=grpc` to run the same router smoke against
-gRPC SRT workers.
+The smoke builds `sglang-rs`, creates a temporary CPU embedding LM checkpoint,
+starts one centralized reference server, sends an OpenAI completions request,
+verifies the model-generated `world` token, and then shuts the server down. CPU
+reference execution is not used to claim P/D transfer support. Use
+`KEEP_RUNNING=1` to leave the service running after the request.

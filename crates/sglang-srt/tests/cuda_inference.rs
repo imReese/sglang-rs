@@ -11,10 +11,18 @@ use sglang_srt::http::serve_http_router_with_shutdown;
 use sglang_srt::server::build_bootstrap_http_router_service;
 use tokio::sync::oneshot;
 
+fn cuda_test_device_ordinal() -> usize {
+    std::env::var("SGLANG_CUDA_TEST_DEVICE")
+        .unwrap_or_else(|_| "0".to_string())
+        .parse()
+        .expect("SGLANG_CUDA_TEST_DEVICE must be a CUDA device ordinal")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a CUDA device, NVIDIA driver, and cuBLAS"]
 async fn cuda_auto_selects_cublas_for_weight_backed_http_inference() {
-    let backend = CudaBackend::initialize(0).expect("CUDA backend should initialize");
+    let device_ordinal = cuda_test_device_ordinal();
+    let backend = CudaBackend::initialize(device_ordinal).expect("CUDA backend should initialize");
     let ComputeCapability::Cuda(_) = backend.capabilities().compute_capability else {
         panic!("CUDA backend must report CUDA compute capability");
     };
@@ -22,7 +30,7 @@ async fn cuda_auto_selects_cublas_for_weight_backed_http_inference() {
 
     let model_dir = temp_model_dir("cuda-cublas-http");
     write_embedding_lm_artifacts(&model_dir);
-    let args = ServerArgs::parse_from([
+    let mut args = ServerArgs::parse_from([
         "serve",
         "--model-path",
         model_dir.to_str().expect("temp model path should be utf-8"),
@@ -32,6 +40,7 @@ async fn cuda_auto_selects_cublas_for_weight_backed_http_inference() {
         "0",
     ])
     .expect("server args should parse");
+    args.base_gpu_id = device_ordinal;
     let service = build_bootstrap_http_router_service(&args);
     let addr = unused_local_addr();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -67,7 +76,8 @@ async fn cuda_auto_selects_cublas_for_weight_backed_http_inference() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a CUDA device, NVIDIA driver, NVRTC, and cuBLAS with BF16 support"]
 async fn cuda_qwen3_uses_the_shared_dense_decoder_and_runtime_kv_pool() {
-    let backend = CudaBackend::initialize(0).expect("CUDA backend should initialize");
+    let device_ordinal = cuda_test_device_ordinal();
+    let backend = CudaBackend::initialize(device_ordinal).expect("CUDA backend should initialize");
     assert!(
         backend
             .capabilities()
@@ -79,7 +89,7 @@ async fn cuda_qwen3_uses_the_shared_dense_decoder_and_runtime_kv_pool() {
 
     let model_dir = temp_model_dir("cuda-qwen3-dense-http");
     write_qwen3_dense_artifacts(&model_dir);
-    let args = ServerArgs::parse_from([
+    let mut args = ServerArgs::parse_from([
         "serve",
         "--model-path",
         model_dir.to_str().expect("temp model path should be utf-8"),
@@ -93,6 +103,7 @@ async fn cuda_qwen3_uses_the_shared_dense_decoder_and_runtime_kv_pool() {
         "32",
     ])
     .expect("server args should parse");
+    args.base_gpu_id = device_ordinal;
     let service = build_bootstrap_http_router_service(&args);
     let addr = unused_local_addr();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();

@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       mooncake:
-        description: Run the native Mooncake CUDA memory registration test
+        description: Run native Mooncake CUDA registration and linked P/D network tests
         required: false
         default: false
         type: boolean
@@ -25,6 +25,7 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
+  SGLANG_CUDA_TEST_DEVICE: "1"
 
 jobs:
   cuda:
@@ -59,6 +60,10 @@ jobs:
             exit 1
           }
           nvidia-smi
+          nvidia-smi --query-gpu=index --format=csv,noheader | grep -Fx "${SGLANG_CUDA_TEST_DEVICE}" >/dev/null || {
+            echo "::error::CUDA acceptance requires nonzero device ordinal ${SGLANG_CUDA_TEST_DEVICE}; configure a multi-GPU runner."
+            exit 1
+          }
 
       - name: Install Rust toolchain
         shell: bash
@@ -93,6 +98,22 @@ jobs:
           cargo test -p sglang-srt --locked --features mooncake-link \
             --test cuda_backend \
             cuda_mooncake_registers_real_cuda_kv_memory -- \
+            --ignored --nocapture --test-threads=1
+
+      - name: Run linked Mooncake CUDA P/D network acceptance
+        if: ${{ (github.event_name == 'workflow_dispatch' && inputs.mooncake) || vars.ENABLE_MOONCAKE_CI == 'true' }}
+        env:
+          MOONCAKE_BUILD_DIR: ${{ vars.MOONCAKE_BUILD_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${MOONCAKE_BUILD_DIR}" ]]; then
+            echo "::error::Set the MOONCAKE_BUILD_DIR repository variable to the native Mooncake build directory on the runner."
+            exit 1
+          fi
+          cargo test -p sglang-router --locked --features mooncake-link \
+            --test proxy \
+            real_srt_pd::router_pd_chat_completes_with_real_cuda_qwen_mooncake_workers -- \
             --ignored --nocapture --test-threads=1
 
       - name: Remove CUDA build artifacts

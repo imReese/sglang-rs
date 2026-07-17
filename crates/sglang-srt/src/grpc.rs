@@ -55,7 +55,6 @@ use crate::serving_metrics::{
     observe_response as observe_grpc_response,
 };
 use crate::tokenizer::Tokenizer;
-use crate::transfer::PdConfig;
 use crate::weight_update::{get_weights_by_name_from_disk, update_model_info_from_disk};
 use crate::worker::WorkerExecutor;
 
@@ -1902,7 +1901,7 @@ fn default_server_info_attributes() -> HashMap<String, String> {
     HashMap::from([("transport".to_string(), "tonic-grpc".to_string())])
 }
 
-fn server_info_attributes_from_args(args: &ServerArgs) -> HashMap<String, String> {
+pub(crate) fn server_info_attributes_from_args(args: &ServerArgs) -> HashMap<String, String> {
     let mut attributes = default_server_info_attributes();
     attributes.insert(
         "served_model_name".to_string(),
@@ -1942,38 +1941,6 @@ fn server_info_attributes_from_args(args: &ServerArgs) -> HashMap<String, String
             args.page_size.to_string(),
         );
         attributes.insert("kv_events.dp_size".to_string(), args.dp_size.to_string());
-    }
-
-    if let Some(layout) = PdConfig::from_server_args(args)
-        .ok()
-        .and_then(|config| config.kv_cache_runtime_layout().ok().flatten())
-    {
-        attributes.insert(
-            "kv_cache.dtype".to_string(),
-            layout.dtype.as_str().to_string(),
-        );
-        attributes.insert(
-            "kv_cache.page_size".to_string(),
-            layout.page_size.to_string(),
-        );
-        attributes.insert(
-            "kv_cache.num_layers".to_string(),
-            layout.num_layers.to_string(),
-        );
-        attributes.insert("kv_cache.kv_heads".to_string(), layout.kv_heads.to_string());
-        attributes.insert("kv_cache.head_dim".to_string(), layout.head_dim.to_string());
-        attributes.insert(
-            "kv_cache.kv_tensors_per_token".to_string(),
-            layout.kv_tensors_per_token.to_string(),
-        );
-        attributes.insert(
-            "kv_cache.bytes_per_token".to_string(),
-            layout.bytes_per_token.to_string(),
-        );
-        attributes.insert(
-            "kv_cache.page_size_bytes".to_string(),
-            layout.page_size_bytes.to_string(),
-        );
     }
 
     attributes

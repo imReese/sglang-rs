@@ -83,10 +83,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Check all targets
-        run: cargo check --workspace --all-targets --locked
+        run: cargo check --workspace --all-targets --locked --features sglang-srt/test-support
 
       - name: Run strict Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked --features sglang-srt/test-support -- -D warnings
 
       - name: Run workspace tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --features sglang-srt/test-support

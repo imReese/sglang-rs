@@ -1,9 +1,8 @@
 use crate::cache::CachePageId;
+use crate::kv_cache::KvCacheModelLayout;
 use crate::runtime_kv_cache::{ModelExecutionResources, RuntimeKvCache};
 use crate::scheduler::{ForwardMode, ScheduleBatch, ScheduledRequest};
-use crate::transfer::{
-    KvCacheMemoryProvider, KvCacheModelLayout, KvCacheTransferError, TransferableKvCacheMemory,
-};
+use crate::transfer::{KvCacheMemoryProvider, KvCacheTransferError, TransferableKvCacheMemory};
 use crate::types::{DisaggregatedParams, RequestId};
 use rand::RngExt as _;
 use std::fmt;
@@ -1000,6 +999,10 @@ impl<M, S> ModelRunner<M, S> {
 
     pub fn kv_cache_layout(&self) -> Option<KvCacheModelLayout> {
         self.kv_cache_layout
+    }
+
+    pub(crate) fn active_kv_cache_layout(&self) -> Option<crate::kv_cache::PagedKvCacheLayout> {
+        self.runtime_kv_cache.as_ref().map(RuntimeKvCache::layout)
     }
 
     pub(crate) fn install_runtime_kv_cache(

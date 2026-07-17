@@ -1,3 +1,6 @@
+#![cfg(feature = "test-support")]
+
+use std::ffi::c_void;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
@@ -19,11 +22,13 @@ use sglang_srt::pd_bootstrap::{
 };
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::transfer::{
-    DecodeBootstrapRegistry, FakeKvCacheTransferExecutor, KvPoll, KvTransferModelWorker,
-    MooncakeBatchId, MooncakeBatchReleaser, MooncakeError, MooncakeKvCacheLayout,
-    MooncakeKvCacheTransferExecutor, MooncakeRemoteKvLayout, MooncakeTransferRequest,
+    DecodeBootstrapRegistry, FakeKvCacheTransferExecutor, KvCacheMemoryLocation, KvPoll,
+    KvTransferBackend, KvTransferModelWorker, MooncakeBatchId, MooncakeBatchReleaser,
+    MooncakeBufferEntry, MooncakeError, MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor,
+    MooncakeMemoryRegistrar, MooncakeRemoteKvLayout, MooncakeTransferRequest,
     MooncakeTransferStatus, MooncakeTransferStatusCode, MooncakeTransferStatusReader,
-    MooncakeTransferSubmitter, MooncakeTransferTarget,
+    MooncakeTransferSubmitter, MooncakeTransferTarget, TransferableKvCacheMemory,
+    TransferableKvCacheRegion,
 };
 use sglang_srt::types::{BootstrapRoom, DisaggregatedParams, RequestId, SamplingParams};
 use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
@@ -226,7 +231,7 @@ async fn prefill_transfer_executor_registers_dp_rank_for_bootstrap_queries() {
             .expect("decode transfer metadata should parse");
     }
 
-    let inner = MooncakeKvCacheTransferExecutor::new(
+    let mut inner = MooncakeKvCacheTransferExecutor::new(
         RecordingMooncakeSubmitter::default(),
         MooncakeKvCacheLayout {
             source_base_addr: 0x5000,
@@ -234,7 +239,22 @@ async fn prefill_transfer_executor_registers_dp_rank_for_bootstrap_queries() {
             target_base_offset: 0,
         },
         MooncakeTransferTarget { target_id: 7 },
-    );
+    )
+    .with_memory_registrar(RecordingMooncakeSubmitter::default());
+    inner
+        .register(
+            TransferableKvCacheMemory::new(
+                vec![TransferableKvCacheRegion {
+                    base_addr: 0x5000,
+                    byte_len: 128 * 4,
+                    page_size_bytes: 128,
+                }],
+                128,
+                KvCacheMemoryLocation::Cpu { numa_node: 0 },
+            )
+            .expect("test NexusKV descriptor should be valid"),
+        )
+        .expect("test Mooncake executor should register active KV memory");
     let transfer_executor = MooncakeBootstrapKvCacheTransferExecutor::new(service, inner)
         .with_metadata_wait_timeout(Duration::from_millis(50));
     let worker = KvTransferModelWorker::new(
@@ -1177,6 +1197,20 @@ impl MooncakeTransferStatusReader for RecordingMooncakeSubmitter {
 impl MooncakeBatchReleaser for RecordingMooncakeSubmitter {
     fn free_batch(&mut self, batch_id: MooncakeBatchId) -> Result<(), MooncakeError> {
         self.freed_batches.push(batch_id);
+        Ok(())
+    }
+}
+
+impl MooncakeMemoryRegistrar for RecordingMooncakeSubmitter {
+    fn register_memory_batch(
+        &mut self,
+        _buffers: &mut [MooncakeBufferEntry],
+        _location: &str,
+    ) -> Result<(), MooncakeError> {
+        Ok(())
+    }
+
+    fn unregister_memory_batch(&mut self, _addrs: &mut [*mut c_void]) -> Result<(), MooncakeError> {
         Ok(())
     }
 }

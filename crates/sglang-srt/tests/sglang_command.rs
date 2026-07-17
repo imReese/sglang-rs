@@ -44,25 +44,25 @@ fn sglang_binary_accepts_upstream_serve_command_shape() {
 }
 
 #[test]
-fn cpu_pd_smoke_script_is_syntax_checked_and_asserts_real_generation() {
-    let script = workspace_root().join("scripts/run_cpu_pd_smoke.sh");
+fn cpu_reference_smoke_script_runs_real_centralized_generation() {
+    let script = workspace_root().join("scripts/run_cpu_reference_smoke.sh");
 
-    let content = std::fs::read_to_string(&script).expect("CPU PD smoke script should exist");
+    let content =
+        std::fs::read_to_string(&script).expect("CPU reference smoke script should exist");
+    assert!(content.contains("SglangEmbeddingLmForCausalLM"));
     assert!(content.contains("sglang_embedding_lm"));
-    assert!(content.contains("content != \"world\""));
-    assert!(content.contains("--pd-disaggregation"));
-    assert!(content.contains("--disaggregation-transfer-backend"));
-    assert!(content.contains("fake"));
-    assert!(content.contains("TRANSPORT"));
-    assert!(content.contains("grpc"));
-    assert!(content.contains("--grpc-mode"));
-    assert!(content.contains("grpc://${PREFILL_HOST}:${PREFILL_PORT}"));
+    assert!(content.contains("/v1/completions"));
+    assert!(content.contains("text != \"world\""));
+    assert!(!content.contains("/v1/chat/completions"));
+    assert!(content.contains("--device cpu"));
+    assert!(!content.contains("--disaggregation-mode"));
+    assert!(!content.contains("--disaggregation-transfer-backend"));
 
     let status = Command::new("bash")
         .arg("-n")
         .arg(&script)
         .status()
-        .expect("bash should syntax-check smoke script");
+        .expect("bash should syntax-check CPU reference smoke script");
     assert!(status.success(), "smoke script should pass bash -n");
 }
 

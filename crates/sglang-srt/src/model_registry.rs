@@ -5,6 +5,7 @@ use crate::backend::{
     InitializedRuntimeBackend, RuntimeBackend, RuntimeCapability, RuntimeRequirements,
 };
 use crate::cli::ServerArgs;
+use crate::kv_cache::KvCacheModelLayout;
 use crate::model_artifacts::{HfModelConfig, LocalModelArtifacts, ModelArtifactError};
 use crate::model_executor::{
     ForwardModel, KvCacheAllocationConfig, ModelForwardError, ModelForwardOutput, ModelWorkerBatch,
@@ -17,7 +18,6 @@ use crate::models::{
     ModelAdapterError, ModelDefinition, QWEN2_ADAPTER, QWEN3_5_ADAPTER, QWEN3_ADAPTER,
 };
 use crate::runtime_kv_cache::{ModelExecutionResources, RuntimeKvCache};
-use crate::transfer::KvCacheModelLayout;
 use crate::worker::WorkerWeightUpdateRequest;
 
 static MODEL_ADAPTERS: [&'static dyn ModelAdapter; 6] = [
@@ -104,13 +104,14 @@ impl ModelRegistry {
     ) -> Result<RegisteredModel, ModelRegistryError> {
         let resolved = self.resolve(artifacts.model_path(), artifacts.config())?;
         let definition = resolved.build_definition(artifacts.model_path(), artifacts.config())?;
-        let backend =
-            InitializedRuntimeBackend::initialize(requested_backend).map_err(|error| {
-                ModelRegistryError::BackendInitialization {
-                    requested: error.requested,
-                    message: error.message,
-                }
-            })?;
+        let backend = InitializedRuntimeBackend::initialize(
+            requested_backend,
+            runtime_config.device_placement,
+        )
+        .map_err(|error| ModelRegistryError::BackendInitialization {
+            requested: error.requested,
+            message: error.message,
+        })?;
 
         validate_runtime_support(&definition, &backend, runtime_config.tensor_parallel_size)
             .map_err(|error| {
@@ -221,12 +222,36 @@ impl BootstrapForwardModel {
         let artifacts = LocalModelArtifacts::from_model_path(&args.model_path)?;
         let requested_backend = RuntimeBackend::parse(&args.device)
             .ok_or_else(|| ModelRegistryError::InvalidDevice(args.device.clone()))?;
+        let ranks_per_node = args.tp_size.checked_div(args.nnodes).ok_or_else(|| {
+            ModelRegistryError::BackendInitialization {
+                requested: requested_backend,
+                message: "node count must be positive".to_string(),
+            }
+        })?;
+        let tensor_parallel_rank = args.node_rank.checked_mul(ranks_per_node).ok_or_else(|| {
+            ModelRegistryError::BackendInitialization {
+                requested: requested_backend,
+                message: "tensor parallel rank overflowed".to_string(),
+            }
+        })?;
+        let device_placement = crate::backend::RuntimeDevicePlacement::for_tensor_parallel_rank(
+            args.base_gpu_id,
+            args.gpu_id_step,
+            tensor_parallel_rank,
+            args.tp_size,
+            args.nnodes,
+        )
+        .map_err(|message| ModelRegistryError::BackendInitialization {
+            requested: requested_backend,
+            message,
+        })?;
         ModelRegistry
             .load(
                 &artifacts,
                 requested_backend,
                 ModelRuntimeConfig {
                     tensor_parallel_size: args.tp_size,
+                    device_placement,
                     kv_cache: Some(KvCacheAllocationConfig {
                         slot_capacity: args.num_reserved_decode_tokens,
                         page_size: args.page_size,
@@ -262,6 +287,15 @@ impl BootstrapForwardModel {
 
     pub(crate) fn take_runtime_kv_cache(&mut self) -> Option<RuntimeKvCache> {
         self.registered.runtime.take_runtime_kv_cache()
+    }
+
+    #[cfg(feature = "mooncake-link")]
+    pub(crate) fn runtime_device_ordinal(&self) -> Result<usize, String> {
+        self.registered
+            .runtime
+            .config()
+            .device_placement
+            .device_ordinal()
     }
 
     fn reload_backend(&self) -> RuntimeBackend {

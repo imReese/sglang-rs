@@ -4,38 +4,64 @@
 //! further: it starts actual `sglang-srt` prefill/decode HTTP workers
 //! and drives the router's PD fan-out through reqwest into those workers.
 
+#[cfg(feature = "mooncake-link")]
 use std::io::{Read, Write};
+#[cfg(feature = "mooncake-link")]
 use std::net::TcpStream;
 use std::net::{SocketAddr, TcpListener};
+#[cfg(feature = "mooncake-link")]
 use std::path::Path;
+#[cfg(feature = "mooncake-link")]
 use std::sync::Arc;
+#[cfg(feature = "mooncake-link")]
 use std::time::Duration;
+#[cfg(feature = "mooncake-link")]
 use std::{fs, io};
 
+#[cfg(feature = "mooncake-link")]
 use axum::body::Body;
+#[cfg(feature = "mooncake-link")]
 use axum::http::{Request, StatusCode};
+#[cfg(feature = "mooncake-link")]
 use http_body_util::BodyExt;
+#[cfg(feature = "mooncake-link")]
 use serde_json::json;
+#[cfg(feature = "mooncake-link")]
 use sglang_router::config::{
     ActiveLoadConfig, Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig,
     PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
-use sglang_router::discovery::{DiscoveryEvent, ModelId, WorkerId, WorkerMode, WorkerSpec};
+#[cfg(feature = "mooncake-link")]
+use sglang_router::discovery::ModelId;
+#[cfg(feature = "mooncake-link")]
+use sglang_router::discovery::{DiscoveryEvent, WorkerId, WorkerMode, WorkerSpec};
+#[cfg(feature = "mooncake-link")]
 use sglang_router::policies::factory::build_registry_with_defaults;
+#[cfg(feature = "mooncake-link")]
 use sglang_router::proxy::Proxy;
+#[cfg(feature = "mooncake-link")]
 use sglang_router::server::app::build_router;
+#[cfg(feature = "mooncake-link")]
 use sglang_router::server::app_context::AppContext;
+#[cfg(feature = "mooncake-link")]
 use sglang_router::tokenizer::TokenizerRegistry;
+#[cfg(feature = "mooncake-link")]
 use sglang_router::workers::{manager, WorkerRegistry};
 use sglang_srt::cli::ServerArgs;
 use sglang_srt::server::launch_http_server_with_shutdown;
+#[cfg(feature = "mooncake-link")]
 use sglang_srt::server::ServerLaunchError;
+#[cfg(feature = "mooncake-link")]
 use tempfile::TempDir;
+#[cfg(feature = "mooncake-link")]
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+#[cfg(feature = "mooncake-link")]
 use tokio::task::JoinHandle;
+#[cfg(feature = "mooncake-link")]
 use tower::ServiceExt;
 
+#[cfg(feature = "mooncake-link")]
 fn config() -> Config {
     Config {
         server: ServerConfig {
@@ -60,6 +86,7 @@ fn config() -> Config {
     }
 }
 
+#[cfg(feature = "mooncake-link")]
 async fn build_ctx(prefill_addr: SocketAddr, decode_addr: SocketAddr) -> Arc<AppContext> {
     let cfg = config();
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
@@ -87,6 +114,7 @@ async fn build_ctx(prefill_addr: SocketAddr, decode_addr: SocketAddr) -> Arc<App
     Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
 }
 
+#[cfg(feature = "mooncake-link")]
 async fn register_real_srt_workers_with_manager(
     prefill_addr: SocketAddr,
     decode_addr: SocketAddr,
@@ -158,14 +186,6 @@ async fn real_rust_srt_mooncake_workers_reject_unlinked_transfer_backend() {
         "decode",
         "--disaggregation-transfer-backend",
         "mooncake_tcp",
-        "--kv-cache-dtype",
-        "bfloat16",
-        "--kv-cache-num-layers",
-        "2",
-        "--kv-cache-kv-heads",
-        "1",
-        "--kv-cache-head-dim",
-        "8",
         "--num-reserved-decode-tokens",
         "8",
     ])
@@ -211,66 +231,11 @@ async fn real_rust_srt_mooncake_workers_reject_unlinked_transfer_backend() {
     drop(decode_shutdown_tx);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn router_pd_chat_completes_with_real_cpu_embedding_lm_http_workers() {
-    let model_dir = write_cpu_embedding_lm_fixture_model("router-fake-pd-chat");
-    let prefill_addr = unused_local_addr();
-    let bootstrap_addr = unused_local_addr();
-    let decode_addr = unused_local_addr();
-    let (mut prefill_server, prefill_shutdown_tx) =
-        spawn_fake_prefill_worker(prefill_addr, bootstrap_addr, model_dir.path()).await;
-    let (mut decode_server, decode_shutdown_tx) =
-        spawn_fake_decode_worker(decode_addr, model_dir.path()).await;
-    wait_for_worker_health(prefill_addr, "prefill", &mut prefill_server).await;
-    wait_for_worker_health(decode_addr, "decode", &mut decode_server).await;
-
-    let app = build_router(build_ctx(prefill_addr, decode_addr).await);
-    let response = app
-        .oneshot(chat_request("tiny", "hi", 1))
-        .await
-        .expect("router should respond");
-    let status = response.status();
-    let body = response
-        .into_body()
-        .collect()
-        .await
-        .expect("router response body should collect")
-        .to_bytes();
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "router response body: {}",
-        String::from_utf8_lossy(&body)
-    );
-    let body: serde_json::Value =
-        serde_json::from_slice(&body).expect("response should be OpenAI chat JSON");
-    assert_eq!(body["model"], "tiny");
-    assert_eq!(body["choices"][0]["message"]["content"], "world");
-    assert_eq!(body["choices"][0]["finish_reason"], "stop");
-    assert_eq!(body["usage"]["prompt_tokens"], 3);
-    assert_eq!(body["usage"]["completion_tokens"], 1);
-
-    prefill_shutdown_tx
-        .send(())
-        .expect("prefill should still run");
-    decode_shutdown_tx
-        .send(())
-        .expect("decode should still run");
-    prefill_server
-        .await
-        .expect("prefill server task should join")
-        .expect("prefill server should stop cleanly");
-    decode_server
-        .await
-        .expect("decode server task should join")
-        .expect("decode server should stop cleanly");
-}
-
 #[cfg(feature = "mooncake-link")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires linked Mooncake runtime and a TCP-capable local environment"]
-async fn router_pd_chat_completes_with_real_rust_srt_mooncake_workers() {
-    let model_dir = write_linked_glm_fixture_model("router-linked-mooncake-pd-chat");
+#[ignore = "requires linked Mooncake, CUDA, and a TCP-capable local environment"]
+async fn router_pd_chat_completes_with_real_cuda_qwen_mooncake_workers() {
+    let model_dir = write_linked_qwen3_fixture_model("router-linked-cuda-qwen-pd-chat");
     let (prefill_addr, bootstrap_addr, prefill_zmq_addr, decode_addr) = test_addrs();
     let (mut prefill_server, prefill_shutdown_tx) = spawn_prefill_worker(
         prefill_addr,
@@ -323,6 +288,7 @@ async fn router_pd_chat_completes_with_real_rust_srt_mooncake_workers() {
         .expect("decode server should stop cleanly");
 }
 
+#[cfg(feature = "mooncake-link")]
 async fn wait_for_worker_health(
     addr: SocketAddr,
     worker_name: &'static str,
@@ -358,6 +324,19 @@ fn test_addrs() -> (SocketAddr, SocketAddr, SocketAddr, SocketAddr) {
 }
 
 #[cfg(feature = "mooncake-link")]
+fn cuda_test_device_ordinal() -> usize {
+    let ordinal = std::env::var("SGLANG_CUDA_TEST_DEVICE")
+        .expect("SGLANG_CUDA_TEST_DEVICE must select a nonzero CUDA ordinal")
+        .parse()
+        .expect("SGLANG_CUDA_TEST_DEVICE must be a CUDA device ordinal");
+    assert_ne!(
+        ordinal, 0,
+        "linked P/D acceptance must exercise a nonzero CUDA ordinal"
+    );
+    ordinal
+}
+
+#[cfg(feature = "mooncake-link")]
 async fn spawn_prefill_worker(
     prefill_addr: SocketAddr,
     bootstrap_addr: SocketAddr,
@@ -367,12 +346,15 @@ async fn spawn_prefill_worker(
     JoinHandle<Result<(), ServerLaunchError>>,
     oneshot::Sender<()>,
 ) {
+    let device_ordinal = cuda_test_device_ordinal().to_string();
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
         model_path.to_str().expect("model path should be UTF-8"),
         "--device",
-        "cpu",
+        "cuda",
+        "--base-gpu-id",
+        &device_ordinal,
         "--served-model-name",
         "tiny",
         "--host",
@@ -404,12 +386,15 @@ async fn spawn_decode_worker(
     JoinHandle<Result<(), ServerLaunchError>>,
     oneshot::Sender<()>,
 ) {
+    let device_ordinal = cuda_test_device_ordinal().to_string();
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
         model_path.to_str().expect("model path should be UTF-8"),
         "--device",
-        "cpu",
+        "cuda",
+        "--base-gpu-id",
+        &device_ordinal,
         "--served-model-name",
         "tiny",
         "--host",
@@ -429,75 +414,7 @@ async fn spawn_decode_worker(
     spawn_worker(args)
 }
 
-async fn spawn_fake_prefill_worker(
-    prefill_addr: SocketAddr,
-    bootstrap_addr: SocketAddr,
-    model_path: &Path,
-) -> (
-    JoinHandle<Result<(), ServerLaunchError>>,
-    oneshot::Sender<()>,
-) {
-    let engine_info_addr = unused_local_addr();
-    let args = ServerArgs::parse_from([
-        "serve",
-        "--model-path",
-        model_path.to_str().expect("model path should be UTF-8"),
-        "--device",
-        "cpu",
-        "--served-model-name",
-        "tiny",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        &prefill_addr.port().to_string(),
-        "--disaggregation-mode",
-        "prefill",
-        "--disaggregation-transfer-backend",
-        "fake",
-        "--disaggregation-bootstrap-port",
-        &bootstrap_addr.port().to_string(),
-        "--engine-info-bootstrap-port",
-        &engine_info_addr.port().to_string(),
-        "--num-reserved-decode-tokens",
-        "8",
-    ])
-    .expect("prefill args should parse");
-    spawn_worker(args)
-}
-
-async fn spawn_fake_decode_worker(
-    decode_addr: SocketAddr,
-    model_path: &Path,
-) -> (
-    JoinHandle<Result<(), ServerLaunchError>>,
-    oneshot::Sender<()>,
-) {
-    let engine_info_addr = unused_local_addr();
-    let args = ServerArgs::parse_from([
-        "serve",
-        "--model-path",
-        model_path.to_str().expect("model path should be UTF-8"),
-        "--device",
-        "cpu",
-        "--served-model-name",
-        "tiny",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        &decode_addr.port().to_string(),
-        "--disaggregation-mode",
-        "decode",
-        "--disaggregation-transfer-backend",
-        "fake",
-        "--engine-info-bootstrap-port",
-        &engine_info_addr.port().to_string(),
-        "--num-reserved-decode-tokens",
-        "8",
-    ])
-    .expect("decode args should parse");
-    spawn_worker(args)
-}
-
+#[cfg(feature = "mooncake-link")]
 fn spawn_worker(
     args: ServerArgs,
 ) -> (
@@ -514,6 +431,7 @@ fn spawn_worker(
     (server, shutdown_tx)
 }
 
+#[cfg(feature = "mooncake-link")]
 fn chat_request(model: &str, content: &str, max_tokens: u32) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -531,12 +449,13 @@ fn chat_request(model: &str, content: &str, max_tokens: u32) -> Request<Body> {
         .expect("chat request should build")
 }
 
-fn write_cpu_embedding_lm_fixture_model(name: &str) -> TempDir {
+#[cfg(feature = "mooncake-link")]
+fn write_linked_qwen3_fixture_model(name: &str) -> TempDir {
     let model_dir = tempfile::Builder::new()
         .prefix(&format!("sglang-rs-{name}-"))
         .tempdir()
         .expect("temp model dir should be created");
-    write_cpu_embedding_lm_fixture(model_dir.path());
+    write_qwen3_dense_fixture(model_dir.path());
     fs::write(
         model_dir.path().join("tokenizer.json"),
         word_level_tokenizer_json(),
@@ -544,170 +463,102 @@ fn write_cpu_embedding_lm_fixture_model(name: &str) -> TempDir {
     .expect("tokenizer.json should be written");
     fs::write(
         model_dir.path().join("tokenizer_config.json"),
-        r#"{
-  "chat_template": "{% for message in messages %}{{ message['role'] }} {{ message['content'] }} {% endfor %}{% if add_generation_prompt %}assistant {% endif %}"
-}"#,
+        r#"{"chat_template":"{% for message in messages %}{{ message.content }}{% endfor %}"}"#,
     )
     .expect("tokenizer_config.json should be written");
     model_dir
 }
 
-fn write_cpu_embedding_lm_fixture(model_dir: &Path) {
+#[cfg(feature = "mooncake-link")]
+fn write_qwen3_dense_fixture(model_dir: &Path) {
     fs::write(
         model_dir.join("config.json"),
         r#"{
-  "architectures": ["SglangEmbeddingLmForCausalLM"],
-  "model_type": "sglang_embedding_lm",
+  "architectures": ["Qwen3ForCausalLM"],
+  "model_type": "qwen3",
   "vocab_size": 3,
-  "hidden_size": 2,
-  "eos_token_id": 2
-}"#,
-    )
-    .expect("config should be written");
-
-    let tensors = [
-        (
-            "model.embed_tokens.weight",
-            vec![3, 2],
-            vec![
-                0.0, 0.0, // [UNK]
-                1.0, 0.0, // hi
-                0.0, 1.0, // world
-            ],
-        ),
-        (
-            "lm_head.weight",
-            vec![3, 2],
-            vec![
-                0.0, 0.0, // [UNK]
-                0.25, 0.0, // hi
-                1.0, 0.0, // world
-            ],
-        ),
-    ];
-    let mut cursor = 0_usize;
-    let mut metadata = Vec::new();
-    let mut payload = Vec::new();
-    for (name, shape, values) in tensors {
-        let start = cursor;
-        for value in values.into_iter().map(|value| value as f32) {
-            payload.extend_from_slice(&value.to_le_bytes());
-            cursor += 4;
-        }
-        metadata.push((name, "F32", shape, [start, cursor]));
-    }
-
-    write_safetensors_file(&model_dir.join("model.safetensors"), &metadata, &payload)
-        .expect("safetensors shard should be written");
-}
-
-#[cfg(feature = "mooncake-link")]
-fn write_linked_glm_fixture_model(name: &str) -> TempDir {
-    let model_dir = tempfile::Builder::new()
-        .prefix(&format!("sglang-rs-{name}-"))
-        .tempdir()
-        .expect("temp model dir should be created");
-    write_glm_moe_dsa_attention_output_fixture(model_dir.path());
-    fs::write(
-        model_dir.path().join("tokenizer.json"),
-        word_level_tokenizer_json(),
-    )
-    .expect("tokenizer.json should be written");
-    model_dir
-}
-
-#[cfg(feature = "mooncake-link")]
-fn write_glm_moe_dsa_attention_output_fixture(model_dir: &Path) {
-    fs::write(
-        model_dir.join("config.json"),
-        r#"{
-  "architectures": ["GlmMoeDsaForCausalLM"],
-  "model_type": "glm_moe_dsa",
-  "vocab_size": 2,
   "num_hidden_layers": 1,
   "hidden_size": 2,
   "intermediate_size": 2,
-  "num_attention_heads": 2,
-  "num_key_value_heads": 2,
-  "head_dim": 1,
-  "qk_nope_head_dim": 1,
-  "qk_rope_head_dim": 0,
-  "v_head_dim": 1,
-  "rms_norm_eps": 0.0,
-  "n_routed_experts": 1,
-  "first_k_dense_replace": 1,
-  "moe_layer_freq": 1
+  "num_attention_heads": 1,
+  "num_key_value_heads": 1,
+  "head_dim": 2,
+  "hidden_act": "silu",
+  "attention_bias": false,
+  "rms_norm_eps": 0.000001,
+  "rope_theta": 1000000.0,
+  "max_position_embeddings": 32,
+  "tie_word_embeddings": false
 }"#,
     )
-    .expect("config should be written");
+    .expect("Qwen3 config should be written");
 
     let tensors = [
         (
             "model.embed_tokens.weight",
-            vec![2, 2],
-            vec![1.0, 1.0, 1.0, -1.0],
+            vec![3, 2],
+            vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
         ),
         ("model.norm.weight", vec![2], vec![1.0, 1.0]),
-        ("lm_head.weight", vec![2, 2], vec![1.0, 0.0, 0.0, 1.0]),
         (
-            "model.layers.0.self_attn.q_a_proj.weight",
-            vec![2, 2],
-            vec![1.0, 0.0, 0.0, 1.0],
+            "lm_head.weight",
+            vec![3, 2],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0],
         ),
         (
-            "model.layers.0.self_attn.q_a_layernorm.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
+        ),
+        (
+            "model.layers.0.self_attn.q_norm.weight",
             vec![2],
-            vec![1.0, 1.0],
+            vec![1.0; 2],
         ),
         (
-            "model.layers.0.self_attn.q_b_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
             vec![2, 2],
-            vec![1.0, 0.0, 0.0, 1.0],
+            vec![0.0; 4],
         ),
         (
-            "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
-            vec![2, 2],
-            vec![1.0, 0.0, 0.0, 1.0],
-        ),
-        (
-            "model.layers.0.self_attn.kv_a_layernorm.weight",
+            "model.layers.0.self_attn.k_norm.weight",
             vec![2],
-            vec![1.0, 1.0],
+            vec![1.0; 2],
         ),
         (
-            "model.layers.0.self_attn.kv_b_proj.weight",
-            vec![4, 2],
-            vec![1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0],
+            "model.layers.0.self_attn.v_proj.weight",
+            vec![2, 2],
+            vec![0.0; 4],
         ),
         (
             "model.layers.0.self_attn.o_proj.weight",
             vec![2, 2],
-            vec![2.0, 3.0, 5.0, 7.0],
+            vec![0.0; 4],
         ),
         (
             "model.layers.0.input_layernorm.weight",
             vec![2],
-            vec![1.0, 1.0],
+            vec![1.0; 2],
         ),
         (
             "model.layers.0.post_attention_layernorm.weight",
             vec![2],
-            vec![1.0, 1.0],
+            vec![1.0; 2],
         ),
         (
             "model.layers.0.mlp.gate_proj.weight",
             vec![2, 2],
-            vec![1.0, 0.0, 0.0, 1.0],
+            vec![0.0; 4],
         ),
         (
             "model.layers.0.mlp.up_proj.weight",
             vec![2, 2],
-            vec![2.0, 0.0, 0.0, 3.0],
+            vec![0.0; 4],
         ),
         (
             "model.layers.0.mlp.down_proj.weight",
             vec![2, 2],
-            vec![5.0, 7.0, 11.0, 13.0],
+            vec![0.0; 4],
         ),
     ];
     let mut cursor = 0_usize;
@@ -726,6 +577,7 @@ fn write_glm_moe_dsa_attention_output_fixture(model_dir: &Path) {
         .expect("safetensors shard should be written");
 }
 
+#[cfg(feature = "mooncake-link")]
 fn write_safetensors_file(
     path: &Path,
     tensors: &[(&str, &str, Vec<usize>, [usize; 2])],
@@ -751,6 +603,7 @@ fn write_safetensors_file(
     fs::write(path, bytes)
 }
 
+#[cfg(feature = "mooncake-link")]
 fn word_level_tokenizer_json() -> &'static str {
     r#"{
   "version": "1.0",
@@ -783,6 +636,7 @@ fn unused_local_addr() -> SocketAddr {
         .expect("ephemeral listener should have local addr")
 }
 
+#[cfg(feature = "mooncake-link")]
 async fn request_raw(
     addr: SocketAddr,
     method: &'static str,

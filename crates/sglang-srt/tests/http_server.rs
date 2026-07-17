@@ -1,3 +1,6 @@
+#![cfg(feature = "test-support")]
+
+use std::ffi::c_void;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
@@ -31,10 +34,12 @@ use sglang_srt::server::{
 };
 use sglang_srt::tokenizer::ByteTokenizer;
 use sglang_srt::transfer::{
-    DecodeBootstrapRegistry, MooncakeBatchId, MooncakeBatchReleaser, MooncakeError,
-    MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeTransferRequest,
+    DecodeBootstrapRegistry, KvCacheMemoryLocation, KvTransferBackend, MooncakeBatchId,
+    MooncakeBatchReleaser, MooncakeBufferEntry, MooncakeError, MooncakeKvCacheLayout,
+    MooncakeKvCacheTransferExecutor, MooncakeMemoryRegistrar, MooncakeTransferRequest,
     MooncakeTransferStatus, MooncakeTransferStatusCode, MooncakeTransferStatusReader,
-    MooncakeTransferSubmitter, MooncakeTransferTarget,
+    MooncakeTransferSubmitter, MooncakeTransferTarget, TransferableKvCacheMemory,
+    TransferableKvCacheRegion,
 };
 use sglang_srt::types::{BootstrapRoom, RequestId, SamplingParams as RuntimeSamplingParams};
 use sglang_srt::worker::{
@@ -2145,12 +2150,6 @@ async fn http_prefill_server_reports_router_server_info_with_kv_events() {
         "64",
         "--kv-cache-dtype",
         "bfloat16",
-        "--kv-cache-num-layers",
-        "78",
-        "--kv-cache-kv-heads",
-        "64",
-        "--kv-cache-head-dim",
-        "64",
         "--disaggregation-mode",
         "prefill",
         "--disaggregation-transfer-backend",
@@ -2188,19 +2187,9 @@ async fn http_prefill_server_reports_router_server_info_with_kv_events() {
     assert_eq!(server_info["kv_events"]["topic"], "");
     assert_eq!(server_info["kv_events"]["block_size"], 64);
     assert_eq!(server_info["kv_events"]["dp_size"], 1);
-    assert_eq!(server_info["kv_cache"]["dtype"], "bfloat16");
-    assert_eq!(server_info["kv_cache"]["page_size"], 64);
-    assert_eq!(server_info["kv_cache"]["num_layers"], 78);
-    assert_eq!(server_info["kv_cache"]["kv_heads"], 64);
-    assert_eq!(server_info["kv_cache"]["head_dim"], 64);
-    assert_eq!(server_info["kv_cache"]["kv_tensors_per_token"], 2);
-    assert_eq!(
-        server_info["kv_cache"]["bytes_per_token"],
-        78 * 2 * 64 * 64 * 2
-    );
-    assert_eq!(
-        server_info["kv_cache"]["page_size_bytes"],
-        64 * 78 * 2 * 64 * 64 * 2
+    assert!(
+        server_info.get("kv_cache").is_none(),
+        "reference service without an active KV pool must not advertise KV geometry"
     );
 
     shutdown_tx
@@ -2586,15 +2575,7 @@ async fn http_pd_server_polls_async_transfer_before_decode() {
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let transfer_executor = MooncakeKvCacheTransferExecutor::new(
-        RecordingMooncakeBackend::completed(),
-        MooncakeKvCacheLayout {
-            source_base_addr: 0x3000,
-            page_size_bytes: 64,
-            target_base_offset: 0,
-        },
-        MooncakeTransferTarget { target_id: 17 },
-    );
+    let transfer_executor = registered_recording_mooncake_executor(0x3000, 64, 0, 17);
     let service = build_reference_pd_http_router_service(
         &args,
         DecodeBootstrapRegistry::default(),
@@ -2649,15 +2630,7 @@ async fn http_server_poll_transfers_advances_async_pd_batches() {
     ])
     .expect("args should parse");
     let addr = unused_local_addr();
-    let transfer_executor = MooncakeKvCacheTransferExecutor::new(
-        RecordingMooncakeBackend::completed(),
-        MooncakeKvCacheLayout {
-            source_base_addr: 0x4000,
-            page_size_bytes: 64,
-            target_base_offset: 0,
-        },
-        MooncakeTransferTarget { target_id: 18 },
-    );
+    let transfer_executor = registered_recording_mooncake_executor(0x4000, 64, 0, 18);
     let service = build_reference_pd_http_router_service(
         &args,
         DecodeBootstrapRegistry::default(),
@@ -2745,15 +2718,7 @@ async fn mooncake_prefill_http_uses_bootstrap_kv_layout_for_transfer() {
             .ingest_mooncake_bootstrap_frame(&transfer_metadata_frame(34, "session-a", &[4, 5]))
             .expect("transfer metadata frame should parse");
     }
-    let transfer_executor = MooncakeKvCacheTransferExecutor::new(
-        RecordingMooncakeBackend::completed(),
-        MooncakeKvCacheLayout {
-            source_base_addr: 0x2000,
-            page_size_bytes: 128,
-            target_base_offset: 0xdead_0000,
-        },
-        MooncakeTransferTarget { target_id: 7 },
-    );
+    let transfer_executor = registered_recording_mooncake_executor(0x2000, 128, 0xdead_0000, 7);
     let service = build_reference_mooncake_prefill_http_router_service(
         &args,
         bootstrap_service,
@@ -2926,35 +2891,6 @@ async fn prefill_http_launch_routes_reject_unstartable_dummy_mooncake_runtime() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn decode_http_launch_requires_kv_model_layout_for_mooncake() {
-    let args = ServerArgs::parse_from([
-        "serve",
-        "--model-path",
-        "dummy",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        "0",
-        "--disaggregation-mode",
-        "decode",
-        "--disaggregation-transfer-backend",
-        "mooncake",
-        "--kv-cache-dtype",
-        "bfloat16",
-    ])
-    .expect("args should parse");
-
-    let error = launch_http_server_with_shutdown(args, async {}).await;
-    let error = error.expect_err("missing Mooncake KV layout should fail before serving");
-
-    assert!(
-        error
-            .to_string()
-            .contains("mooncake decode requires kv cache model layout")
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn decode_http_launch_rejects_unstartable_dummy_mooncake_runtime() {
     let http_addr = unused_local_addr();
     let args = ServerArgs::parse_from([
@@ -2973,12 +2909,6 @@ async fn decode_http_launch_rejects_unstartable_dummy_mooncake_runtime() {
         "mooncake",
         "--kv-cache-dtype",
         "bfloat16",
-        "--kv-cache-num-layers",
-        "2",
-        "--kv-cache-kv-heads",
-        "1",
-        "--kv-cache-head-dim",
-        "8",
         "--num-reserved-decode-tokens",
         "8",
     ])
@@ -3317,6 +3247,53 @@ impl MooncakeBatchReleaser for RecordingMooncakeBackend {
         self.freed_batches.push(batch_id);
         Ok(())
     }
+}
+
+impl MooncakeMemoryRegistrar for RecordingMooncakeBackend {
+    fn register_memory_batch(
+        &mut self,
+        _buffers: &mut [MooncakeBufferEntry],
+        _location: &str,
+    ) -> Result<(), MooncakeError> {
+        Ok(())
+    }
+
+    fn unregister_memory_batch(&mut self, _addrs: &mut [*mut c_void]) -> Result<(), MooncakeError> {
+        Ok(())
+    }
+}
+
+fn registered_recording_mooncake_executor(
+    source_base_addr: usize,
+    page_size_bytes: usize,
+    target_base_offset: u64,
+    target_id: i32,
+) -> MooncakeKvCacheTransferExecutor<RecordingMooncakeBackend> {
+    let mut executor = MooncakeKvCacheTransferExecutor::new(
+        RecordingMooncakeBackend::completed(),
+        MooncakeKvCacheLayout {
+            source_base_addr,
+            page_size_bytes,
+            target_base_offset,
+        },
+        MooncakeTransferTarget { target_id },
+    )
+    .with_memory_registrar(RecordingMooncakeBackend::completed());
+    executor
+        .register(
+            TransferableKvCacheMemory::new(
+                vec![TransferableKvCacheRegion {
+                    base_addr: source_base_addr,
+                    byte_len: page_size_bytes * 8,
+                    page_size_bytes,
+                }],
+                page_size_bytes,
+                KvCacheMemoryLocation::Cpu { numa_node: 0 },
+            )
+            .expect("test NexusKV descriptor should be valid"),
+        )
+        .expect("test Mooncake executor should register NexusKV memory");
+    executor
 }
 
 async fn get_json_with_retry(addr: SocketAddr, path: &str) -> Value {

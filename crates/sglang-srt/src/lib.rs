@@ -1,4 +1,5 @@
 pub mod backend;
+mod backend_model;
 pub mod cache;
 pub mod cli;
 mod cpu_hybrid;
@@ -33,6 +34,7 @@ pub mod server;
 mod serving_metrics;
 pub mod tokenizer;
 pub mod transfer;
+mod transfer_backend_factory;
 pub mod types;
 mod weight_update;
 pub mod worker;

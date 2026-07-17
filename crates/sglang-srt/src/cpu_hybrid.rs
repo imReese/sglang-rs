@@ -21,6 +21,7 @@ use crate::models::{
     GatedDeltaNetWeightNames, HybridDecoderExecutionPlan, HybridDecoderLayerKind,
     HybridDecoderLayerWeightNames, HybridFullAttentionWeightNames, ModelDefinition,
 };
+use crate::runtime_kv_cache::ModelExecutionResources;
 use crate::types::RequestId;
 
 #[derive(Debug)]
@@ -30,7 +31,6 @@ pub(crate) struct CpuReferenceHybridDecoder {
     final_norm: Vec<f32>,
     lm_head: Option<FloatMatrix>,
     layers: Vec<HybridDecoderLayerWeights>,
-    kv_cache: CpuReferenceKvCache,
     request_states: HashMap<String, HybridRequestState>,
 }
 
@@ -114,20 +114,12 @@ impl CpuReferenceHybridDecoder {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let full_attention_layer_count = plan
-            .weights
-            .layers
-            .iter()
-            .filter(|layer| matches!(&layer.mixer, HybridDecoderLayerKind::FullAttention { .. }))
-            .count();
-
         Ok(Self {
             plan,
             token_embeddings,
             final_norm,
             lm_head,
             layers,
-            kv_cache: CpuReferenceKvCache::new(full_attention_layer_count, kv_size),
             request_states: HashMap::new(),
         })
     }
@@ -142,6 +134,7 @@ impl CpuReferenceHybridDecoder {
 
     fn forward_token(
         &mut self,
+        kv_cache: &mut CpuReferenceKvCache,
         request_id: &RequestId,
         token_id: u32,
         position: usize,
@@ -209,7 +202,7 @@ impl CpuReferenceHybridDecoder {
                     weights,
                 } => forward_full_attention(
                     weights,
-                    &mut self.kv_cache,
+                    kv_cache,
                     &normalized,
                     FullAttentionForwardContext {
                         cache_layer_index: *cache_layer_index,
@@ -273,8 +266,33 @@ impl CpuReferenceHybridDecoder {
 impl ForwardModel for CpuReferenceHybridDecoder {
     fn forward(
         &mut self,
-        batch: &ModelWorkerBatch,
+        _batch: &ModelWorkerBatch,
     ) -> Result<ModelForwardOutput, ModelForwardError> {
+        Err(ModelForwardError::Runtime(
+            "CPU reference hybrid decoder requires ModelRunner-owned active KV memory".to_string(),
+        ))
+    }
+
+    fn forward_with_resources(
+        &mut self,
+        batch: &ModelWorkerBatch,
+        resources: ModelExecutionResources<'_>,
+    ) -> Result<ModelForwardOutput, ModelForwardError> {
+        let kv_cache = resources
+            .active_kv_cache()
+            .ok_or_else(|| {
+                ModelForwardError::Runtime(
+                    "CPU reference hybrid decoder has no active KV allocation".to_string(),
+                )
+            })?
+            .as_any_mut()
+            .downcast_mut::<CpuReferenceKvCache>()
+            .ok_or_else(|| {
+                ModelForwardError::Runtime(
+                    "CPU reference hybrid decoder received a non-CPU active KV allocation"
+                        .to_string(),
+                )
+            })?;
         validate_batch(batch).map_err(model_forward_error)?;
         let mut logits = Vec::with_capacity(batch.request_ids().len());
         for request_index in 0..batch.request_ids().len() {
@@ -295,6 +313,7 @@ impl ForwardModel for CpuReferenceHybridDecoder {
             for input_index in input_offset..input_offset + input_count {
                 request_logits = Some(
                     self.forward_token(
+                        kv_cache,
                         &batch.request_ids()[request_index],
                         batch.input_ids()[input_index],
                         batch.positions()[input_index],

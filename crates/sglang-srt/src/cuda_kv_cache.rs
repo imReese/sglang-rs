@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::fmt;
 
 use nexus_transfer::{
@@ -11,9 +12,11 @@ use sglang_kernel::cuda_kv_kernels::{
 };
 
 use crate::kv_cache::{
-    KvCachePool, KvCachePoolError, KvCacheStorage, PagedKvCacheLayout, PagedKvCacheLayoutError,
+    KvCachePool, KvCachePoolError, KvCacheRuntimeLayout, KvCacheStorage, PagedKvCacheLayout,
+    PagedKvCacheLayoutError,
 };
-use crate::transfer::KvCacheRuntimeLayout;
+use crate::runtime_kv_cache::ActiveKvCache;
+use crate::transfer::KvCacheTransferError;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CudaKvStorageError {
@@ -485,6 +488,28 @@ pub fn allocate_cuda_kv_cache(
         layout.runtime().page_size_bytes,
     )?;
     Ok(KvCachePool::new(layout, storage)?)
+}
+
+impl ActiveKvCache for KvCachePool<CudaKvStorage> {
+    fn backend(&self) -> crate::backend::RuntimeBackend {
+        crate::backend::RuntimeBackend::Cuda
+    }
+
+    fn layout(&self) -> PagedKvCacheLayout {
+        self.layout()
+    }
+
+    fn transferable_memory(&self) -> Result<TransferableKvCacheMemory, KvCacheTransferError> {
+        self.transferable_kv_cache_memory().map_err(|error| {
+            KvCacheTransferError::Runtime(format!(
+                "CUDA runtime KV memory cannot be described by NexusKV: {error}"
+            ))
+        })
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 fn kv_pair_copy_plan(
