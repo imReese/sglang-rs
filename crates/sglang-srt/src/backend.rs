@@ -589,7 +589,10 @@ impl TransferBackendCapability {
 
 #[cfg(test)]
 mod tests {
-    use super::{InitializedRuntimeBackend, RuntimeBackend, RuntimeDevicePlacement};
+    use super::RuntimeDevicePlacement;
+
+    #[cfg(target_os = "macos")]
+    use super::{InitializedRuntimeBackend, RuntimeBackend};
 
     #[test]
     fn device_placement_uses_base_step_and_local_tensor_parallel_rank() {
