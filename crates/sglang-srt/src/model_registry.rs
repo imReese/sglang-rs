@@ -1,9 +1,8 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::backend::{
-    InitializedRuntimeBackend, RuntimeBackend, RuntimeCapability, RuntimeRequirements,
-};
+use crate::backend::{RuntimeBackend, RuntimeCapability, RuntimeRequirements};
+use crate::backend_model::BackendProviderRegistry;
 use crate::cli::ServerArgs;
 use crate::kv_cache::KvCacheModelLayout;
 use crate::model_artifacts::{HfModelConfig, LocalModelArtifacts, ModelArtifactError};
@@ -17,7 +16,8 @@ use crate::models::{
     DEEPSEEK_V4_ADAPTER, GLM_MOE_DSA_ADAPTER, ModelAdapter, ModelAdapterError, ModelDefinition,
     QWEN2_ADAPTER, QWEN3_5_ADAPTER, QWEN3_ADAPTER,
 };
-use crate::runtime_kv_cache::{ModelExecutionResources, RuntimeKvCache};
+use crate::runtime_kv_cache::RuntimeKvCacheMetadata;
+use crate::transfer::{KvCacheMemoryProvider, KvCacheTransferError, TransferableKvCacheMemory};
 use crate::worker::WorkerWeightUpdateRequest;
 
 static MODEL_ADAPTERS: [&'static dyn ModelAdapter; 5] = [
@@ -105,24 +105,26 @@ impl ModelRegistry {
     ) -> Result<RegisteredModel, ModelRegistryError> {
         let resolved = self.resolve(artifacts.model_path(), artifacts.config())?;
         let definition = resolved.build_definition(artifacts.model_path(), artifacts.config())?;
-        let backend = InitializedRuntimeBackend::initialize(
-            requested_backend,
-            runtime_config.device_placement,
-        )
-        .map_err(|error| ModelRegistryError::BackendInitialization {
-            requested: error.requested,
-            message: error.message,
-        })?;
+        let backend =
+            BackendProviderRegistry::initialize(requested_backend, runtime_config.device_placement)
+                .map_err(|error| ModelRegistryError::BackendInitialization {
+                    requested: error.requested,
+                    message: error.message,
+                })?;
 
-        validate_runtime_support(&definition, &backend, runtime_config.tensor_parallel_size)
-            .map_err(|error| {
-                runtime_error(
-                    artifacts,
-                    definition.architecture(),
-                    backend.runtime_backend(),
-                    error,
-                )
-            })?;
+        validate_runtime_support(
+            &definition,
+            backend.as_ref(),
+            runtime_config.tensor_parallel_size,
+        )
+        .map_err(|error| {
+            runtime_error(
+                artifacts,
+                definition.architecture(),
+                backend.runtime_backend(),
+                error,
+            )
+        })?;
         definition.validate_checkpoint(artifacts)?;
         let runtime_backend = backend.runtime_backend();
         let runtime = LoadedModelRuntime::load(&definition, artifacts, backend, runtime_config)
@@ -277,10 +279,6 @@ impl BootstrapForwardModel {
         self.registered.definition.cache_architecture()
     }
 
-    pub(crate) fn take_runtime_kv_cache(&mut self) -> Option<RuntimeKvCache> {
-        self.registered.runtime.take_runtime_kv_cache()
-    }
-
     #[cfg(feature = "mooncake-link")]
     pub(crate) fn runtime_device_ordinal(&self) -> Result<usize, String> {
         self.registered
@@ -305,16 +303,6 @@ impl ForwardModel for BootstrapForwardModel {
         batch: &ModelWorkerBatch,
     ) -> Result<ModelForwardOutput, ModelForwardError> {
         self.registered.runtime.forward(batch)
-    }
-
-    fn forward_with_resources(
-        &mut self,
-        batch: &ModelWorkerBatch,
-        resources: ModelExecutionResources<'_>,
-    ) -> Result<ModelForwardOutput, ModelForwardError> {
-        self.registered
-            .runtime
-            .forward_with_resources(batch, resources)
     }
 
     fn complete_request(&mut self, request_id: &crate::types::RequestId) {
@@ -343,6 +331,20 @@ impl ForwardModel for BootstrapForwardModel {
             .map_err(|error| ModelForwardError::Runtime(error.to_string()))?;
         *self = next;
         Ok(())
+    }
+}
+
+impl KvCacheMemoryProvider for BootstrapForwardModel {
+    type Error = KvCacheTransferError;
+
+    fn transferable_kv_cache_memory(&self) -> Result<TransferableKvCacheMemory, Self::Error> {
+        self.registered.runtime.transferable_kv_cache_memory()
+    }
+}
+
+impl RuntimeKvCacheMetadata for BootstrapForwardModel {
+    fn active_kv_cache_layout(&self) -> Option<crate::kv_cache::PagedKvCacheLayout> {
+        self.registered.runtime.active_kv_cache_layout()
     }
 }
 
@@ -488,6 +490,14 @@ mod tests {
         AttentionArchitecture, FeedForwardArchitecture, ModelExecutionArchitecture,
     };
     use serde_json::json;
+
+    fn cpu_reference_backend() -> Box<dyn crate::model_runtime::InitializedRuntimeBackend> {
+        let placement =
+            crate::backend::RuntimeDevicePlacement::for_tensor_parallel_rank(0, 1, 0, 1, 1)
+                .expect("CPU reference placement");
+        BackendProviderRegistry::initialize(RuntimeBackend::Cpu, placement)
+            .expect("CPU reference provider should initialize")
+    }
 
     fn mla_moe_config(architecture: &str, model_type: &str) -> HfModelConfig {
         HfModelConfig::from_json_value(json!({
@@ -701,7 +711,8 @@ mod tests {
                 .num_layers,
             1
         );
-        validate_runtime_support(&qwen3_5, &InitializedRuntimeBackend::CpuReference, 1)
+        let backend = cpu_reference_backend();
+        validate_runtime_support(&qwen3_5, backend.as_ref(), 1)
             .expect("CPU reference backend should execute a shared hybrid decoder plan");
         qwen3_5
             .validate_tensor_parallel(8)
@@ -711,7 +722,7 @@ mod tests {
 
     #[test]
     fn generic_runtime_preflight_distinguishes_component_families_without_model_branches() {
-        let backend = InitializedRuntimeBackend::CpuReference;
+        let backend = cpu_reference_backend();
         let mla = ModelRegistry
             .definition(
                 Path::new("/models/glm"),
@@ -722,9 +733,9 @@ mod tests {
             .definition(Path::new("/models/qwen"), &qwen_config())
             .expect("dense model definition");
 
-        let mla_error = validate_runtime_support(&mla, &backend, 1)
+        let mla_error = validate_runtime_support(&mla, backend.as_ref(), 1)
             .expect_err("CPU reference backend has no production MLA executor");
-        validate_runtime_support(&dense, &backend, 1)
+        validate_runtime_support(&dense, backend.as_ref(), 1)
             .expect("CPU reference backend should execute the shared dense decoder plan");
 
         assert!(matches!(

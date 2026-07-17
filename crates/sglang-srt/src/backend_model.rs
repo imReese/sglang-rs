@@ -1,4 +1,6 @@
-use crate::backend::{CudaBackend, InitializedRuntimeBackend, RuntimeCapability, RuntimeDtype};
+use crate::backend::{
+    CudaBackend, RuntimeBackend, RuntimeCapability, RuntimeDevicePlacement, RuntimeDtype,
+};
 use crate::cpu_hybrid::CpuReferenceHybridDecoder;
 use crate::cpu_reference::{CpuReferenceDenseDecoder, CpuReferenceKvCache};
 use crate::cuda_dense_decoder::CudaBf16DenseDecoder;
@@ -6,83 +8,198 @@ use crate::cuda_kv_cache::allocate_cuda_kv_cache;
 use crate::kv_cache::{KvCacheDtype, KvCacheRuntimeLayout, PagedKvCacheLayout};
 use crate::model_artifacts::LocalModelArtifacts;
 use crate::model_executor::KvCacheAllocationConfig;
-use crate::model_runtime::{ModelExecutor, ModelRuntimeConfig, ModelRuntimeLoadError};
+use crate::model_runtime::{
+    BackendExecutionBundle, BackendExecutionRuntime, InitializedRuntimeBackend, ModelRuntimeConfig,
+    ModelRuntimeLoadError,
+};
 use crate::models::{ModelDefinition, ModelExecutionArchitecture};
-use crate::runtime_kv_cache::RuntimeKvCache;
 
-pub(crate) struct BackendModelRuntime {
-    pub(crate) executor: Box<dyn ModelExecutor>,
-    pub(crate) active_kv_cache: Option<RuntimeKvCache>,
+pub(crate) struct BackendProviderRegistry;
+
+impl BackendProviderRegistry {
+    pub(crate) fn initialize(
+        requested: RuntimeBackend,
+        placement: RuntimeDevicePlacement,
+    ) -> Result<Box<dyn InitializedRuntimeBackend>, RuntimeBackendInitializationError> {
+        if requested == RuntimeBackend::Auto {
+            return initialize_auto_backend(placement);
+        }
+
+        let provider = runtime_backend_providers()
+            .iter()
+            .copied()
+            .find(|provider| provider.backend() == requested)
+            .ok_or_else(|| RuntimeBackendInitializationError {
+                requested,
+                message: format!(
+                    "{} backend provider is not registered; registered providers: {}",
+                    requested,
+                    registered_backend_names()
+                ),
+            })?;
+        provider
+            .initialize(placement)
+            .map_err(|message| RuntimeBackendInitializationError { requested, message })
+    }
 }
 
-impl InitializedRuntimeBackend {
-    pub(crate) fn create_model_runtime(
-        self,
-        definition: &ModelDefinition,
-        artifacts: &LocalModelArtifacts,
-        config: ModelRuntimeConfig,
-    ) -> Result<BackendModelRuntime, ModelRuntimeLoadError> {
-        match self {
-            Self::CpuReference => create_cpu_model_runtime(definition, artifacts, config),
-            Self::Cuda(backend) => {
-                create_cuda_model_runtime(definition, artifacts, backend, config)
-            }
-            Self::Unavailable(runtime_backend) => {
-                Err(ModelRuntimeLoadError::MissingCapabilities(vec![format!(
-                    "{} runtime backend implementation",
-                    runtime_backend.as_str()
-                )]))
-            }
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeBackendInitializationError {
+    pub(crate) requested: RuntimeBackend,
+    pub(crate) message: String,
+}
+
+trait RuntimeBackendProvider: Sync {
+    fn backend(&self) -> RuntimeBackend;
+    fn is_production(&self) -> bool;
+    fn initialize(
+        &self,
+        placement: RuntimeDevicePlacement,
+    ) -> Result<Box<dyn InitializedRuntimeBackend>, String>;
+}
+
+struct CpuReferenceBackendProvider;
+struct CudaBackendProvider;
+struct CpuReferenceBackend;
+
+static CPU_REFERENCE_BACKEND_PROVIDER: CpuReferenceBackendProvider = CpuReferenceBackendProvider;
+static CUDA_BACKEND_PROVIDER: CudaBackendProvider = CudaBackendProvider;
+static RUNTIME_BACKEND_PROVIDERS: [&'static dyn RuntimeBackendProvider; 2] =
+    [&CPU_REFERENCE_BACKEND_PROVIDER, &CUDA_BACKEND_PROVIDER];
+
+fn runtime_backend_providers() -> &'static [&'static dyn RuntimeBackendProvider] {
+    &RUNTIME_BACKEND_PROVIDERS
+}
+
+fn registered_backend_names() -> String {
+    runtime_backend_providers()
+        .iter()
+        .map(|provider| provider.backend().as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn initialize_auto_backend(
+    placement: RuntimeDevicePlacement,
+) -> Result<Box<dyn InitializedRuntimeBackend>, RuntimeBackendInitializationError> {
+    let mut failures = Vec::new();
+    for provider in runtime_backend_providers()
+        .iter()
+        .copied()
+        .filter(|provider| provider.is_production())
+    {
+        match provider.initialize(placement) {
+            Ok(backend) => return Ok(backend),
+            Err(message) => failures.push(format!("{}: {message}", provider.backend())),
         }
     }
 
-    pub(crate) fn validate_model_runtime(
+    let attempted = if failures.is_empty() {
+        "no production backend providers are registered".to_string()
+    } else {
+        failures.join("; ")
+    };
+    Err(RuntimeBackendInitializationError {
+        requested: RuntimeBackend::Auto,
+        message: format!(
+            "no executable production backend was detected; {attempted}; auto never falls back to the CPU reference backend"
+        ),
+    })
+}
+
+impl RuntimeBackendProvider for CpuReferenceBackendProvider {
+    fn backend(&self) -> RuntimeBackend {
+        RuntimeBackend::Cpu
+    }
+
+    fn is_production(&self) -> bool {
+        false
+    }
+
+    fn initialize(
+        &self,
+        _placement: RuntimeDevicePlacement,
+    ) -> Result<Box<dyn InitializedRuntimeBackend>, String> {
+        Ok(Box::new(CpuReferenceBackend))
+    }
+}
+
+impl RuntimeBackendProvider for CudaBackendProvider {
+    fn backend(&self) -> RuntimeBackend {
+        RuntimeBackend::Cuda
+    }
+
+    fn is_production(&self) -> bool {
+        true
+    }
+
+    fn initialize(
+        &self,
+        placement: RuntimeDevicePlacement,
+    ) -> Result<Box<dyn InitializedRuntimeBackend>, String> {
+        let device_ordinal = placement.device_ordinal()?;
+        CudaBackend::initialize(device_ordinal)
+            .map(|backend| Box::new(backend) as Box<dyn InitializedRuntimeBackend>)
+            .map_err(|error| {
+                format!(
+                    "failed to initialize CUDA device ordinal {device_ordinal} for local rank {} / TP rank {}: {error}",
+                    placement.local_rank, placement.tensor_parallel_rank
+                )
+            })
+    }
+}
+
+impl InitializedRuntimeBackend for CpuReferenceBackend {
+    fn runtime_backend(&self) -> RuntimeBackend {
+        RuntimeBackend::Cpu
+    }
+
+    fn capabilities(&self) -> RuntimeCapability {
+        RuntimeCapability::cpu_reference("cpu-reference-backend", false)
+    }
+
+    fn validate_model_runtime(
+        &self,
+        definition: &ModelDefinition,
+        _tensor_parallel_size: usize,
+    ) -> Vec<String> {
+        validate_cpu_model_runtime(definition)
+    }
+
+    fn create_model_runtime(
+        self: Box<Self>,
+        definition: &ModelDefinition,
+        artifacts: &LocalModelArtifacts,
+        config: ModelRuntimeConfig,
+    ) -> Result<Box<dyn BackendExecutionRuntime>, ModelRuntimeLoadError> {
+        create_cpu_model_runtime(definition, artifacts, config)
+    }
+}
+
+impl InitializedRuntimeBackend for CudaBackend {
+    fn runtime_backend(&self) -> RuntimeBackend {
+        RuntimeBackend::Cuda
+    }
+
+    fn capabilities(&self) -> RuntimeCapability {
+        CudaBackend::capabilities(self)
+    }
+
+    fn validate_model_runtime(
         &self,
         definition: &ModelDefinition,
         tensor_parallel_size: usize,
     ) -> Vec<String> {
-        match self {
-            Self::CpuReference => validate_cpu_model_runtime(definition),
-            Self::Cuda(backend) => {
-                validate_cuda_model_runtime(definition, backend, tensor_parallel_size)
-            }
-            Self::Unavailable(runtime_backend) => {
-                vec![format!(
-                    "{} runtime backend implementation",
-                    runtime_backend.as_str()
-                )]
-            }
-        }
-    }
-}
-
-impl ModelExecutor for CudaBf16DenseDecoder {
-    fn runtime_capability(&self) -> RuntimeCapability {
-        CudaBf16DenseDecoder::runtime_capability(self)
+        validate_cuda_model_runtime(definition, self, tensor_parallel_size)
     }
 
-    fn execution_dtype(&self) -> RuntimeDtype {
-        RuntimeDtype::Bf16
-    }
-}
-
-impl ModelExecutor for CpuReferenceDenseDecoder {
-    fn runtime_capability(&self) -> RuntimeCapability {
-        CpuReferenceDenseDecoder::runtime_capability(self)
-    }
-
-    fn execution_dtype(&self) -> RuntimeDtype {
-        CpuReferenceDenseDecoder::execution_dtype(self)
-    }
-}
-
-impl ModelExecutor for CpuReferenceHybridDecoder {
-    fn runtime_capability(&self) -> RuntimeCapability {
-        CpuReferenceHybridDecoder::runtime_capability(self)
-    }
-
-    fn execution_dtype(&self) -> RuntimeDtype {
-        CpuReferenceHybridDecoder::execution_dtype(self)
+    fn create_model_runtime(
+        self: Box<Self>,
+        definition: &ModelDefinition,
+        artifacts: &LocalModelArtifacts,
+        config: ModelRuntimeConfig,
+    ) -> Result<Box<dyn BackendExecutionRuntime>, ModelRuntimeLoadError> {
+        create_cuda_model_runtime(definition, artifacts, *self, config)
     }
 }
 
@@ -90,33 +207,18 @@ fn create_cpu_model_runtime(
     definition: &ModelDefinition,
     artifacts: &LocalModelArtifacts,
     config: ModelRuntimeConfig,
-) -> Result<BackendModelRuntime, ModelRuntimeLoadError> {
+) -> Result<Box<dyn BackendExecutionRuntime>, ModelRuntimeLoadError> {
+    let kv_cache = allocate_cpu_active_kv_cache(definition, required_kv_cache_config(config)?)?;
     match definition.execution() {
         ModelExecutionArchitecture::Transformer { .. } if definition.hybrid_decoder().is_some() => {
-            let executor = Box::new(
-                CpuReferenceHybridDecoder::load(definition, artifacts)
-                    .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?,
-            );
-            Ok(BackendModelRuntime {
-                executor,
-                active_kv_cache: Some(allocate_cpu_active_kv_cache(
-                    definition,
-                    required_kv_cache_config(config)?,
-                )?),
-            })
+            let executor = CpuReferenceHybridDecoder::load(definition, artifacts)
+                .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?;
+            Ok(Box::new(BackendExecutionBundle::new(executor, kv_cache)))
         }
         ModelExecutionArchitecture::Transformer { .. } if definition.dense_decoder().is_some() => {
-            let executor = Box::new(
-                CpuReferenceDenseDecoder::load(definition, artifacts)
-                    .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?,
-            );
-            Ok(BackendModelRuntime {
-                executor,
-                active_kv_cache: Some(allocate_cpu_active_kv_cache(
-                    definition,
-                    required_kv_cache_config(config)?,
-                )?),
-            })
+            let executor = CpuReferenceDenseDecoder::load(definition, artifacts)
+                .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?;
+            Ok(Box::new(BackendExecutionBundle::new(executor, kv_cache)))
         }
         ModelExecutionArchitecture::Transformer {
             attention,
@@ -142,11 +244,9 @@ fn required_kv_cache_config(
 fn allocate_cpu_active_kv_cache(
     definition: &ModelDefinition,
     config: KvCacheAllocationConfig,
-) -> Result<RuntimeKvCache, ModelRuntimeLoadError> {
+) -> Result<CpuReferenceKvCache, ModelRuntimeLoadError> {
     let layout = paged_kv_cache_layout(definition, KvCacheDtype::Float32, config)?;
-    let cache = CpuReferenceKvCache::new(layout)
-        .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?;
-    Ok(RuntimeKvCache::new(cache))
+    CpuReferenceKvCache::new(layout).map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))
 }
 
 fn create_cuda_model_runtime(
@@ -154,21 +254,17 @@ fn create_cuda_model_runtime(
     artifacts: &LocalModelArtifacts,
     backend: CudaBackend,
     config: ModelRuntimeConfig,
-) -> Result<BackendModelRuntime, ModelRuntimeLoadError> {
+) -> Result<Box<dyn BackendExecutionRuntime>, ModelRuntimeLoadError> {
     match definition.execution() {
         ModelExecutionArchitecture::Transformer { .. } if definition.dense_decoder().is_some() => {
-            let active_kv_cache = allocate_cuda_active_kv_cache(
+            let kv_cache = allocate_cuda_active_kv_cache(
                 definition,
                 &backend,
                 required_kv_cache_config(config)?,
             )?;
             let executor = CudaBf16DenseDecoder::load(definition, artifacts, backend)
-                .map(|model| Box::new(model) as Box<dyn ModelExecutor>)
                 .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?;
-            Ok(BackendModelRuntime {
-                executor,
-                active_kv_cache: Some(active_kv_cache),
-            })
+            Ok(Box::new(BackendExecutionBundle::new(executor, kv_cache)))
         }
         ModelExecutionArchitecture::Transformer {
             attention,
@@ -185,11 +281,11 @@ fn allocate_cuda_active_kv_cache(
     definition: &ModelDefinition,
     backend: &CudaBackend,
     config: KvCacheAllocationConfig,
-) -> Result<RuntimeKvCache, ModelRuntimeLoadError> {
+) -> Result<crate::kv_cache::KvCachePool<crate::cuda_kv_cache::CudaKvStorage>, ModelRuntimeLoadError>
+{
     let layout = paged_kv_cache_layout(definition, KvCacheDtype::Bfloat16, config)?;
-    let pool = allocate_cuda_kv_cache(backend.context(), layout.runtime(), layout.page_count())
-        .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?;
-    Ok(RuntimeKvCache::new(pool))
+    allocate_cuda_kv_cache(backend.context(), layout.runtime(), layout.page_count())
+        .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))
 }
 
 fn paged_kv_cache_layout(
@@ -295,4 +391,43 @@ fn validate_cache_config(config: KvCacheAllocationConfig) -> Result<(), ModelRun
         )]));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BackendProviderRegistry;
+    use crate::backend::{RuntimeBackend, RuntimeCapabilityClass, RuntimeDevicePlacement};
+
+    fn placement() -> RuntimeDevicePlacement {
+        RuntimeDevicePlacement::for_tensor_parallel_rank(0, 1, 0, 1, 1)
+            .expect("single-rank placement")
+    }
+
+    #[test]
+    fn explicit_cpu_uses_registered_reference_provider() {
+        let backend = BackendProviderRegistry::initialize(RuntimeBackend::Cpu, placement())
+            .expect("CPU reference provider should initialize");
+
+        assert_eq!(backend.runtime_backend(), RuntimeBackend::Cpu);
+        assert_eq!(
+            backend.capabilities().class,
+            RuntimeCapabilityClass::CpuReference
+        );
+    }
+
+    #[test]
+    fn unregistered_accelerator_provider_fails_before_model_loading() {
+        let error = match BackendProviderRegistry::initialize(RuntimeBackend::Metal, placement()) {
+            Ok(_) => panic!("Metal provider is not implemented"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.requested, RuntimeBackend::Metal);
+        assert!(
+            error
+                .message
+                .contains("metal backend provider is not registered")
+        );
+        assert!(error.message.contains("cpu, cuda"));
+    }
 }

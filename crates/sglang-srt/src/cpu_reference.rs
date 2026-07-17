@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -12,15 +11,15 @@ use crate::cache::CachePageId;
 use crate::kv_cache::PagedKvCacheLayout;
 use crate::model_artifacts::{LocalModelArtifacts, ModelArtifactError};
 use crate::model_executor::{
-    ForwardModel, ModelForwardError, ModelForwardOutput, ModelWorkerBatch,
-    validate_model_worker_batch,
+    ModelForwardError, ModelForwardOutput, ModelWorkerBatch, validate_model_worker_batch,
 };
+use crate::model_runtime::BackendModelExecutor;
 use crate::models::{
     AttentionArchitecture, DenseDecoderActivation, DenseDecoderExecutionPlan,
     DenseDecoderLayerWeightNames, FeedForwardArchitecture, ModelDefinition,
     ModelExecutionArchitecture,
 };
-use crate::runtime_kv_cache::{ActiveKvCache, ModelExecutionResources};
+use crate::runtime_kv_cache::ActiveKvCache;
 use crate::transfer::{KvCacheTransferError, TransferableKvCacheMemory};
 
 #[derive(Debug)]
@@ -177,36 +176,20 @@ impl CpuReferenceDenseDecoder {
     }
 }
 
-impl ForwardModel for CpuReferenceDenseDecoder {
-    fn forward(
-        &mut self,
-        _batch: &ModelWorkerBatch,
-    ) -> Result<ModelForwardOutput, ModelForwardError> {
-        Err(ModelForwardError::Runtime(
-            "CPU reference dense decoder requires ModelRunner-owned active KV memory".to_string(),
-        ))
+impl BackendModelExecutor<CpuReferenceKvCache> for CpuReferenceDenseDecoder {
+    fn runtime_capability(&self) -> RuntimeCapability {
+        CpuReferenceDenseDecoder::runtime_capability(self)
     }
 
-    fn forward_with_resources(
+    fn execution_dtype(&self) -> RuntimeDtype {
+        CpuReferenceDenseDecoder::execution_dtype(self)
+    }
+
+    fn forward(
         &mut self,
         batch: &ModelWorkerBatch,
-        resources: ModelExecutionResources<'_>,
+        kv_cache: &mut CpuReferenceKvCache,
     ) -> Result<ModelForwardOutput, ModelForwardError> {
-        let kv_cache = resources
-            .active_kv_cache()
-            .ok_or_else(|| {
-                ModelForwardError::Runtime(
-                    "CPU reference dense decoder has no active KV allocation".to_string(),
-                )
-            })?
-            .as_any_mut()
-            .downcast_mut::<CpuReferenceKvCache>()
-            .ok_or_else(|| {
-                ModelForwardError::Runtime(
-                    "CPU reference dense decoder received a non-CPU active KV allocation"
-                        .to_string(),
-                )
-            })?;
         validate_batch(batch).map_err(model_forward_error)?;
         let mut logits = Vec::with_capacity(batch.request_ids().len());
         for request_index in 0..batch.request_ids().len() {
@@ -807,10 +790,6 @@ impl ActiveKvCache for CpuReferenceKvCache {
             "CPU reference active KV memory is not a production transfer or offload tier"
                 .to_string(),
         ))
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
     }
 }
 

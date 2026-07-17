@@ -286,11 +286,12 @@ fn unsupported_accelerator_fails_before_cpu_weight_materialization() {
         assert!(
             matches!(
                 error,
-                ServerLaunchError::ModelRegistry(ModelRegistryError::MissingCapabilities {
-                    backend,
-                    ..
+                ServerLaunchError::ModelRegistry(ModelRegistryError::BackendInitialization {
+                    requested,
+                    ref message,
                 })
-                    if backend.as_str() == device
+                    if requested.as_str() == device
+                        && message.contains("backend provider is not registered")
             ),
             "unexpected {device} error: {error:?}"
         );

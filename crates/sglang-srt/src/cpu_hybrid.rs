@@ -14,14 +14,12 @@ use crate::cpu_reference::{
     validate_batch,
 };
 use crate::model_artifacts::LocalModelArtifacts;
-use crate::model_executor::{
-    ForwardModel, ModelForwardError, ModelForwardOutput, ModelWorkerBatch,
-};
+use crate::model_executor::{ModelForwardError, ModelForwardOutput, ModelWorkerBatch};
+use crate::model_runtime::BackendModelExecutor;
 use crate::models::{
     GatedDeltaNetWeightNames, HybridDecoderExecutionPlan, HybridDecoderLayerKind,
     HybridDecoderLayerWeightNames, HybridFullAttentionWeightNames, ModelDefinition,
 };
-use crate::runtime_kv_cache::ModelExecutionResources;
 use crate::types::RequestId;
 
 #[derive(Debug)]
@@ -263,36 +261,20 @@ impl CpuReferenceHybridDecoder {
     }
 }
 
-impl ForwardModel for CpuReferenceHybridDecoder {
-    fn forward(
-        &mut self,
-        _batch: &ModelWorkerBatch,
-    ) -> Result<ModelForwardOutput, ModelForwardError> {
-        Err(ModelForwardError::Runtime(
-            "CPU reference hybrid decoder requires ModelRunner-owned active KV memory".to_string(),
-        ))
+impl BackendModelExecutor<CpuReferenceKvCache> for CpuReferenceHybridDecoder {
+    fn runtime_capability(&self) -> RuntimeCapability {
+        CpuReferenceHybridDecoder::runtime_capability(self)
     }
 
-    fn forward_with_resources(
+    fn execution_dtype(&self) -> RuntimeDtype {
+        CpuReferenceHybridDecoder::execution_dtype(self)
+    }
+
+    fn forward(
         &mut self,
         batch: &ModelWorkerBatch,
-        resources: ModelExecutionResources<'_>,
+        kv_cache: &mut CpuReferenceKvCache,
     ) -> Result<ModelForwardOutput, ModelForwardError> {
-        let kv_cache = resources
-            .active_kv_cache()
-            .ok_or_else(|| {
-                ModelForwardError::Runtime(
-                    "CPU reference hybrid decoder has no active KV allocation".to_string(),
-                )
-            })?
-            .as_any_mut()
-            .downcast_mut::<CpuReferenceKvCache>()
-            .ok_or_else(|| {
-                ModelForwardError::Runtime(
-                    "CPU reference hybrid decoder received a non-CPU active KV allocation"
-                        .to_string(),
-                )
-            })?;
         validate_batch(batch).map_err(model_forward_error)?;
         let mut logits = Vec::with_capacity(batch.request_ids().len());
         for request_index in 0..batch.request_ids().len() {

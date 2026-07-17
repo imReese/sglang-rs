@@ -1,17 +1,160 @@
 use std::fmt;
 
-use crate::backend::{InitializedRuntimeBackend, RuntimeBackend, RuntimeCapability, RuntimeDtype};
+use nexus_transfer::{KvCacheMemoryProvider, TransferableKvCacheMemory};
+
+use crate::backend::{RuntimeBackend, RuntimeCapability, RuntimeDtype};
 use crate::model_artifacts::LocalModelArtifacts;
 use crate::model_executor::{
     ForwardModel, KvCacheAllocationConfig, ModelForwardError, ModelForwardOutput, ModelWorkerBatch,
 };
 use crate::models::ModelDefinition;
-use crate::runtime_kv_cache::{ModelExecutionResources, RuntimeKvCache};
+use crate::runtime_kv_cache::{ActiveKvCache, RuntimeKvCache, RuntimeKvCacheMetadata};
+use crate::transfer::KvCacheTransferError;
+use crate::types::RequestId;
 use crate::worker::WorkerWeightUpdateRequest;
 
-pub(crate) trait ModelExecutor: ForwardModel + fmt::Debug + Send {
+pub(crate) trait BackendModelExecutor<K>: fmt::Debug + Send
+where
+    K: ActiveKvCache,
+{
     fn runtime_capability(&self) -> RuntimeCapability;
     fn execution_dtype(&self) -> RuntimeDtype;
+    fn forward(
+        &mut self,
+        batch: &ModelWorkerBatch,
+        kv_cache: &mut K,
+    ) -> Result<ModelForwardOutput, ModelForwardError>;
+    fn complete_request(&mut self, _request_id: &RequestId) {}
+    fn update_weights_from_disk(
+        &mut self,
+        _request: &WorkerWeightUpdateRequest,
+    ) -> Result<(), ModelForwardError> {
+        Err(ModelForwardError::Runtime(
+            "backend model executor does not support update_weights_from_disk".to_string(),
+        ))
+    }
+}
+
+pub(crate) trait BackendExecutionRuntime:
+    ForwardModel
+    + KvCacheMemoryProvider<Error = KvCacheTransferError>
+    + RuntimeKvCacheMetadata
+    + fmt::Debug
+    + Send
+{
+    fn runtime_capability(&self) -> RuntimeCapability;
+    fn execution_dtype(&self) -> RuntimeDtype;
+}
+
+pub(crate) struct BackendExecutionBundle<E, K>
+where
+    K: ActiveKvCache,
+{
+    executor: E,
+    active_kv_cache: RuntimeKvCache<K>,
+}
+
+impl<E, K> fmt::Debug for BackendExecutionBundle<E, K>
+where
+    E: fmt::Debug,
+    K: ActiveKvCache,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BackendExecutionBundle")
+            .field("executor", &self.executor)
+            .field("active_kv_cache", &self.active_kv_cache)
+            .finish()
+    }
+}
+
+impl<E, K> BackendExecutionBundle<E, K>
+where
+    K: ActiveKvCache,
+{
+    pub(crate) fn new(executor: E, active_kv_cache: K) -> Self {
+        Self {
+            executor,
+            active_kv_cache: RuntimeKvCache::new(active_kv_cache),
+        }
+    }
+}
+
+impl<E, K> ForwardModel for BackendExecutionBundle<E, K>
+where
+    E: BackendModelExecutor<K>,
+    K: ActiveKvCache,
+{
+    fn forward(
+        &mut self,
+        batch: &ModelWorkerBatch,
+    ) -> Result<ModelForwardOutput, ModelForwardError> {
+        self.executor
+            .forward(batch, self.active_kv_cache.allocation_mut())
+    }
+
+    fn complete_request(&mut self, request_id: &RequestId) {
+        self.executor.complete_request(request_id);
+    }
+
+    fn update_weights_from_disk(
+        &mut self,
+        request: &WorkerWeightUpdateRequest,
+    ) -> Result<(), ModelForwardError> {
+        self.executor.update_weights_from_disk(request)
+    }
+}
+
+impl<E, K> KvCacheMemoryProvider for BackendExecutionBundle<E, K>
+where
+    E: BackendModelExecutor<K>,
+    K: ActiveKvCache,
+{
+    type Error = KvCacheTransferError;
+
+    fn transferable_kv_cache_memory(&self) -> Result<TransferableKvCacheMemory, Self::Error> {
+        self.active_kv_cache.transferable_kv_cache_memory()
+    }
+}
+
+impl<E, K> RuntimeKvCacheMetadata for BackendExecutionBundle<E, K>
+where
+    E: BackendModelExecutor<K>,
+    K: ActiveKvCache,
+{
+    fn active_kv_cache_layout(&self) -> Option<crate::kv_cache::PagedKvCacheLayout> {
+        Some(self.active_kv_cache.layout())
+    }
+}
+
+impl<E, K> BackendExecutionRuntime for BackendExecutionBundle<E, K>
+where
+    E: BackendModelExecutor<K> + 'static,
+    K: ActiveKvCache + 'static,
+{
+    fn runtime_capability(&self) -> RuntimeCapability {
+        self.executor.runtime_capability()
+    }
+
+    fn execution_dtype(&self) -> RuntimeDtype {
+        self.executor.execution_dtype()
+    }
+}
+
+pub(crate) trait InitializedRuntimeBackend: Send {
+    fn runtime_backend(&self) -> RuntimeBackend;
+    fn capabilities(&self) -> RuntimeCapability;
+    fn validate_model_runtime(
+        &self,
+        definition: &ModelDefinition,
+        tensor_parallel_size: usize,
+    ) -> Vec<String>;
+    fn create_model_runtime(
+        self: Box<Self>,
+        definition: &ModelDefinition,
+        artifacts: &LocalModelArtifacts,
+        config: ModelRuntimeConfig,
+    ) -> Result<Box<dyn BackendExecutionRuntime>, ModelRuntimeLoadError>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,25 +167,22 @@ pub(crate) struct ModelRuntimeConfig {
 #[derive(Debug)]
 pub(crate) struct LoadedModelRuntime {
     runtime_backend: RuntimeBackend,
-    executor: Box<dyn ModelExecutor>,
+    execution: Box<dyn BackendExecutionRuntime>,
     config: ModelRuntimeConfig,
-    runtime_kv_cache: Option<RuntimeKvCache>,
 }
 
 impl LoadedModelRuntime {
     pub(crate) fn load(
         definition: &ModelDefinition,
         artifacts: &LocalModelArtifacts,
-        backend: InitializedRuntimeBackend,
+        backend: Box<dyn InitializedRuntimeBackend>,
         config: ModelRuntimeConfig,
     ) -> Result<Self, ModelRuntimeLoadError> {
-        validate_runtime_support(definition, &backend, config.tensor_parallel_size)?;
+        validate_runtime_support(definition, backend.as_ref(), config.tensor_parallel_size)?;
         let runtime_backend = backend.runtime_backend();
-        let backend_runtime = backend.create_model_runtime(definition, artifacts, config)?;
-        let executor = backend_runtime.executor;
-        let runtime_kv_cache = backend_runtime.active_kv_cache;
-        let capability = executor.runtime_capability();
-        let execution_dtype = executor.execution_dtype();
+        let execution = backend.create_model_runtime(definition, artifacts, config)?;
+        let capability = execution.runtime_capability();
+        let execution_dtype = execution.execution_dtype();
         if !definition.supported_dtypes().contains(&execution_dtype) {
             return Err(ModelRuntimeLoadError::MissingCapabilities(vec![format!(
                 "model execution dtype {execution_dtype}"
@@ -57,9 +197,8 @@ impl LoadedModelRuntime {
             .map_err(|mismatch| ModelRuntimeLoadError::MissingCapabilities(mismatch.missing))?;
         Ok(Self {
             runtime_backend,
-            executor,
+            execution,
             config,
-            runtime_kv_cache,
         })
     }
 
@@ -68,23 +207,19 @@ impl LoadedModelRuntime {
     }
 
     pub(crate) fn runtime_capability(&self) -> RuntimeCapability {
-        self.executor.runtime_capability()
+        self.execution.runtime_capability()
     }
 
     pub(crate) fn execution_dtype(&self) -> RuntimeDtype {
-        self.executor.execution_dtype()
+        self.execution.execution_dtype()
     }
 
     pub(crate) fn config(&self) -> ModelRuntimeConfig {
         self.config
     }
 
-    pub(crate) fn take_runtime_kv_cache(&mut self) -> Option<RuntimeKvCache> {
-        self.runtime_kv_cache.take()
-    }
-
     pub(crate) fn has_runtime_kv_cache(&self) -> bool {
-        self.runtime_kv_cache.is_some()
+        self.execution.active_kv_cache_layout().is_some()
     }
 }
 
@@ -93,46 +228,40 @@ impl ForwardModel for LoadedModelRuntime {
         &mut self,
         batch: &ModelWorkerBatch,
     ) -> Result<ModelForwardOutput, ModelForwardError> {
-        let resources = self
-            .runtime_kv_cache
-            .as_mut()
-            .map(RuntimeKvCache::execution_resources)
-            .unwrap_or_else(ModelExecutionResources::without_kv_cache);
-        self.executor.forward_with_resources(batch, resources)
+        self.execution.forward(batch)
     }
 
-    fn forward_with_resources(
-        &mut self,
-        batch: &ModelWorkerBatch,
-        resources: ModelExecutionResources<'_>,
-    ) -> Result<ModelForwardOutput, ModelForwardError> {
-        self.executor.forward_with_resources(batch, resources)
-    }
-
-    fn complete_request(&mut self, request_id: &crate::types::RequestId) {
-        self.executor.complete_request(request_id);
+    fn complete_request(&mut self, request_id: &RequestId) {
+        self.execution.complete_request(request_id);
     }
 
     fn update_weights_from_disk(
         &mut self,
         request: &WorkerWeightUpdateRequest,
     ) -> Result<(), ModelForwardError> {
-        self.executor.update_weights_from_disk(request)
+        self.execution.update_weights_from_disk(request)
+    }
+}
+
+impl KvCacheMemoryProvider for LoadedModelRuntime {
+    type Error = KvCacheTransferError;
+
+    fn transferable_kv_cache_memory(&self) -> Result<TransferableKvCacheMemory, Self::Error> {
+        self.execution.transferable_kv_cache_memory()
+    }
+}
+
+impl RuntimeKvCacheMetadata for LoadedModelRuntime {
+    fn active_kv_cache_layout(&self) -> Option<crate::kv_cache::PagedKvCacheLayout> {
+        self.execution.active_kv_cache_layout()
     }
 }
 
 pub(crate) fn validate_runtime_support(
     definition: &ModelDefinition,
-    backend: &InitializedRuntimeBackend,
+    backend: &dyn InitializedRuntimeBackend,
     tensor_parallel_size: usize,
 ) -> Result<(), ModelRuntimeLoadError> {
-    if let InitializedRuntimeBackend::Unavailable(runtime_backend) = backend {
-        return Err(ModelRuntimeLoadError::MissingCapabilities(vec![format!(
-            "{} runtime backend implementation",
-            runtime_backend.as_str()
-        )]));
-    }
-
     definition
         .validate_tensor_parallel(tensor_parallel_size)
         .map_err(|message| ModelRuntimeLoadError::MissingCapabilities(vec![message]))?;

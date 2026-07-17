@@ -11,19 +11,18 @@ use crate::cuda_attention::{
     CudaPagedAttentionMetadata,
 };
 use crate::cuda_kv_cache::{CudaKvSlotScatterLaunch, CudaKvStorage, CudaKvStorageError};
-use crate::kv_cache::PagedKvCacheLayout;
+use crate::kv_cache::{KvCachePool, PagedKvCacheLayout};
 use crate::model_artifacts::{
     LocalModelArtifacts, ModelArtifactError, SafetensorsTensorDecodeError,
 };
 use crate::model_executor::{
-    ForwardModel, ModelForwardError, ModelForwardOutput, ModelWorkerBatch,
-    validate_model_worker_batch,
+    ModelForwardError, ModelForwardOutput, ModelWorkerBatch, validate_model_worker_batch,
 };
+use crate::model_runtime::BackendModelExecutor;
 use crate::models::{
     AttentionArchitecture, DenseDecoderExecutionPlan, DenseDecoderLayerWeightNames,
     FeedForwardArchitecture, ModelDefinition, ModelExecutionArchitecture,
 };
-use crate::runtime_kv_cache::ModelExecutionResources;
 
 const BF16_BYTES: usize = 2;
 
@@ -550,38 +549,21 @@ struct CudaDenseLayerForward<'a> {
     kv_storage: &'a mut CudaKvStorage,
 }
 
-impl ForwardModel for CudaBf16DenseDecoder {
+impl BackendModelExecutor<KvCachePool<CudaKvStorage>> for CudaBf16DenseDecoder {
+    fn runtime_capability(&self) -> RuntimeCapability {
+        CudaBf16DenseDecoder::runtime_capability(self)
+    }
+
+    fn execution_dtype(&self) -> RuntimeDtype {
+        RuntimeDtype::Bf16
+    }
+
     fn forward(
         &mut self,
         batch: &ModelWorkerBatch,
+        kv_pool: &mut KvCachePool<CudaKvStorage>,
     ) -> Result<ModelForwardOutput, ModelForwardError> {
-        Err(ModelForwardError::Runtime(format!(
-            "CUDA dense decoder requires ModelRunner-owned KV cache resources for a batch of {} requests",
-            batch.request_ids().len()
-        )))
-    }
-
-    fn forward_with_resources(
-        &mut self,
-        batch: &ModelWorkerBatch,
-        resources: ModelExecutionResources<'_>,
-    ) -> Result<ModelForwardOutput, ModelForwardError> {
-        let active_kv_cache = resources.active_kv_cache().ok_or_else(|| {
-            ModelForwardError::Runtime(
-                "CUDA dense decoder requires an active CUDA KV cache owned by ModelRunner"
-                    .to_string(),
-            )
-        })?;
-        let kv_layout = active_kv_cache.layout();
-        let kv_pool = active_kv_cache
-            .as_any_mut()
-            .downcast_mut::<crate::kv_cache::KvCachePool<CudaKvStorage>>()
-            .ok_or_else(|| {
-                ModelForwardError::Runtime(
-                    "CUDA dense decoder received active KV memory from a non-CUDA backend"
-                        .to_string(),
-                )
-            })?;
+        let kv_layout = kv_pool.layout();
         let kv_storage = kv_pool.storage_mut();
         self.forward_batch(batch, kv_layout, kv_storage)
             .map_err(|error| ModelForwardError::Runtime(error.to_string()))

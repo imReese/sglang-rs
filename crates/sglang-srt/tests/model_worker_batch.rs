@@ -6,7 +6,9 @@ use sglang_srt::model_executor::{
 use sglang_srt::scheduler::{
     ForwardMode, ScheduleBatch, ScheduledRequest, Scheduler, SchedulerError,
 };
-use sglang_srt::transfer::{KvCacheMemoryProvider, KvCacheModelLayout};
+use sglang_srt::transfer::{
+    KvCacheMemoryProvider, KvCacheModelLayout, KvCacheTransferError, TransferableKvCacheMemory,
+};
 use sglang_srt::types::{DisaggregatedParams, FAKE_BOOTSTRAP_HOST, RequestId, SamplingParams};
 use sglang_srt::worker::{
     BatchGeneratedTokens, GeneratedToken, ModelWorker, WorkerExecutor, WorkerWeightUpdateRequest,
@@ -15,10 +17,22 @@ use sglang_srt::worker::{
 #[derive(Default)]
 struct NoopWorker;
 
+struct MissingRuntimeKvModel;
+
+impl KvCacheMemoryProvider for MissingRuntimeKvModel {
+    type Error = KvCacheTransferError;
+
+    fn transferable_kv_cache_memory(&self) -> Result<TransferableKvCacheMemory, Self::Error> {
+        Err(KvCacheTransferError::Runtime(
+            "model runtime does not own an active KV cache allocation".to_string(),
+        ))
+    }
+}
+
 #[test]
 fn model_runner_rejects_transfer_without_a_runtime_owned_kv_allocation() {
     let runner = ModelRunner::new_with_kv_cache_layout(
-        RecordingForwardModel::default(),
+        MissingRuntimeKvModel,
         Some(KvCacheModelLayout::multi_tensor(2, 1, 8, 2)),
     );
     let missing = runner
@@ -27,7 +41,7 @@ fn model_runner_rejects_transfer_without_a_runtime_owned_kv_allocation() {
     assert!(
         missing
             .to_string()
-            .contains("does not own a runtime KV cache"),
+            .contains("does not own an active KV cache"),
         "{missing}"
     );
 }

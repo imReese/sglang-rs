@@ -66,3 +66,34 @@ fn production_launch_has_no_fake_transfer_backend() {
     assert!(!transfer.contains("\"fake\" =>"));
     assert!(!server.contains("TransferBackend::Fake"));
 }
+
+#[test]
+fn backend_execution_bundle_prevents_runtime_kv_type_erasure() {
+    let runtime = include_str!("../src/model_runtime.rs");
+    let runtime_kv = include_str!("../src/runtime_kv_cache.rs");
+    let server = include_str!("../src/server.rs");
+    let runner = include_str!("../src/model_executor.rs");
+
+    for source in [runtime, runtime_kv] {
+        assert!(!source.contains("std::any::Any"));
+        assert!(!source.contains("downcast"));
+        assert!(!source.contains("as_any"));
+    }
+    assert!(runtime.contains("BackendExecutionBundle<E, K>"));
+    assert!(!server.contains("take_runtime_kv_cache"));
+    assert!(!runner.contains("install_runtime_kv_cache"));
+}
+
+#[test]
+fn model_adapters_do_not_select_runtime_backend_providers() {
+    for adapter in [
+        include_str!("../src/models/qwen.rs"),
+        include_str!("../src/models/qwen3_5.rs"),
+        include_str!("../src/models/deepseek.rs"),
+        include_str!("../src/models/glm.rs"),
+    ] {
+        assert!(!adapter.contains("BackendProviderRegistry"));
+        assert!(!adapter.contains("CudaBackend"));
+        assert!(!adapter.contains("RuntimeBackend::"));
+    }
+}

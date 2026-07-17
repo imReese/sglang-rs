@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::fmt;
 
 use nexus_transfer::{
@@ -505,10 +504,6 @@ impl ActiveKvCache for KvCachePool<CudaKvStorage> {
                 "CUDA runtime KV memory cannot be described by NexusKV: {error}"
             ))
         })
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
     }
 }
 

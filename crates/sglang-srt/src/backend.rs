@@ -202,66 +202,6 @@ impl RuntimeDevicePlacement {
     }
 }
 
-pub(crate) enum InitializedRuntimeBackend {
-    CpuReference,
-    Cuda(CudaBackend),
-    Unavailable(RuntimeBackend),
-}
-
-impl InitializedRuntimeBackend {
-    pub(crate) fn initialize(
-        requested: RuntimeBackend,
-        placement: RuntimeDevicePlacement,
-    ) -> Result<Self, RuntimeBackendInitializationError> {
-        let device_ordinal = placement
-            .device_ordinal()
-            .map_err(|message| RuntimeBackendInitializationError { requested, message })?;
-        match requested {
-            RuntimeBackend::Cpu => Ok(Self::CpuReference),
-            RuntimeBackend::Cuda => CudaBackend::initialize(device_ordinal)
-                .map(Self::Cuda)
-                .map_err(|error| RuntimeBackendInitializationError {
-                    requested,
-                    message: format!(
-                        "failed to initialize CUDA device ordinal {device_ordinal} for local rank {} / TP rank {}: {error}",
-                        placement.local_rank, placement.tensor_parallel_rank
-                    ),
-                }),
-            RuntimeBackend::Auto => CudaBackend::initialize(device_ordinal)
-                .map(Self::Cuda)
-                .map_err(|error| RuntimeBackendInitializationError {
-                    requested,
-                    message: format!(
-                        "no executable production backend was detected for device ordinal {device_ordinal}; registered CUDA backend initialization failed: {error}; auto never falls back to the CPU reference backend"
-                    ),
-                }),
-            backend => Ok(Self::Unavailable(backend)),
-        }
-    }
-
-    pub(crate) fn runtime_backend(&self) -> RuntimeBackend {
-        match self {
-            Self::CpuReference => RuntimeBackend::Cpu,
-            Self::Cuda(_) => RuntimeBackend::Cuda,
-            Self::Unavailable(backend) => *backend,
-        }
-    }
-
-    pub(crate) fn capabilities(&self) -> RuntimeCapability {
-        match self {
-            Self::CpuReference => RuntimeCapability::cpu_reference("cpu-reference-backend", false),
-            Self::Cuda(backend) => backend.capabilities(),
-            Self::Unavailable(backend) => RuntimeCapability::unsupported(backend.as_str()),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeBackendInitializationError {
-    pub(crate) requested: RuntimeBackend,
-    pub(crate) message: String,
-}
-
 impl CudaBackend {
     pub fn initialize(device_ordinal: usize) -> Result<Self, CudaError> {
         let driver = CudaDriver::load()?;
@@ -592,7 +532,9 @@ mod tests {
     use super::RuntimeDevicePlacement;
 
     #[cfg(target_os = "macos")]
-    use super::{InitializedRuntimeBackend, RuntimeBackend};
+    use super::RuntimeBackend;
+    #[cfg(target_os = "macos")]
+    use crate::backend_model::BackendProviderRegistry;
 
     #[test]
     fn device_placement_uses_base_step_and_local_tensor_parallel_rank() {
@@ -616,12 +558,12 @@ mod tests {
     fn auto_does_not_fall_back_to_cpu_reference_on_macos() {
         let placement = RuntimeDevicePlacement::for_tensor_parallel_rank(0, 1, 0, 1, 1)
             .expect("placement should be valid");
-        let error = match InitializedRuntimeBackend::initialize(RuntimeBackend::Auto, placement) {
+        let error = match BackendProviderRegistry::initialize(RuntimeBackend::Auto, placement) {
             Ok(_) => panic!("Mac has no registered production CUDA backend"),
             Err(error) => error,
         };
 
         assert!(error.message.contains("auto never falls back"));
-        assert!(error.message.contains("device ordinal 0"));
+        assert!(error.message.contains("CUDA device ordinal 0"));
     }
 }

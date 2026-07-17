@@ -31,6 +31,7 @@ use crate::pd_bootstrap::{
     serve_mooncake_bootstrap_zmq_endpoints_with_shutdown, serve_prefill_bootstrap_with_shutdown,
 };
 use crate::router::{RouterGetModelInfoResponse, RouterRuntime};
+use crate::runtime_kv_cache::RuntimeKvCacheMetadata;
 use crate::scheduler::{PrefixCachePolicy, Scheduler};
 use crate::tokenizer::{RuntimeTokenizer, Tokenizer, TokenizerError};
 #[cfg(any(test, feature = "test-support"))]
@@ -281,17 +282,13 @@ fn bootstrap_forward_model_for_launch(
 }
 
 fn bootstrap_model_runner(
-    mut model: BootstrapForwardModel,
+    model: BootstrapForwardModel,
 ) -> Result<ModelRunner<BootstrapForwardModel>, ServerLaunchError> {
     let kv_cache_layout = model.kv_cache_layout();
-    let runtime_kv_cache = model.take_runtime_kv_cache();
-    let mut runner = ModelRunner::new_with_kv_cache_layout(model, kv_cache_layout);
-    if let Some(kv_cache) = runtime_kv_cache {
-        runner
-            .install_runtime_kv_cache(kv_cache)
-            .map_err(|error| ServerLaunchError::KvCacheTransfer(error.to_string()))?;
-    }
-    Ok(runner)
+    Ok(ModelRunner::new_with_kv_cache_layout(
+        model,
+        kv_cache_layout,
+    ))
 }
 
 fn model_prefix_cache_policy(model: &BootstrapForwardModel) -> PrefixCachePolicy {
@@ -770,7 +767,10 @@ fn http_server_info_from_args(args: &ServerArgs) -> HttpServerInfo {
     server_info
 }
 
-fn active_kv_cache_info<M, S>(model_runner: &ModelRunner<M, S>) -> Option<HttpKvCacheInfo> {
+fn active_kv_cache_info<M, S>(model_runner: &ModelRunner<M, S>) -> Option<HttpKvCacheInfo>
+where
+    M: RuntimeKvCacheMetadata,
+{
     let runtime = model_runner.active_kv_cache_layout()?.runtime();
     Some(HttpKvCacheInfo {
         dtype: runtime.dtype.as_str().to_string(),
@@ -787,7 +787,10 @@ fn active_kv_cache_info<M, S>(model_runner: &ModelRunner<M, S>) -> Option<HttpKv
 fn http_server_info_from_model_runner<M, S>(
     args: &ServerArgs,
     model_runner: &ModelRunner<M, S>,
-) -> HttpServerInfo {
+) -> HttpServerInfo
+where
+    M: RuntimeKvCacheMetadata,
+{
     let mut server_info = http_server_info_from_args(args);
     server_info.kv_cache = active_kv_cache_info(model_runner);
     server_info
@@ -796,7 +799,10 @@ fn http_server_info_from_model_runner<M, S>(
 fn grpc_server_info_from_model_runner<M, S>(
     args: &ServerArgs,
     model_runner: &ModelRunner<M, S>,
-) -> HashMap<String, String> {
+) -> HashMap<String, String>
+where
+    M: RuntimeKvCacheMetadata,
+{
     let mut attributes = server_info_attributes_from_args(args);
     if let Some(kv_cache) = active_kv_cache_info(model_runner) {
         attributes.extend([

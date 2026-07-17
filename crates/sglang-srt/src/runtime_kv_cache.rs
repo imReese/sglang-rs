@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::fmt;
 
 use nexus_transfer::{KvCacheMemoryProvider, TransferableKvCacheMemory};
@@ -11,32 +10,33 @@ pub(crate) trait ActiveKvCache: Send {
     fn backend(&self) -> RuntimeBackend;
     fn layout(&self) -> PagedKvCacheLayout;
     fn transferable_memory(&self) -> Result<TransferableKvCacheMemory, KvCacheTransferError>;
-    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
-pub(crate) struct RuntimeKvCache {
-    allocation: Box<dyn ActiveKvCache>,
+pub(crate) struct RuntimeKvCache<K> {
+    allocation: K,
 }
 
-impl RuntimeKvCache {
-    pub(crate) fn new(allocation: impl ActiveKvCache + 'static) -> Self {
-        Self {
-            allocation: Box::new(allocation),
-        }
-    }
-
-    pub(crate) fn execution_resources(&mut self) -> ModelExecutionResources<'_> {
-        ModelExecutionResources {
-            kv_cache: Some(self.allocation.as_mut()),
-        }
+impl<K> RuntimeKvCache<K>
+where
+    K: ActiveKvCache,
+{
+    pub(crate) fn new(allocation: K) -> Self {
+        Self { allocation }
     }
 
     pub(crate) fn layout(&self) -> PagedKvCacheLayout {
         self.allocation.layout()
     }
+
+    pub(crate) fn allocation_mut(&mut self) -> &mut K {
+        &mut self.allocation
+    }
 }
 
-impl fmt::Debug for RuntimeKvCache {
+impl<K> fmt::Debug for RuntimeKvCache<K>
+where
+    K: ActiveKvCache,
+{
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RuntimeKvCache")
@@ -46,7 +46,10 @@ impl fmt::Debug for RuntimeKvCache {
     }
 }
 
-impl KvCacheMemoryProvider for RuntimeKvCache {
+impl<K> KvCacheMemoryProvider for RuntimeKvCache<K>
+where
+    K: ActiveKvCache,
+{
     type Error = KvCacheTransferError;
 
     fn transferable_kv_cache_memory(&self) -> Result<TransferableKvCacheMemory, Self::Error> {
@@ -54,16 +57,6 @@ impl KvCacheMemoryProvider for RuntimeKvCache {
     }
 }
 
-pub struct ModelExecutionResources<'a> {
-    kv_cache: Option<&'a mut dyn ActiveKvCache>,
-}
-
-impl<'a> ModelExecutionResources<'a> {
-    pub fn without_kv_cache() -> Self {
-        Self { kv_cache: None }
-    }
-
-    pub(crate) fn active_kv_cache(self) -> Option<&'a mut dyn ActiveKvCache> {
-        self.kv_cache
-    }
+pub(crate) trait RuntimeKvCacheMetadata {
+    fn active_kv_cache_layout(&self) -> Option<PagedKvCacheLayout>;
 }
