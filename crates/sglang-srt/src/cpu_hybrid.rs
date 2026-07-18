@@ -509,7 +509,7 @@ impl GatedDeltaNetWeights {
     fn forward(
         &self,
         hidden: &[f32],
-        state: &mut GatedDeltaLayerState,
+        state: &mut LinearAttentionLayerState,
         plan: &HybridDecoderExecutionPlan,
     ) -> Result<Vec<f32>, CpuReferenceDenseDecoderError> {
         let mut qkv = self.in_proj_qkv.project(hidden, 1)?;
@@ -600,7 +600,7 @@ impl GatedDeltaNetWeights {
 #[derive(Debug)]
 struct HybridRequestState {
     next_position: usize,
-    recurrent_layers: Vec<GatedDeltaLayerState>,
+    recurrent_layers: Vec<LinearAttentionLayerState>,
 }
 
 impl HybridRequestState {
@@ -644,7 +644,7 @@ impl HybridRequestState {
         Ok(Self {
             next_position: 0,
             recurrent_layers: (0..layer_count)
-                .map(|_| GatedDeltaLayerState {
+                .map(|_| LinearAttentionLayerState {
                     conv: vec![0.0; conv_state_size],
                     recurrent: vec![0.0; recurrent_state_size],
                 })
@@ -654,7 +654,7 @@ impl HybridRequestState {
 }
 
 #[derive(Debug)]
-struct GatedDeltaLayerState {
+struct LinearAttentionLayerState {
     conv: Vec<f32>,
     recurrent: Vec<f32>,
 }

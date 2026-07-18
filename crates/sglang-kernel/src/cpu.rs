@@ -323,6 +323,116 @@ pub fn gated_delta_rule_step(
     Ok(output)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KeyGatedDeltaRuleShape {
+    pub head_count: usize,
+    pub key_head_dim: usize,
+    pub value_head_dim: usize,
+}
+
+pub fn key_gated_delta_rule_step(
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    decay: &[f32],
+    beta: &[f32],
+    state: &mut [f32],
+    shape: KeyGatedDeltaRuleShape,
+) -> KernelResult<Vec<f32>> {
+    let KeyGatedDeltaRuleShape {
+        head_count,
+        key_head_dim,
+        value_head_dim,
+    } = shape;
+    if head_count == 0 || key_head_dim == 0 || value_head_dim == 0 {
+        return Err(KernelError::InvalidArgument(
+            "key-gated delta dimensions must be non-zero".to_string(),
+        ));
+    }
+    validate_matrix_len(
+        "key-gated delta query",
+        query.len(),
+        head_count,
+        key_head_dim,
+    )?;
+    validate_matrix_len("key-gated delta key", key.len(), head_count, key_head_dim)?;
+    validate_matrix_len(
+        "key-gated delta value",
+        value.len(),
+        head_count,
+        value_head_dim,
+    )?;
+    validate_matrix_len(
+        "key-gated delta decay",
+        decay.len(),
+        head_count,
+        key_head_dim,
+    )?;
+    if beta.len() != head_count {
+        return Err(KernelError::Shape(format!(
+            "key-gated delta beta length {} does not match head count {head_count}",
+            beta.len()
+        )));
+    }
+    let state_head_size = key_head_dim.checked_mul(value_head_dim).ok_or_else(|| {
+        KernelError::InvalidArgument("key-gated delta state head size overflowed".to_string())
+    })?;
+    validate_matrix_len(
+        "key-gated delta state",
+        state.len(),
+        head_count,
+        state_head_size,
+    )?;
+    if decay.iter().any(|value| !value.is_finite() || *value < 0.0)
+        || beta.iter().any(|value| !value.is_finite())
+    {
+        return Err(KernelError::InvalidArgument(
+            "key-gated delta decay and beta values must be finite, with non-negative decay"
+                .to_string(),
+        ));
+    }
+
+    let mut output = vec![0.0; value.len()];
+    for (head, &head_beta) in beta.iter().enumerate() {
+        let key_offset = head * key_head_dim;
+        let value_offset = head * value_head_dim;
+        let state_offset = head * state_head_size;
+        let state_head = &mut state[state_offset..state_offset + state_head_size];
+
+        for key_index in 0..key_head_dim {
+            let row_offset = key_index * value_head_dim;
+            let row_decay = decay[key_offset + key_index];
+            for element in &mut state_head[row_offset..row_offset + value_head_dim] {
+                *element *= row_decay;
+            }
+        }
+
+        for value_index in 0..value_head_dim {
+            let previous = (0..key_head_dim)
+                .map(|key_index| {
+                    key[key_offset + key_index]
+                        * state_head[key_index * value_head_dim + value_index]
+                })
+                .sum::<f32>();
+            let delta = (value[value_offset + value_index] - previous) * head_beta;
+            for key_index in 0..key_head_dim {
+                state_head[key_index * value_head_dim + value_index] +=
+                    key[key_offset + key_index] * delta;
+            }
+        }
+
+        for value_index in 0..value_head_dim {
+            output[value_offset + value_index] = (0..key_head_dim)
+                .map(|key_index| {
+                    query[key_offset + key_index]
+                        * state_head[key_index * value_head_dim + value_index]
+                })
+                .sum();
+        }
+    }
+    Ok(output)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GroupedQueryAttentionShape {
     pub token_count: usize,

@@ -1,8 +1,8 @@
 use sglang_kernel::cpu::{
-    GatedDeltaRuleShape, GroupedQueryAttentionShape, apply_neox_rope_inplace,
-    apply_partial_neox_rope_inplace, apply_token_bitmask_inplace, causal_depthwise_conv1d_step,
-    gated_delta_rule_step, gemma_rms_norm, grouped_query_attention, linear, rms_norm, silu_and_mul,
-    top_k_renorm_probs,
+    GatedDeltaRuleShape, GroupedQueryAttentionShape, KeyGatedDeltaRuleShape,
+    apply_neox_rope_inplace, apply_partial_neox_rope_inplace, apply_token_bitmask_inplace,
+    causal_depthwise_conv1d_step, gated_delta_rule_step, gemma_rms_norm, grouped_query_attention,
+    key_gated_delta_rule_step, linear, rms_norm, silu_and_mul, top_k_renorm_probs,
 };
 use sglang_kernel::{KernelError, TopK};
 
@@ -124,6 +124,50 @@ fn cpu_gated_delta_rule_updates_state_before_readout() {
     assert_close(&first, &[1.0, 1.5]);
     assert_close(&second, &[4.0, 6.0]);
     assert_close(&state, &[0.5, 0.75, 4.0, 6.0]);
+}
+
+#[test]
+fn cpu_key_gated_delta_rule_applies_distinct_decay_per_key_dimension() {
+    let shape = KeyGatedDeltaRuleShape {
+        head_count: 1,
+        key_head_dim: 2,
+        value_head_dim: 1,
+    };
+    let mut state = vec![2.0, 4.0];
+
+    let output = key_gated_delta_rule_step(
+        &[1.0, 1.0],
+        &[0.0, 0.0],
+        &[0.0],
+        &[0.5, 0.25],
+        &[0.0],
+        &mut state,
+        shape,
+    )
+    .expect("key-gated delta step should succeed");
+
+    assert_eq!(state, vec![1.0, 1.0]);
+    assert_eq!(output, vec![2.0]);
+}
+
+#[test]
+fn cpu_key_gated_delta_rule_rejects_head_level_decay() {
+    let error = key_gated_delta_rule_step(
+        &[1.0, 0.0],
+        &[1.0, 0.0],
+        &[1.0],
+        &[0.5],
+        &[1.0],
+        &mut [0.0, 0.0],
+        KeyGatedDeltaRuleShape {
+            head_count: 1,
+            key_head_dim: 2,
+            value_head_dim: 1,
+        },
+    )
+    .expect_err("KDA decay must be expressed per key dimension");
+
+    assert!(error.to_string().contains("decay"));
 }
 
 #[test]
