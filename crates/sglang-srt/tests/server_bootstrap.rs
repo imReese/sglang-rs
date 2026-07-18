@@ -696,6 +696,20 @@ async fn bootstrap_runs_kimi_k25_text_through_shared_deepseek_v3_runtime() {
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
 
+#[tokio::test]
+async fn bootstrap_runs_compressed_kimi_k25_routed_experts_through_shared_runtime() {
+    let model_dir = temp_model_dir("server-kimi-k25-compressed-forward");
+    std::fs::create_dir_all(&model_dir).expect("model directory should be created");
+    write_complete_compressed_kimi_k25_checkpoint(&model_dir);
+    assert_centralized_generation_with_kv_layers(
+        &model_dir,
+        "centralized-kimi-k25-compressed-text",
+        2,
+    )
+    .await;
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
 #[test]
 fn qwen3_5_pd_startup_rejects_kv_only_transfer_before_serving() {
     let model_dir = temp_model_dir("server-qwen35-pd-fail-fast");
@@ -2421,6 +2435,210 @@ fn write_complete_kimi_k25_checkpoint(model_dir: &std::path::Path) {
     );
 }
 
+fn write_complete_compressed_kimi_k25_checkpoint(model_dir: &std::path::Path) {
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "architectures": ["KimiK25ForConditionalGeneration"],
+  "model_type": "kimi_k25",
+  "encoder_only": false,
+  "language_only": false,
+  "vision_config": {"model_type": "kimi_k25", "hidden_size": 4},
+  "text_config": {
+    "architectures": ["DeepseekV3ForCausalLM"],
+    "model_type": "kimi_k2",
+    "vocab_size": 3,
+    "max_position_embeddings": 32,
+    "num_hidden_layers": 2,
+    "hidden_size": 32,
+    "intermediate_size": 2,
+    "num_attention_heads": 1,
+    "hidden_act": "silu",
+    "rms_norm_eps": 0.00001,
+    "rope_theta": 10000.0,
+    "rope_scaling": null,
+    "attention_bias": false,
+    "tie_word_embeddings": false,
+    "q_lora_rank": 2,
+    "kv_lora_rank": 2,
+    "qk_nope_head_dim": 1,
+    "qk_rope_head_dim": 2,
+    "v_head_dim": 2,
+    "moe_intermediate_size": 32,
+    "n_routed_experts": 1,
+    "n_shared_experts": 1,
+    "num_experts_per_tok": 1,
+    "routed_scaling_factor": 1.0,
+    "first_k_dense_replace": 1,
+    "moe_layer_freq": 1,
+    "n_group": 1,
+    "topk_group": 1,
+    "norm_topk_prob": true,
+    "scoring_func": "sigmoid",
+    "topk_method": "noaux_tc",
+    "num_nextn_predict_layers": 0,
+    "quantization_config": {
+      "quant_method": "compressed-tensors",
+      "format": "pack-quantized",
+      "quantization_status": "compressed",
+      "kv_cache_scheme": null,
+      "config_groups": {
+        "group_0": {
+          "targets": ["Linear"],
+          "input_activations": null,
+          "output_activations": null,
+          "weights": {
+            "type": "int",
+            "num_bits": 4,
+            "group_size": 32,
+            "strategy": "group",
+            "symmetric": true,
+            "dynamic": false,
+            "observer": "minmax",
+            "actorder": null,
+            "block_structure": null
+          }
+        }
+      },
+      "ignore": [
+        "re:.*self_attn.*",
+        "re:.*shared_experts.*",
+        "re:.*mlp\\.(gate|up|gate_up|down)_proj.*",
+        "re:.*lm_head.*",
+        "re:vision_tower.*",
+        "re:mm_projector.*"
+      ]
+    }
+  }
+}"#,
+    )
+    .expect("compressed Kimi K2.5 config should be written");
+    fs::write(
+        model_dir.join("tokenizer.json"),
+        word_level_tokenizer_json(),
+    )
+    .expect("compressed Kimi K2.5 tokenizer should be written");
+
+    let model_prefix = "language_model.model";
+    let mut tensors = Vec::<(String, &'static str, Vec<usize>, Vec<u8>)>::new();
+    let mut embeddings = vec![0.0_f32; 3 * 32];
+    embeddings[32] = 1.0;
+    embeddings[2 * 32 + 1] = 1.0;
+    push_f32_tensor(
+        &mut tensors,
+        format!("{model_prefix}.embed_tokens.weight"),
+        vec![3, 32],
+        embeddings,
+    );
+    push_f32_tensor(
+        &mut tensors,
+        format!("{model_prefix}.norm.weight"),
+        vec![32],
+        vec![1.0; 32],
+    );
+    let mut lm_head = vec![0.0_f32; 3 * 32];
+    lm_head[32 + 1] = 1.0;
+    lm_head[2 * 32] = 1.0;
+    push_f32_tensor(
+        &mut tensors,
+        "language_model.lm_head.weight".to_string(),
+        vec![3, 32],
+        lm_head,
+    );
+    for layer_id in 0..2 {
+        let prefix = format!("{model_prefix}.layers.{layer_id}");
+        push_f32_tensor(
+            &mut tensors,
+            format!("{prefix}.input_layernorm.weight"),
+            vec![32],
+            vec![1.0; 32],
+        );
+        push_f32_tensor(
+            &mut tensors,
+            format!("{prefix}.post_attention_layernorm.weight"),
+            vec![32],
+            vec![1.0; 32],
+        );
+        for (suffix, shape) in [
+            ("self_attn.q_a_proj.weight", vec![2, 32]),
+            ("self_attn.q_a_layernorm.weight", vec![2]),
+            ("self_attn.q_b_proj.weight", vec![3, 2]),
+            ("self_attn.kv_a_proj_with_mqa.weight", vec![4, 32]),
+            ("self_attn.kv_a_layernorm.weight", vec![2]),
+            ("self_attn.kv_b_proj.weight", vec![3, 2]),
+            ("self_attn.o_proj.weight", vec![32, 2]),
+        ] {
+            let count = shape.iter().product();
+            push_f32_tensor(
+                &mut tensors,
+                format!("{prefix}.{suffix}"),
+                shape,
+                vec![0.0; count],
+            );
+        }
+    }
+    for (suffix, shape) in [
+        ("gate_proj", vec![2, 32]),
+        ("up_proj", vec![2, 32]),
+        ("down_proj", vec![32, 2]),
+    ] {
+        let count = shape.iter().product();
+        push_f32_tensor(
+            &mut tensors,
+            format!("{model_prefix}.layers.0.mlp.{suffix}.weight"),
+            shape,
+            vec![0.0; count],
+        );
+    }
+    push_f32_tensor(
+        &mut tensors,
+        format!("{model_prefix}.layers.1.mlp.gate.weight"),
+        vec![1, 32],
+        vec![0.0; 32],
+    );
+    push_f32_tensor(
+        &mut tensors,
+        format!("{model_prefix}.layers.1.mlp.gate.e_score_correction_bias"),
+        vec![1],
+        vec![0.0],
+    );
+    for projection in ["w1", "w2", "w3"] {
+        let base = format!("{model_prefix}.layers.1.mlp.experts.0.{projection}");
+        tensors.push((
+            format!("{base}.weight_packed"),
+            "I32",
+            vec![32, 4],
+            (0..128)
+                .flat_map(|_| 0x8888_8888_u32.to_le_bytes())
+                .collect(),
+        ));
+        push_f32_tensor(
+            &mut tensors,
+            format!("{base}.weight_scale"),
+            vec![32, 1],
+            vec![1.0; 32],
+        );
+        tensors.push((
+            format!("{base}.weight_shape"),
+            "I64",
+            vec![2],
+            [32_i64, 32]
+                .into_iter()
+                .flat_map(i64::to_le_bytes)
+                .collect(),
+        ));
+    }
+    for projection in ["gate_proj", "up_proj", "down_proj"] {
+        push_f32_tensor(
+            &mut tensors,
+            format!("{model_prefix}.layers.1.mlp.shared_experts.{projection}.weight"),
+            vec![32, 32],
+            vec![0.0; 32 * 32],
+        );
+    }
+    write_typed_safetensors_file(&model_dir.join("model.safetensors"), &tensors);
+}
+
 fn write_complete_deepseek_v3_family_weights(
     model_dir: &std::path::Path,
     model_prefix: &str,
@@ -2657,6 +2875,47 @@ fn write_safetensors_file(
     bytes.extend_from_slice(header.as_bytes());
     bytes.extend_from_slice(payload);
     fs::write(path, bytes)
+}
+
+fn write_typed_safetensors_file(
+    path: &std::path::Path,
+    tensors: &[(String, &'static str, Vec<usize>, Vec<u8>)],
+) {
+    let mut payload = Vec::new();
+    let mut fields = Vec::new();
+    for (name, dtype, shape, bytes) in tensors {
+        let start = payload.len();
+        payload.extend_from_slice(bytes);
+        let shape = shape
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        fields.push(format!(
+            r#""{name}":{{"dtype":"{dtype}","shape":[{shape}],"data_offsets":[{start},{}]}}"#,
+            payload.len()
+        ));
+    }
+    let header = format!("{{{}}}", fields.join(","));
+    let mut file = Vec::new();
+    file.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    file.extend_from_slice(header.as_bytes());
+    file.extend_from_slice(&payload);
+    fs::write(path, file).expect("typed safetensors checkpoint should be written");
+}
+
+fn push_f32_tensor(
+    tensors: &mut Vec<(String, &'static str, Vec<usize>, Vec<u8>)>,
+    name: String,
+    shape: Vec<usize>,
+    values: Vec<f32>,
+) {
+    tensors.push((
+        name,
+        "F32",
+        shape,
+        values.into_iter().flat_map(f32::to_le_bytes).collect(),
+    ));
 }
 
 async fn connect_grpc_with_retry(addr: std::net::SocketAddr) -> SglangServiceClient<Channel> {

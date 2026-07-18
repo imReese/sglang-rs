@@ -543,6 +543,20 @@ pub(crate) struct DenseFeedForwardWeights {
 }
 
 impl DenseFeedForwardWeights {
+    pub(crate) fn from_values(
+        hidden_size: usize,
+        intermediate_size: usize,
+        gate: Vec<f32>,
+        up: Vec<f32>,
+        down: Vec<f32>,
+    ) -> Result<Self, CpuReferenceDenseDecoderError> {
+        Ok(Self {
+            gate: FloatMatrix::try_from_values(intermediate_size, hidden_size, gate)?,
+            up: FloatMatrix::try_from_values(intermediate_size, hidden_size, up)?,
+            down: FloatMatrix::try_from_values(hidden_size, intermediate_size, down)?,
+        })
+    }
+
     pub(crate) fn load(
         artifacts: &LocalModelArtifacts,
         gate_weight: &str,
@@ -641,15 +655,33 @@ pub(crate) struct FloatMatrix {
 }
 
 impl FloatMatrix {
-    #[cfg(test)]
-    pub(crate) fn from_values(rows: usize, columns: usize, values: Vec<f32>) -> Self {
-        assert_eq!(values.len(), rows * columns);
-        Self {
+    fn try_from_values(
+        rows: usize,
+        columns: usize,
+        values: Vec<f32>,
+    ) -> Result<Self, CpuReferenceDenseDecoderError> {
+        let expected = rows.checked_mul(columns).ok_or_else(|| {
+            CpuReferenceDenseDecoderError::Unsupported(
+                "float matrix element count overflowed".to_string(),
+            )
+        })?;
+        if values.len() != expected {
+            return Err(CpuReferenceDenseDecoderError::Unsupported(format!(
+                "float matrix has {} values, expected {expected} for shape [{rows}, {columns}]",
+                values.len()
+            )));
+        }
+        Ok(Self {
             rows,
             columns,
             values,
             bias: None,
-        }
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_values(rows: usize, columns: usize, values: Vec<f32>) -> Self {
+        Self::try_from_values(rows, columns, values).expect("test matrix shape should be valid")
     }
 
     pub(crate) fn load(

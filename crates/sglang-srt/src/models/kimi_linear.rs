@@ -312,6 +312,7 @@ fn build_definition(hf_config: &HfModelConfig) -> Result<ModelDefinition, ModelA
         renormalize: config.moe_renormalize.unwrap_or(true),
         router_activation,
         routed_scaling_factor,
+        routed_expert_weight_format: super::RoutedExpertWeightFormat::Unquantized,
     };
     let weights = weight_names(
         num_layers,

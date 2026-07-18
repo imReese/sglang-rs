@@ -10,6 +10,7 @@ use sglang_kernel::cuda_linear_attention::{
     CudaKeyGatedDeltaLaunch, CudaKeyGatedDeltaShape,
 };
 use sglang_kernel::cuda_mla::CudaBf16MlaKernels;
+use sglang_kernel::cuda_w4a16::CudaW4A16Kernels;
 
 use crate::backend::{CapabilityStatus, CudaBackend, RuntimeCapability, RuntimeDtype};
 use crate::cuda_attention::CudaBf16PagedAttentionExecutor;
@@ -30,7 +31,7 @@ use crate::model_runtime::BackendModelExecutor;
 use crate::models::{
     DecoderNormalization, HybridDecoderExecutionPlan, HybridDecoderLayerKind,
     HybridDecoderLayerWeightNames, HybridFeedForward, HybridLinearAttentionConfig,
-    KeyGatedDeltaWeightNames, ModelDefinition,
+    KeyGatedDeltaWeightNames, ModelDefinition, RoutedExpertWeightFormat,
 };
 
 const BF16_BYTES: usize = 2;
@@ -40,6 +41,7 @@ pub(crate) struct CudaBf16HybridDecoder {
     plan: HybridDecoderExecutionPlan,
     blas: CudaBlas,
     dense_kernels: CudaBf16DenseKernels,
+    w4a16_kernels: Option<CudaW4A16Kernels>,
     hybrid_kernels: Option<CudaBf16HybridKernels>,
     linear_attention: Option<CudaBf16LinearAttentionKernels>,
     mla_kernels: Option<CudaBf16MlaKernels>,
@@ -116,6 +118,22 @@ impl CudaBf16HybridDecoder {
         let compute_capability = backend.device().compute_capability;
         let blas = CudaBlas::load(backend.context())?;
         let dense_kernels = CudaBf16DenseKernels::compile(backend.context(), compute_capability)?;
+        let has_w4a16 = plan.weights.layers.iter().any(|layer| {
+            matches!(
+                layer.feed_forward,
+                HybridFeedForward::MixtureOfExperts {
+                    ref config,
+                    ..
+                } if matches!(
+                    config.routed_expert_weight_format,
+                    RoutedExpertWeightFormat::CompressedTensorsInt4 { .. }
+                )
+            )
+        });
+        let w4a16_kernels = has_w4a16
+            .then(|| CudaW4A16Kernels::compile(backend.context(), compute_capability))
+            .transpose()
+            .map_err(|error| CudaExecutorError::Unsupported(error.to_string()))?;
         let has_key_gated_delta = plan
             .weights
             .layers
@@ -177,6 +195,7 @@ impl CudaBf16HybridDecoder {
             plan,
             blas,
             dense_kernels,
+            w4a16_kernels,
             hybrid_kernels,
             linear_attention,
             mla_kernels,
@@ -364,6 +383,7 @@ impl CudaBf16HybridDecoder {
                     let feed_forward = layer.feed_forward.forward_single(
                         &self.blas,
                         &self.dense_kernels,
+                        self.w4a16_kernels.as_ref(),
                         self.backend.context(),
                         &normalized,
                         self.plan.hidden_size,
@@ -538,6 +558,7 @@ impl CudaHybridFeedForward {
         &self,
         blas: &CudaBlas,
         kernels: &CudaBf16DenseKernels,
+        w4a16_kernels: Option<&CudaW4A16Kernels>,
         context: &CudaContext,
         hidden: &CudaDeviceAllocation,
         hidden_size: usize,
@@ -547,7 +568,7 @@ impl CudaHybridFeedForward {
                 component.forward(blas, kernels, context, hidden, 1, hidden_size)
             }
             Self::MixtureOfExperts(component) => {
-                component.forward_single(blas, kernels, context, hidden)
+                component.forward_single(blas, kernels, w4a16_kernels, context, hidden)
             }
         }
     }

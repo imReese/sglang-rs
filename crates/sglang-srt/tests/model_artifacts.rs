@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
-use sglang_srt::model_artifacts::{HfModelConfig, LocalModelArtifacts, ModelArtifactError};
+use sglang_srt::model_artifacts::{
+    CheckpointTopology, HfModelConfig, LocalModelArtifacts, ModelArtifactError,
+    SafetensorsRoutedExpertProjectionWeights,
+};
 use sglang_srt::model_registry::ModelRegistry;
 
 #[test]
@@ -70,6 +73,61 @@ fn checkpoint_catalog_exposes_generic_layer_tensor_spans() {
         .span(0, "self_attn.q_proj.weight")
         .expect("layer tensor should be indexed");
     assert_eq!(q_proj.span.metadata.shape, vec![2, 2]);
+}
+
+#[test]
+fn routed_expert_catalog_groups_complete_compressed_tensors_projections() {
+    let model_dir = temp_model_dir("compressed-routed-expert-catalog");
+    write_json(
+        &model_dir.join("config.json"),
+        &json!({
+            "architectures": ["UnknownForCausalLM"],
+            "model_type": "unknown"
+        }),
+    );
+    let mut tensors = Vec::new();
+    for projection in ["w1", "w2", "w3"] {
+        let base = format!("model.layers.0.mlp.experts.0.{projection}");
+        tensors.extend([
+            (
+                format!("{base}.weight_packed"),
+                "I32",
+                vec![1, 1],
+                0x8888_8888_u32.to_le_bytes().to_vec(),
+            ),
+            (
+                format!("{base}.weight_scale"),
+                "F32",
+                vec![1, 1],
+                1.0_f32.to_le_bytes().to_vec(),
+            ),
+            (
+                format!("{base}.weight_shape"),
+                "I64",
+                vec![2],
+                [1_i64, 8].into_iter().flat_map(i64::to_le_bytes).collect(),
+            ),
+        ]);
+    }
+    write_typed_safetensors(&model_dir.join("model.safetensors"), &tensors);
+
+    let artifacts =
+        LocalModelArtifacts::from_model_path(&model_dir).expect("compressed fixture should load");
+    let catalog = artifacts
+        .routed_expert_weight_catalog()
+        .expect("compressed routed-expert catalog should build");
+    let group = catalog.group(0, 0).expect("layer 0 expert 0 group");
+    assert_eq!(group.tensor_count(), 9);
+    assert!(matches!(
+        group.gate,
+        SafetensorsRoutedExpertProjectionWeights::CompressedTensorsInt4(_)
+    ));
+    let coverage = artifacts
+        .validate_routed_expert_checkpoint_coverage(
+            &CheckpointTopology::new(Vec::new()).with_routed_experts([(0, 0)], 9),
+        )
+        .expect("compressed coverage should count all packed components");
+    assert_eq!(coverage.actual_weight_count, 9);
 }
 
 #[test]
@@ -242,6 +300,32 @@ fn write_safetensors(path: &Path, tensors: &[(String, Vec<usize>)]) {
     bytes.extend(header_bytes);
     bytes.extend(data);
     fs::write(path, bytes).expect("safetensors fixture should write");
+}
+
+fn write_typed_safetensors(path: &Path, tensors: &[(String, &'static str, Vec<usize>, Vec<u8>)]) {
+    let mut header = BTreeMap::new();
+    let mut data = Vec::new();
+    for (name, dtype, shape, bytes) in tensors {
+        let start = data.len();
+        data.extend_from_slice(bytes);
+        header.insert(
+            name.clone(),
+            json!({
+                "dtype": dtype,
+                "shape": shape,
+                "data_offsets": [start, data.len()]
+            }),
+        );
+    }
+    let mut header_bytes = serde_json::to_vec(&header).expect("header should serialize");
+    while header_bytes.len() % 8 != 0 {
+        header_bytes.push(b' ');
+    }
+    let mut file = Vec::new();
+    file.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+    file.extend_from_slice(&header_bytes);
+    file.extend_from_slice(&data);
+    fs::write(path, file).expect("typed safetensors fixture should be written");
 }
 
 fn write_json(path: &Path, value: &Value) {

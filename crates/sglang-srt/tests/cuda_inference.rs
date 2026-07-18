@@ -11,6 +11,9 @@ use sglang_srt::http::serve_http_router_with_shutdown;
 use sglang_srt::server::build_bootstrap_http_router_service;
 use tokio::sync::oneshot;
 
+#[path = "support/compressed_kimi_k25.rs"]
+mod compressed_kimi_k25;
+
 fn cuda_test_device_ordinal() -> usize {
     std::env::var("SGLANG_CUDA_TEST_DEVICE")
         .unwrap_or_else(|_| "0".to_string())
@@ -158,6 +161,16 @@ async fn cuda_kimi_k25_text_uses_shared_deepseek_v3_runtime_and_kv_pool() {
     assert_cuda_deepseek_v3_family_generation(
         "cuda-kimi-k25-text-mla-moe-http",
         write_kimi_k25_artifacts,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a CUDA device, NVIDIA driver, NVRTC, and cuBLAS with BF16/W4A16 support"]
+async fn cuda_compressed_kimi_k25_executes_packed_routed_experts() {
+    assert_cuda_deepseek_v3_family_generation(
+        "cuda-kimi-k25-compressed-mla-moe-http",
+        compressed_kimi_k25::write_artifacts,
     )
     .await;
 }

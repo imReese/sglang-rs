@@ -8,6 +8,7 @@ use sglang_kernel::cpu::{
 
 use crate::backend::{RuntimeCapability, RuntimeDtype};
 use crate::cache::CachePageId;
+use crate::compressed_tensors::CompressedTensorsInt4Weight;
 use crate::cpu_reference::{
     CpuNormalization, CpuReferenceDenseDecoderError, CpuReferenceKvCache, DenseFeedForwardWeights,
     FloatMatrix, FullAttentionForwardContext, FullAttentionShape, FullAttentionWeightNamesRef,
@@ -24,7 +25,7 @@ use crate::models::{
     HybridFullAttentionConfig, HybridFullAttentionWeightNames, HybridLinearAttentionConfig,
     HybridMultiLatentAttentionWeightNames, KeyGatedDeltaWeightNames, ModelDefinition,
     MoeFeedForwardConfig, MoeFeedForwardWeightNames, MultiLatentQueryConfig,
-    MultiLatentQueryWeightNames, RecurrentStateLayout,
+    MultiLatentQueryWeightNames, RecurrentStateLayout, RoutedExpertWeightFormat,
 };
 use crate::moe::MoeRouter;
 use crate::runtime_kv_cache::{RuntimeKvCache, RuntimeKvCacheMetadata};
@@ -704,15 +705,54 @@ impl MoeFeedForwardWeights {
         let experts = names
             .experts
             .iter()
-            .map(|expert| {
-                DenseFeedForwardWeights::load(
+            .map(|expert| match config.routed_expert_weight_format {
+                RoutedExpertWeightFormat::Unquantized => DenseFeedForwardWeights::load(
                     artifacts,
                     &expert.gate_weight,
                     &expert.up_weight,
                     &expert.down_weight,
                     hidden_size,
                     config.expert_intermediate_size,
-                )
+                ),
+                RoutedExpertWeightFormat::CompressedTensorsInt4 { group_size } => {
+                    let gate = CompressedTensorsInt4Weight::load(
+                        artifacts,
+                        &expert.gate_weight,
+                        config.expert_intermediate_size,
+                        hidden_size,
+                        group_size,
+                    )
+                    .map_err(|error| {
+                        CpuReferenceDenseDecoderError::Unsupported(error.to_string())
+                    })?;
+                    let up = CompressedTensorsInt4Weight::load(
+                        artifacts,
+                        &expert.up_weight,
+                        config.expert_intermediate_size,
+                        hidden_size,
+                        group_size,
+                    )
+                    .map_err(|error| {
+                        CpuReferenceDenseDecoderError::Unsupported(error.to_string())
+                    })?;
+                    let down = CompressedTensorsInt4Weight::load(
+                        artifacts,
+                        &expert.down_weight,
+                        hidden_size,
+                        config.expert_intermediate_size,
+                        group_size,
+                    )
+                    .map_err(|error| {
+                        CpuReferenceDenseDecoderError::Unsupported(error.to_string())
+                    })?;
+                    DenseFeedForwardWeights::from_values(
+                        hidden_size,
+                        config.expert_intermediate_size,
+                        gate.dequantize_f32(),
+                        up.dequantize_f32(),
+                        down.dequantize_f32(),
+                    )
+                }
             })
             .collect::<Result<Vec<_>, _>>()?;
         let shared_intermediate_size = config

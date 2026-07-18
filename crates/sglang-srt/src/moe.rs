@@ -340,6 +340,7 @@ mod tests {
             renormalize: true,
             router_activation: RouterActivation::Sigmoid,
             routed_scaling_factor: 2.0,
+            routed_expert_weight_format: crate::models::RoutedExpertWeightFormat::Unquantized,
         }
     }
 

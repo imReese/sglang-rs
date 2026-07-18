@@ -92,11 +92,13 @@ impl LocalModelArtifacts {
             })?;
 
         let actual_group_count = groups.len();
-        let actual_weight_count = actual_group_count.checked_mul(3).ok_or_else(|| {
-            invalid_safetensors_data(
-                &self.model_path,
-                "actual routed expert weight count overflowed",
-            )
+        let actual_weight_count = groups.iter().try_fold(0_usize, |count, group| {
+            count.checked_add(group.tensor_count()).ok_or_else(|| {
+                invalid_safetensors_data(
+                    &self.model_path,
+                    "actual routed expert weight count overflowed",
+                )
+            })
         })?;
 
         if actual_group_count != expected_group_count {
@@ -104,6 +106,14 @@ impl LocalModelArtifacts {
                 &self.model_path,
                 format!(
                     "expected {expected_group_count} routed expert groups from model config but found {actual_group_count}"
+                ),
+            ));
+        }
+        if actual_weight_count != expected_weight_count {
+            return Err(invalid_safetensors_data(
+                &self.model_path,
+                format!(
+                    "expected {expected_weight_count} routed expert tensors but found {actual_weight_count}"
                 ),
             ));
         }
@@ -680,12 +690,15 @@ impl SafetensorsManifest {
             .into_iter()
             .filter_map(|(tensor_name, span)| {
                 parse_routed_expert_weight_name(&tensor_name).map(
-                    |(layer_id, expert_id, projection)| SafetensorsRoutedExpertWeightSpan {
-                        tensor_name,
-                        layer_id,
-                        expert_id,
-                        projection,
-                        span,
+                    |(layer_id, expert_id, projection, component)| {
+                        SafetensorsRoutedExpertWeightSpan {
+                            tensor_name,
+                            layer_id,
+                            expert_id,
+                            projection,
+                            component,
+                            span,
+                        }
                     },
                 )
             })
@@ -1091,22 +1104,59 @@ pub enum SafetensorsRoutedExpertProjection {
     Down,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SafetensorsRoutedExpertWeightComponent {
+    Weight,
+    PackedWeight,
+    WeightScale,
+    WeightShape,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SafetensorsRoutedExpertWeightSpan {
     pub tensor_name: String,
     pub layer_id: usize,
     pub expert_id: usize,
     pub projection: SafetensorsRoutedExpertProjection,
+    pub component: SafetensorsRoutedExpertWeightComponent,
     pub span: SafetensorsTensorSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SafetensorsRoutedExpertProjectionWeights {
+    Unquantized { weight: SafetensorsTensorSpan },
+    CompressedTensorsInt4(Box<SafetensorsCompressedInt4ProjectionWeights>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SafetensorsCompressedInt4ProjectionWeights {
+    pub packed: SafetensorsTensorSpan,
+    pub scale: SafetensorsTensorSpan,
+    pub shape: SafetensorsTensorSpan,
+}
+
+impl SafetensorsRoutedExpertProjectionWeights {
+    pub fn tensor_count(&self) -> usize {
+        match self {
+            Self::Unquantized { .. } => 1,
+            Self::CompressedTensorsInt4(_) => 3,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SafetensorsRoutedExpertWeightGroup {
     pub layer_id: usize,
     pub expert_id: usize,
-    pub gate: SafetensorsTensorSpan,
-    pub up: SafetensorsTensorSpan,
-    pub down: SafetensorsTensorSpan,
+    pub gate: SafetensorsRoutedExpertProjectionWeights,
+    pub up: SafetensorsRoutedExpertProjectionWeights,
+    pub down: SafetensorsRoutedExpertProjectionWeights,
+}
+
+impl SafetensorsRoutedExpertWeightGroup {
+    pub fn tensor_count(&self) -> usize {
+        self.gate.tensor_count() + self.up.tensor_count() + self.down.tensor_count()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1207,10 +1257,18 @@ impl<'a> SafetensorsRoutedExpertLayerWeights<'a> {
 struct RoutedExpertWeightGroupBuilder {
     layer_id: usize,
     expert_id: usize,
-    gate: Option<SafetensorsTensorSpan>,
-    up: Option<SafetensorsTensorSpan>,
-    down: Option<SafetensorsTensorSpan>,
+    gate: RoutedExpertProjectionBuilder,
+    up: RoutedExpertProjectionBuilder,
+    down: RoutedExpertProjectionBuilder,
     error_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Default)]
+struct RoutedExpertProjectionBuilder {
+    weight: Option<SafetensorsTensorSpan>,
+    packed: Option<SafetensorsTensorSpan>,
+    scale: Option<SafetensorsTensorSpan>,
+    shape: Option<SafetensorsTensorSpan>,
 }
 
 impl RoutedExpertWeightGroupBuilder {
@@ -1218,9 +1276,9 @@ impl RoutedExpertWeightGroupBuilder {
         Self {
             layer_id,
             expert_id,
-            gate: None,
-            up: None,
-            down: None,
+            gate: RoutedExpertProjectionBuilder::default(),
+            up: RoutedExpertProjectionBuilder::default(),
+            down: RoutedExpertProjectionBuilder::default(),
             error_path: None,
         }
     }
@@ -1231,23 +1289,12 @@ impl RoutedExpertWeightGroupBuilder {
     ) -> Result<(), ModelArtifactError> {
         self.error_path
             .get_or_insert_with(|| weight.span.path.clone());
-        let slot = match weight.projection {
+        let projection = match weight.projection {
             SafetensorsRoutedExpertProjection::Gate => &mut self.gate,
             SafetensorsRoutedExpertProjection::Up => &mut self.up,
             SafetensorsRoutedExpertProjection::Down => &mut self.down,
         };
-        if slot.is_some() {
-            return Err(invalid_safetensors_data(
-                &weight.span.path,
-                format!(
-                    "duplicate routed expert projection for layer {} expert {}",
-                    self.layer_id, self.expert_id
-                ),
-            ));
-        }
-
-        *slot = Some(weight.span);
-        Ok(())
+        projection.insert(weight.component, weight.span, self.layer_id, self.expert_id)
     }
 
     fn finish(self) -> Result<SafetensorsRoutedExpertWeightGroup, ModelArtifactError> {
@@ -1255,33 +1302,13 @@ impl RoutedExpertWeightGroupBuilder {
             .error_path
             .as_deref()
             .unwrap_or_else(|| Path::new("<unknown>"));
-        let gate = self.gate.ok_or_else(|| {
-            invalid_safetensors_data(
-                path,
-                format!(
-                    "routed expert weight group for layer {} expert {} is missing gate projection",
-                    self.layer_id, self.expert_id
-                ),
-            )
-        })?;
-        let up = self.up.ok_or_else(|| {
-            invalid_safetensors_data(
-                path,
-                format!(
-                    "routed expert weight group for layer {} expert {} is missing up projection",
-                    self.layer_id, self.expert_id
-                ),
-            )
-        })?;
-        let down = self.down.ok_or_else(|| {
-            invalid_safetensors_data(
-                path,
-                format!(
-                    "routed expert weight group for layer {} expert {} is missing down projection",
-                    self.layer_id, self.expert_id
-                ),
-            )
-        })?;
+        let gate = self
+            .gate
+            .finish(path, self.layer_id, self.expert_id, "gate")?;
+        let up = self.up.finish(path, self.layer_id, self.expert_id, "up")?;
+        let down = self
+            .down
+            .finish(path, self.layer_id, self.expert_id, "down")?;
 
         Ok(SafetensorsRoutedExpertWeightGroup {
             layer_id: self.layer_id,
@@ -1290,6 +1317,68 @@ impl RoutedExpertWeightGroupBuilder {
             up,
             down,
         })
+    }
+}
+
+impl RoutedExpertProjectionBuilder {
+    fn insert(
+        &mut self,
+        component: SafetensorsRoutedExpertWeightComponent,
+        span: SafetensorsTensorSpan,
+        layer_id: usize,
+        expert_id: usize,
+    ) -> Result<(), ModelArtifactError> {
+        let slot = match component {
+            SafetensorsRoutedExpertWeightComponent::Weight => &mut self.weight,
+            SafetensorsRoutedExpertWeightComponent::PackedWeight => &mut self.packed,
+            SafetensorsRoutedExpertWeightComponent::WeightScale => &mut self.scale,
+            SafetensorsRoutedExpertWeightComponent::WeightShape => &mut self.shape,
+        };
+        if slot.is_some() {
+            return Err(invalid_safetensors_data(
+                &span.path,
+                format!(
+                    "duplicate routed expert weight component {component:?} for layer {layer_id} expert {expert_id}"
+                ),
+            ));
+        }
+        *slot = Some(span);
+        Ok(())
+    }
+
+    fn finish(
+        self,
+        path: &Path,
+        layer_id: usize,
+        expert_id: usize,
+        projection: &str,
+    ) -> Result<SafetensorsRoutedExpertProjectionWeights, ModelArtifactError> {
+        match (self.weight, self.packed, self.scale, self.shape) {
+            (Some(weight), None, None, None) => {
+                Ok(SafetensorsRoutedExpertProjectionWeights::Unquantized { weight })
+            }
+            (None, Some(packed), Some(scale), Some(shape)) => Ok(
+                SafetensorsRoutedExpertProjectionWeights::CompressedTensorsInt4(Box::new(
+                    SafetensorsCompressedInt4ProjectionWeights {
+                        packed,
+                        scale,
+                        shape,
+                    },
+                )),
+            ),
+            (None, None, None, None) => Err(invalid_safetensors_data(
+                path,
+                format!(
+                    "routed expert weight group for layer {layer_id} expert {expert_id} is missing {projection} projection"
+                ),
+            )),
+            _ => Err(invalid_safetensors_data(
+                path,
+                format!(
+                    "routed expert {projection} projection for layer {layer_id} expert {expert_id} mixes unquantized and incomplete compressed-tensors components"
+                ),
+            )),
+        }
     }
 }
 
@@ -1928,7 +2017,12 @@ fn quantized_linear_scale_tensor(
 
 fn parse_routed_expert_weight_name(
     tensor_name: &str,
-) -> Option<(usize, usize, SafetensorsRoutedExpertProjection)> {
+) -> Option<(
+    usize,
+    usize,
+    SafetensorsRoutedExpertProjection,
+    SafetensorsRoutedExpertWeightComponent,
+)> {
     let parts = tensor_name.split('.').collect::<Vec<_>>();
     let layer_id = parts.windows(2).find_map(|window| {
         if window[0] == "layers" {
@@ -1948,11 +2042,18 @@ fn parse_routed_expert_weight_name(
         "w3" | "up_proj" => SafetensorsRoutedExpertProjection::Up,
         _ => return None,
     };
-    if parts.get(experts_index + 3) != Some(&"weight") || experts_index + 4 != parts.len() {
+    let component = match *parts.get(experts_index + 3)? {
+        "weight" => SafetensorsRoutedExpertWeightComponent::Weight,
+        "weight_packed" => SafetensorsRoutedExpertWeightComponent::PackedWeight,
+        "weight_scale" => SafetensorsRoutedExpertWeightComponent::WeightScale,
+        "weight_shape" => SafetensorsRoutedExpertWeightComponent::WeightShape,
+        _ => return None,
+    };
+    if experts_index + 4 != parts.len() {
         return None;
     }
 
-    Some((layer_id, expert_id, projection))
+    Some((layer_id, expert_id, projection, component))
 }
 
 fn parse_usize_segment(value: &str) -> Option<usize> {

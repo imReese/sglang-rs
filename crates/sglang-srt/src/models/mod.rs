@@ -341,6 +341,21 @@ pub(crate) enum RouterActivation {
     Softmax,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RoutedExpertWeightFormat {
+    Unquantized,
+    CompressedTensorsInt4 { group_size: usize },
+}
+
+impl RoutedExpertWeightFormat {
+    pub(crate) fn checkpoint_tensor_count_per_expert(self) -> usize {
+        match self {
+            Self::Unquantized => 3,
+            Self::CompressedTensorsInt4 { .. } => 9,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct MoeFeedForwardConfig {
     pub(crate) routed_expert_count: usize,
@@ -352,6 +367,7 @@ pub(crate) struct MoeFeedForwardConfig {
     pub(crate) renormalize: bool,
     pub(crate) router_activation: RouterActivation,
     pub(crate) routed_scaling_factor: f32,
+    pub(crate) routed_expert_weight_format: RoutedExpertWeightFormat,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

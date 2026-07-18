@@ -16,7 +16,7 @@ use super::{
     HybridFeedForward, HybridFullAttentionConfig, HybridMultiLatentAttentionWeightNames,
     ModelAdapter, ModelAdapterError, ModelDefinition, ModelExecutionArchitecture,
     MoeFeedForwardConfig, MoeFeedForwardWeightNames, MultiLatentQueryConfig,
-    MultiLatentQueryWeightNames, RouterActivation, required_usize,
+    MultiLatentQueryWeightNames, RoutedExpertWeightFormat, RouterActivation, required_usize,
 };
 
 pub(crate) const DEEPSEEK_V3_ARCHITECTURE: &str = "DeepseekV3ForCausalLM";
@@ -122,6 +122,7 @@ fn build_deepseek_v3_definition(
             architecture: DEEPSEEK_V3_ARCHITECTURE,
             model_prefix: "model",
             lm_head: "lm_head.weight",
+            routed_expert_weight_format: RoutedExpertWeightFormat::Unquantized,
         },
     )
 }
@@ -131,6 +132,7 @@ pub(super) struct DeepSeekV3DefinitionSpec {
     pub(super) architecture: &'static str,
     pub(super) model_prefix: &'static str,
     pub(super) lm_head: &'static str,
+    pub(super) routed_expert_weight_format: RoutedExpertWeightFormat,
 }
 
 pub(super) fn build_deepseek_v3_definition_for_adapter(
@@ -139,7 +141,11 @@ pub(super) fn build_deepseek_v3_definition_for_adapter(
     spec: DeepSeekV3DefinitionSpec,
 ) -> Result<ModelDefinition, ModelAdapterError> {
     let architecture = spec.architecture;
-    reject_unsupported_deepseek_v3_features(architecture, &config)?;
+    reject_unsupported_deepseek_v3_features(
+        architecture,
+        &config,
+        spec.routed_expert_weight_format,
+    )?;
 
     let vocab_size = required_usize(architecture, "vocab_size", config.vocab_size)?;
     let hidden_size = required_usize(architecture, "hidden_size", config.hidden_size)?;
@@ -265,6 +271,7 @@ pub(super) fn build_deepseek_v3_definition_for_adapter(
         renormalize,
         router_activation,
         routed_scaling_factor,
+        routed_expert_weight_format: spec.routed_expert_weight_format,
     };
     let weights = deepseek_v3_weight_names(DeepSeekV3WeightLayout {
         num_layers,
@@ -338,6 +345,7 @@ pub(super) fn build_deepseek_v3_definition_for_adapter(
 fn reject_unsupported_deepseek_v3_features(
     architecture: &'static str,
     config: &MlaMoeConfig,
+    routed_expert_weight_format: RoutedExpertWeightFormat,
 ) -> Result<(), ModelAdapterError> {
     if config.hidden_act.as_deref() != Some("silu") {
         return Err(ModelAdapterError::invalid(
@@ -361,15 +369,25 @@ fn reject_unsupported_deepseek_v3_features(
             "rope_scaling/YaRN is not implemented by the shared MLA component",
         ));
     }
-    if config
+    let has_quantization = config
         .quantization_config
         .as_ref()
-        .is_some_and(|value| !value.is_null())
-    {
-        return Err(ModelAdapterError::invalid(
-            architecture,
-            "quantized DeepSeek/Kimi checkpoints are not implemented; an unquantized checkpoint is required",
-        ));
+        .is_some_and(|value| !value.is_null());
+    match (has_quantization, routed_expert_weight_format) {
+        (false, RoutedExpertWeightFormat::Unquantized)
+        | (true, RoutedExpertWeightFormat::CompressedTensorsInt4 { .. }) => {}
+        (true, RoutedExpertWeightFormat::Unquantized) => {
+            return Err(ModelAdapterError::invalid(
+                architecture,
+                "quantized DeepSeek checkpoints are not implemented by this model adapter",
+            ));
+        }
+        (false, RoutedExpertWeightFormat::CompressedTensorsInt4 { .. }) => {
+            return Err(ModelAdapterError::invalid(
+                architecture,
+                "compressed routed-expert execution requires quantization_config",
+            ));
+        }
     }
     if config.num_nextn_predict_layers.unwrap_or(0) != 0 {
         return Err(ModelAdapterError::invalid(
@@ -628,11 +646,13 @@ fn deepseek_v3_checkpoint_topology(
                     ));
                 }
                 for (expert_id, expert) in weights.experts.iter().enumerate() {
-                    tensors.extend(dense_feed_forward_requirements(
+                    tensors.extend(routed_expert_requirements(
+                        architecture,
                         expert,
                         plan.hidden_size,
                         config.expert_intermediate_size,
-                    ));
+                        config.routed_expert_weight_format,
+                    )?);
                     routed_coordinates.push((layer_id, expert_id));
                 }
                 if let Some(shared) = &weights.shared_expert {
@@ -651,7 +671,106 @@ fn deepseek_v3_checkpoint_topology(
             }
         }
     }
-    Ok(CheckpointTopology::new(tensors).with_routed_experts(routed_coordinates, 3))
+    let tensors_per_expert = if routed_coordinates.is_empty() {
+        0
+    } else {
+        plan.weights
+            .layers
+            .iter()
+            .find_map(|layer| match &layer.feed_forward {
+                HybridFeedForward::MixtureOfExperts { config, .. } => Some(
+                    config
+                        .routed_expert_weight_format
+                        .checkpoint_tensor_count_per_expert(),
+                ),
+                HybridFeedForward::Dense { .. } => None,
+            })
+            .ok_or_else(|| {
+                ModelAdapterError::invalid(
+                    architecture,
+                    "routed expert checkpoint coordinates have no MoE execution layer",
+                )
+            })?
+    };
+    Ok(
+        CheckpointTopology::new(tensors)
+            .with_routed_experts(routed_coordinates, tensors_per_expert),
+    )
+}
+
+fn routed_expert_requirements(
+    architecture: &'static str,
+    weights: &DenseFeedForwardWeightNames,
+    hidden_size: usize,
+    intermediate_size: usize,
+    format: RoutedExpertWeightFormat,
+) -> Result<Vec<CheckpointTensorRequirement>, ModelAdapterError> {
+    match format {
+        RoutedExpertWeightFormat::Unquantized => Ok(Vec::from(dense_feed_forward_requirements(
+            weights,
+            hidden_size,
+            intermediate_size,
+        ))),
+        RoutedExpertWeightFormat::CompressedTensorsInt4 { group_size } => {
+            let mut requirements = Vec::with_capacity(9);
+            requirements.extend(compressed_int4_matrix_requirements(
+                architecture,
+                &weights.gate_weight,
+                intermediate_size,
+                hidden_size,
+                group_size,
+            )?);
+            requirements.extend(compressed_int4_matrix_requirements(
+                architecture,
+                &weights.up_weight,
+                intermediate_size,
+                hidden_size,
+                group_size,
+            )?);
+            requirements.extend(compressed_int4_matrix_requirements(
+                architecture,
+                &weights.down_weight,
+                hidden_size,
+                intermediate_size,
+                group_size,
+            )?);
+            Ok(requirements)
+        }
+    }
+}
+
+fn compressed_int4_matrix_requirements(
+    architecture: &'static str,
+    weight_name: &str,
+    rows: usize,
+    columns: usize,
+    group_size: usize,
+) -> Result<[CheckpointTensorRequirement; 3], ModelAdapterError> {
+    if group_size == 0 || !columns.is_multiple_of(group_size) || !columns.is_multiple_of(8) {
+        return Err(ModelAdapterError::invalid(
+            architecture,
+            format!(
+                "compressed INT4 tensor {weight_name} input width {columns} must be divisible by group_size {group_size} and packed factor 8"
+            ),
+        ));
+    }
+    let base = weight_name.strip_suffix(".weight").ok_or_else(|| {
+        ModelAdapterError::invalid(
+            architecture,
+            format!("compressed INT4 logical weight name {weight_name} must end in .weight"),
+        )
+    })?;
+    Ok([
+        CheckpointTensorRequirement::with_shape(
+            format!("{base}.weight_packed"),
+            [rows, columns / 8],
+        ),
+        CheckpointTensorRequirement::with_shape(
+            format!("{base}.weight_scale"),
+            [rows, columns / group_size],
+        ),
+        CheckpointTensorRequirement::with_shape(format!("{base}.weight_shape"), [2]),
+    ])
 }
 
 fn dense_feed_forward_requirements(

@@ -856,26 +856,64 @@ mod tests {
     }
 
     #[test]
-    fn kimi_k25_compressed_checkpoint_fails_during_adapter_loading() {
+    fn kimi_k25_compressed_checkpoint_builds_shared_mla_moe_plan() {
         let mut value = kimi_k25_config().raw_document().clone();
-        value["quantization_config"] = json!({
+        value["text_config"]["hidden_size"] = json!(32);
+        value["text_config"]["moe_intermediate_size"] = json!(32);
+        value["text_config"]["quantization_config"] = json!({
             "quant_method": "compressed-tensors",
-            "format": "pack-quantized"
+            "format": "pack-quantized",
+            "quantization_status": "compressed",
+            "kv_cache_scheme": null,
+            "config_groups": {
+                "group_0": {
+                    "targets": ["Linear"],
+                    "input_activations": null,
+                    "output_activations": null,
+                    "weights": {
+                        "type": "int",
+                        "num_bits": 4,
+                        "group_size": 32,
+                        "strategy": "group",
+                        "symmetric": true,
+                        "dynamic": false,
+                        "observer": "minmax",
+                        "actorder": null,
+                        "block_structure": null
+                    }
+                }
+            },
+            "ignore": [
+                "re:.*self_attn.*",
+                "re:.*shared_experts.*",
+                "re:.*mlp\\.(gate|up|gate_up|down)_proj.*",
+                "re:.*lm_head.*",
+                "re:vision_tower.*",
+                "re:mm_projector.*"
+            ]
         });
         let config = HfModelConfig::from_json_value(value).expect("routing config should parse");
 
-        let error = ModelRegistry
+        let definition = ModelRegistry
             .definition(Path::new("/models/kimi-k2.5-compressed"), &config)
-            .expect_err("unsupported Kimi quantization must fail before backend initialization");
-
-        assert!(matches!(
-            error,
-            ModelRegistryError::InvalidAdapterConfig {
-                architecture: "KimiK25ForConditionalGeneration",
-                ref message,
-                ..
-            } if message.contains("compressed-tensors support is required")
-        ));
+            .expect("official Kimi routed-expert quantization should build");
+        let plan = definition.hybrid_decoder().expect("shared MLA/MoE plan");
+        let crate::models::HybridFeedForward::MixtureOfExperts { config, .. } =
+            &plan.weights.layers[1].feed_forward
+        else {
+            panic!("second Kimi layer should use shared MoE")
+        };
+        assert_eq!(
+            config.routed_expert_weight_format,
+            crate::models::RoutedExpertWeightFormat::CompressedTensorsInt4 { group_size: 32 }
+        );
+        assert!(
+            definition
+                .checkpoint_topology()
+                .required_tensors()
+                .iter()
+                .any(|tensor| tensor.name().ends_with("experts.0.w1.weight_packed"))
+        );
     }
 
     #[test]
@@ -891,7 +929,7 @@ mod tests {
         assert!(matches!(
             error,
             ModelRegistryError::InvalidAdapterConfig { ref message, .. }
-                if message.contains("quantized DeepSeek/Kimi checkpoints are not implemented")
+                if message.contains("quantized DeepSeek checkpoints are not implemented")
         ));
     }
 

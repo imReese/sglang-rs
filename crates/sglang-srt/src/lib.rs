@@ -2,6 +2,7 @@ pub mod backend;
 mod backend_model;
 pub mod cache;
 pub mod cli;
+mod compressed_tensors;
 mod cpu_hybrid;
 mod cpu_reference;
 pub mod cuda_attention;
