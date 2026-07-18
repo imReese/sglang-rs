@@ -128,3 +128,34 @@ fn attention_plan_rejects_non_bf16_kv_without_cuda_fallback() {
         })
     );
 }
+
+#[test]
+fn attention_plan_rejects_asymmetric_kv_before_kernel_launch() {
+    let batch = two_request_prefill_batch();
+    let metadata_pool = PagedKvCacheLayout::new(runtime_layout(KvCacheDtype::Bfloat16), 2)
+        .expect("uniform metadata pool should be valid");
+    let metadata = CudaPagedAttentionMetadata::from_model_worker_batch(&batch, metadata_pool)
+        .expect("metadata should validate");
+    let asymmetric_runtime = KvCacheRuntimeLayout {
+        dtype: KvCacheDtype::Bfloat16,
+        page_size: 4,
+        num_layers: 2,
+        kv_heads: 2,
+        head_dim: 8,
+        kv_tensors_per_token: 2,
+        bytes_per_token: 96,
+        page_size_bytes: 384,
+    };
+    let asymmetric_pool = PagedKvCacheLayout::new_with_tensor_pair(asymmetric_runtime, 2, 32, 16)
+        .expect("asymmetric pool should be representable by the common layout");
+
+    assert_eq!(
+        CudaBf16PagedAttentionExecutor::plan(asymmetric_pool, 0, &metadata, 4, 1.0),
+        Err(CudaPagedAttentionError::KvLayout(
+            PagedKvCacheLayoutError::UnevenKvPairCopy {
+                key_token_bytes: 32,
+                value_token_bytes: 16,
+            }
+        ))
+    );
+}

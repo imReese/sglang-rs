@@ -302,6 +302,9 @@ fn paged_kv_cache_layout(
     let bytes_per_token = model_layout
         .token_size_bytes(dtype)
         .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?;
+    let tensor_pair_size_bytes = model_layout
+        .tensor_pair_size_bytes(dtype)
+        .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?;
     let page_size_bytes = config
         .page_size
         .checked_mul(bytes_per_token)
@@ -317,8 +320,16 @@ fn paged_kv_cache_layout(
         page_size_bytes,
     };
     let page_count = config.slot_capacity / config.page_size;
-    PagedKvCacheLayout::new(runtime_layout, page_count)
-        .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))
+    let layout = match tensor_pair_size_bytes {
+        Some([key_token_bytes, value_token_bytes]) => PagedKvCacheLayout::new_with_tensor_pair(
+            runtime_layout,
+            page_count,
+            key_token_bytes,
+            value_token_bytes,
+        ),
+        None => PagedKvCacheLayout::new(runtime_layout, page_count),
+    };
+    layout.map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))
 }
 
 fn validate_cpu_model_runtime(definition: &ModelDefinition) -> Vec<String> {

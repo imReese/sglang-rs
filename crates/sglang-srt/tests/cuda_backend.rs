@@ -461,7 +461,9 @@ fn cuda_runtime_kernels_execute_and_write_kv_slots() {
     let mut kv_cache = allocate_cuda_kv_cache(backend.context(), cuda_test_layout(), 2)
         .expect("CUDA KV cache should allocate");
     let layout = kv_cache.layout();
-    let slot_byte_len = layout.bytes_per_token_per_tensor();
+    let slot_byte_len = layout
+        .bytes_per_token_per_tensor()
+        .expect("CUDA test layout must have uniform tensor widths");
     let pattern = (0..slot_byte_len)
         .map(|offset| (offset % 251) as u8)
         .collect::<Vec<_>>();
@@ -510,7 +512,9 @@ fn cuda_kv_kernels_scatter_and_gather_batched_physical_slots() {
         .storage()
         .upload_slot_map(layout, &slots)
         .expect("scheduler physical slots should upload after validation");
-    let row_bytes = layout.bytes_per_token_per_tensor();
+    let row_bytes = layout
+        .bytes_per_token_per_tensor()
+        .expect("CUDA test layout must have uniform tensor widths");
     let key_stride = row_bytes + 37;
     let value_stride = row_bytes + 53;
     let (key_bytes, expected_keys) = strided_byte_rows(slots.len(), row_bytes, key_stride, 17);
@@ -690,7 +694,9 @@ fn cuda_bf16_paged_attention_reads_mooncake_registered_physical_kv_slots() {
     values
         .copy_from_host(0, &value_bytes)
         .expect("BF16 values should upload");
-    let row_bytes = kv_layout.bytes_per_token_per_tensor();
+    let row_bytes = kv_layout
+        .bytes_per_token_per_tensor()
+        .expect("CUDA attention test layout must have uniform tensor widths");
     kv_cache
         .storage_mut()
         .write_kv_slots_from_device(

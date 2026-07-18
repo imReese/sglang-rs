@@ -1,5 +1,6 @@
 use sglang_srt::kv_cache::{
-    KvCachePool, KvCachePoolError, KvCacheStorage, PagedKvCacheLayout, PagedKvCacheLayoutError,
+    KvCacheModelLayout, KvCachePool, KvCachePoolError, KvCacheStorage, PagedKvCacheLayout,
+    PagedKvCacheLayoutError,
 };
 use sglang_srt::transfer::{
     KvCacheDtype, KvCacheMemoryLocation, KvCacheMemoryProvider, KvCacheRuntimeLayout,
@@ -67,9 +68,9 @@ fn page_major_layout_matches_page_layer_tensor_token_order() {
     assert_eq!(layout.runtime(), runtime_layout());
     assert_eq!(layout.page_count(), 3);
     assert_eq!(layout.bytes_per_token_per_layer(), 64);
-    assert_eq!(layout.bytes_per_token_per_tensor(), 32);
+    assert_eq!(layout.bytes_per_token_per_tensor(), Some(32));
     assert_eq!(layout.bytes_per_layer_page(), 256);
-    assert_eq!(layout.bytes_per_tensor_page(), 128);
+    assert_eq!(layout.bytes_per_tensor_page(), Some(128));
     assert_eq!(layout.total_byte_len(), 1_536);
     assert_eq!(layout.slot_count(), 12);
     assert_eq!(layout.page_byte_range(1).unwrap(), 512..1_024);
@@ -173,6 +174,66 @@ fn page_major_layout_describes_a_layer_kv_pair() {
     assert_eq!(geometry.key_offset_bytes, 256);
     assert_eq!(geometry.value_offset_bytes, 384);
     assert_eq!(geometry.token_bytes, 32);
+}
+
+#[test]
+fn asymmetric_tensor_pair_preserves_each_tensor_width() {
+    let model_layout =
+        KvCacheModelLayout::tensor_pair(2, 1, 5, 1, 3).expect("tensor widths are valid");
+    assert_eq!(model_layout.elements_per_token(), Some(16));
+    assert_eq!(
+        model_layout
+            .token_size_bytes(KvCacheDtype::Bfloat16)
+            .expect("BF16 has a known element width"),
+        32
+    );
+
+    let runtime = KvCacheRuntimeLayout {
+        dtype: KvCacheDtype::Bfloat16,
+        page_size: 4,
+        num_layers: 2,
+        kv_heads: 1,
+        head_dim: 5,
+        kv_tensors_per_token: 2,
+        bytes_per_token: 32,
+        page_size_bytes: 128,
+    };
+    let layout = PagedKvCacheLayout::new_with_tensor_pair(runtime, 2, 10, 6)
+        .expect("asymmetric pair must match the aggregate runtime layout");
+
+    assert_eq!(layout.bytes_per_token_per_tensor(), None);
+    assert_eq!(layout.bytes_per_tensor_page(), None);
+    assert_eq!(layout.total_byte_len(), 256);
+    assert_eq!(layout.tensor_token_byte_range(0, 0, 0, 3).unwrap(), 30..40);
+    assert_eq!(layout.tensor_token_byte_range(0, 0, 1, 3).unwrap(), 58..64);
+    assert_eq!(layout.tensor_token_byte_range(0, 1, 0, 0).unwrap(), 64..74);
+    assert_eq!(
+        layout.kv_pair_copy_geometry(0),
+        Err(PagedKvCacheLayoutError::UnevenKvPairCopy {
+            key_token_bytes: 10,
+            value_token_bytes: 6,
+        })
+    );
+}
+
+#[test]
+fn explicit_tensor_pair_rejects_inconsistent_runtime_geometry() {
+    let mut runtime = runtime_layout();
+    runtime.kv_tensors_per_token = 3;
+    assert_eq!(
+        PagedKvCacheLayout::new_with_tensor_pair(runtime, 1, 32, 32),
+        Err(PagedKvCacheLayoutError::TensorPairRequiresTwoTensors { tensor_count: 3 })
+    );
+
+    let runtime = runtime_layout();
+    assert_eq!(
+        PagedKvCacheLayout::new_with_tensor_pair(runtime, 1, 40, 20),
+        Err(PagedKvCacheLayoutError::TensorPairSizeMismatch {
+            bytes_per_token_per_layer: 64,
+            key_token_bytes: 40,
+            value_token_bytes: 20,
+        })
+    );
 }
 
 #[test]

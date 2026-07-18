@@ -55,14 +55,6 @@ pub enum CudaPagedAttentionError {
         actual: KvCacheDtype,
         required: KvCacheDtype,
     },
-    LayerOutOfRange {
-        layer_index: usize,
-        layer_count: usize,
-    },
-    KvPairRequiresTwoTensors {
-        tensor_count: usize,
-    },
-    SizeOverflow,
     Cuda(CudaError),
     KvLayout(PagedKvCacheLayoutError),
     KvStorage(CudaKvStorageError),
@@ -136,18 +128,6 @@ impl fmt::Display for CudaPagedAttentionError {
                 formatter,
                 "CUDA paged attention requires KV cache dtype {required:?}, found {actual:?}"
             ),
-            Self::LayerOutOfRange {
-                layer_index,
-                layer_count,
-            } => write!(
-                formatter,
-                "CUDA paged attention layer {layer_index} is outside {layer_count} KV cache layers"
-            ),
-            Self::KvPairRequiresTwoTensors { tensor_count } => write!(
-                formatter,
-                "CUDA paged attention requires key and value tensors, KV layout has {tensor_count} tensor(s) per token"
-            ),
-            Self::SizeOverflow => formatter.write_str("CUDA paged attention size overflowed"),
             Self::Cuda(error) => write!(formatter, "CUDA paged attention metadata failed: {error}"),
             Self::KvLayout(error) => {
                 write!(formatter, "CUDA paged attention KV layout failed: {error}")
@@ -501,29 +481,13 @@ fn build_plan(
             required: KvCacheDtype::Bfloat16,
         });
     }
-    if layer_index >= runtime.num_layers {
-        return Err(CudaPagedAttentionError::LayerOutOfRange {
-            layer_index,
-            layer_count: runtime.num_layers,
-        });
-    }
-    if runtime.kv_tensors_per_token < 2 {
-        return Err(CudaPagedAttentionError::KvPairRequiresTwoTensors {
-            tensor_count: runtime.kv_tensors_per_token,
-        });
-    }
-    let key_in_page_offset = layer_index
-        .checked_mul(pool_layout.bytes_per_layer_page())
-        .ok_or(CudaPagedAttentionError::SizeOverflow)?;
-    let value_in_page_offset = key_in_page_offset
-        .checked_add(pool_layout.bytes_per_tensor_page())
-        .ok_or(CudaPagedAttentionError::SizeOverflow)?;
+    let copy_geometry = pool_layout.kv_pair_copy_geometry(layer_index)?;
     let attention_layout = CudaBf16PagedAttentionLayout::new(
-        runtime.page_size,
-        runtime.page_size_bytes,
-        key_in_page_offset,
-        value_in_page_offset,
-        pool_layout.bytes_per_token_per_tensor(),
+        copy_geometry.page_size,
+        copy_geometry.page_stride_bytes,
+        copy_geometry.key_offset_bytes,
+        copy_geometry.value_offset_bytes,
+        copy_geometry.token_bytes,
     );
     Ok(CudaBf16PagedAttentionPlan::new(
         CudaBf16PagedAttentionPlanConfig {

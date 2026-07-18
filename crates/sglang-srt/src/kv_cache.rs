@@ -72,6 +72,17 @@ pub struct KvCacheModelLayout {
     pub head_dim: usize,
     pub kv_tensors_per_token: usize,
     pub bytes_per_token_per_layer: Option<usize>,
+    tensor_geometry: KvCacheTensorGeometry,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KvCacheTensorGeometry {
+    Uniform,
+    Pair {
+        key_elements: usize,
+        value_elements: usize,
+    },
+    PackedBytes,
 }
 
 impl KvCacheModelLayout {
@@ -87,7 +98,37 @@ impl KvCacheModelLayout {
             head_dim,
             kv_tensors_per_token,
             bytes_per_token_per_layer: None,
+            tensor_geometry: KvCacheTensorGeometry::Uniform,
         }
+    }
+
+    pub fn tensor_pair(
+        num_layers: usize,
+        key_heads: usize,
+        key_head_dim: usize,
+        value_heads: usize,
+        value_head_dim: usize,
+    ) -> Result<Self, KvCacheLayoutError> {
+        let key_elements = key_heads
+            .checked_mul(key_head_dim)
+            .ok_or(KvCacheLayoutError::SizeOverflow)?;
+        let value_elements = value_heads
+            .checked_mul(value_head_dim)
+            .ok_or(KvCacheLayoutError::SizeOverflow)?;
+        if key_elements == 0 || value_elements == 0 {
+            return Err(KvCacheLayoutError::ZeroTensorWidth);
+        }
+        Ok(Self {
+            num_layers,
+            kv_heads: key_heads,
+            head_dim: key_head_dim,
+            kv_tensors_per_token: 2,
+            bytes_per_token_per_layer: None,
+            tensor_geometry: KvCacheTensorGeometry::Pair {
+                key_elements,
+                value_elements,
+            },
+        })
     }
 
     pub fn packed_bytes_per_layer(num_layers: usize, bytes_per_token_per_layer: usize) -> Self {
@@ -97,14 +138,23 @@ impl KvCacheModelLayout {
             head_dim: bytes_per_token_per_layer,
             kv_tensors_per_token: 1,
             bytes_per_token_per_layer: Some(bytes_per_token_per_layer),
+            tensor_geometry: KvCacheTensorGeometry::PackedBytes,
         }
     }
 
     pub fn elements_per_token(self) -> Option<usize> {
-        self.num_layers
-            .checked_mul(self.kv_tensors_per_token)
-            .and_then(|value| value.checked_mul(self.kv_heads))
-            .and_then(|value| value.checked_mul(self.head_dim))
+        let elements_per_layer = match self.tensor_geometry {
+            KvCacheTensorGeometry::Uniform => self
+                .kv_tensors_per_token
+                .checked_mul(self.kv_heads)?
+                .checked_mul(self.head_dim)?,
+            KvCacheTensorGeometry::Pair {
+                key_elements,
+                value_elements,
+            } => key_elements.checked_add(value_elements)?,
+            KvCacheTensorGeometry::PackedBytes => return None,
+        };
+        self.num_layers.checked_mul(elements_per_layer)
     }
 
     pub fn token_size_bytes(self, dtype: KvCacheDtype) -> Result<usize, KvCacheLayoutError> {
@@ -123,6 +173,29 @@ impl KvCacheModelLayout {
                     .ok_or(KvCacheLayoutError::DtypeRequiresModelMetadata(dtype))?,
             )
             .ok_or(KvCacheLayoutError::SizeOverflow)
+    }
+
+    pub(crate) fn tensor_pair_size_bytes(
+        self,
+        dtype: KvCacheDtype,
+    ) -> Result<Option<[usize; 2]>, KvCacheLayoutError> {
+        let KvCacheTensorGeometry::Pair {
+            key_elements,
+            value_elements,
+        } = self.tensor_geometry
+        else {
+            return Ok(None);
+        };
+        let element_bytes = dtype
+            .bytes_per_element()
+            .ok_or(KvCacheLayoutError::DtypeRequiresModelMetadata(dtype))?;
+        let key_bytes = key_elements
+            .checked_mul(element_bytes)
+            .ok_or(KvCacheLayoutError::SizeOverflow)?;
+        let value_bytes = value_elements
+            .checked_mul(element_bytes)
+            .ok_or(KvCacheLayoutError::SizeOverflow)?;
+        Ok(Some([key_bytes, value_bytes]))
     }
 
     pub fn packed_mla(
@@ -155,6 +228,7 @@ impl KvCacheModelLayout {
 pub enum KvCacheLayoutError {
     DtypeRequiresModelMetadata(KvCacheDtype),
     InvalidPackedMlaNopeHeadDim(usize),
+    ZeroTensorWidth,
     SizeOverflow,
 }
 
@@ -170,6 +244,7 @@ impl fmt::Display for KvCacheLayoutError {
                 formatter,
                 "qk_nope_head_dim must be divisible by 64 for packed MLA KV layout: {head_dim}"
             ),
+            Self::ZeroTensorWidth => formatter.write_str("KV cache tensor width must be non-zero"),
             Self::SizeOverflow => formatter.write_str("KV cache layout byte size overflowed"),
         }
     }
@@ -222,6 +297,18 @@ pub enum PagedKvCacheLayoutError {
     },
     KvPairRequiresTwoTensors {
         tensor_count: usize,
+    },
+    TensorPairRequiresTwoTensors {
+        tensor_count: usize,
+    },
+    TensorPairSizeMismatch {
+        bytes_per_token_per_layer: usize,
+        key_token_bytes: usize,
+        value_token_bytes: usize,
+    },
+    UnevenKvPairCopy {
+        key_token_bytes: usize,
+        value_token_bytes: usize,
     },
 }
 
@@ -299,6 +386,25 @@ impl fmt::Display for PagedKvCacheLayoutError {
                 formatter,
                 "KV cache K/V pair layout requires at least two tensors per token, layout has {tensor_count}"
             ),
+            Self::TensorPairRequiresTwoTensors { tensor_count } => write!(
+                formatter,
+                "explicit KV tensor-pair layout requires exactly two tensors per token, layout has {tensor_count}"
+            ),
+            Self::TensorPairSizeMismatch {
+                bytes_per_token_per_layer,
+                key_token_bytes,
+                value_token_bytes,
+            } => write!(
+                formatter,
+                "KV tensor-pair widths ({key_token_bytes} key bytes + {value_token_bytes} value bytes) do not match the runtime per-layer token size of {bytes_per_token_per_layer} bytes"
+            ),
+            Self::UnevenKvPairCopy {
+                key_token_bytes,
+                value_token_bytes,
+            } => write!(
+                formatter,
+                "the selected KV copy/attention kernel requires equal key and value widths, but the layout has {key_token_bytes} key bytes and {value_token_bytes} value bytes per token"
+            ),
         }
     }
 }
@@ -315,13 +421,25 @@ pub struct KvPairCopyGeometry {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PagedKvTensorGeometry {
+    Uniform {
+        token_bytes: usize,
+        page_bytes: usize,
+    },
+    Pair {
+        key_token_bytes: usize,
+        value_token_bytes: usize,
+        key_page_bytes: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PagedKvCacheLayout {
     runtime: KvCacheRuntimeLayout,
     page_count: usize,
     bytes_per_token_per_layer: usize,
-    bytes_per_token_per_tensor: usize,
     bytes_per_layer_page: usize,
-    bytes_per_tensor_page: usize,
+    tensor_geometry: PagedKvTensorGeometry,
     total_byte_len: usize,
     slot_count: usize,
 }
@@ -331,6 +449,89 @@ impl PagedKvCacheLayout {
         runtime: KvCacheRuntimeLayout,
         page_count: usize,
     ) -> Result<Self, PagedKvCacheLayoutError> {
+        let (bytes_per_token_per_layer, bytes_per_layer_page, total_byte_len, slot_count) =
+            Self::validate_runtime(runtime, page_count)?;
+        if !bytes_per_token_per_layer.is_multiple_of(runtime.kv_tensors_per_token) {
+            return Err(PagedKvCacheLayoutError::UnevenTensorLayout {
+                bytes_per_token_per_layer,
+                kv_tensors_per_token: runtime.kv_tensors_per_token,
+            });
+        }
+        let token_bytes = bytes_per_token_per_layer / runtime.kv_tensors_per_token;
+        let page_bytes = runtime
+            .page_size
+            .checked_mul(token_bytes)
+            .ok_or(PagedKvCacheLayoutError::SizeOverflow)?;
+
+        Ok(Self {
+            runtime,
+            page_count,
+            bytes_per_token_per_layer,
+            bytes_per_layer_page,
+            tensor_geometry: PagedKvTensorGeometry::Uniform {
+                token_bytes,
+                page_bytes,
+            },
+            total_byte_len,
+            slot_count,
+        })
+    }
+
+    pub fn new_with_tensor_pair(
+        runtime: KvCacheRuntimeLayout,
+        page_count: usize,
+        key_token_bytes: usize,
+        value_token_bytes: usize,
+    ) -> Result<Self, PagedKvCacheLayoutError> {
+        let (bytes_per_token_per_layer, bytes_per_layer_page, total_byte_len, slot_count) =
+            Self::validate_runtime(runtime, page_count)?;
+        if runtime.kv_tensors_per_token != 2 {
+            return Err(PagedKvCacheLayoutError::TensorPairRequiresTwoTensors {
+                tensor_count: runtime.kv_tensors_per_token,
+            });
+        }
+        for (field, value) in [
+            ("key_token_bytes", key_token_bytes),
+            ("value_token_bytes", value_token_bytes),
+        ] {
+            if value == 0 {
+                return Err(PagedKvCacheLayoutError::ZeroLayoutField(field));
+            }
+        }
+        let pair_bytes = key_token_bytes
+            .checked_add(value_token_bytes)
+            .ok_or(PagedKvCacheLayoutError::SizeOverflow)?;
+        if pair_bytes != bytes_per_token_per_layer {
+            return Err(PagedKvCacheLayoutError::TensorPairSizeMismatch {
+                bytes_per_token_per_layer,
+                key_token_bytes,
+                value_token_bytes,
+            });
+        }
+        let key_page_bytes = runtime
+            .page_size
+            .checked_mul(key_token_bytes)
+            .ok_or(PagedKvCacheLayoutError::SizeOverflow)?;
+
+        Ok(Self {
+            runtime,
+            page_count,
+            bytes_per_token_per_layer,
+            bytes_per_layer_page,
+            tensor_geometry: PagedKvTensorGeometry::Pair {
+                key_token_bytes,
+                value_token_bytes,
+                key_page_bytes,
+            },
+            total_byte_len,
+            slot_count,
+        })
+    }
+
+    fn validate_runtime(
+        runtime: KvCacheRuntimeLayout,
+        page_count: usize,
+    ) -> Result<(usize, usize, usize, usize), PagedKvCacheLayoutError> {
         if page_count == 0 {
             return Err(PagedKvCacheLayoutError::ZeroPageCount);
         }
@@ -365,20 +566,9 @@ impl PagedKvCacheLayout {
             });
         }
         let bytes_per_token_per_layer = runtime.bytes_per_token / runtime.num_layers;
-        if !bytes_per_token_per_layer.is_multiple_of(runtime.kv_tensors_per_token) {
-            return Err(PagedKvCacheLayoutError::UnevenTensorLayout {
-                bytes_per_token_per_layer,
-                kv_tensors_per_token: runtime.kv_tensors_per_token,
-            });
-        }
-        let bytes_per_token_per_tensor = bytes_per_token_per_layer / runtime.kv_tensors_per_token;
         let bytes_per_layer_page = runtime
             .page_size
             .checked_mul(bytes_per_token_per_layer)
-            .ok_or(PagedKvCacheLayoutError::SizeOverflow)?;
-        let bytes_per_tensor_page = runtime
-            .page_size
-            .checked_mul(bytes_per_token_per_tensor)
             .ok_or(PagedKvCacheLayoutError::SizeOverflow)?;
         let total_byte_len = page_count
             .checked_mul(runtime.page_size_bytes)
@@ -387,16 +577,12 @@ impl PagedKvCacheLayout {
             .checked_mul(runtime.page_size)
             .ok_or(PagedKvCacheLayoutError::SizeOverflow)?;
 
-        Ok(Self {
-            runtime,
-            page_count,
+        Ok((
             bytes_per_token_per_layer,
-            bytes_per_token_per_tensor,
             bytes_per_layer_page,
-            bytes_per_tensor_page,
             total_byte_len,
             slot_count,
-        })
+        ))
     }
 
     pub fn runtime(&self) -> KvCacheRuntimeLayout {
@@ -419,16 +605,22 @@ impl PagedKvCacheLayout {
         self.bytes_per_token_per_layer
     }
 
-    pub fn bytes_per_token_per_tensor(&self) -> usize {
-        self.bytes_per_token_per_tensor
+    pub fn bytes_per_token_per_tensor(&self) -> Option<usize> {
+        match self.tensor_geometry {
+            PagedKvTensorGeometry::Uniform { token_bytes, .. } => Some(token_bytes),
+            PagedKvTensorGeometry::Pair { .. } => None,
+        }
     }
 
     pub fn bytes_per_layer_page(&self) -> usize {
         self.bytes_per_layer_page
     }
 
-    pub fn bytes_per_tensor_page(&self) -> usize {
-        self.bytes_per_tensor_page
+    pub fn bytes_per_tensor_page(&self) -> Option<usize> {
+        match self.tensor_geometry {
+            PagedKvTensorGeometry::Uniform { page_bytes, .. } => Some(page_bytes),
+            PagedKvTensorGeometry::Pair { .. } => None,
+        }
     }
 
     pub fn page_byte_range(
@@ -478,11 +670,10 @@ impl PagedKvCacheLayout {
         let layer_offset = layer_index
             .checked_mul(self.bytes_per_layer_page)
             .ok_or(PagedKvCacheLayoutError::SizeOverflow)?;
-        let tensor_offset = tensor_index
-            .checked_mul(self.bytes_per_tensor_page)
-            .ok_or(PagedKvCacheLayoutError::SizeOverflow)?;
+        let tensor_offset = self.tensor_page_offset(tensor_index)?;
+        let tensor_token_bytes = self.tensor_token_bytes(tensor_index)?;
         let token_offset = token_index
-            .checked_mul(self.bytes_per_token_per_tensor)
+            .checked_mul(tensor_token_bytes)
             .ok_or(PagedKvCacheLayoutError::SizeOverflow)?;
         let start = page_offset
             .checked_add(layer_offset)
@@ -490,7 +681,7 @@ impl PagedKvCacheLayout {
             .and_then(|offset| offset.checked_add(token_offset))
             .ok_or(PagedKvCacheLayoutError::SizeOverflow)?;
         let end = start
-            .checked_add(self.bytes_per_token_per_tensor)
+            .checked_add(tensor_token_bytes)
             .ok_or(PagedKvCacheLayoutError::SizeOverflow)?;
         Ok(start..end)
     }
@@ -546,19 +737,64 @@ impl PagedKvCacheLayout {
                 tensor_count: self.runtime.kv_tensors_per_token,
             });
         }
-        let key_offset_bytes = layer_index
+        let layer_offset_bytes = layer_index
             .checked_mul(self.bytes_per_layer_page)
             .ok_or(PagedKvCacheLayoutError::SizeOverflow)?;
-        let value_offset_bytes = key_offset_bytes
-            .checked_add(self.bytes_per_tensor_page)
+        let key_token_bytes = self.tensor_token_bytes(0)?;
+        let value_token_bytes = self.tensor_token_bytes(1)?;
+        if key_token_bytes != value_token_bytes {
+            return Err(PagedKvCacheLayoutError::UnevenKvPairCopy {
+                key_token_bytes,
+                value_token_bytes,
+            });
+        }
+        let key_offset_bytes = layer_offset_bytes
+            .checked_add(self.tensor_page_offset(0)?)
+            .ok_or(PagedKvCacheLayoutError::SizeOverflow)?;
+        let value_offset_bytes = layer_offset_bytes
+            .checked_add(self.tensor_page_offset(1)?)
             .ok_or(PagedKvCacheLayoutError::SizeOverflow)?;
         Ok(KvPairCopyGeometry {
             page_size: self.runtime.page_size,
             page_stride_bytes: self.runtime.page_size_bytes,
             key_offset_bytes,
             value_offset_bytes,
-            token_bytes: self.bytes_per_token_per_tensor,
+            token_bytes: key_token_bytes,
         })
+    }
+
+    fn tensor_token_bytes(&self, tensor_index: usize) -> Result<usize, PagedKvCacheLayoutError> {
+        match self.tensor_geometry {
+            PagedKvTensorGeometry::Uniform { token_bytes, .. } => Ok(token_bytes),
+            PagedKvTensorGeometry::Pair {
+                key_token_bytes,
+                value_token_bytes,
+                ..
+            } => match tensor_index {
+                0 => Ok(key_token_bytes),
+                1 => Ok(value_token_bytes),
+                _ => Err(PagedKvCacheLayoutError::TensorOutOfRange {
+                    tensor_index,
+                    tensor_count: self.runtime.kv_tensors_per_token,
+                }),
+            },
+        }
+    }
+
+    fn tensor_page_offset(&self, tensor_index: usize) -> Result<usize, PagedKvCacheLayoutError> {
+        match self.tensor_geometry {
+            PagedKvTensorGeometry::Uniform { page_bytes, .. } => tensor_index
+                .checked_mul(page_bytes)
+                .ok_or(PagedKvCacheLayoutError::SizeOverflow),
+            PagedKvTensorGeometry::Pair { key_page_bytes, .. } => match tensor_index {
+                0 => Ok(0),
+                1 => Ok(key_page_bytes),
+                _ => Err(PagedKvCacheLayoutError::TensorOutOfRange {
+                    tensor_index,
+                    tensor_count: self.runtime.kv_tensors_per_token,
+                }),
+            },
+        }
     }
 
     fn validate_page(&self, page_index: usize) -> Result<(), PagedKvCacheLayoutError> {
