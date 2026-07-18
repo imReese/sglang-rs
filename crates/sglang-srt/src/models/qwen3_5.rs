@@ -281,19 +281,19 @@ fn build_definition(hf_config: &HfModelConfig) -> Result<ModelDefinition, ModelA
             rotary_dim,
             output_gate: config.attn_output_gate.unwrap_or(true),
         },
-        linear_attention: HybridLinearAttentionConfig::GatedDeltaNet {
+        linear_attention: Some(HybridLinearAttentionConfig::GatedDeltaNet {
             conv_kernel_dim: linear_conv_kernel_dim,
             key_head_dim: linear_key_head_dim,
             value_head_dim: linear_value_head_dim,
             num_key_heads: linear_num_key_heads,
             num_value_heads: linear_num_value_heads,
-        },
+        }),
         activation: DenseDecoderActivation::Silu,
         weights,
     };
     let topology = hybrid_decoder_checkpoint_topology(QWEN3_5_ARCHITECTURE, &plan)?;
 
-    Ok(ModelDefinition::new(
+    ModelDefinition::new(
         QWEN3_5_ARCHITECTURE,
         hf_config,
         execution,
@@ -307,7 +307,7 @@ fn build_definition(hf_config: &HfModelConfig) -> Result<ModelDefinition, ModelA
     )
     .with_serving_metadata(vocab_size, max_position_embeddings)
     .with_checkpoint_topology(topology)
-    .with_hybrid_decoder(plan))
+    .with_hybrid_decoder(plan)
 }
 
 fn resolve_layer_types(

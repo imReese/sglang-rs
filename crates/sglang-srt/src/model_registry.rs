@@ -14,14 +14,16 @@ use crate::model_runtime::{
     validate_runtime_support,
 };
 use crate::models::{
-    DEEPSEEK_V4_ADAPTER, GLM_MOE_DSA_ADAPTER, KIMI_LINEAR_ADAPTER, ModelAdapter, ModelAdapterError,
-    ModelDefinition, QWEN2_ADAPTER, QWEN3_5_ADAPTER, QWEN3_ADAPTER,
+    DEEPSEEK_V3_ADAPTER, DEEPSEEK_V4_ADAPTER, GLM_MOE_DSA_ADAPTER, KIMI_LINEAR_ADAPTER,
+    ModelAdapter, ModelAdapterError, ModelDefinition, QWEN2_ADAPTER, QWEN3_5_ADAPTER,
+    QWEN3_ADAPTER,
 };
 use crate::runtime_kv_cache::RuntimeKvCacheMetadata;
 use crate::transfer::{KvCacheMemoryProvider, KvCacheTransferError, TransferableKvCacheMemory};
 use crate::worker::WorkerWeightUpdateRequest;
 
-static MODEL_ADAPTERS: [&'static dyn ModelAdapter; 6] = [
+static MODEL_ADAPTERS: [&'static dyn ModelAdapter; 7] = [
+    &DEEPSEEK_V3_ADAPTER,
     &DEEPSEEK_V4_ADAPTER,
     &GLM_MOE_DSA_ADAPTER,
     &QWEN2_ADAPTER,
@@ -531,6 +533,45 @@ mod tests {
         .expect("valid MLA/MoE config")
     }
 
+    fn deepseek_v3_kimi_k2_config() -> HfModelConfig {
+        HfModelConfig::from_json_value(json!({
+            "model_type": "kimi_k2",
+            "architectures": ["DeepseekV3ForCausalLM"],
+            "vocab_size": 3,
+            "max_position_embeddings": 32,
+            "num_hidden_layers": 2,
+            "hidden_size": 2,
+            "intermediate_size": 2,
+            "num_attention_heads": 1,
+            "hidden_act": "silu",
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10_000.0,
+            "rope_scaling": null,
+            "attention_bias": false,
+            "tie_word_embeddings": false,
+            "q_lora_rank": 2,
+            "kv_lora_rank": 2,
+            "qk_nope_head_dim": 1,
+            "qk_rope_head_dim": 2,
+            "v_head_dim": 2,
+            "moe_intermediate_size": 2,
+            "n_routed_experts": 1,
+            "n_shared_experts": 1,
+            "num_experts_per_tok": 1,
+            "routed_scaling_factor": 1.0,
+            "first_k_dense_replace": 1,
+            "moe_layer_freq": 1,
+            "n_group": 1,
+            "topk_group": 1,
+            "norm_topk_prob": true,
+            "scoring_func": "sigmoid",
+            "topk_method": "noaux_tc",
+            "num_nextn_predict_layers": 0,
+            "quantization_config": null
+        }))
+        .expect("valid Kimi-K2-compatible DeepSeek V3 config")
+    }
+
     fn qwen_config() -> HfModelConfig {
         HfModelConfig::from_json_value(json!({
             "model_type": "qwen2",
@@ -689,6 +730,78 @@ mod tests {
         deepseek
             .validate_tensor_parallel(8)
             .expect("shared MLA definition should validate TP");
+    }
+
+    #[test]
+    fn kimi_k2_model_type_routes_to_the_shared_deepseek_v3_mla_moe_plan() {
+        let deepseek = ModelRegistry
+            .definition(
+                Path::new("/models/kimi-k2-unquantized"),
+                &deepseek_v3_kimi_k2_config(),
+            )
+            .expect("DeepSeek V3 adapter should build the Kimi-K2-compatible definition");
+        let glm = ModelRegistry
+            .definition(
+                Path::new("/models/glm"),
+                &mla_moe_config("GlmMoeDsaForCausalLM", "glm_moe_dsa"),
+            )
+            .expect("GLM adapter should build its shared MLA/MoE definition");
+
+        assert_eq!(deepseek.architecture(), "DeepseekV3ForCausalLM");
+        assert_eq!(
+            deepseek.execution().attention_family(),
+            glm.execution().attention_family()
+        );
+        assert_eq!(
+            deepseek.execution().feed_forward_family(),
+            glm.execution().feed_forward_family()
+        );
+        assert_eq!(
+            deepseek.cache_architecture(),
+            crate::models::ModelCacheArchitecture::PagedKv
+        );
+        assert!(deepseek.recurrent_state_layout().is_none());
+        let layout = deepseek.kv_cache_layout().expect("DeepSeek V3 KV layout");
+        assert_eq!(layout.num_layers, 2);
+        assert_eq!(
+            layout
+                .tensor_pair_size_bytes(crate::kv_cache::KvCacheDtype::Float32)
+                .expect("DeepSeek V3 tensor-pair geometry"),
+            Some([16, 8])
+        );
+        let plan = deepseek.hybrid_decoder().expect("shared component plan");
+        assert!(plan.linear_attention.is_none());
+        assert!(plan.weights.layers.iter().all(|layer| matches!(
+            layer.mixer,
+            HybridDecoderLayerKind::MultiLatentAttention { .. }
+        )));
+        assert!(matches!(
+            plan.weights.layers[0].feed_forward,
+            crate::models::HybridFeedForward::Dense { .. }
+        ));
+        assert!(matches!(
+            plan.weights.layers[1].feed_forward,
+            crate::models::HybridFeedForward::MixtureOfExperts { .. }
+        ));
+        validate_runtime_support(&deepseek, cpu_reference_backend().as_ref(), 1)
+            .expect("CPU reference backend should execute the shared pure MLA/MoE plan");
+    }
+
+    #[test]
+    fn deepseek_v3_quantized_checkpoint_fails_during_adapter_loading() {
+        let mut value = deepseek_v3_kimi_k2_config().raw_document().clone();
+        value["quantization_config"] = json!({"quant_method": "fp8"});
+        let config = HfModelConfig::from_json_value(value).expect("routing config should parse");
+
+        let error = ModelRegistry
+            .definition(Path::new("/models/kimi-k2-fp8"), &config)
+            .expect_err("unsupported quantization must fail before backend initialization");
+
+        assert!(matches!(
+            error,
+            ModelRegistryError::InvalidAdapterConfig { ref message, .. }
+                if message.contains("quantized DeepSeek/Kimi checkpoints are not implemented")
+        ));
     }
 
     #[test]

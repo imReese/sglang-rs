@@ -216,11 +216,7 @@ fn create_cpu_model_runtime(
         ModelExecutionArchitecture::Transformer { .. } if definition.hybrid_decoder().is_some() => {
             let executor = CpuReferenceHybridDecoder::load(definition, artifacts)
                 .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?;
-            let recurrent_state_layout = definition.recurrent_state_layout().ok_or_else(|| {
-                ModelRuntimeLoadError::MissingCapabilities(vec![
-                    "model recurrent-state layout".to_string(),
-                ])
-            })?;
+            let recurrent_state_layout = definition.recurrent_state_layout();
             let resources = CpuHybridExecutionResources::new(kv_cache, recurrent_state_layout)
                 .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?;
             Ok(Box::new(BackendExecutionBundle::new(executor, resources)))
@@ -285,20 +281,20 @@ fn create_cuda_model_runtime(
                 &backend,
                 required_kv_cache_config(config)?,
             )?;
-            let recurrent_layout = definition.recurrent_state_layout().ok_or_else(|| {
-                ModelRuntimeLoadError::MissingCapabilities(vec![
-                    "model recurrent-state layout".to_string(),
-                ])
-            })?;
-            let recurrent_state = CudaRecurrentStateStorage::allocate(
-                backend.context(),
-                recurrent_layout,
-                config.recurrent_state_slot_capacity,
-            )
-            .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?;
+            let recurrent_state = definition
+                .recurrent_state_layout()
+                .map(|recurrent_layout| {
+                    CudaRecurrentStateStorage::allocate(
+                        backend.context(),
+                        recurrent_layout,
+                        config.recurrent_state_slot_capacity,
+                    )
+                })
+                .transpose()
+                .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?;
             let executor = CudaBf16HybridDecoder::load(definition, artifacts, backend)
                 .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?;
-            let resources = CudaExecutionResources::new(kv_cache, Some(recurrent_state));
+            let resources = CudaExecutionResources::new(kv_cache, recurrent_state);
             Ok(Box::new(BackendExecutionBundle::new(executor, resources)))
         }
         ModelExecutionArchitecture::Transformer {
@@ -408,9 +404,9 @@ fn validate_cuda_model_runtime(
         missing.push("runtime-owned KV cache allocation".to_string());
         return missing;
     }
-    if definition.hybrid_decoder().is_some() {
+    if let Some(plan) = definition.hybrid_decoder() {
         missing.extend(CudaBf16HybridDecoder::missing_components(definition));
-        if definition.recurrent_state_layout().is_none() {
+        if plan.has_recurrent_layers() && definition.recurrent_state_layout().is_none() {
             missing.push("model recurrent-state layout".to_string());
         }
     }

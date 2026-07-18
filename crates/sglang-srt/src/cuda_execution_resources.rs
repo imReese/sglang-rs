@@ -30,6 +30,10 @@ impl CudaExecutionResources {
         self.active_kv_cache.allocation_mut()
     }
 
+    pub(crate) fn has_recurrent_state(&self) -> bool {
+        self.recurrent_state.is_some()
+    }
+
     pub(crate) fn execution_memory_mut(
         &mut self,
     ) -> (

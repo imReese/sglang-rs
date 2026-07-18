@@ -675,6 +675,17 @@ async fn bootstrap_runs_kimi_linear_hybrid_centralized_prefill_and_decode_withou
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
 
+#[tokio::test]
+async fn bootstrap_runs_kimi_k2_compatible_deepseek_v3_mla_moe_without_transfer() {
+    let model_dir = temp_model_dir("server-kimi-k2-deepseek-v3-forward");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_complete_deepseek_v3_checkpoint(&model_dir);
+    assert_centralized_generation_with_kv_layers(&model_dir, "centralized-kimi-k2-deepseek-v3", 2)
+        .await;
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
 #[test]
 fn qwen3_5_pd_startup_rejects_kv_only_transfer_before_serving() {
     let model_dir = temp_model_dir("server-qwen35-pd-fail-fast");
@@ -709,6 +720,14 @@ async fn assert_centralized_qwen_generation(model_dir: &std::path::Path, request
 }
 
 async fn assert_centralized_generation(model_dir: &std::path::Path, request_id: &str) {
+    assert_centralized_generation_with_kv_layers(model_dir, request_id, 1).await;
+}
+
+async fn assert_centralized_generation_with_kv_layers(
+    model_dir: &std::path::Path,
+    request_id: &str,
+    expected_kv_layers: usize,
+) {
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
@@ -721,11 +740,11 @@ async fn assert_centralized_generation(model_dir: &std::path::Path, request_id: 
     ])
     .expect("args should parse");
     let service = try_build_bootstrap_grpc_router_service(&args)
-        .expect("Qwen should start on the CPU reference backend");
+        .expect("model should start on the CPU reference backend");
     let server_info = service
         .get_server_info(Request::new(GetServerInfoRequest {}))
         .await
-        .expect("active Qwen KV metadata should be observable")
+        .expect("active model KV metadata should be observable")
         .into_inner();
     assert_eq!(
         server_info.attributes.get("kv_cache.dtype"),
@@ -733,7 +752,7 @@ async fn assert_centralized_generation(model_dir: &std::path::Path, request_id: 
     );
     assert_eq!(
         server_info.attributes.get("kv_cache.num_layers"),
-        Some(&"1".to_string())
+        Some(&expected_kv_layers.to_string())
     );
     assert_eq!(
         server_info.attributes.get("kv_cache.page_size"),
@@ -760,7 +779,7 @@ async fn assert_centralized_generation(model_dir: &std::path::Path, request_id: 
             disaggregated_params: None,
         }))
         .await
-        .expect("centralized Qwen generation should execute")
+        .expect("centralized model generation should execute")
         .into_inner();
 
     let first = tonic::codegen::tokio_stream::StreamExt::next(&mut stream)
@@ -2276,6 +2295,124 @@ fn write_complete_kimi_linear_checkpoint(model_dir: &std::path::Path) {
     }
     write_safetensors_file(&model_dir.join("model.safetensors"), &tensors, &payload)
         .expect("Kimi Linear checkpoint should be written");
+}
+
+fn write_complete_deepseek_v3_checkpoint(model_dir: &std::path::Path) {
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "architectures": ["DeepseekV3ForCausalLM"],
+  "model_type": "kimi_k2",
+  "vocab_size": 3,
+  "max_position_embeddings": 32,
+  "num_hidden_layers": 2,
+  "hidden_size": 2,
+  "intermediate_size": 2,
+  "num_attention_heads": 1,
+  "hidden_act": "silu",
+  "rms_norm_eps": 0.00001,
+  "rope_theta": 10000.0,
+  "rope_scaling": null,
+  "attention_bias": false,
+  "tie_word_embeddings": false,
+  "q_lora_rank": 2,
+  "kv_lora_rank": 2,
+  "qk_nope_head_dim": 1,
+  "qk_rope_head_dim": 2,
+  "v_head_dim": 2,
+  "moe_intermediate_size": 2,
+  "n_routed_experts": 1,
+  "n_shared_experts": 1,
+  "num_experts_per_tok": 1,
+  "routed_scaling_factor": 1.0,
+  "first_k_dense_replace": 1,
+  "moe_layer_freq": 1,
+  "n_group": 1,
+  "topk_group": 1,
+  "norm_topk_prob": true,
+  "scoring_func": "sigmoid",
+  "topk_method": "noaux_tc",
+  "num_nextn_predict_layers": 0,
+  "quantization_config": null
+}"#,
+    )
+    .expect("DeepSeek V3 config should be written");
+    fs::write(
+        model_dir.join("tokenizer.json"),
+        word_level_tokenizer_json(),
+    )
+    .expect("DeepSeek V3 tokenizer should be written");
+
+    let mut descriptors: Vec<(String, Vec<usize>, Vec<f32>)> = vec![
+        (
+            "model.embed_tokens.weight".to_string(),
+            vec![3, 2],
+            vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
+        ),
+        ("model.norm.weight".to_string(), vec![2], vec![1.0; 2]),
+        (
+            "lm_head.weight".to_string(),
+            vec![3, 2],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0],
+        ),
+    ];
+    let mut add_tensor = |name: String, shape: Vec<usize>, value: f32| {
+        descriptors.push((name, shape.clone(), vec![value; shape.iter().product()]));
+    };
+    for layer_id in 0..2 {
+        let prefix = format!("model.layers.{layer_id}");
+        add_tensor(format!("{prefix}.input_layernorm.weight"), vec![2], 1.0);
+        add_tensor(
+            format!("{prefix}.post_attention_layernorm.weight"),
+            vec![2],
+            1.0,
+        );
+        for (suffix, shape) in [
+            ("self_attn.q_a_proj.weight", vec![2, 2]),
+            ("self_attn.q_a_layernorm.weight", vec![2]),
+            ("self_attn.q_b_proj.weight", vec![3, 2]),
+            ("self_attn.kv_a_proj_with_mqa.weight", vec![4, 2]),
+            ("self_attn.kv_a_layernorm.weight", vec![2]),
+            ("self_attn.kv_b_proj.weight", vec![3, 2]),
+            ("self_attn.o_proj.weight", vec![2, 2]),
+        ] {
+            add_tensor(format!("{prefix}.{suffix}"), shape, 0.0);
+        }
+    }
+    for suffix in ["gate_proj", "up_proj", "down_proj"] {
+        add_tensor(
+            format!("model.layers.0.mlp.{suffix}.weight"),
+            vec![2, 2],
+            0.0,
+        );
+    }
+    for (suffix, shape) in [
+        ("gate.weight", vec![1, 2]),
+        ("gate.e_score_correction_bias", vec![1]),
+        ("experts.0.w1.weight", vec![2, 2]),
+        ("experts.0.w2.weight", vec![2, 2]),
+        ("experts.0.w3.weight", vec![2, 2]),
+        ("shared_experts.gate_proj.weight", vec![2, 2]),
+        ("shared_experts.up_proj.weight", vec![2, 2]),
+        ("shared_experts.down_proj.weight", vec![2, 2]),
+    ] {
+        add_tensor(format!("model.layers.1.mlp.{suffix}"), shape, 0.0);
+    }
+
+    let mut payload = Vec::new();
+    let mut tensors = Vec::new();
+    for (name, shape, values) in &descriptors {
+        let start = payload.len();
+        payload.extend(values.iter().flat_map(|value| value.to_le_bytes()));
+        tensors.push((
+            name.as_str(),
+            "F32",
+            shape.as_slice(),
+            [start, payload.len()],
+        ));
+    }
+    write_safetensors_file(&model_dir.join("model.safetensors"), &tensors, &payload)
+        .expect("DeepSeek V3 checkpoint should be written");
 }
 
 fn write_complete_glm_moe_dsa_forward_checkpoint(model_dir: &std::path::Path) {

@@ -34,25 +34,31 @@ use crate::types::RequestId;
 #[derive(Debug)]
 pub(crate) struct CpuHybridExecutionResources {
     active_kv_cache: RuntimeKvCache<CpuReferenceKvCache>,
-    recurrent_state: CpuHybridStatePool,
+    recurrent_state: Option<CpuHybridStatePool>,
 }
 
 impl CpuHybridExecutionResources {
     pub(crate) fn new(
         active_kv_cache: CpuReferenceKvCache,
-        recurrent_state_layout: RecurrentStateLayout,
+        recurrent_state_layout: Option<RecurrentStateLayout>,
     ) -> Result<Self, CpuReferenceDenseDecoderError> {
         Ok(Self {
             active_kv_cache: RuntimeKvCache::new(active_kv_cache),
-            recurrent_state: CpuHybridStatePool::new(recurrent_state_layout)?,
+            recurrent_state: recurrent_state_layout
+                .map(CpuHybridStatePool::new)
+                .transpose()?,
         })
     }
 
-    fn parts_mut(&mut self) -> (&mut CpuReferenceKvCache, &mut CpuHybridStatePool) {
+    fn parts_mut(&mut self) -> (&mut CpuReferenceKvCache, Option<&mut CpuHybridStatePool>) {
         (
             self.active_kv_cache.allocation_mut(),
-            &mut self.recurrent_state,
+            self.recurrent_state.as_mut(),
         )
+    }
+
+    fn has_recurrent_state(&self) -> bool {
+        self.recurrent_state.is_some()
     }
 }
 
@@ -76,11 +82,15 @@ impl BackendExecutionResources for CpuHybridExecutionResources {
     }
 
     fn complete_request(&mut self, request_id: &RequestId) {
-        self.recurrent_state.complete_request(request_id);
+        if let Some(recurrent_state) = self.recurrent_state.as_mut() {
+            recurrent_state.complete_request(request_id);
+        }
     }
 
     fn recurrent_state_layout(&self) -> Option<RecurrentStateLayout> {
-        Some(self.recurrent_state.layout())
+        self.recurrent_state
+            .as_ref()
+            .map(CpuHybridStatePool::layout)
     }
 }
 
@@ -217,12 +227,16 @@ impl CpuReferenceHybridDecoder {
         }
 
         let (kv_cache, state_pool) = resources.parts_mut();
-        let request_state = state_pool.request_state_mut(request_id, position)?;
-        if request_state.next_position != position {
+        let mut request_state = state_pool
+            .map(|state_pool| state_pool.request_state_mut(request_id, position))
+            .transpose()?;
+        if let Some(state) = request_state.as_deref()
+            && state.next_position != position
+        {
             return Err(CpuReferenceDenseDecoderError::Execution(format!(
                 "hybrid request {} expected position {} but received {position}",
                 request_id.as_str(),
-                request_state.next_position
+                state.next_position
             )));
         }
 
@@ -279,12 +293,27 @@ impl CpuReferenceHybridDecoder {
                 HybridMixerWeights::GatedDeltaNet {
                     state_layer_index,
                     weights,
-                } => weights.forward(
-                    &normalized,
-                    &mut request_state.recurrent_layers[*state_layer_index],
-                    self.plan.linear_attention,
-                    self.plan.rms_norm_eps,
-                )?,
+                } => {
+                    let state = request_state.as_deref_mut().ok_or_else(|| {
+                        CpuReferenceDenseDecoderError::Execution(
+                            "GDN layer requires backend-owned recurrent state".to_string(),
+                        )
+                    })?;
+                    let layer_state = state
+                        .recurrent_layers
+                        .get_mut(*state_layer_index)
+                        .ok_or_else(|| {
+                            CpuReferenceDenseDecoderError::Execution(format!(
+                                "GDN recurrent layer index {state_layer_index} is out of range"
+                            ))
+                        })?;
+                    let config = self.plan.linear_attention.ok_or_else(|| {
+                        CpuReferenceDenseDecoderError::Execution(
+                            "GDN layer has no linear-attention config".to_string(),
+                        )
+                    })?;
+                    weights.forward(&normalized, layer_state, config, self.plan.rms_norm_eps)?
+                }
                 HybridMixerWeights::MultiLatentAttention {
                     cache_layer_index,
                     weights,
@@ -304,12 +333,27 @@ impl CpuReferenceHybridDecoder {
                 HybridMixerWeights::KeyGatedDelta {
                     state_layer_index,
                     weights,
-                } => weights.forward(
-                    &normalized,
-                    &mut request_state.recurrent_layers[*state_layer_index],
-                    self.plan.linear_attention,
-                    self.plan.rms_norm_eps,
-                )?,
+                } => {
+                    let state = request_state.as_deref_mut().ok_or_else(|| {
+                        CpuReferenceDenseDecoderError::Execution(
+                            "KDA layer requires backend-owned recurrent state".to_string(),
+                        )
+                    })?;
+                    let layer_state = state
+                        .recurrent_layers
+                        .get_mut(*state_layer_index)
+                        .ok_or_else(|| {
+                            CpuReferenceDenseDecoderError::Execution(format!(
+                                "KDA recurrent layer index {state_layer_index} is out of range"
+                            ))
+                        })?;
+                    let config = self.plan.linear_attention.ok_or_else(|| {
+                        CpuReferenceDenseDecoderError::Execution(
+                            "KDA layer has no linear-attention config".to_string(),
+                        )
+                    })?;
+                    weights.forward(&normalized, layer_state, config, self.plan.rms_norm_eps)?
+                }
             };
             let after_mixer = add_residual(&hidden, &mixer_output)?;
             let normalized = apply_normalization(
@@ -325,7 +369,9 @@ impl CpuReferenceHybridDecoder {
                 .forward(&normalized, self.plan.activation)?;
             hidden = add_residual(&after_mixer, &feed_forward)?;
         }
-        request_state.next_position += 1;
+        if let Some(state) = request_state {
+            state.next_position += 1;
+        }
 
         let hidden = apply_normalization(
             &hidden,
@@ -359,7 +405,7 @@ impl BackendModelExecutor<CpuHybridExecutionResources> for CpuReferenceHybridDec
         validate_batch(batch).map_err(model_forward_error)?;
         let mut logits = Vec::with_capacity(batch.request_ids().len());
         for request_index in 0..batch.request_ids().len() {
-            if batch.cached_token_counts()[request_index] != 0 {
+            if resources.has_recurrent_state() && batch.cached_token_counts()[request_index] != 0 {
                 return Err(ModelForwardError::Runtime(format!(
                     "hybrid request {} received {} cached prefix tokens, but recurrent state snapshots are not implemented",
                     batch.request_ids()[request_index].as_str(),
@@ -453,7 +499,11 @@ impl HybridDecoderLayerWeights {
                 state_layer_index,
                 weights,
             } => {
-                let config = plan.linear_attention;
+                let config = plan.linear_attention.ok_or_else(|| {
+                    CpuReferenceDenseDecoderError::Unsupported(
+                        "GDN weights require a linear-attention config".to_string(),
+                    )
+                })?;
                 HybridMixerWeights::GatedDeltaNet {
                     state_layer_index: *state_layer_index,
                     weights: Box::new(GatedDeltaNetWeights::load(
@@ -479,15 +529,22 @@ impl HybridDecoderLayerWeights {
             HybridDecoderLayerKind::KeyGatedDelta {
                 state_layer_index,
                 weights,
-            } => HybridMixerWeights::KeyGatedDelta {
-                state_layer_index: *state_layer_index,
-                weights: Box::new(KeyGatedDeltaWeights::load(
-                    artifacts,
-                    weights,
-                    plan.hidden_size,
-                    plan.linear_attention,
-                )?),
-            },
+            } => {
+                let config = plan.linear_attention.ok_or_else(|| {
+                    CpuReferenceDenseDecoderError::Unsupported(
+                        "KDA weights require a linear-attention config".to_string(),
+                    )
+                })?;
+                HybridMixerWeights::KeyGatedDelta {
+                    state_layer_index: *state_layer_index,
+                    weights: Box::new(KeyGatedDeltaWeights::load(
+                        artifacts,
+                        weights,
+                        plan.hidden_size,
+                        config,
+                    )?),
+                }
+            }
         };
         Ok(Self {
             input_norm: load_vector(artifacts, &names.input_norm, plan.hidden_size)?,

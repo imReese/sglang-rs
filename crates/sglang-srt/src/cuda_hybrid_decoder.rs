@@ -40,8 +40,8 @@ pub(crate) struct CudaBf16HybridDecoder {
     plan: HybridDecoderExecutionPlan,
     blas: CudaBlas,
     dense_kernels: CudaBf16DenseKernels,
-    hybrid_kernels: CudaBf16HybridKernels,
-    linear_attention: CudaBf16LinearAttentionKernels,
+    hybrid_kernels: Option<CudaBf16HybridKernels>,
+    linear_attention: Option<CudaBf16LinearAttentionKernels>,
     mla_kernels: Option<CudaBf16MlaKernels>,
     paged_attention: Option<CudaBf16PagedAttentionExecutor>,
     token_embeddings: CudaBf16Matrix,
@@ -74,7 +74,7 @@ impl CudaBf16HybridDecoder {
                 HybridDecoderLayerKind::KeyGatedDelta { .. } => {
                     if !matches!(
                         plan.linear_attention,
-                        HybridLinearAttentionConfig::KeyGatedDelta { .. }
+                        Some(HybridLinearAttentionConfig::KeyGatedDelta { .. })
                     ) {
                         missing.insert("CUDA KDA typed execution config".to_string());
                     }
@@ -116,9 +116,17 @@ impl CudaBf16HybridDecoder {
         let compute_capability = backend.device().compute_capability;
         let blas = CudaBlas::load(backend.context())?;
         let dense_kernels = CudaBf16DenseKernels::compile(backend.context(), compute_capability)?;
-        let hybrid_kernels = CudaBf16HybridKernels::compile(backend.context(), compute_capability)?;
-        let linear_attention =
-            CudaBf16LinearAttentionKernels::compile(backend.context(), compute_capability)?;
+        let has_key_gated_delta = plan
+            .weights
+            .layers
+            .iter()
+            .any(|layer| matches!(layer.mixer, HybridDecoderLayerKind::KeyGatedDelta { .. }));
+        let hybrid_kernels = has_key_gated_delta
+            .then(|| CudaBf16HybridKernels::compile(backend.context(), compute_capability))
+            .transpose()?;
+        let linear_attention = has_key_gated_delta
+            .then(|| CudaBf16LinearAttentionKernels::compile(backend.context(), compute_capability))
+            .transpose()?;
         let has_mla = plan.weights.layers.iter().any(|layer| {
             matches!(
                 layer.mixer,
@@ -185,7 +193,20 @@ impl CudaBf16HybridDecoder {
         capability.runtime_name = "cuda-bf16-hybrid-decoder";
         capability.supports_forward = true;
         capability.supported_dtypes = vec![RuntimeDtype::Bf16];
-        capability.attention_backends = vec!["cuda-kda-bf16", "cuda-mla-bf16"];
+        capability.attention_backends = self
+            .plan
+            .weights
+            .layers
+            .iter()
+            .filter_map(|layer| match layer.mixer {
+                HybridDecoderLayerKind::KeyGatedDelta { .. } => Some("cuda-kda-bf16"),
+                HybridDecoderLayerKind::MultiLatentAttention { .. } => Some("cuda-mla-bf16"),
+                HybridDecoderLayerKind::FullAttention { .. }
+                | HybridDecoderLayerKind::GatedDeltaNet { .. } => None,
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         capability.tensor_parallel = CapabilityStatus::Unsupported;
         capability
     }
@@ -202,12 +223,13 @@ impl CudaBf16HybridDecoder {
                 "hybrid forward batch contains no input tokens".to_string(),
             ));
         }
-        if let Some((request_index, cached)) = batch
-            .cached_token_counts()
-            .iter()
-            .copied()
-            .enumerate()
-            .find(|(_, cached)| *cached != 0)
+        if resources.has_recurrent_state()
+            && let Some((request_index, cached)) = batch
+                .cached_token_counts()
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|(_, cached)| *cached != 0)
         {
             return Err(CudaExecutorError::Unsupported(format!(
                 "CUDA hybrid request {request_index} has {cached} cached prefix tokens, but recurrent prefix-state restoration is not implemented"
@@ -266,12 +288,24 @@ impl CudaBf16HybridDecoder {
                                 )
                             })?;
                             let mut layer_state = state.layer_state_mut(*state_layer_index)?;
+                            let hybrid_kernels = self.hybrid_kernels.as_ref().ok_or_else(|| {
+                                CudaExecutorError::Unsupported(
+                                    "CUDA KDA hybrid kernels were not initialized".to_string(),
+                                )
+                            })?;
+                            let linear_attention =
+                                self.linear_attention.as_mut().ok_or_else(|| {
+                                    CudaExecutorError::Unsupported(
+                                        "CUDA KDA linear-attention kernels were not initialized"
+                                            .to_string(),
+                                    )
+                                })?;
                             component.forward(CudaKeyGatedDeltaForward {
                                 context: self.backend.context(),
                                 blas: &self.blas,
                                 dense_kernels: &self.dense_kernels,
-                                hybrid_kernels: &self.hybrid_kernels,
-                                linear_attention: &mut self.linear_attention,
+                                hybrid_kernels,
+                                linear_attention,
                                 hidden: &normalized,
                                 batch_size: 1,
                                 rms_norm_eps: self.plan.rms_norm_eps,
@@ -406,16 +440,23 @@ impl CudaHybridLayer {
             HybridDecoderLayerKind::KeyGatedDelta {
                 state_layer_index,
                 weights,
-            } => CudaHybridMixer::KeyGatedDelta {
-                state_layer_index: *state_layer_index,
-                component: Box::new(CudaBf16KeyGatedDelta::load(
-                    artifacts,
-                    context,
-                    weights,
-                    plan.hidden_size,
-                    plan.linear_attention,
-                )?),
-            },
+            } => {
+                let config = plan.linear_attention.ok_or_else(|| {
+                    CudaExecutorError::Unsupported(
+                        "CUDA KDA weights require a linear-attention config".to_string(),
+                    )
+                })?;
+                CudaHybridMixer::KeyGatedDelta {
+                    state_layer_index: *state_layer_index,
+                    component: Box::new(CudaBf16KeyGatedDelta::load(
+                        artifacts,
+                        context,
+                        weights,
+                        plan.hidden_size,
+                        config,
+                    )?),
+                }
+            }
             HybridDecoderLayerKind::MultiLatentAttention {
                 cache_layer_index,
                 weights,

@@ -341,12 +341,12 @@ fn build_definition(hf_config: &HfModelConfig) -> Result<ModelDefinition, ModelA
             value_head_dim,
             skip_rope: true,
         },
-        linear_attention: HybridLinearAttentionConfig::KeyGatedDelta {
+        linear_attention: Some(HybridLinearAttentionConfig::KeyGatedDelta {
             conv_kernel_dim: linear_conv_kernel_dim,
             key_head_dim: linear_head_dim,
             value_head_dim: linear_head_dim,
             num_heads: linear_num_heads,
-        },
+        }),
         activation: DenseDecoderActivation::Silu,
         weights,
     };
@@ -361,7 +361,7 @@ fn build_definition(hf_config: &HfModelConfig) -> Result<ModelDefinition, ModelA
     )
     .map_err(|error| ModelAdapterError::invalid(KIMI_LINEAR_ARCHITECTURE, error.to_string()))?;
 
-    Ok(ModelDefinition::new(
+    ModelDefinition::new(
         KIMI_LINEAR_ARCHITECTURE,
         hf_config,
         execution,
@@ -370,7 +370,7 @@ fn build_definition(hf_config: &HfModelConfig) -> Result<ModelDefinition, ModelA
     )
     .with_serving_metadata(vocab_size, max_position_embeddings)
     .with_checkpoint_topology(topology)
-    .with_hybrid_decoder(plan))
+    .with_hybrid_decoder(plan)
 }
 
 fn validate_layer_partition(
@@ -597,12 +597,12 @@ fn checkpoint_topology(
             "Kimi checkpoint topology requires MLA",
         ));
     };
-    let HybridLinearAttentionConfig::KeyGatedDelta {
+    let Some(HybridLinearAttentionConfig::KeyGatedDelta {
         conv_kernel_dim,
         key_head_dim,
         value_head_dim: linear_value_head_dim,
         num_heads: linear_num_heads,
-    } = plan.linear_attention
+    }) = plan.linear_attention
     else {
         return Err(ModelAdapterError::invalid(
             KIMI_LINEAR_ARCHITECTURE,

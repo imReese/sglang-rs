@@ -15,7 +15,7 @@ use crate::model_artifacts::{
     ModelArtifactError,
 };
 
-pub(crate) use deepseek::DEEPSEEK_V4_ADAPTER;
+pub(crate) use deepseek::{DEEPSEEK_V3_ADAPTER, DEEPSEEK_V4_ADAPTER};
 pub(crate) use glm::GLM_MOE_DSA_ADAPTER;
 pub(crate) use kimi_linear::KIMI_LINEAR_ADAPTER;
 pub(crate) use qwen::{QWEN2_ADAPTER, QWEN3_ADAPTER};
@@ -417,9 +417,21 @@ pub(crate) struct HybridDecoderExecutionPlan {
     pub(crate) rope_theta: f32,
     pub(crate) normalization: DecoderNormalization,
     pub(crate) full_attention: HybridFullAttentionConfig,
-    pub(crate) linear_attention: HybridLinearAttentionConfig,
+    pub(crate) linear_attention: Option<HybridLinearAttentionConfig>,
     pub(crate) activation: DenseDecoderActivation,
     pub(crate) weights: HybridDecoderWeightNames,
+}
+
+impl HybridDecoderExecutionPlan {
+    pub(crate) fn has_recurrent_layers(&self) -> bool {
+        self.weights.layers.iter().any(|layer| {
+            matches!(
+                layer.mixer,
+                HybridDecoderLayerKind::GatedDeltaNet { .. }
+                    | HybridDecoderLayerKind::KeyGatedDelta { .. }
+            )
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -589,7 +601,10 @@ impl ModelDefinition {
         self
     }
 
-    pub(crate) fn with_hybrid_decoder(mut self, plan: HybridDecoderExecutionPlan) -> Self {
+    pub(crate) fn with_hybrid_decoder(
+        mut self,
+        plan: HybridDecoderExecutionPlan,
+    ) -> Result<Self, ModelAdapterError> {
         let full_attention_layer_count = plan
             .weights
             .layers
@@ -603,8 +618,30 @@ impl ModelDefinition {
             })
             .count();
         let recurrent_state_layer_count = plan.weights.layers.len() - full_attention_layer_count;
+        if recurrent_state_layer_count == 0 {
+            if plan.linear_attention.is_some() {
+                return Err(ModelAdapterError::invalid(
+                    self.architecture,
+                    "decoder plan without recurrent layers must not declare linear-attention state",
+                ));
+            }
+            self.recurrent_state_layout = None;
+            self.cache_architecture = if self.kv_cache_layout.is_some() {
+                ModelCacheArchitecture::PagedKv
+            } else {
+                ModelCacheArchitecture::None
+            };
+            self.hybrid_decoder = Some(plan);
+            return Ok(self);
+        }
+        let linear_attention = plan.linear_attention.ok_or_else(|| {
+            ModelAdapterError::invalid(
+                self.architecture,
+                "decoder plan with recurrent layers requires a linear-attention state config",
+            )
+        })?;
         let (conv_kernel_dim, key_head_count, value_head_count, key_head_dim, value_head_dim) =
-            match plan.linear_attention {
+            match linear_attention {
                 HybridLinearAttentionConfig::GatedDeltaNet {
                     conv_kernel_dim,
                     key_head_dim,
@@ -644,7 +681,7 @@ impl ModelDefinition {
             recurrent_state_layer_count,
         };
         self.hybrid_decoder = Some(plan);
-        self
+        Ok(self)
     }
 
     pub fn architecture(&self) -> &'static str {
@@ -957,13 +994,13 @@ pub(crate) fn hybrid_decoder_checkpoint_topology(
             "multi-head/GDN checkpoint topology cannot validate multi-latent attention",
         ));
     };
-    let HybridLinearAttentionConfig::GatedDeltaNet {
+    let Some(HybridLinearAttentionConfig::GatedDeltaNet {
         conv_kernel_dim,
         key_head_dim,
         value_head_dim,
         num_key_heads,
         num_value_heads,
-    } = plan.linear_attention
+    }) = plan.linear_attention
     else {
         return Err(ModelAdapterError::invalid(
             architecture,
