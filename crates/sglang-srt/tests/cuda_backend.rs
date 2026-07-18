@@ -2,13 +2,14 @@ use sglang_kernel::cublas::CudaBlas;
 use sglang_kernel::cuda_kernels::{CudaF32Kernels, CudaRmsNormLaunch, CudaSiluMulLaunch};
 use sglang_kernel::cuda_kv_kernels::CudaKvPairCopyKernels;
 use sglang_srt::backend::{ComputeCapability, CudaBackend};
-use sglang_srt::cache::{CachePageAllocator, RadixCache};
+use sglang_srt::cache::{CachePageAllocator, CachePageId, RadixCache};
 use sglang_srt::cuda_attention::{
     CudaBf16PagedAttentionExecutor, CudaPagedAttentionForward, CudaPagedAttentionMetadata,
 };
 use sglang_srt::cuda_kv_cache::{
-    CudaKvSlotGatherLaunch, CudaKvSlotScatterLaunch, allocate_cuda_kv_cache,
+    CudaKvSlotGatherLaunch, CudaKvSlotScatterLaunch, CudaKvStorage, allocate_cuda_kv_cache,
 };
+use sglang_srt::kv_cache::PagedKvCacheLayout;
 use sglang_srt::model_executor::ModelWorkerBatch;
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::transfer::{
@@ -775,6 +776,109 @@ fn cuda_bf16_paged_attention_reads_mooncake_registered_physical_kv_slots() {
         },
     );
     assert_f32_close(&bytes_bf16(&output_bytes), &expected, 0.02);
+}
+
+#[test]
+#[ignore = "requires a BF16-capable CUDA device, NVIDIA driver, and NVRTC"]
+fn cuda_bf16_paged_attention_executes_asymmetric_compressed_mla_kv() {
+    let backend = CudaBackend::initialize(cuda_test_device_ordinal())
+        .expect("CUDA backend should initialize");
+    let ComputeCapability::Cuda(compute_capability) = backend.capabilities().compute_capability
+    else {
+        panic!("CUDA backend must report CUDA compute capability");
+    };
+    let runtime = KvCacheRuntimeLayout {
+        dtype: KvCacheDtype::Bfloat16,
+        page_size: 4,
+        num_layers: 1,
+        kv_heads: 1,
+        head_dim: 3,
+        kv_tensors_per_token: 2,
+        bytes_per_token: 10,
+        page_size_bytes: 40,
+    };
+    let layout = PagedKvCacheLayout::new_with_tensor_pair(runtime, 1, 6, 4)
+        .expect("asymmetric MLA KV layout");
+    let mut storage = CudaKvStorage::allocate(
+        backend.context(),
+        layout.total_byte_len(),
+        layout.runtime().page_size_bytes,
+    )
+    .expect("CUDA MLA KV storage");
+    for (slot, key_values, value_values) in [
+        (0, [1.0, 0.0, 0.0], [10.0, 20.0]),
+        (1, [0.0, 1.0, 0.0], [30.0, 40.0]),
+    ] {
+        let key_bytes = bf16_bytes(&key_values);
+        let value_bytes = bf16_bytes(&value_values);
+        let mut key = backend
+            .context()
+            .allocate(key_bytes.len())
+            .expect("key allocation");
+        let mut value = backend
+            .context()
+            .allocate(value_bytes.len())
+            .expect("value allocation");
+        key.copy_from_host(0, &key_bytes).expect("key upload");
+        value.copy_from_host(0, &value_bytes).expect("value upload");
+        storage
+            .write_tensor_slot_from_device(layout, 0, 0, slot, &key, 0)
+            .expect("write compressed key");
+        storage
+            .write_tensor_slot_from_device(layout, 0, 1, slot, &value, 0)
+            .expect("write compressed value");
+    }
+
+    let metadata = CudaPagedAttentionMetadata::for_single_query(
+        &[CachePageId::from(0), CachePageId::from(1)],
+        layout,
+    )
+    .expect("single MLA query metadata");
+    let device_metadata = metadata
+        .upload(backend.context())
+        .expect("MLA metadata upload");
+    let query_bytes = bf16_bytes(&[1.0, 0.0, 0.0]);
+    let mut query = backend
+        .context()
+        .allocate(query_bytes.len())
+        .expect("query allocation");
+    query.copy_from_host(0, &query_bytes).expect("query upload");
+    let mut output = backend
+        .context()
+        .allocate(2 * size_of::<u16>())
+        .expect("MLA attention output allocation");
+    let mut attention =
+        CudaBf16PagedAttentionExecutor::compile(backend.context(), compute_capability)
+            .expect("MLA paged attention compile");
+    attention
+        .forward(CudaPagedAttentionForward {
+            kv_layout: layout,
+            kv_storage: &storage,
+            layer_index: 0,
+            metadata: &device_metadata,
+            queries: &query,
+            queries_offset: 0,
+            query_head_count: 1,
+            scale: 1.0,
+            output: &mut output,
+            output_offset: 0,
+        })
+        .expect("asymmetric MLA paged attention");
+
+    let mut output_bytes = vec![0_u8; 2 * size_of::<u16>()];
+    output
+        .copy_to_host(0, &mut output_bytes)
+        .expect("MLA output download");
+    let first_weight = 1.0_f32.exp() / (1.0_f32.exp() + 1.0);
+    let second_weight = 1.0 - first_weight;
+    assert_f32_close(
+        &bytes_bf16(&output_bytes),
+        &[
+            first_weight * 10.0 + second_weight * 30.0,
+            first_weight * 20.0 + second_weight * 40.0,
+        ],
+        0.05,
+    );
 }
 
 #[cfg(feature = "mooncake-link")]

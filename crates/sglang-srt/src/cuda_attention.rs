@@ -55,6 +55,12 @@ pub enum CudaPagedAttentionError {
         actual: KvCacheDtype,
         required: KvCacheDtype,
     },
+    TensorRowGeometryMismatch {
+        tensor: &'static str,
+        row_bytes: usize,
+        kv_head_count: usize,
+        element_bytes: usize,
+    },
     Cuda(CudaError),
     KvLayout(PagedKvCacheLayoutError),
     KvStorage(CudaKvStorageError),
@@ -128,6 +134,15 @@ impl fmt::Display for CudaPagedAttentionError {
                 formatter,
                 "CUDA paged attention requires KV cache dtype {required:?}, found {actual:?}"
             ),
+            Self::TensorRowGeometryMismatch {
+                tensor,
+                row_bytes,
+                kv_head_count,
+                element_bytes,
+            } => write!(
+                formatter,
+                "CUDA paged attention {tensor} row has {row_bytes} bytes, which cannot be divided across {kv_head_count} heads of {element_bytes}-byte elements"
+            ),
             Self::Cuda(error) => write!(formatter, "CUDA paged attention metadata failed: {error}"),
             Self::KvLayout(error) => {
                 write!(formatter, "CUDA paged attention KV layout failed: {error}")
@@ -175,6 +190,28 @@ pub struct CudaPagedAttentionMetadata {
 }
 
 impl CudaPagedAttentionMetadata {
+    pub fn for_single_query(
+        sequence_slots: &[crate::cache::CachePageId],
+        pool_layout: PagedKvCacheLayout,
+    ) -> Result<Self, CudaPagedAttentionError> {
+        let host_slots = sequence_slots
+            .iter()
+            .map(|slot| slot.as_usize())
+            .collect::<Vec<_>>();
+        pool_layout.validate_slot_indices(&host_slots)?;
+        let sequence_length = convert_u64("single query sequence length", host_slots.len())?;
+        let sequence_slots = host_slots
+            .into_iter()
+            .map(|slot| convert_u64("single query sequence slot", slot))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            query_request_indices: vec![0],
+            query_sequence_lengths: vec![sequence_length],
+            request_slot_offsets: vec![0, sequence_length],
+            sequence_slots,
+        })
+    }
+
     pub fn from_model_worker_batch(
         batch: &ModelWorkerBatch,
         pool_layout: PagedKvCacheLayout,
@@ -481,13 +518,47 @@ fn build_plan(
             required: KvCacheDtype::Bfloat16,
         });
     }
-    let copy_geometry = pool_layout.kv_pair_copy_geometry(layer_index)?;
-    let attention_layout = CudaBf16PagedAttentionLayout::new(
-        copy_geometry.page_size,
-        copy_geometry.page_stride_bytes,
-        copy_geometry.key_offset_bytes,
-        copy_geometry.value_offset_bytes,
-        copy_geometry.token_bytes,
+    let element_bytes = std::mem::size_of::<u16>();
+    let key_row_bytes = pool_layout.tensor_token_size_bytes(0)?;
+    let value_row_bytes = pool_layout.tensor_token_size_bytes(1)?;
+    let key_denominator = runtime.kv_heads.checked_mul(element_bytes).ok_or(
+        CudaPagedAttentionError::TensorRowGeometryMismatch {
+            tensor: "key",
+            row_bytes: key_row_bytes,
+            kv_head_count: runtime.kv_heads,
+            element_bytes,
+        },
+    )?;
+    let value_denominator = key_denominator;
+    if !key_row_bytes.is_multiple_of(key_denominator) {
+        return Err(CudaPagedAttentionError::TensorRowGeometryMismatch {
+            tensor: "key",
+            row_bytes: key_row_bytes,
+            kv_head_count: runtime.kv_heads,
+            element_bytes,
+        });
+    }
+    if !value_row_bytes.is_multiple_of(value_denominator) {
+        return Err(CudaPagedAttentionError::TensorRowGeometryMismatch {
+            tensor: "value",
+            row_bytes: value_row_bytes,
+            kv_head_count: runtime.kv_heads,
+            element_bytes,
+        });
+    }
+    let key_offset_bytes = pool_layout
+        .tensor_token_byte_range(0, layer_index, 0, 0)?
+        .start;
+    let value_offset_bytes = pool_layout
+        .tensor_token_byte_range(0, layer_index, 1, 0)?
+        .start;
+    let attention_layout = CudaBf16PagedAttentionLayout::new_tensor_pair(
+        runtime.page_size,
+        runtime.page_size_bytes,
+        key_offset_bytes,
+        value_offset_bytes,
+        key_row_bytes,
+        value_row_bytes,
     );
     Ok(CudaBf16PagedAttentionPlan::new(
         CudaBf16PagedAttentionPlanConfig {
@@ -497,7 +568,8 @@ fn build_plan(
             slot_count: pool_layout.slot_count(),
             query_head_count,
             kv_head_count: runtime.kv_heads,
-            head_dim: runtime.head_dim,
+            query_key_head_dim: key_row_bytes / key_denominator,
+            value_head_dim: value_row_bytes / value_denominator,
             scale,
             layout: attention_layout,
         },

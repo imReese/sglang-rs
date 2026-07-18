@@ -6,6 +6,7 @@ use sglang_kernel::cuda_bf16_kernels::{CudaBf16DenseKernels, CudaBf16KernelError
 use sglang_kernel::cuda_hybrid_kernels::CudaHybridKernelError;
 use sglang_kernel::cuda_kv_kernels::CudaKvPairCopyError;
 use sglang_kernel::cuda_linear_attention::CudaLinearAttentionError;
+use sglang_kernel::cuda_mla::CudaMlaKernelError;
 
 use crate::cuda_attention::CudaPagedAttentionError;
 use crate::cuda_kv_cache::CudaKvStorageError;
@@ -29,6 +30,7 @@ pub(crate) enum CudaExecutorError {
     Kernel(CudaBf16KernelError),
     HybridKernel(CudaHybridKernelError),
     LinearAttention(CudaLinearAttentionError),
+    MultiLatentAttention(CudaMlaKernelError),
     Attention(CudaPagedAttentionError),
     KvCache(CudaKvStorageError),
     KvCopy(CudaKvPairCopyError),
@@ -60,6 +62,12 @@ impl fmt::Display for CudaExecutorError {
             Self::LinearAttention(error) => {
                 write!(formatter, "CUDA executor linear attention failed: {error}")
             }
+            Self::MultiLatentAttention(error) => {
+                write!(
+                    formatter,
+                    "CUDA executor multi-latent attention failed: {error}"
+                )
+            }
             Self::Attention(error) => write!(formatter, "CUDA executor attention failed: {error}"),
             Self::KvCache(error) => write!(formatter, "CUDA executor KV cache failed: {error}"),
             Self::KvCopy(error) => write!(formatter, "CUDA executor KV scatter failed: {error}"),
@@ -89,6 +97,7 @@ error_conversion!(CudaBlasError, CudaBlas);
 error_conversion!(CudaBf16KernelError, Kernel);
 error_conversion!(CudaHybridKernelError, HybridKernel);
 error_conversion!(CudaLinearAttentionError, LinearAttention);
+error_conversion!(CudaMlaKernelError, MultiLatentAttention);
 error_conversion!(CudaPagedAttentionError, Attention);
 error_conversion!(CudaKvStorageError, KvCache);
 error_conversion!(CudaKvPairCopyError, KvCopy);

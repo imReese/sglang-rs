@@ -102,11 +102,13 @@ fn model_adapters_do_not_select_runtime_backend_providers() {
 fn cuda_backend_components_do_not_branch_on_model_names() {
     let dense = include_str!("../src/cuda_dense_decoder.rs");
     let hybrid = include_str!("../src/cuda_hybrid_decoder.rs");
+    let mla = include_str!("../src/cuda_mla.rs");
     for source in [
         include_str!("../src/backend_model.rs"),
         include_str!("../src/cuda_execution_resources.rs"),
         include_str!("../src/cuda_transformer.rs"),
         hybrid,
+        mla,
     ] {
         for model_name in ["Kimi", "Qwen", "DeepSeek", "GlmMoe", "GLM"] {
             assert!(
@@ -117,4 +119,6 @@ fn cuda_backend_components_do_not_branch_on_model_names() {
     }
     assert!(dense.contains("CudaBf16DenseFeedForward"));
     assert!(hybrid.contains("CudaBf16DenseFeedForward"));
+    assert!(hybrid.contains("CudaBf16MultiLatentAttention"));
+    assert!(mla.contains("CudaPagedAttentionForward"));
 }

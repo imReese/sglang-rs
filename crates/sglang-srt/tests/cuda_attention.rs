@@ -89,7 +89,8 @@ fn scheduler_batch_builds_causal_attention_metadata_over_physical_slots() {
     assert_eq!(plan.sequence_slot_count(), 5);
     assert_eq!(plan.query_head_count(), 4);
     assert_eq!(plan.kv_head_count(), 2);
-    assert_eq!(plan.head_dim(), 8);
+    assert_eq!(plan.query_key_head_dim(), 8);
+    assert_eq!(plan.value_head_dim(), 8);
 }
 
 #[test]
@@ -130,7 +131,18 @@ fn attention_plan_rejects_non_bf16_kv_without_cuda_fallback() {
 }
 
 #[test]
-fn attention_plan_rejects_asymmetric_kv_before_kernel_launch() {
+fn kv_layout_rejects_zero_heads_before_attention_plan_building() {
+    let mut invalid_runtime = runtime_layout(KvCacheDtype::Bfloat16);
+    invalid_runtime.kv_heads = 0;
+
+    assert_eq!(
+        PagedKvCacheLayout::new(invalid_runtime, 2),
+        Err(PagedKvCacheLayoutError::ZeroLayoutField("kv_heads"))
+    );
+}
+
+#[test]
+fn attention_plan_accepts_asymmetric_mla_kv_geometry() {
     let batch = two_request_prefill_batch();
     let metadata_pool = PagedKvCacheLayout::new(runtime_layout(KvCacheDtype::Bfloat16), 2)
         .expect("uniform metadata pool should be valid");
@@ -149,13 +161,8 @@ fn attention_plan_rejects_asymmetric_kv_before_kernel_launch() {
     let asymmetric_pool = PagedKvCacheLayout::new_with_tensor_pair(asymmetric_runtime, 2, 32, 16)
         .expect("asymmetric pool should be representable by the common layout");
 
-    assert_eq!(
-        CudaBf16PagedAttentionExecutor::plan(asymmetric_pool, 0, &metadata, 4, 1.0),
-        Err(CudaPagedAttentionError::KvLayout(
-            PagedKvCacheLayoutError::UnevenKvPairCopy {
-                key_token_bytes: 32,
-                value_token_bytes: 16,
-            }
-        ))
-    );
+    let plan = CudaBf16PagedAttentionExecutor::plan(asymmetric_pool, 0, &metadata, 4, 1.0)
+        .expect("asymmetric compressed MLA KV should produce a paged attention plan");
+    assert_eq!(plan.query_key_head_dim(), 8);
+    assert_eq!(plan.value_head_dim(), 4);
 }

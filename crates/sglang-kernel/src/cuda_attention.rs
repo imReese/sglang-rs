@@ -28,10 +28,12 @@ extern "C" __global__ void sglang_paged_attention_bf16(
     unsigned long long page_stride_bytes,
     unsigned long long key_in_page_offset,
     unsigned long long value_in_page_offset,
-    unsigned long long kv_row_bytes,
+    unsigned long long key_row_bytes,
+    unsigned long long value_row_bytes,
     unsigned int query_head_count,
     unsigned int kv_head_count,
-    unsigned int head_dim,
+    unsigned int query_key_head_dim,
+    unsigned int value_head_dim,
     float scale) {
   const unsigned long long query_index = blockIdx.x;
   const unsigned int query_head = blockIdx.y;
@@ -73,7 +75,7 @@ extern "C" __global__ void sglang_paged_attention_bf16(
     running_max = -3.402823466e+38F;
     denominator = 0.0f;
   }
-  for (unsigned int dimension = threadIdx.x; dimension < head_dim;
+  for (unsigned int dimension = threadIdx.x; dimension < value_head_dim;
        dimension += blockDim.x) {
     accumulator[dimension] = 0.0f;
   }
@@ -85,7 +87,7 @@ extern "C" __global__ void sglang_paged_attention_bf16(
   const unsigned int query_heads_per_kv_head = query_head_count / kv_head_count;
   const unsigned int kv_head = query_head / query_heads_per_kv_head;
   const unsigned long long query_vector_offset =
-      (query_index * query_head_count + query_head) * head_dim;
+      (query_index * query_head_count + query_head) * query_key_head_dim;
   const __nv_bfloat16* query = queries + query_vector_offset;
 
   for (unsigned long long sequence_index = 0; sequence_index < sequence_length;
@@ -104,19 +106,22 @@ extern "C" __global__ void sglang_paged_attention_bf16(
 
     const unsigned long long page = current_slot / page_size;
     const unsigned long long token = current_slot % page_size;
-    const unsigned long long head_byte_offset =
-        static_cast<unsigned long long>(kv_head) * head_dim * sizeof(__nv_bfloat16);
-    const unsigned long long token_byte_offset = token * kv_row_bytes;
+    const unsigned long long key_head_byte_offset =
+        static_cast<unsigned long long>(kv_head) * query_key_head_dim *
+        sizeof(__nv_bfloat16);
+    const unsigned long long value_head_byte_offset =
+        static_cast<unsigned long long>(kv_head) * value_head_dim *
+        sizeof(__nv_bfloat16);
     const unsigned long long page_byte_offset = page * page_stride_bytes;
     const __nv_bfloat16* key = reinterpret_cast<const __nv_bfloat16*>(
-        pool + page_byte_offset + key_in_page_offset + token_byte_offset +
-        head_byte_offset);
+        pool + page_byte_offset + key_in_page_offset + token * key_row_bytes +
+        key_head_byte_offset);
     const __nv_bfloat16* value = reinterpret_cast<const __nv_bfloat16*>(
-        pool + page_byte_offset + value_in_page_offset + token_byte_offset +
-        head_byte_offset);
+        pool + page_byte_offset + value_in_page_offset + token * value_row_bytes +
+        value_head_byte_offset);
 
     float dot = 0.0f;
-    for (unsigned int dimension = threadIdx.x; dimension < head_dim;
+    for (unsigned int dimension = threadIdx.x; dimension < query_key_head_dim;
          dimension += blockDim.x) {
       dot += __bfloat162float(query[dimension]) * __bfloat162float(key[dimension]);
     }
@@ -138,7 +143,7 @@ extern "C" __global__ void sglang_paged_attention_bf16(
       running_max = next_max;
     }
     __syncthreads();
-    for (unsigned int dimension = threadIdx.x; dimension < head_dim;
+    for (unsigned int dimension = threadIdx.x; dimension < value_head_dim;
          dimension += blockDim.x) {
       accumulator[dimension] = accumulator[dimension] * accumulator_rescale +
                                current_weight * __bfloat162float(value[dimension]);
@@ -147,8 +152,8 @@ extern "C" __global__ void sglang_paged_attention_bf16(
   }
 
   const unsigned long long output_vector_offset =
-      (query_index * query_head_count + query_head) * head_dim;
-  for (unsigned int dimension = threadIdx.x; dimension < head_dim;
+      (query_index * query_head_count + query_head) * value_head_dim;
+  for (unsigned int dimension = threadIdx.x; dimension < value_head_dim;
        dimension += blockDim.x) {
     output[output_vector_offset + dimension] =
         __float2bfloat16_rn(accumulator[dimension] / denominator);
@@ -166,7 +171,8 @@ pub struct CudaBf16PagedAttentionLayout {
     page_stride_bytes: usize,
     key_in_page_offset: usize,
     value_in_page_offset: usize,
-    kv_row_bytes: usize,
+    key_row_bytes: usize,
+    value_row_bytes: usize,
 }
 
 impl CudaBf16PagedAttentionLayout {
@@ -177,12 +183,31 @@ impl CudaBf16PagedAttentionLayout {
         value_in_page_offset: usize,
         kv_row_bytes: usize,
     ) -> Self {
-        Self {
+        Self::new_tensor_pair(
             page_size,
             page_stride_bytes,
             key_in_page_offset,
             value_in_page_offset,
             kv_row_bytes,
+            kv_row_bytes,
+        )
+    }
+
+    pub const fn new_tensor_pair(
+        page_size: usize,
+        page_stride_bytes: usize,
+        key_in_page_offset: usize,
+        value_in_page_offset: usize,
+        key_row_bytes: usize,
+        value_row_bytes: usize,
+    ) -> Self {
+        Self {
+            page_size,
+            page_stride_bytes,
+            key_in_page_offset,
+            value_in_page_offset,
+            key_row_bytes,
+            value_row_bytes,
         }
     }
 
@@ -202,8 +227,12 @@ impl CudaBf16PagedAttentionLayout {
         self.value_in_page_offset
     }
 
-    pub const fn kv_row_bytes(self) -> usize {
-        self.kv_row_bytes
+    pub const fn key_row_bytes(self) -> usize {
+        self.key_row_bytes
+    }
+
+    pub const fn value_row_bytes(self) -> usize {
+        self.value_row_bytes
     }
 }
 
@@ -215,7 +244,8 @@ pub struct CudaBf16PagedAttentionPlan {
     slot_count: usize,
     query_head_count: usize,
     kv_head_count: usize,
-    head_dim: usize,
+    query_key_head_dim: usize,
+    value_head_dim: usize,
     scale: f32,
     layout: CudaBf16PagedAttentionLayout,
     query_required_bytes: usize,
@@ -237,7 +267,8 @@ pub struct CudaBf16PagedAttentionPlanConfig {
     pub slot_count: usize,
     pub query_head_count: usize,
     pub kv_head_count: usize,
-    pub head_dim: usize,
+    pub query_key_head_dim: usize,
+    pub value_head_dim: usize,
     pub scale: f32,
     pub layout: CudaBf16PagedAttentionLayout,
 }
@@ -253,7 +284,8 @@ impl CudaBf16PagedAttentionPlan {
             slot_count,
             query_head_count,
             kv_head_count,
-            head_dim,
+            query_key_head_dim,
+            value_head_dim,
             scale,
             layout,
         } = config;
@@ -264,10 +296,12 @@ impl CudaBf16PagedAttentionPlan {
             ("slot_count", slot_count),
             ("query_head_count", query_head_count),
             ("kv_head_count", kv_head_count),
-            ("head_dim", head_dim),
+            ("query_key_head_dim", query_key_head_dim),
+            ("value_head_dim", value_head_dim),
             ("page_size", layout.page_size),
             ("page_stride_bytes", layout.page_stride_bytes),
-            ("kv_row_bytes", layout.kv_row_bytes),
+            ("key_row_bytes", layout.key_row_bytes),
+            ("value_row_bytes", layout.value_row_bytes),
         ] {
             if value == 0 {
                 return Err(CudaBf16PagedAttentionError::ZeroDimension(dimension));
@@ -284,31 +318,45 @@ impl CudaBf16PagedAttentionPlan {
                 },
             );
         }
-        let expected_kv_row_bytes = kv_head_count
-            .checked_mul(head_dim)
+        let expected_key_row_bytes = kv_head_count
+            .checked_mul(query_key_head_dim)
             .and_then(|value| value.checked_mul(BF16_BYTES))
             .ok_or(CudaBf16PagedAttentionError::ShapeOverflow)?;
-        if layout.kv_row_bytes != expected_kv_row_bytes {
+        if layout.key_row_bytes != expected_key_row_bytes {
             return Err(CudaBf16PagedAttentionError::KvRowByteSizeMismatch {
-                expected: expected_kv_row_bytes,
-                actual: layout.kv_row_bytes,
+                expected: expected_key_row_bytes,
+                actual: layout.key_row_bytes,
+            });
+        }
+        let expected_value_row_bytes = kv_head_count
+            .checked_mul(value_head_dim)
+            .and_then(|value| value.checked_mul(BF16_BYTES))
+            .ok_or(CudaBf16PagedAttentionError::ShapeOverflow)?;
+        if layout.value_row_bytes != expected_value_row_bytes {
+            return Err(CudaBf16PagedAttentionError::ValueRowByteSizeMismatch {
+                expected: expected_value_row_bytes,
+                actual: layout.value_row_bytes,
             });
         }
 
-        let tensor_page_bytes = layout
+        let key_page_bytes = layout
             .page_size
-            .checked_mul(layout.kv_row_bytes)
+            .checked_mul(layout.key_row_bytes)
+            .ok_or(CudaBf16PagedAttentionError::ShapeOverflow)?;
+        let value_page_bytes = layout
+            .page_size
+            .checked_mul(layout.value_row_bytes)
             .ok_or(CudaBf16PagedAttentionError::ShapeOverflow)?;
         let key_page_end = validate_tensor_page_region(
             "key",
             layout.key_in_page_offset,
-            tensor_page_bytes,
+            key_page_bytes,
             layout.page_stride_bytes,
         )?;
         let value_page_end = validate_tensor_page_region(
             "value",
             layout.value_in_page_offset,
-            tensor_page_bytes,
+            value_page_bytes,
             layout.page_stride_bytes,
         )?;
         if layout.key_in_page_offset < value_page_end && layout.value_in_page_offset < key_page_end
@@ -316,13 +364,14 @@ impl CudaBf16PagedAttentionPlan {
             return Err(CudaBf16PagedAttentionError::TensorPageRegionsOverlap {
                 key_offset: layout.key_in_page_offset,
                 value_offset: layout.value_in_page_offset,
-                tensor_page_bytes,
+                key_page_bytes,
+                value_page_bytes,
             });
         }
 
         let query_elements = query_count
             .checked_mul(query_head_count)
-            .and_then(|value| value.checked_mul(head_dim))
+            .and_then(|value| value.checked_mul(query_key_head_dim))
             .ok_or(CudaBf16PagedAttentionError::ShapeOverflow)?;
         let query_required_bytes = query_elements
             .checked_mul(BF16_BYTES)
@@ -343,15 +392,35 @@ impl CudaBf16PagedAttentionPlan {
         let last_slot = slot_count - 1;
         let last_page = last_slot / layout.page_size;
         let last_token = last_slot % layout.page_size;
-        let later_tensor_offset = layout.key_in_page_offset.max(layout.value_in_page_offset);
+        let key_end = layout
+            .key_in_page_offset
+            .checked_add(
+                last_token
+                    .checked_mul(layout.key_row_bytes)
+                    .ok_or(CudaBf16PagedAttentionError::ShapeOverflow)?,
+            )
+            .and_then(|offset| offset.checked_add(layout.key_row_bytes))
+            .ok_or(CudaBf16PagedAttentionError::ShapeOverflow)?;
+        let value_end = layout
+            .value_in_page_offset
+            .checked_add(
+                last_token
+                    .checked_mul(layout.value_row_bytes)
+                    .ok_or(CudaBf16PagedAttentionError::ShapeOverflow)?,
+            )
+            .and_then(|offset| offset.checked_add(layout.value_row_bytes))
+            .ok_or(CudaBf16PagedAttentionError::ShapeOverflow)?;
         let pool_required_bytes = last_page
             .checked_mul(layout.page_stride_bytes)
-            .and_then(|offset| offset.checked_add(later_tensor_offset))
-            .and_then(|offset| offset.checked_add(last_token.checked_mul(layout.kv_row_bytes)?))
-            .and_then(|offset| offset.checked_add(layout.kv_row_bytes))
+            .and_then(|offset| offset.checked_add(key_end.max(value_end)))
+            .ok_or(CudaBf16PagedAttentionError::ShapeOverflow)?;
+        let output_required_bytes = query_count
+            .checked_mul(query_head_count)
+            .and_then(|value| value.checked_mul(value_head_dim))
+            .and_then(|value| value.checked_mul(BF16_BYTES))
             .ok_or(CudaBf16PagedAttentionError::ShapeOverflow)?;
         let shared_memory_bytes = (CUDA_BLOCK_SIZE as usize)
-            .checked_add(head_dim)
+            .checked_add(value_head_dim)
             .and_then(|value| value.checked_mul(size_of::<f32>()))
             .and_then(|value| u32::try_from(value).ok())
             .ok_or(CudaBf16PagedAttentionError::ShapeOverflow)?;
@@ -377,7 +446,8 @@ impl CudaBf16PagedAttentionPlan {
             slot_count,
             query_head_count,
             kv_head_count,
-            head_dim,
+            query_key_head_dim,
+            value_head_dim,
             scale,
             layout,
             query_required_bytes,
@@ -386,7 +456,7 @@ impl CudaBf16PagedAttentionPlan {
             request_slot_offsets_required_bytes,
             sequence_slots_required_bytes,
             pool_required_bytes,
-            output_required_bytes: query_required_bytes,
+            output_required_bytes,
             grid: CudaLaunchDimensions::new(grid_x, grid_y, 1),
             shared_memory_bytes,
         })
@@ -416,8 +486,12 @@ impl CudaBf16PagedAttentionPlan {
         self.kv_head_count
     }
 
-    pub const fn head_dim(self) -> usize {
-        self.head_dim
+    pub const fn query_key_head_dim(self) -> usize {
+        self.query_key_head_dim
+    }
+
+    pub const fn value_head_dim(self) -> usize {
+        self.value_head_dim
     }
 
     pub const fn scale(self) -> f32 {
@@ -465,6 +539,10 @@ pub enum CudaBf16PagedAttentionError {
         expected: usize,
         actual: usize,
     },
+    ValueRowByteSizeMismatch {
+        expected: usize,
+        actual: usize,
+    },
     TensorPageRegionOutOfBounds {
         tensor: &'static str,
         offset: usize,
@@ -474,7 +552,8 @@ pub enum CudaBf16PagedAttentionError {
     TensorPageRegionsOverlap {
         key_offset: usize,
         value_offset: usize,
-        tensor_page_bytes: usize,
+        key_page_bytes: usize,
+        value_page_bytes: usize,
     },
     DeviceMismatch {
         allocation: &'static str,
@@ -528,6 +607,10 @@ impl fmt::Display for CudaBf16PagedAttentionError {
                 formatter,
                 "CUDA BF16 paged attention requires {expected} bytes per KV row, layout has {actual}"
             ),
+            Self::ValueRowByteSizeMismatch { expected, actual } => write!(
+                formatter,
+                "CUDA BF16 paged attention requires {expected} bytes per value row, layout has {actual}"
+            ),
             Self::TensorPageRegionOutOfBounds {
                 tensor,
                 offset,
@@ -541,10 +624,11 @@ impl fmt::Display for CudaBf16PagedAttentionError {
             Self::TensorPageRegionsOverlap {
                 key_offset,
                 value_offset,
-                tensor_page_bytes,
+                key_page_bytes,
+                value_page_bytes,
             } => write!(
                 formatter,
-                "CUDA paged attention key/value page regions overlap: key offset {key_offset}, value offset {value_offset}, tensor page size {tensor_page_bytes} bytes"
+                "CUDA paged attention key/value page regions overlap: key offset {key_offset} ({key_page_bytes} bytes), value offset {value_offset} ({value_page_bytes} bytes)"
             ),
             Self::DeviceMismatch {
                 allocation,
@@ -694,10 +778,12 @@ impl CudaBf16PagedAttentionKernels {
             dimension_u64("key_in_page_offset", plan.layout.key_in_page_offset)?;
         let mut value_in_page_offset =
             dimension_u64("value_in_page_offset", plan.layout.value_in_page_offset)?;
-        let mut kv_row_bytes = dimension_u64("kv_row_bytes", plan.layout.kv_row_bytes)?;
+        let mut key_row_bytes = dimension_u64("key_row_bytes", plan.layout.key_row_bytes)?;
+        let mut value_row_bytes = dimension_u64("value_row_bytes", plan.layout.value_row_bytes)?;
         let mut query_head_count = dimension_u32("query_head_count", plan.query_head_count)?;
         let mut kv_head_count = dimension_u32("kv_head_count", plan.kv_head_count)?;
-        let mut head_dim = dimension_u32("head_dim", plan.head_dim)?;
+        let mut query_key_head_dim = dimension_u32("query_key_head_dim", plan.query_key_head_dim)?;
+        let mut value_head_dim = dimension_u32("value_head_dim", plan.value_head_dim)?;
         let mut scale = plan.scale;
         let mut arguments = [
             argument_pointer(&mut queries_ptr),
@@ -716,10 +802,12 @@ impl CudaBf16PagedAttentionKernels {
             argument_pointer(&mut page_stride_bytes),
             argument_pointer(&mut key_in_page_offset),
             argument_pointer(&mut value_in_page_offset),
-            argument_pointer(&mut kv_row_bytes),
+            argument_pointer(&mut key_row_bytes),
+            argument_pointer(&mut value_row_bytes),
             argument_pointer(&mut query_head_count),
             argument_pointer(&mut kv_head_count),
-            argument_pointer(&mut head_dim),
+            argument_pointer(&mut query_key_head_dim),
+            argument_pointer(&mut value_head_dim),
             argument_pointer(&mut scale),
         ];
         unsafe {
@@ -823,7 +911,8 @@ mod tests {
             slot_count: 4,
             query_head_count: 4,
             kv_head_count: 2,
-            head_dim: 8,
+            query_key_head_dim: 8,
+            value_head_dim: 8,
             scale: 1.0,
             layout: test_layout(),
         }
@@ -847,7 +936,8 @@ mod tests {
         assert_eq!(plan.slot_count(), 12);
         assert_eq!(plan.query_head_count(), 4);
         assert_eq!(plan.kv_head_count(), 2);
-        assert_eq!(plan.head_dim(), 8);
+        assert_eq!(plan.query_key_head_dim(), 8);
+        assert_eq!(plan.value_head_dim(), 8);
         assert_eq!(plan.layout(), test_layout());
         assert_eq!(plan.query_required_bytes(), 3 * 4 * 8 * 2);
         assert_eq!(plan.output_required_bytes(), 3 * 4 * 8 * 2);
@@ -880,6 +970,33 @@ mod tests {
                 actual: 31,
             })
         );
+        assert_eq!(
+            CudaBf16PagedAttentionPlan::new(CudaBf16PagedAttentionPlanConfig {
+                value_head_dim: 4,
+                ..test_plan_config()
+            }),
+            Err(CudaBf16PagedAttentionError::ValueRowByteSizeMismatch {
+                expected: 16,
+                actual: 32,
+            })
+        );
+    }
+
+    #[test]
+    fn plan_supports_unequal_mla_key_and_value_widths() {
+        let plan = CudaBf16PagedAttentionPlan::new(CudaBf16PagedAttentionPlanConfig {
+            kv_head_count: 1,
+            query_key_head_dim: 12,
+            value_head_dim: 8,
+            layout: CudaBf16PagedAttentionLayout::new_tensor_pair(4, 512, 128, 224, 24, 16),
+            ..test_plan_config()
+        })
+        .expect("valid unequal-width MLA plan should build");
+
+        assert_eq!(plan.query_required_bytes(), 4 * 12 * 2);
+        assert_eq!(plan.output_required_bytes(), 4 * 8 * 2);
+        assert_eq!(plan.layout().key_row_bytes(), 24);
+        assert_eq!(plan.layout().value_row_bytes(), 16);
     }
 
     #[test]

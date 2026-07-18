@@ -9,6 +9,7 @@ mod cuda_dense_decoder;
 mod cuda_execution_resources;
 mod cuda_hybrid_decoder;
 pub mod cuda_kv_cache;
+mod cuda_mla;
 pub mod cuda_recurrent_state;
 mod cuda_transformer;
 pub mod engine;

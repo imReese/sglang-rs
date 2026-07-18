@@ -885,7 +885,7 @@ mod tests {
         assert!(
             missing
                 .iter()
-                .any(|component| component.contains("multi-latent-attention"))
+                .all(|component| !component.contains("multi-latent-attention"))
         );
         assert!(
             missing

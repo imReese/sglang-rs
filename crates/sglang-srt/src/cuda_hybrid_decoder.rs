@@ -9,9 +9,12 @@ use sglang_kernel::cuda_linear_attention::{
     CudaBf16LinearAttentionKernels, CudaCausalConv1dSegmentLaunch, CudaCausalConv1dSegmentShape,
     CudaKeyGatedDeltaLaunch, CudaKeyGatedDeltaShape,
 };
+use sglang_kernel::cuda_mla::CudaBf16MlaKernels;
 
 use crate::backend::{CapabilityStatus, CudaBackend, RuntimeCapability, RuntimeDtype};
+use crate::cuda_attention::CudaBf16PagedAttentionExecutor;
 use crate::cuda_execution_resources::CudaExecutionResources;
+use crate::cuda_mla::{CudaBf16MultiLatentAttention, CudaMultiLatentAttentionForward};
 use crate::cuda_recurrent_state::CudaRecurrentLayerState;
 use crate::cuda_transformer::{
     CudaBf16DenseFeedForward, CudaBf16Matrix, CudaExecutorError, add, allocate_bf16, allocate_f32,
@@ -38,6 +41,8 @@ pub(crate) struct CudaBf16HybridDecoder {
     dense_kernels: CudaBf16DenseKernels,
     hybrid_kernels: CudaBf16HybridKernels,
     linear_attention: CudaBf16LinearAttentionKernels,
+    mla_kernels: Option<CudaBf16MlaKernels>,
+    paged_attention: Option<CudaBf16PagedAttentionExecutor>,
     token_embeddings: CudaBf16Matrix,
     final_norm: CudaDeviceAllocation,
     lm_head: Option<CudaBf16Matrix>,
@@ -80,7 +85,12 @@ impl CudaBf16HybridDecoder {
                     missing.insert("CUDA gated-delta-net component".to_string());
                 }
                 HybridDecoderLayerKind::MultiLatentAttention { .. } => {
-                    missing.insert("CUDA multi-latent-attention component".to_string());
+                    if !matches!(
+                        plan.full_attention,
+                        crate::models::HybridFullAttentionConfig::MultiLatent { .. }
+                    ) {
+                        missing.insert("CUDA MLA typed execution config".to_string());
+                    }
                 }
             }
             if matches!(
@@ -114,6 +124,18 @@ impl CudaBf16HybridDecoder {
         let hybrid_kernels = CudaBf16HybridKernels::compile(backend.context(), compute_capability)?;
         let linear_attention =
             CudaBf16LinearAttentionKernels::compile(backend.context(), compute_capability)?;
+        let has_mla = plan.weights.layers.iter().any(|layer| {
+            matches!(
+                layer.mixer,
+                HybridDecoderLayerKind::MultiLatentAttention { .. }
+            )
+        });
+        let mla_kernels = has_mla
+            .then(|| CudaBf16MlaKernels::compile(backend.context(), compute_capability))
+            .transpose()?;
+        let paged_attention = has_mla
+            .then(|| CudaBf16PagedAttentionExecutor::compile(backend.context(), compute_capability))
+            .transpose()?;
         let token_embeddings = CudaBf16Matrix::load(
             artifacts,
             backend.context(),
@@ -154,6 +176,8 @@ impl CudaBf16HybridDecoder {
             dense_kernels,
             hybrid_kernels,
             linear_attention,
+            mla_kernels,
+            paged_attention,
             token_embeddings,
             final_norm,
             lm_head,
@@ -166,7 +190,7 @@ impl CudaBf16HybridDecoder {
         capability.runtime_name = "cuda-bf16-hybrid-decoder";
         capability.supports_forward = true;
         capability.supported_dtypes = vec![RuntimeDtype::Bf16];
-        capability.attention_backends = vec!["cuda-kda-bf16"];
+        capability.attention_backends = vec!["cuda-kda-bf16", "cuda-mla-bf16"];
         capability.tensor_parallel = CapabilityStatus::Unsupported;
         capability
     }
@@ -194,17 +218,16 @@ impl CudaBf16HybridDecoder {
                 "CUDA hybrid request {request_index} has {cached} cached prefix tokens, but recurrent prefix-state restoration is not implemented"
             )));
         }
-        let (_active_kv_cache, recurrent_state) = resources.execution_memory_mut();
-        let recurrent_state = recurrent_state.ok_or_else(|| {
-            CudaExecutorError::Unsupported(
-                "CUDA hybrid decoder requires backend-owned recurrent state".to_string(),
-            )
-        })?;
+        let (active_kv_cache, mut recurrent_state) = resources.execution_memory_mut();
         let mut logits = Vec::with_capacity(batch.request_ids().len());
         for request_index in 0..batch.request_ids().len() {
             let request_id = &batch.request_ids()[request_index];
             let offset = batch.request_offsets()[request_index];
             let token_count = batch.input_token_counts()[request_index];
+            let sequence_offset = batch.sequence_offsets()[request_index];
+            let sequence_count = batch.sequence_token_counts()[request_index];
+            let sequence_slots =
+                &batch.sequence_cache_pages()[sequence_offset..sequence_offset + sequence_count];
             for relative_index in 0..token_count {
                 let row_index = offset + relative_index;
                 let position = batch.positions()[row_index];
@@ -214,7 +237,9 @@ impl CudaBf16HybridDecoder {
                         self.plan.max_position_embeddings
                     )));
                 }
-                recurrent_state.prepare_batch(std::slice::from_ref(request_id))?;
+                if let Some(state) = recurrent_state.as_deref_mut() {
+                    state.prepare_batch(std::slice::from_ref(request_id))?;
+                }
                 let token_id = upload_u32(self.backend.context(), &[batch.input_ids()[row_index]])?;
                 let mut hidden = allocate_bf16(self.backend.context(), self.plan.hidden_size)?;
                 self.dense_kernels.embedding_lookup(
@@ -235,19 +260,61 @@ impl CudaBf16HybridDecoder {
                         self.plan.hidden_size,
                         self.plan.rms_norm_eps,
                     )?;
-                    let mut layer_state =
-                        recurrent_state.layer_state_mut(layer.state_layer_index)?;
-                    let mixer = layer.mixer.forward(CudaKeyGatedDeltaForward {
-                        context: self.backend.context(),
-                        blas: &self.blas,
-                        dense_kernels: &self.dense_kernels,
-                        hybrid_kernels: &self.hybrid_kernels,
-                        linear_attention: &mut self.linear_attention,
-                        hidden: &normalized,
-                        batch_size: 1,
-                        rms_norm_eps: self.plan.rms_norm_eps,
-                        state: &mut layer_state,
-                    })?;
+                    let mixer = match &layer.mixer {
+                        CudaHybridMixer::KeyGatedDelta {
+                            state_layer_index,
+                            component,
+                        } => {
+                            let state = recurrent_state.as_deref_mut().ok_or_else(|| {
+                                CudaExecutorError::Unsupported(
+                                    "CUDA KDA requires backend-owned recurrent state".to_string(),
+                                )
+                            })?;
+                            let mut layer_state = state.layer_state_mut(*state_layer_index)?;
+                            component.forward(CudaKeyGatedDeltaForward {
+                                context: self.backend.context(),
+                                blas: &self.blas,
+                                dense_kernels: &self.dense_kernels,
+                                hybrid_kernels: &self.hybrid_kernels,
+                                linear_attention: &mut self.linear_attention,
+                                hidden: &normalized,
+                                batch_size: 1,
+                                rms_norm_eps: self.plan.rms_norm_eps,
+                                state: &mut layer_state,
+                            })?
+                        }
+                        CudaHybridMixer::MultiLatentAttention {
+                            cache_layer_index,
+                            component,
+                        } => {
+                            let kernels = self.mla_kernels.as_ref().ok_or_else(|| {
+                                CudaExecutorError::Unsupported(
+                                    "CUDA MLA kernels were not initialized".to_string(),
+                                )
+                            })?;
+                            let attention = self.paged_attention.as_mut().ok_or_else(|| {
+                                CudaExecutorError::Unsupported(
+                                    "CUDA MLA paged attention was not initialized".to_string(),
+                                )
+                            })?;
+                            let kv_layout = active_kv_cache.layout();
+                            component.forward(CudaMultiLatentAttentionForward {
+                                context: self.backend.context(),
+                                blas: &self.blas,
+                                kernels,
+                                attention,
+                                hidden: &normalized,
+                                position,
+                                output_slot: batch.out_cache_pages()[row_index],
+                                sequence_slots,
+                                cache_layer_index: *cache_layer_index,
+                                kv_layout,
+                                kv_storage: active_kv_cache.storage_mut(),
+                                rms_norm_epsilon: self.plan.rms_norm_eps,
+                                rope_theta: self.plan.rope_theta,
+                            })?
+                        }
+                    };
                     let after_mixer = add(
                         &self.dense_kernels,
                         self.backend.context(),
@@ -328,8 +395,7 @@ impl BackendModelExecutor<CudaExecutionResources> for CudaBf16HybridDecoder {
 
 struct CudaHybridLayer {
     input_norm: CudaDeviceAllocation,
-    state_layer_index: usize,
-    mixer: CudaBf16KeyGatedDelta,
+    mixer: CudaHybridMixer,
     post_attention_norm: CudaDeviceAllocation,
     feed_forward: CudaBf16DenseFeedForward,
 }
@@ -341,14 +407,39 @@ impl CudaHybridLayer {
         names: &HybridDecoderLayerWeightNames,
         plan: &HybridDecoderExecutionPlan,
     ) -> Result<Self, CudaExecutorError> {
-        let HybridDecoderLayerKind::KeyGatedDelta {
-            state_layer_index,
-            weights,
-        } = &names.mixer
-        else {
-            return Err(CudaExecutorError::Unsupported(
-                "CUDA hybrid layer loader received an unimplemented mixer".to_string(),
-            ));
+        let mixer = match &names.mixer {
+            HybridDecoderLayerKind::KeyGatedDelta {
+                state_layer_index,
+                weights,
+            } => CudaHybridMixer::KeyGatedDelta {
+                state_layer_index: *state_layer_index,
+                component: Box::new(CudaBf16KeyGatedDelta::load(
+                    artifacts,
+                    context,
+                    weights,
+                    plan.hidden_size,
+                    plan.linear_attention,
+                )?),
+            },
+            HybridDecoderLayerKind::MultiLatentAttention {
+                cache_layer_index,
+                weights,
+            } => CudaHybridMixer::MultiLatentAttention {
+                cache_layer_index: *cache_layer_index,
+                component: Box::new(CudaBf16MultiLatentAttention::load(
+                    artifacts,
+                    context,
+                    weights,
+                    plan.hidden_size,
+                    plan.full_attention,
+                )?),
+            },
+            HybridDecoderLayerKind::FullAttention { .. }
+            | HybridDecoderLayerKind::GatedDeltaNet { .. } => {
+                return Err(CudaExecutorError::Unsupported(
+                    "CUDA hybrid layer loader received an unimplemented mixer".to_string(),
+                ));
+            }
         };
         let HybridFeedForward::Dense {
             intermediate_size,
@@ -367,14 +458,7 @@ impl CudaHybridLayer {
                 &names.input_norm,
                 plan.hidden_size,
             )?,
-            state_layer_index: *state_layer_index,
-            mixer: CudaBf16KeyGatedDelta::load(
-                artifacts,
-                context,
-                weights,
-                plan.hidden_size,
-                plan.linear_attention,
-            )?,
+            mixer,
             post_attention_norm: upload_required_bf16(
                 artifacts,
                 context,
@@ -390,6 +474,17 @@ impl CudaHybridLayer {
             )?,
         })
     }
+}
+
+enum CudaHybridMixer {
+    KeyGatedDelta {
+        state_layer_index: usize,
+        component: Box<CudaBf16KeyGatedDelta>,
+    },
+    MultiLatentAttention {
+        cache_layer_index: usize,
+        component: Box<CudaBf16MultiLatentAttention>,
+    },
 }
 
 pub(crate) struct CudaBf16KeyGatedDelta {
