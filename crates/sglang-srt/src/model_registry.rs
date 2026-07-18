@@ -14,19 +14,20 @@ use crate::model_runtime::{
     validate_runtime_support,
 };
 use crate::models::{
-    DEEPSEEK_V4_ADAPTER, GLM_MOE_DSA_ADAPTER, ModelAdapter, ModelAdapterError, ModelDefinition,
-    QWEN2_ADAPTER, QWEN3_5_ADAPTER, QWEN3_ADAPTER,
+    DEEPSEEK_V4_ADAPTER, GLM_MOE_DSA_ADAPTER, KIMI_LINEAR_ADAPTER, ModelAdapter, ModelAdapterError,
+    ModelDefinition, QWEN2_ADAPTER, QWEN3_5_ADAPTER, QWEN3_ADAPTER,
 };
 use crate::runtime_kv_cache::RuntimeKvCacheMetadata;
 use crate::transfer::{KvCacheMemoryProvider, KvCacheTransferError, TransferableKvCacheMemory};
 use crate::worker::WorkerWeightUpdateRequest;
 
-static MODEL_ADAPTERS: [&'static dyn ModelAdapter; 5] = [
+static MODEL_ADAPTERS: [&'static dyn ModelAdapter; 6] = [
     &DEEPSEEK_V4_ADAPTER,
     &GLM_MOE_DSA_ADAPTER,
     &QWEN2_ADAPTER,
     &QWEN3_ADAPTER,
     &QWEN3_5_ADAPTER,
+    &KIMI_LINEAR_ADAPTER,
 ];
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -605,6 +606,51 @@ mod tests {
         .expect("valid Qwen3.5 config")
     }
 
+    fn kimi_linear_config() -> HfModelConfig {
+        HfModelConfig::from_json_value(json!({
+            "model_type": "kimi_linear",
+            "architectures": ["KimiLinearForCausalLM"],
+            "vocab_size": 3,
+            "model_max_length": 32,
+            "num_hidden_layers": 2,
+            "hidden_size": 2,
+            "intermediate_size": 2,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "hidden_act": "silu",
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10_000.0,
+            "tie_word_embeddings": false,
+            "kv_lora_rank": 2,
+            "q_lora_rank": null,
+            "qk_nope_head_dim": 2,
+            "qk_rope_head_dim": 2,
+            "v_head_dim": 2,
+            "mla_use_nope": true,
+            "moe_intermediate_size": 2,
+            "moe_renormalize": true,
+            "moe_router_activation_func": "sigmoid",
+            "num_experts": 1,
+            "num_experts_per_token": 1,
+            "num_shared_experts": 1,
+            "routed_scaling_factor": 1.0,
+            "first_k_dense_replace": 1,
+            "moe_layer_freq": 1,
+            "use_grouped_topk": true,
+            "num_expert_group": 1,
+            "topk_group": 1,
+            "num_nextn_predict_layers": 0,
+            "linear_attn_config": {
+                "head_dim": 2,
+                "num_heads": 1,
+                "short_conv_kernel_size": 2,
+                "kda_layers": [1],
+                "full_attn_layers": [2]
+            }
+        }))
+        .expect("valid Kimi Linear config")
+    }
+
     #[test]
     fn glm_and_deepseek_share_mla_moe_execution_components() {
         let glm = ModelRegistry
@@ -725,6 +771,66 @@ mod tests {
             .validate_tensor_parallel(8)
             .expect("all hybrid head families should support TP 8");
         assert!(qwen3_5.validate_tensor_parallel(3).is_err());
+    }
+
+    #[test]
+    fn kimi_and_qwen3_5_use_distinct_components_through_the_shared_hybrid_executor() {
+        let kimi = ModelRegistry
+            .definition(Path::new("/models/kimi-linear"), &kimi_linear_config())
+            .expect("Kimi Linear definition");
+        let qwen3_5 = ModelRegistry
+            .definition(Path::new("/models/qwen3.5"), &qwen3_5_config())
+            .expect("Qwen3.5 definition");
+
+        assert!(matches!(
+            kimi.execution(),
+            ModelExecutionArchitecture::Transformer {
+                attention: AttentionArchitecture::HybridMultiLatent { .. },
+                feed_forward: FeedForwardArchitecture::MixtureOfExperts { .. },
+            }
+        ));
+        assert!(matches!(
+            qwen3_5.execution(),
+            ModelExecutionArchitecture::Transformer {
+                attention: AttentionArchitecture::Hybrid { .. },
+                feed_forward: FeedForwardArchitecture::Dense { .. },
+            }
+        ));
+        assert_eq!(
+            kimi.cache_architecture(),
+            crate::models::ModelCacheArchitecture::HybridState {
+                full_attention_layer_count: 1,
+                recurrent_state_layer_count: 1,
+            }
+        );
+        let layout = kimi.kv_cache_layout().expect("Kimi MLA KV layout");
+        assert_eq!(layout.num_layers, 1);
+        assert_eq!(
+            layout
+                .tensor_pair_size_bytes(crate::kv_cache::KvCacheDtype::Float32)
+                .expect("Kimi tensor-pair geometry"),
+            Some([16, 8])
+        );
+        let plan = kimi.hybrid_decoder().expect("shared hybrid plan");
+        assert!(matches!(
+            plan.weights.layers[0].mixer,
+            crate::models::HybridDecoderLayerKind::KeyGatedDelta { .. }
+        ));
+        assert!(matches!(
+            plan.weights.layers[1].mixer,
+            crate::models::HybridDecoderLayerKind::MultiLatentAttention { .. }
+        ));
+        assert!(matches!(
+            plan.weights.layers[0].feed_forward,
+            crate::models::HybridFeedForward::Dense { .. }
+        ));
+        assert!(matches!(
+            plan.weights.layers[1].feed_forward,
+            crate::models::HybridFeedForward::MixtureOfExperts { .. }
+        ));
+        let backend = cpu_reference_backend();
+        validate_runtime_support(&kimi, backend.as_ref(), 1)
+            .expect("CPU reference backend should execute the shared Kimi component plan");
     }
 
     #[test]

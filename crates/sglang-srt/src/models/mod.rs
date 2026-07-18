@@ -1,5 +1,6 @@
 mod deepseek;
 mod glm;
+mod kimi_linear;
 mod mla_moe_weights;
 mod qwen;
 mod qwen3_5;
@@ -16,6 +17,7 @@ use crate::model_artifacts::{
 
 pub(crate) use deepseek::DEEPSEEK_V4_ADAPTER;
 pub(crate) use glm::GLM_MOE_DSA_ADAPTER;
+pub(crate) use kimi_linear::KIMI_LINEAR_ADAPTER;
 pub(crate) use qwen::{QWEN2_ADAPTER, QWEN3_ADAPTER};
 pub(crate) use qwen3_5::QWEN3_5_ADAPTER;
 
@@ -42,6 +44,15 @@ pub enum AttentionArchitecture {
         linear_key_head_dim: usize,
         linear_value_head_dim: usize,
     },
+    HybridMultiLatent {
+        num_attention_heads: usize,
+        qk_nope_head_dim: usize,
+        qk_rope_head_dim: usize,
+        value_head_dim: usize,
+        linear_num_heads: usize,
+        linear_key_head_dim: usize,
+        linear_value_head_dim: usize,
+    },
 }
 
 impl AttentionArchitecture {
@@ -50,7 +61,7 @@ impl AttentionArchitecture {
             Self::None => AttentionFamily::None,
             Self::MultiHead { .. } => AttentionFamily::MultiHead,
             Self::MultiLatent { .. } => AttentionFamily::MultiLatent,
-            Self::Hybrid { .. } => AttentionFamily::Hybrid,
+            Self::Hybrid { .. } | Self::HybridMultiLatent { .. } => AttentionFamily::Hybrid,
         }
     }
 
@@ -80,6 +91,11 @@ impl AttentionArchitecture {
                     ("linear value", linear_num_value_heads),
                 ],
             ),
+            Self::HybridMultiLatent {
+                num_attention_heads,
+                linear_num_heads,
+                ..
+            } => (num_attention_heads, vec![("linear", linear_num_heads)]),
         };
 
         if !num_attention_heads.is_multiple_of(tensor_parallel_size) {
@@ -216,6 +232,15 @@ pub(crate) struct HybridFullAttentionWeightNames {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HybridMultiLatentAttentionWeightNames {
+    pub(crate) query_weight: String,
+    pub(crate) kv_a_weight: String,
+    pub(crate) kv_a_norm: String,
+    pub(crate) kv_b_weight: String,
+    pub(crate) output_weight: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GatedDeltaNetWeightNames {
     pub(crate) a_log: String,
     pub(crate) conv1d_weight: String,
@@ -229,6 +254,106 @@ pub(crate) struct GatedDeltaNetWeightNames {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KeyGatedDeltaWeightNames {
+    pub(crate) a_log: String,
+    pub(crate) dt_bias: String,
+    pub(crate) query_weight: String,
+    pub(crate) key_weight: String,
+    pub(crate) value_weight: String,
+    pub(crate) beta_weight: String,
+    pub(crate) forget_a_weight: String,
+    pub(crate) forget_b_weight: String,
+    pub(crate) gate_a_weight: String,
+    pub(crate) gate_b_weight: String,
+    pub(crate) query_conv_weight: String,
+    pub(crate) key_conv_weight: String,
+    pub(crate) value_conv_weight: String,
+    pub(crate) output_norm: String,
+    pub(crate) output_weight: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DecoderNormalization {
+    Rms,
+    GemmaRms,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HybridFullAttentionConfig {
+    MultiHead {
+        num_attention_heads: usize,
+        num_key_value_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        output_gate: bool,
+    },
+    MultiLatent {
+        num_attention_heads: usize,
+        kv_lora_rank: usize,
+        qk_nope_head_dim: usize,
+        qk_rope_head_dim: usize,
+        value_head_dim: usize,
+        skip_rope: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HybridLinearAttentionConfig {
+    GatedDeltaNet {
+        conv_kernel_dim: usize,
+        key_head_dim: usize,
+        value_head_dim: usize,
+        num_key_heads: usize,
+        num_value_heads: usize,
+    },
+    KeyGatedDelta {
+        conv_kernel_dim: usize,
+        key_head_dim: usize,
+        value_head_dim: usize,
+        num_heads: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RouterActivation {
+    Sigmoid,
+    Softmax,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct MoeFeedForwardConfig {
+    pub(crate) routed_expert_count: usize,
+    pub(crate) experts_per_token: usize,
+    pub(crate) expert_group_count: usize,
+    pub(crate) selected_expert_group_count: usize,
+    pub(crate) shared_expert_count: usize,
+    pub(crate) expert_intermediate_size: usize,
+    pub(crate) renormalize: bool,
+    pub(crate) router_activation: RouterActivation,
+    pub(crate) routed_scaling_factor: f32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MoeFeedForwardWeightNames {
+    pub(crate) gate_weight: String,
+    pub(crate) correction_bias: Option<String>,
+    pub(crate) experts: Vec<DenseFeedForwardWeightNames>,
+    pub(crate) shared_expert: Option<DenseFeedForwardWeightNames>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum HybridFeedForward {
+    Dense {
+        intermediate_size: usize,
+        weights: DenseFeedForwardWeightNames,
+    },
+    MixtureOfExperts {
+        config: MoeFeedForwardConfig,
+        weights: MoeFeedForwardWeightNames,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum HybridDecoderLayerKind {
     FullAttention {
         cache_layer_index: usize,
@@ -238,17 +363,25 @@ pub(crate) enum HybridDecoderLayerKind {
         state_layer_index: usize,
         weights: GatedDeltaNetWeightNames,
     },
+    MultiLatentAttention {
+        cache_layer_index: usize,
+        weights: HybridMultiLatentAttentionWeightNames,
+    },
+    KeyGatedDelta {
+        state_layer_index: usize,
+        weights: KeyGatedDeltaWeightNames,
+    },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct HybridDecoderLayerWeightNames {
     pub(crate) input_norm: String,
     pub(crate) mixer: HybridDecoderLayerKind,
     pub(crate) post_attention_norm: String,
-    pub(crate) feed_forward: DenseFeedForwardWeightNames,
+    pub(crate) feed_forward: HybridFeedForward,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct HybridDecoderWeightNames {
     pub(crate) token_embeddings: String,
     pub(crate) final_norm: String,
@@ -260,20 +393,12 @@ pub(crate) struct HybridDecoderWeightNames {
 pub(crate) struct HybridDecoderExecutionPlan {
     pub(crate) vocab_size: usize,
     pub(crate) hidden_size: usize,
-    pub(crate) intermediate_size: usize,
     pub(crate) max_position_embeddings: usize,
     pub(crate) rms_norm_eps: f32,
     pub(crate) rope_theta: f32,
-    pub(crate) rotary_dim: usize,
-    pub(crate) attention_output_gate: bool,
-    pub(crate) num_attention_heads: usize,
-    pub(crate) num_key_value_heads: usize,
-    pub(crate) attention_head_dim: usize,
-    pub(crate) linear_conv_kernel_dim: usize,
-    pub(crate) linear_key_head_dim: usize,
-    pub(crate) linear_value_head_dim: usize,
-    pub(crate) linear_num_key_heads: usize,
-    pub(crate) linear_num_value_heads: usize,
+    pub(crate) normalization: DecoderNormalization,
+    pub(crate) full_attention: HybridFullAttentionConfig,
+    pub(crate) linear_attention: HybridLinearAttentionConfig,
     pub(crate) activation: DenseDecoderActivation,
     pub(crate) weights: HybridDecoderWeightNames,
 }
@@ -408,7 +533,13 @@ impl ModelDefinition {
             .weights
             .layers
             .iter()
-            .filter(|layer| matches!(layer.mixer, HybridDecoderLayerKind::FullAttention { .. }))
+            .filter(|layer| {
+                matches!(
+                    layer.mixer,
+                    HybridDecoderLayerKind::FullAttention { .. }
+                        | HybridDecoderLayerKind::MultiLatentAttention { .. }
+                )
+            })
             .count();
         let recurrent_state_layer_count = plan.weights.layers.len() - full_attention_layer_count;
         self.cache_architecture = ModelCacheArchitecture::HybridState {
@@ -582,154 +713,7 @@ impl ModelDefinition {
                 "hybrid decoder weight map has no layers",
             ));
         }
-
-        let query_size = plan
-            .num_attention_heads
-            .checked_mul(plan.attention_head_dim)
-            .ok_or_else(|| {
-                invalid_dense_decoder_checkpoint(artifacts, "query projection size overflowed")
-            })?;
-        let projected_query_size = query_size
-            .checked_mul(if plan.attention_output_gate { 2 } else { 1 })
-            .ok_or_else(|| {
-                invalid_dense_decoder_checkpoint(
-                    artifacts,
-                    "gated query projection size overflowed",
-                )
-            })?;
-        let kv_size = plan
-            .num_key_value_heads
-            .checked_mul(plan.attention_head_dim)
-            .ok_or_else(|| {
-                invalid_dense_decoder_checkpoint(artifacts, "KV projection size overflowed")
-            })?;
-        let linear_key_size = plan
-            .linear_num_key_heads
-            .checked_mul(plan.linear_key_head_dim)
-            .ok_or_else(|| {
-                invalid_dense_decoder_checkpoint(artifacts, "linear key size overflowed")
-            })?;
-        let linear_value_size = plan
-            .linear_num_value_heads
-            .checked_mul(plan.linear_value_head_dim)
-            .ok_or_else(|| {
-                invalid_dense_decoder_checkpoint(artifacts, "linear value size overflowed")
-            })?;
-        let conv_dim = linear_key_size
-            .checked_mul(2)
-            .and_then(|size| size.checked_add(linear_value_size))
-            .ok_or_else(|| {
-                invalid_dense_decoder_checkpoint(artifacts, "linear convolution size overflowed")
-            })?;
-
-        require_tensor_shape(
-            artifacts,
-            &plan.weights.token_embeddings,
-            &[plan.vocab_size, plan.hidden_size],
-        )?;
-        require_tensor_shape(artifacts, &plan.weights.final_norm, &[plan.hidden_size])?;
-        if let Some(lm_head) = &plan.weights.lm_head {
-            require_tensor_shape(artifacts, lm_head, &[plan.vocab_size, plan.hidden_size])?;
-        }
-
-        for layer in &plan.weights.layers {
-            require_tensor_shape(artifacts, &layer.input_norm, &[plan.hidden_size])?;
-            require_tensor_shape(artifacts, &layer.post_attention_norm, &[plan.hidden_size])?;
-            require_tensor_shape(
-                artifacts,
-                &layer.feed_forward.gate_weight,
-                &[plan.intermediate_size, plan.hidden_size],
-            )?;
-            require_tensor_shape(
-                artifacts,
-                &layer.feed_forward.up_weight,
-                &[plan.intermediate_size, plan.hidden_size],
-            )?;
-            require_tensor_shape(
-                artifacts,
-                &layer.feed_forward.down_weight,
-                &[plan.hidden_size, plan.intermediate_size],
-            )?;
-
-            match &layer.mixer {
-                HybridDecoderLayerKind::FullAttention { weights, .. } => {
-                    require_tensor_shape(
-                        artifacts,
-                        &weights.query_weight,
-                        &[projected_query_size, plan.hidden_size],
-                    )?;
-                    require_tensor_shape(
-                        artifacts,
-                        &weights.query_norm,
-                        &[plan.attention_head_dim],
-                    )?;
-                    require_tensor_shape(
-                        artifacts,
-                        &weights.key_weight,
-                        &[kv_size, plan.hidden_size],
-                    )?;
-                    require_tensor_shape(artifacts, &weights.key_norm, &[plan.attention_head_dim])?;
-                    require_tensor_shape(
-                        artifacts,
-                        &weights.value_weight,
-                        &[kv_size, plan.hidden_size],
-                    )?;
-                    require_tensor_shape(
-                        artifacts,
-                        &weights.output_weight,
-                        &[plan.hidden_size, query_size],
-                    )?;
-                }
-                HybridDecoderLayerKind::GatedDeltaNet { weights, .. } => {
-                    require_tensor_shape(
-                        artifacts,
-                        &weights.a_log,
-                        &[plan.linear_num_value_heads],
-                    )?;
-                    require_tensor_shape(
-                        artifacts,
-                        &weights.conv1d_weight,
-                        &[conv_dim, 1, plan.linear_conv_kernel_dim],
-                    )?;
-                    require_tensor_shape(
-                        artifacts,
-                        &weights.dt_bias,
-                        &[plan.linear_num_value_heads],
-                    )?;
-                    require_tensor_shape(
-                        artifacts,
-                        &weights.in_proj_a_weight,
-                        &[plan.linear_num_value_heads, plan.hidden_size],
-                    )?;
-                    require_tensor_shape(
-                        artifacts,
-                        &weights.in_proj_b_weight,
-                        &[plan.linear_num_value_heads, plan.hidden_size],
-                    )?;
-                    require_tensor_shape(
-                        artifacts,
-                        &weights.in_proj_qkv_weight,
-                        &[conv_dim, plan.hidden_size],
-                    )?;
-                    require_tensor_shape(
-                        artifacts,
-                        &weights.in_proj_z_weight,
-                        &[linear_value_size, plan.hidden_size],
-                    )?;
-                    require_tensor_shape(
-                        artifacts,
-                        &weights.norm_weight,
-                        &[plan.linear_value_head_dim],
-                    )?;
-                    require_tensor_shape(
-                        artifacts,
-                        &weights.output_weight,
-                        &[plan.hidden_size, linear_value_size],
-                    )?;
-                }
-            }
-        }
-        Ok(())
+        artifacts.validate_checkpoint_topology(&self.checkpoint_topology)
     }
 
     pub fn runtime_requirements<'a>(
@@ -859,28 +843,48 @@ pub(crate) fn hybrid_decoder_checkpoint_topology(
             "hybrid decoder checkpoint topology has no layers",
         ));
     }
-    let query_size = plan
-        .num_attention_heads
-        .checked_mul(plan.attention_head_dim)
-        .ok_or_else(|| {
-            ModelAdapterError::invalid(architecture, "query projection size overflowed")
-        })?;
+    let HybridFullAttentionConfig::MultiHead {
+        num_attention_heads,
+        num_key_value_heads,
+        head_dim,
+        output_gate,
+        ..
+    } = plan.full_attention
+    else {
+        return Err(ModelAdapterError::invalid(
+            architecture,
+            "multi-head/GDN checkpoint topology cannot validate multi-latent attention",
+        ));
+    };
+    let HybridLinearAttentionConfig::GatedDeltaNet {
+        conv_kernel_dim,
+        key_head_dim,
+        value_head_dim,
+        num_key_heads,
+        num_value_heads,
+    } = plan.linear_attention
+    else {
+        return Err(ModelAdapterError::invalid(
+            architecture,
+            "multi-head/GDN checkpoint topology cannot validate key-gated delta attention",
+        ));
+    };
+    let query_size = num_attention_heads.checked_mul(head_dim).ok_or_else(|| {
+        ModelAdapterError::invalid(architecture, "query projection size overflowed")
+    })?;
     let projected_query_size = query_size
-        .checked_mul(if plan.attention_output_gate { 2 } else { 1 })
+        .checked_mul(if output_gate { 2 } else { 1 })
         .ok_or_else(|| {
             ModelAdapterError::invalid(architecture, "gated query projection size overflowed")
         })?;
-    let kv_size = plan
-        .num_key_value_heads
-        .checked_mul(plan.attention_head_dim)
+    let kv_size = num_key_value_heads
+        .checked_mul(head_dim)
         .ok_or_else(|| ModelAdapterError::invalid(architecture, "KV projection size overflowed"))?;
-    let linear_key_size = plan
-        .linear_num_key_heads
-        .checked_mul(plan.linear_key_head_dim)
+    let linear_key_size = num_key_heads
+        .checked_mul(key_head_dim)
         .ok_or_else(|| ModelAdapterError::invalid(architecture, "linear key size overflowed"))?;
-    let linear_value_size = plan
-        .linear_num_value_heads
-        .checked_mul(plan.linear_value_head_dim)
+    let linear_value_size = num_value_heads
+        .checked_mul(value_head_dim)
         .ok_or_else(|| ModelAdapterError::invalid(architecture, "linear value size overflowed"))?;
     let conv_dim = linear_key_size
         .checked_mul(2)
@@ -906,17 +910,29 @@ pub(crate) fn hybrid_decoder_checkpoint_topology(
         tensors.extend([
             CheckpointTensorRequirement::with_shape(&layer.input_norm, [plan.hidden_size]),
             CheckpointTensorRequirement::with_shape(&layer.post_attention_norm, [plan.hidden_size]),
+        ]);
+        let HybridFeedForward::Dense {
+            intermediate_size,
+            weights: feed_forward,
+        } = &layer.feed_forward
+        else {
+            return Err(ModelAdapterError::invalid(
+                architecture,
+                "multi-head/GDN checkpoint topology requires dense feed-forward layers",
+            ));
+        };
+        tensors.extend([
             CheckpointTensorRequirement::with_shape(
-                &layer.feed_forward.gate_weight,
-                [plan.intermediate_size, plan.hidden_size],
+                &feed_forward.gate_weight,
+                [*intermediate_size, plan.hidden_size],
             ),
             CheckpointTensorRequirement::with_shape(
-                &layer.feed_forward.up_weight,
-                [plan.intermediate_size, plan.hidden_size],
+                &feed_forward.up_weight,
+                [*intermediate_size, plan.hidden_size],
             ),
             CheckpointTensorRequirement::with_shape(
-                &layer.feed_forward.down_weight,
-                [plan.hidden_size, plan.intermediate_size],
+                &feed_forward.down_weight,
+                [plan.hidden_size, *intermediate_size],
             ),
         ]);
         match &layer.mixer {
@@ -925,18 +941,12 @@ pub(crate) fn hybrid_decoder_checkpoint_topology(
                     &weights.query_weight,
                     [projected_query_size, plan.hidden_size],
                 ),
-                CheckpointTensorRequirement::with_shape(
-                    &weights.query_norm,
-                    [plan.attention_head_dim],
-                ),
+                CheckpointTensorRequirement::with_shape(&weights.query_norm, [head_dim]),
                 CheckpointTensorRequirement::with_shape(
                     &weights.key_weight,
                     [kv_size, plan.hidden_size],
                 ),
-                CheckpointTensorRequirement::with_shape(
-                    &weights.key_norm,
-                    [plan.attention_head_dim],
-                ),
+                CheckpointTensorRequirement::with_shape(&weights.key_norm, [head_dim]),
                 CheckpointTensorRequirement::with_shape(
                     &weights.value_weight,
                     [kv_size, plan.hidden_size],
@@ -947,25 +957,19 @@ pub(crate) fn hybrid_decoder_checkpoint_topology(
                 ),
             ]),
             HybridDecoderLayerKind::GatedDeltaNet { weights, .. } => tensors.extend([
-                CheckpointTensorRequirement::with_shape(
-                    &weights.a_log,
-                    [plan.linear_num_value_heads],
-                ),
+                CheckpointTensorRequirement::with_shape(&weights.a_log, [num_value_heads]),
                 CheckpointTensorRequirement::with_shape(
                     &weights.conv1d_weight,
-                    [conv_dim, 1, plan.linear_conv_kernel_dim],
+                    [conv_dim, 1, conv_kernel_dim],
                 ),
-                CheckpointTensorRequirement::with_shape(
-                    &weights.dt_bias,
-                    [plan.linear_num_value_heads],
-                ),
+                CheckpointTensorRequirement::with_shape(&weights.dt_bias, [num_value_heads]),
                 CheckpointTensorRequirement::with_shape(
                     &weights.in_proj_a_weight,
-                    [plan.linear_num_value_heads, plan.hidden_size],
+                    [num_value_heads, plan.hidden_size],
                 ),
                 CheckpointTensorRequirement::with_shape(
                     &weights.in_proj_b_weight,
-                    [plan.linear_num_value_heads, plan.hidden_size],
+                    [num_value_heads, plan.hidden_size],
                 ),
                 CheckpointTensorRequirement::with_shape(
                     &weights.in_proj_qkv_weight,
@@ -975,15 +979,19 @@ pub(crate) fn hybrid_decoder_checkpoint_topology(
                     &weights.in_proj_z_weight,
                     [linear_value_size, plan.hidden_size],
                 ),
-                CheckpointTensorRequirement::with_shape(
-                    &weights.norm_weight,
-                    [plan.linear_value_head_dim],
-                ),
+                CheckpointTensorRequirement::with_shape(&weights.norm_weight, [value_head_dim]),
                 CheckpointTensorRequirement::with_shape(
                     &weights.output_weight,
                     [plan.hidden_size, linear_value_size],
                 ),
             ]),
+            HybridDecoderLayerKind::MultiLatentAttention { .. }
+            | HybridDecoderLayerKind::KeyGatedDelta { .. } => {
+                return Err(ModelAdapterError::invalid(
+                    architecture,
+                    "multi-head/GDN checkpoint topology received an incompatible mixer",
+                ));
+            }
         }
     }
     Ok(CheckpointTopology::new(tensors))

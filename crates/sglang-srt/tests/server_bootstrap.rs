@@ -665,6 +665,16 @@ async fn bootstrap_runs_qwen3_5_hybrid_centralized_prefill_and_decode_without_tr
     fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
 
+#[tokio::test]
+async fn bootstrap_runs_kimi_linear_hybrid_centralized_prefill_and_decode_without_transfer() {
+    let model_dir = temp_model_dir("server-kimi-linear-runtime-forward");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_complete_kimi_linear_checkpoint(&model_dir);
+    assert_centralized_generation(&model_dir, "centralized-kimi-linear").await;
+
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
+}
+
 #[test]
 fn qwen3_5_pd_startup_rejects_kv_only_transfer_before_serving() {
     let model_dir = temp_model_dir("server-qwen35-pd-fail-fast");
@@ -695,6 +705,10 @@ fn qwen3_5_pd_startup_rejects_kv_only_transfer_before_serving() {
 }
 
 async fn assert_centralized_qwen_generation(model_dir: &std::path::Path, request_id: &str) {
+    assert_centralized_generation(model_dir, request_id).await;
+}
+
+async fn assert_centralized_generation(model_dir: &std::path::Path, request_id: &str) {
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
@@ -2111,6 +2125,151 @@ fn write_complete_qwen3_5_checkpoint(model_dir: &std::path::Path) {
     }
     write_safetensors_file(&model_dir.join("model.safetensors"), &tensors, &payload)
         .expect("Qwen3.5 checkpoint should be written");
+}
+
+fn write_complete_kimi_linear_checkpoint(model_dir: &std::path::Path) {
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "architectures": ["KimiLinearForCausalLM"],
+  "model_type": "kimi_linear",
+  "vocab_size": 3,
+  "model_max_length": 32,
+  "num_hidden_layers": 2,
+  "hidden_size": 2,
+  "intermediate_size": 2,
+  "num_attention_heads": 1,
+  "num_key_value_heads": 1,
+  "hidden_act": "silu",
+  "rms_norm_eps": 0.00001,
+  "rope_theta": 10000.0,
+  "rope_scaling": null,
+  "tie_word_embeddings": false,
+  "q_lora_rank": null,
+  "kv_lora_rank": 2,
+  "qk_nope_head_dim": 2,
+  "qk_rope_head_dim": 2,
+  "v_head_dim": 2,
+  "mla_use_nope": true,
+  "moe_intermediate_size": 2,
+  "moe_renormalize": true,
+  "moe_router_activation_func": "sigmoid",
+  "num_experts": 1,
+  "num_experts_per_token": 1,
+  "num_shared_experts": 1,
+  "routed_scaling_factor": 1.0,
+  "first_k_dense_replace": 1,
+  "moe_layer_freq": 1,
+  "use_grouped_topk": true,
+  "num_expert_group": 1,
+  "topk_group": 1,
+  "num_nextn_predict_layers": 0,
+  "linear_attn_config": {
+    "head_dim": 2,
+    "num_heads": 1,
+    "short_conv_kernel_size": 2,
+    "kda_layers": [1],
+    "full_attn_layers": [2]
+  }
+}"#,
+    )
+    .expect("config should be written");
+    fs::write(
+        model_dir.join("tokenizer.json"),
+        word_level_tokenizer_json(),
+    )
+    .expect("Kimi Linear tokenizer should be written");
+
+    let mut descriptors: Vec<(String, Vec<usize>, Vec<f32>)> = vec![
+        (
+            "model.embed_tokens.weight".to_string(),
+            vec![3, 2],
+            vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
+        ),
+        ("model.norm.weight".to_string(), vec![2], vec![1.0; 2]),
+        (
+            "lm_head.weight".to_string(),
+            vec![3, 2],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0],
+        ),
+    ];
+    {
+        let mut add_tensor = |name: String, shape: Vec<usize>, value: f32| {
+            let element_count = shape.iter().product();
+            descriptors.push((name, shape, vec![value; element_count]));
+        };
+        for layer_id in 0..2 {
+            let prefix = format!("model.layers.{layer_id}");
+            add_tensor(format!("{prefix}.input_layernorm.weight"), vec![2], 1.0);
+            add_tensor(
+                format!("{prefix}.post_attention_layernorm.weight"),
+                vec![2],
+                1.0,
+            );
+        }
+        for (suffix, shape) in [
+            ("self_attn.A_log", vec![1, 1, 1, 1]),
+            ("self_attn.dt_bias", vec![2]),
+            ("self_attn.q_proj.weight", vec![2, 2]),
+            ("self_attn.k_proj.weight", vec![2, 2]),
+            ("self_attn.v_proj.weight", vec![2, 2]),
+            ("self_attn.b_proj.weight", vec![1, 2]),
+            ("self_attn.f_a_proj.weight", vec![2, 2]),
+            ("self_attn.f_b_proj.weight", vec![2, 2]),
+            ("self_attn.g_a_proj.weight", vec![2, 2]),
+            ("self_attn.g_b_proj.weight", vec![2, 2]),
+            ("self_attn.q_conv1d.weight", vec![2, 2]),
+            ("self_attn.k_conv1d.weight", vec![2, 2]),
+            ("self_attn.v_conv1d.weight", vec![2, 2]),
+            ("self_attn.o_proj.weight", vec![2, 2]),
+            ("mlp.gate_proj.weight", vec![2, 2]),
+            ("mlp.up_proj.weight", vec![2, 2]),
+            ("mlp.down_proj.weight", vec![2, 2]),
+        ] {
+            add_tensor(format!("model.layers.0.{suffix}"), shape, 0.0);
+        }
+        add_tensor(
+            "model.layers.0.self_attn.o_norm.weight".to_string(),
+            vec![2],
+            1.0,
+        );
+        for (suffix, shape) in [
+            ("self_attn.q_proj.weight", vec![4, 2]),
+            ("self_attn.kv_a_proj_with_mqa.weight", vec![4, 2]),
+            ("self_attn.kv_b_proj.weight", vec![4, 2]),
+            ("self_attn.o_proj.weight", vec![2, 2]),
+            ("mlp.gate.weight", vec![1, 2]),
+            ("mlp.gate.e_score_correction_bias", vec![1]),
+            ("mlp.experts.0.w1.weight", vec![2, 2]),
+            ("mlp.experts.0.w2.weight", vec![2, 2]),
+            ("mlp.experts.0.w3.weight", vec![2, 2]),
+            ("mlp.shared_experts.gate_proj.weight", vec![2, 2]),
+            ("mlp.shared_experts.up_proj.weight", vec![2, 2]),
+            ("mlp.shared_experts.down_proj.weight", vec![2, 2]),
+        ] {
+            add_tensor(format!("model.layers.1.{suffix}"), shape, 0.0);
+        }
+        add_tensor(
+            "model.layers.1.self_attn.kv_a_layernorm.weight".to_string(),
+            vec![2],
+            1.0,
+        );
+    }
+
+    let mut payload = Vec::new();
+    let mut tensors = Vec::new();
+    for (name, shape, values) in &descriptors {
+        let start = payload.len();
+        payload.extend(values.iter().flat_map(|value| value.to_le_bytes()));
+        tensors.push((
+            name.as_str(),
+            "F32",
+            shape.as_slice(),
+            [start, payload.len()],
+        ));
+    }
+    write_safetensors_file(&model_dir.join("model.safetensors"), &tensors, &payload)
+        .expect("Kimi Linear checkpoint should be written");
 }
 
 fn write_complete_glm_moe_dsa_forward_checkpoint(model_dir: &std::path::Path) {

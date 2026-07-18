@@ -612,6 +612,19 @@ impl PagedKvCacheLayout {
         }
     }
 
+    pub fn tensor_token_size_bytes(
+        &self,
+        tensor_index: usize,
+    ) -> Result<usize, PagedKvCacheLayoutError> {
+        if tensor_index >= self.runtime.kv_tensors_per_token {
+            return Err(PagedKvCacheLayoutError::TensorOutOfRange {
+                tensor_index,
+                tensor_count: self.runtime.kv_tensors_per_token,
+            });
+        }
+        self.tensor_token_bytes(tensor_index)
+    }
+
     pub fn bytes_per_layer_page(&self) -> usize {
         self.bytes_per_layer_page
     }

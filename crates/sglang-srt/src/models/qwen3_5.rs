@@ -7,11 +7,13 @@ use crate::kv_cache::KvCacheModelLayout;
 use crate::model_artifacts::HfModelConfig;
 
 use super::{
-    AttentionArchitecture, DenseDecoderActivation, DenseFeedForwardWeightNames,
-    FeedForwardArchitecture, GatedDeltaNetWeightNames, HybridDecoderExecutionPlan,
-    HybridDecoderLayerKind, HybridDecoderLayerWeightNames, HybridDecoderWeightNames,
-    HybridFullAttentionWeightNames, ModelAdapter, ModelAdapterError, ModelDefinition,
-    ModelExecutionArchitecture, hybrid_decoder_checkpoint_topology, required_usize,
+    AttentionArchitecture, DecoderNormalization, DenseDecoderActivation,
+    DenseFeedForwardWeightNames, FeedForwardArchitecture, GatedDeltaNetWeightNames,
+    HybridDecoderExecutionPlan, HybridDecoderLayerKind, HybridDecoderLayerWeightNames,
+    HybridDecoderWeightNames, HybridFeedForward, HybridFullAttentionConfig,
+    HybridFullAttentionWeightNames, HybridLinearAttentionConfig, ModelAdapter, ModelAdapterError,
+    ModelDefinition, ModelExecutionArchitecture, hybrid_decoder_checkpoint_topology,
+    required_usize,
 };
 
 pub(crate) const QWEN3_5_ARCHITECTURE: &str = "Qwen3_5ForConditionalGeneration";
@@ -253,7 +255,11 @@ fn build_definition(hf_config: &HfModelConfig) -> Result<ModelDefinition, ModelA
         },
         feed_forward: FeedForwardArchitecture::Dense { intermediate_size },
     };
-    let weights = weight_names(&layer_types, config.tie_word_embeddings == Some(true));
+    let weights = weight_names(
+        &layer_types,
+        config.tie_word_embeddings == Some(true),
+        intermediate_size,
+    );
     let max_position_embeddings = config.max_position_embeddings.unwrap_or(32_768);
     if max_position_embeddings == 0 {
         return Err(ModelAdapterError::invalid(
@@ -264,20 +270,24 @@ fn build_definition(hf_config: &HfModelConfig) -> Result<ModelDefinition, ModelA
     let plan = HybridDecoderExecutionPlan {
         vocab_size,
         hidden_size,
-        intermediate_size,
         max_position_embeddings,
         rms_norm_eps,
         rope_theta: rope_theta as f32,
-        rotary_dim,
-        attention_output_gate: config.attn_output_gate.unwrap_or(true),
-        num_attention_heads,
-        num_key_value_heads,
-        attention_head_dim,
-        linear_conv_kernel_dim,
-        linear_key_head_dim,
-        linear_value_head_dim,
-        linear_num_key_heads,
-        linear_num_value_heads,
+        normalization: DecoderNormalization::GemmaRms,
+        full_attention: HybridFullAttentionConfig::MultiHead {
+            num_attention_heads,
+            num_key_value_heads,
+            head_dim: attention_head_dim,
+            rotary_dim,
+            output_gate: config.attn_output_gate.unwrap_or(true),
+        },
+        linear_attention: HybridLinearAttentionConfig::GatedDeltaNet {
+            conv_kernel_dim: linear_conv_kernel_dim,
+            key_head_dim: linear_key_head_dim,
+            value_head_dim: linear_value_head_dim,
+            num_key_heads: linear_num_key_heads,
+            num_value_heads: linear_num_value_heads,
+        },
         activation: DenseDecoderActivation::Silu,
         weights,
     };
@@ -388,7 +398,11 @@ fn validate_rope(config: &Qwen3_5TextConfig) -> Result<(), ModelAdapterError> {
     Ok(())
 }
 
-fn weight_names(layer_types: &[&str], tied_embeddings: bool) -> HybridDecoderWeightNames {
+fn weight_names(
+    layer_types: &[&str],
+    tied_embeddings: bool,
+    intermediate_size: usize,
+) -> HybridDecoderWeightNames {
     let mut cache_layer_index = 0;
     let mut state_layer_index = 0;
     let layers = layer_types
@@ -436,10 +450,13 @@ fn weight_names(layer_types: &[&str], tied_embeddings: bool) -> HybridDecoderWei
                 input_norm: format!("{prefix}.input_layernorm.weight"),
                 mixer,
                 post_attention_norm: format!("{prefix}.post_attention_layernorm.weight"),
-                feed_forward: DenseFeedForwardWeightNames {
-                    gate_weight: format!("{prefix}.mlp.gate_proj.weight"),
-                    up_weight: format!("{prefix}.mlp.up_proj.weight"),
-                    down_weight: format!("{prefix}.mlp.down_proj.weight"),
+                feed_forward: HybridFeedForward::Dense {
+                    intermediate_size,
+                    weights: DenseFeedForwardWeightNames {
+                        gate_weight: format!("{prefix}.mlp.gate_proj.weight"),
+                        up_weight: format!("{prefix}.mlp.up_proj.weight"),
+                        down_weight: format!("{prefix}.mlp.down_proj.weight"),
+                    },
                 },
             }
         })

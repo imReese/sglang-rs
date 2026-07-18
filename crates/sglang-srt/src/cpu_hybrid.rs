@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use sglang_kernel::cpu::{
-    GatedDeltaRuleShape, causal_depthwise_conv1d_step, gated_delta_rule_step, rms_norm,
+    GatedDeltaRuleShape, KeyGatedDeltaRuleShape, apply_partial_neox_rope_inplace,
+    causal_depthwise_conv1d_step, gated_delta_rule_step, key_gated_delta_rule_step, rms_norm,
 };
 
 use crate::backend::{RuntimeCapability, RuntimeDtype};
@@ -17,8 +18,11 @@ use crate::model_artifacts::LocalModelArtifacts;
 use crate::model_executor::{ModelForwardError, ModelForwardOutput, ModelWorkerBatch};
 use crate::model_runtime::BackendModelExecutor;
 use crate::models::{
-    GatedDeltaNetWeightNames, HybridDecoderExecutionPlan, HybridDecoderLayerKind,
-    HybridDecoderLayerWeightNames, HybridFullAttentionWeightNames, ModelDefinition,
+    DecoderNormalization, GatedDeltaNetWeightNames, HybridDecoderExecutionPlan,
+    HybridDecoderLayerKind, HybridDecoderLayerWeightNames, HybridFeedForward,
+    HybridFullAttentionConfig, HybridFullAttentionWeightNames, HybridLinearAttentionConfig,
+    HybridMultiLatentAttentionWeightNames, KeyGatedDeltaWeightNames, ModelDefinition,
+    MoeFeedForwardConfig, MoeFeedForwardWeightNames, RouterActivation,
 };
 use crate::types::RequestId;
 
@@ -46,40 +50,6 @@ impl CpuReferenceHybridDecoder {
                 )
             })?
             .clone();
-        let query_size = checked_product(
-            plan.num_attention_heads,
-            plan.attention_head_dim,
-            "hybrid query projection",
-        )?;
-        let projected_query_size = checked_product(
-            query_size,
-            if plan.attention_output_gate { 2 } else { 1 },
-            "hybrid gated query projection",
-        )?;
-        let kv_size = checked_product(
-            plan.num_key_value_heads,
-            plan.attention_head_dim,
-            "hybrid KV projection",
-        )?;
-        let linear_key_size = checked_product(
-            plan.linear_num_key_heads,
-            plan.linear_key_head_dim,
-            "linear key projection",
-        )?;
-        let linear_value_size = checked_product(
-            plan.linear_num_value_heads,
-            plan.linear_value_head_dim,
-            "linear value projection",
-        )?;
-        let conv_dim = linear_key_size
-            .checked_mul(2)
-            .and_then(|size| size.checked_add(linear_value_size))
-            .ok_or_else(|| {
-                CpuReferenceDenseDecoderError::Unsupported(
-                    "linear convolution size overflowed".to_string(),
-                )
-            })?;
-
         let token_embeddings = FloatMatrix::load(
             artifacts,
             &plan.weights.token_embeddings,
@@ -97,20 +67,7 @@ impl CpuReferenceHybridDecoder {
             .weights
             .layers
             .iter()
-            .map(|names| {
-                HybridDecoderLayerWeights::load(
-                    artifacts,
-                    names,
-                    &plan,
-                    HybridLoadGeometry {
-                        projected_query_size,
-                        query_size,
-                        kv_size,
-                        conv_dim,
-                        linear_value_size,
-                    },
-                )
-            })
+            .map(|names| HybridDecoderLayerWeights::load(artifacts, names, &plan))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             plan,
@@ -155,19 +112,18 @@ impl CpuReferenceHybridDecoder {
         let recurrent_layer_count = self
             .layers
             .iter()
-            .filter(|layer| matches!(layer.mixer, HybridMixerWeights::GatedDeltaNet { .. }))
+            .filter(|layer| {
+                matches!(
+                    layer.mixer,
+                    HybridMixerWeights::GatedDeltaNet { .. }
+                        | HybridMixerWeights::KeyGatedDelta { .. }
+                )
+            })
             .count();
         let request_state = match self.request_states.entry(request_id.as_str().to_string()) {
-            std::collections::hash_map::Entry::Vacant(entry) if position == 0 => {
-                entry.insert(HybridRequestState::new(
-                    recurrent_layer_count,
-                    self.plan.linear_conv_kernel_dim,
-                    self.plan.linear_num_key_heads,
-                    self.plan.linear_num_value_heads,
-                    self.plan.linear_key_head_dim,
-                    self.plan.linear_value_head_dim,
-                )?)
-            }
+            std::collections::hash_map::Entry::Vacant(entry) if position == 0 => entry.insert(
+                HybridRequestState::new(recurrent_layer_count, self.plan.linear_attention)?,
+            ),
             std::collections::hash_map::Entry::Vacant(_) => {
                 return Err(CpuReferenceDenseDecoderError::Execution(format!(
                     "hybrid request {} has no recurrent state at position {position}; prefix-state restoration is not available",
@@ -184,6 +140,7 @@ impl CpuReferenceHybridDecoder {
             )));
         }
 
+        let normalization_kind = cpu_normalization(self.plan.normalization);
         let mut hidden = self.token_embeddings.row(token_id)?;
         for layer in &self.layers {
             let normalized = apply_normalization(
@@ -192,40 +149,80 @@ impl CpuReferenceHybridDecoder {
                 1,
                 self.plan.hidden_size,
                 self.plan.rms_norm_eps,
-                CpuNormalization::Gemma,
+                normalization_kind,
             )?;
             let mixer_output = match &layer.mixer {
                 HybridMixerWeights::FullAttention {
                     cache_layer_index,
                     weights,
-                } => forward_full_attention(
-                    weights,
-                    kv_cache,
-                    &normalized,
-                    FullAttentionForwardContext {
-                        cache_layer_index: *cache_layer_index,
-                        position,
-                        output_slot,
-                        sequence_slots: &sequence_slots[..=position],
-                        shape: FullAttentionShape {
-                            query_head_count: self.plan.num_attention_heads,
-                            kv_head_count: self.plan.num_key_value_heads,
-                            head_dim: self.plan.attention_head_dim,
-                            rotary_dim: self.plan.rotary_dim,
-                            output_gate: self.plan.attention_output_gate,
+                } => {
+                    let HybridFullAttentionConfig::MultiHead {
+                        num_attention_heads,
+                        num_key_value_heads,
+                        head_dim,
+                        rotary_dim,
+                        output_gate,
+                    } = self.plan.full_attention
+                    else {
+                        return Err(CpuReferenceDenseDecoderError::Execution(
+                            "multi-head weights were paired with a multi-latent plan".to_string(),
+                        ));
+                    };
+                    forward_full_attention(
+                        weights,
+                        kv_cache,
+                        &normalized,
+                        FullAttentionForwardContext {
+                            cache_layer_index: *cache_layer_index,
+                            position,
+                            output_slot,
+                            sequence_slots: &sequence_slots[..=position],
+                            shape: FullAttentionShape {
+                                query_head_count: num_attention_heads,
+                                kv_head_count: num_key_value_heads,
+                                head_dim,
+                                rotary_dim,
+                                output_gate,
+                            },
+                            rms_norm_eps: self.plan.rms_norm_eps,
+                            rope_theta: self.plan.rope_theta,
+                            qk_normalization: normalization_kind,
                         },
-                        rms_norm_eps: self.plan.rms_norm_eps,
-                        rope_theta: self.plan.rope_theta,
-                        qk_normalization: CpuNormalization::Gemma,
-                    },
-                )?,
+                    )?
+                }
                 HybridMixerWeights::GatedDeltaNet {
                     state_layer_index,
                     weights,
                 } => weights.forward(
                     &normalized,
                     &mut request_state.recurrent_layers[*state_layer_index],
-                    &self.plan,
+                    self.plan.linear_attention,
+                    self.plan.rms_norm_eps,
+                )?,
+                HybridMixerWeights::MultiLatentAttention {
+                    cache_layer_index,
+                    weights,
+                } => weights.forward(
+                    &normalized,
+                    kv_cache,
+                    MultiLatentAttentionForwardContext {
+                        cache_layer_index: *cache_layer_index,
+                        position,
+                        output_slot,
+                        sequence_slots: &sequence_slots[..=position],
+                        config: self.plan.full_attention,
+                        rms_norm_eps: self.plan.rms_norm_eps,
+                        rope_theta: self.plan.rope_theta,
+                    },
+                )?,
+                HybridMixerWeights::KeyGatedDelta {
+                    state_layer_index,
+                    weights,
+                } => weights.forward(
+                    &normalized,
+                    &mut request_state.recurrent_layers[*state_layer_index],
+                    self.plan.linear_attention,
+                    self.plan.rms_norm_eps,
                 )?,
             };
             let after_mixer = add_residual(&hidden, &mixer_output)?;
@@ -235,13 +232,11 @@ impl CpuReferenceHybridDecoder {
                 1,
                 self.plan.hidden_size,
                 self.plan.rms_norm_eps,
-                CpuNormalization::Gemma,
+                normalization_kind,
             )?;
-            let feed_forward = layer.feed_forward.forward(
-                &normalized,
-                self.plan.intermediate_size,
-                self.plan.activation,
-            )?;
+            let feed_forward = layer
+                .feed_forward
+                .forward(&normalized, self.plan.activation)?;
             hidden = add_residual(&after_mixer, &feed_forward)?;
         }
         request_state.next_position += 1;
@@ -252,7 +247,7 @@ impl CpuReferenceHybridDecoder {
             1,
             self.plan.hidden_size,
             self.plan.rms_norm_eps,
-            CpuNormalization::Gemma,
+            normalization_kind,
         )?;
         self.lm_head
             .as_ref()
@@ -324,16 +319,7 @@ struct HybridDecoderLayerWeights {
     input_norm: Vec<f32>,
     mixer: HybridMixerWeights,
     post_attention_norm: Vec<f32>,
-    feed_forward: DenseFeedForwardWeights,
-}
-
-#[derive(Clone, Copy)]
-struct HybridLoadGeometry {
-    projected_query_size: usize,
-    query_size: usize,
-    kv_size: usize,
-    conv_dim: usize,
-    linear_value_size: usize,
+    feed_forward: HybridFeedForwardWeights,
 }
 
 impl HybridDecoderLayerWeights {
@@ -341,43 +327,84 @@ impl HybridDecoderLayerWeights {
         artifacts: &LocalModelArtifacts,
         names: &HybridDecoderLayerWeightNames,
         plan: &HybridDecoderExecutionPlan,
-        geometry: HybridLoadGeometry,
     ) -> Result<Self, CpuReferenceDenseDecoderError> {
-        let HybridLoadGeometry {
-            projected_query_size,
-            query_size,
-            kv_size,
-            conv_dim,
-            linear_value_size,
-        } = geometry;
         let mixer = match &names.mixer {
             HybridDecoderLayerKind::FullAttention {
                 cache_layer_index,
                 weights,
-            } => HybridMixerWeights::FullAttention {
-                cache_layer_index: *cache_layer_index,
-                weights: load_full_attention(
-                    artifacts,
-                    weights,
-                    plan.hidden_size,
-                    projected_query_size,
+            } => {
+                let HybridFullAttentionConfig::MultiHead {
+                    num_attention_heads,
+                    num_key_value_heads,
+                    head_dim,
+                    output_gate,
+                    ..
+                } = plan.full_attention
+                else {
+                    return Err(CpuReferenceDenseDecoderError::Unsupported(
+                        "multi-head weights require a multi-head hybrid plan".to_string(),
+                    ));
+                };
+                let query_size =
+                    checked_product(num_attention_heads, head_dim, "hybrid query projection")?;
+                let projected_query_size = checked_product(
                     query_size,
-                    kv_size,
-                    plan.attention_head_dim,
-                )?,
-            },
+                    if output_gate { 2 } else { 1 },
+                    "hybrid gated query projection",
+                )?;
+                let kv_size =
+                    checked_product(num_key_value_heads, head_dim, "hybrid KV projection")?;
+                HybridMixerWeights::FullAttention {
+                    cache_layer_index: *cache_layer_index,
+                    weights: Box::new(load_full_attention(
+                        artifacts,
+                        weights,
+                        plan.hidden_size,
+                        projected_query_size,
+                        query_size,
+                        kv_size,
+                        head_dim,
+                    )?),
+                }
+            }
             HybridDecoderLayerKind::GatedDeltaNet {
                 state_layer_index,
                 weights,
-            } => HybridMixerWeights::GatedDeltaNet {
-                state_layer_index: *state_layer_index,
-                weights: GatedDeltaNetWeights::load(
+            } => {
+                let config = plan.linear_attention;
+                HybridMixerWeights::GatedDeltaNet {
+                    state_layer_index: *state_layer_index,
+                    weights: Box::new(GatedDeltaNetWeights::load(
+                        artifacts,
+                        weights,
+                        plan.hidden_size,
+                        config,
+                    )?),
+                }
+            }
+            HybridDecoderLayerKind::MultiLatentAttention {
+                cache_layer_index,
+                weights,
+            } => HybridMixerWeights::MultiLatentAttention {
+                cache_layer_index: *cache_layer_index,
+                weights: Box::new(MultiLatentAttentionWeights::load(
                     artifacts,
                     weights,
-                    plan,
-                    conv_dim,
-                    linear_value_size,
-                )?,
+                    plan.hidden_size,
+                    plan.full_attention,
+                )?),
+            },
+            HybridDecoderLayerKind::KeyGatedDelta {
+                state_layer_index,
+                weights,
+            } => HybridMixerWeights::KeyGatedDelta {
+                state_layer_index: *state_layer_index,
+                weights: Box::new(KeyGatedDeltaWeights::load(
+                    artifacts,
+                    weights,
+                    plan.hidden_size,
+                    plan.linear_attention,
+                )?),
             },
         };
         Ok(Self {
@@ -388,13 +415,10 @@ impl HybridDecoderLayerWeights {
                 &names.post_attention_norm,
                 plan.hidden_size,
             )?,
-            feed_forward: DenseFeedForwardWeights::load(
+            feed_forward: HybridFeedForwardWeights::load(
                 artifacts,
-                &names.feed_forward.gate_weight,
-                &names.feed_forward.up_weight,
-                &names.feed_forward.down_weight,
+                &names.feed_forward,
                 plan.hidden_size,
-                plan.intermediate_size,
             )?,
         })
     }
@@ -404,11 +428,19 @@ impl HybridDecoderLayerWeights {
 enum HybridMixerWeights {
     FullAttention {
         cache_layer_index: usize,
-        weights: FullAttentionWeights,
+        weights: Box<FullAttentionWeights>,
     },
     GatedDeltaNet {
         state_layer_index: usize,
-        weights: GatedDeltaNetWeights,
+        weights: Box<GatedDeltaNetWeights>,
+    },
+    MultiLatentAttention {
+        cache_layer_index: usize,
+        weights: Box<MultiLatentAttentionWeights>,
+    },
+    KeyGatedDelta {
+        state_layer_index: usize,
+        weights: Box<KeyGatedDeltaWeights>,
     },
 }
 
@@ -443,6 +475,669 @@ fn load_full_attention(
     )
 }
 
+fn cpu_normalization(normalization: DecoderNormalization) -> CpuNormalization {
+    match normalization {
+        DecoderNormalization::Rms => CpuNormalization::Standard,
+        DecoderNormalization::GemmaRms => CpuNormalization::Gemma,
+    }
+}
+
+#[derive(Debug)]
+enum HybridFeedForwardWeights {
+    Dense {
+        intermediate_size: usize,
+        weights: DenseFeedForwardWeights,
+    },
+    MixtureOfExperts(MoeFeedForwardWeights),
+}
+
+impl HybridFeedForwardWeights {
+    fn load(
+        artifacts: &LocalModelArtifacts,
+        feed_forward: &HybridFeedForward,
+        hidden_size: usize,
+    ) -> Result<Self, CpuReferenceDenseDecoderError> {
+        match feed_forward {
+            HybridFeedForward::Dense {
+                intermediate_size,
+                weights,
+            } => Ok(Self::Dense {
+                intermediate_size: *intermediate_size,
+                weights: DenseFeedForwardWeights::load(
+                    artifacts,
+                    &weights.gate_weight,
+                    &weights.up_weight,
+                    &weights.down_weight,
+                    hidden_size,
+                    *intermediate_size,
+                )?,
+            }),
+            HybridFeedForward::MixtureOfExperts { config, weights } => Ok(Self::MixtureOfExperts(
+                MoeFeedForwardWeights::load(artifacts, config, weights, hidden_size)?,
+            )),
+        }
+    }
+
+    fn forward(
+        &self,
+        hidden: &[f32],
+        activation: crate::models::DenseDecoderActivation,
+    ) -> Result<Vec<f32>, CpuReferenceDenseDecoderError> {
+        match self {
+            Self::Dense {
+                intermediate_size,
+                weights,
+            } => weights.forward(hidden, *intermediate_size, activation),
+            Self::MixtureOfExperts(weights) => weights.forward(hidden, activation),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MoeFeedForwardWeights {
+    config: MoeFeedForwardConfig,
+    gate: FloatMatrix,
+    correction_bias: Option<Vec<f32>>,
+    experts: Vec<DenseFeedForwardWeights>,
+    shared_expert: Option<DenseFeedForwardWeights>,
+}
+
+impl MoeFeedForwardWeights {
+    fn load(
+        artifacts: &LocalModelArtifacts,
+        config: &MoeFeedForwardConfig,
+        names: &MoeFeedForwardWeightNames,
+        hidden_size: usize,
+    ) -> Result<Self, CpuReferenceDenseDecoderError> {
+        if config.routed_expert_count == 0
+            || config.experts_per_token == 0
+            || config.experts_per_token > config.routed_expert_count
+        {
+            return Err(CpuReferenceDenseDecoderError::Unsupported(format!(
+                "invalid MoE routed expert geometry: {} experts with top-k {}",
+                config.routed_expert_count, config.experts_per_token
+            )));
+        }
+        if config.expert_group_count == 0
+            || !config
+                .routed_expert_count
+                .is_multiple_of(config.expert_group_count)
+            || config.selected_expert_group_count == 0
+            || config.selected_expert_group_count > config.expert_group_count
+        {
+            return Err(CpuReferenceDenseDecoderError::Unsupported(format!(
+                "invalid MoE expert grouping: {} experts across {} groups selecting {}",
+                config.routed_expert_count,
+                config.expert_group_count,
+                config.selected_expert_group_count
+            )));
+        }
+        if !config.routed_scaling_factor.is_finite() || config.routed_scaling_factor <= 0.0 {
+            return Err(CpuReferenceDenseDecoderError::Unsupported(format!(
+                "MoE routed scaling factor {} must be finite and positive",
+                config.routed_scaling_factor
+            )));
+        }
+        if names.experts.len() != config.routed_expert_count {
+            return Err(CpuReferenceDenseDecoderError::Unsupported(format!(
+                "MoE weight map has {} experts but config requires {}",
+                names.experts.len(),
+                config.routed_expert_count
+            )));
+        }
+        let experts = names
+            .experts
+            .iter()
+            .map(|expert| {
+                DenseFeedForwardWeights::load(
+                    artifacts,
+                    &expert.gate_weight,
+                    &expert.up_weight,
+                    &expert.down_weight,
+                    hidden_size,
+                    config.expert_intermediate_size,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let shared_intermediate_size = config
+            .expert_intermediate_size
+            .checked_mul(config.shared_expert_count)
+            .ok_or_else(|| {
+                CpuReferenceDenseDecoderError::Unsupported(
+                    "shared expert intermediate size overflowed".to_string(),
+                )
+            })?;
+        let shared_expert = match (config.shared_expert_count, &names.shared_expert) {
+            (0, None) => None,
+            (0, Some(_)) => {
+                return Err(CpuReferenceDenseDecoderError::Unsupported(
+                    "MoE weight map provides a shared expert but config disables it".to_string(),
+                ));
+            }
+            (_, None) => {
+                return Err(CpuReferenceDenseDecoderError::Unsupported(
+                    "MoE config requires shared experts but the weight map has none".to_string(),
+                ));
+            }
+            (_, Some(shared)) => Some(DenseFeedForwardWeights::load(
+                artifacts,
+                &shared.gate_weight,
+                &shared.up_weight,
+                &shared.down_weight,
+                hidden_size,
+                shared_intermediate_size,
+            )?),
+        };
+        Ok(Self {
+            config: config.clone(),
+            gate: FloatMatrix::load(
+                artifacts,
+                &names.gate_weight,
+                config.routed_expert_count,
+                hidden_size,
+            )?,
+            correction_bias: names
+                .correction_bias
+                .as_deref()
+                .map(|name| load_vector(artifacts, name, config.routed_expert_count))
+                .transpose()?,
+            experts,
+            shared_expert,
+        })
+    }
+
+    fn forward(
+        &self,
+        hidden: &[f32],
+        activation: crate::models::DenseDecoderActivation,
+    ) -> Result<Vec<f32>, CpuReferenceDenseDecoderError> {
+        let logits = self.gate.project(hidden, 1)?;
+        let probabilities = match self.config.router_activation {
+            RouterActivation::Sigmoid => logits
+                .iter()
+                .map(|value| 1.0 / (1.0 + (-value).exp()))
+                .collect::<Vec<_>>(),
+            RouterActivation::Softmax => normalized_exponentials(&logits)?,
+        };
+        let selection_scores = probabilities
+            .iter()
+            .enumerate()
+            .map(|(expert, probability)| {
+                probability
+                    + self
+                        .correction_bias
+                        .as_ref()
+                        .map_or(0.0, |bias| bias[expert])
+            })
+            .collect::<Vec<_>>();
+        let experts_per_group = self.config.routed_expert_count / self.config.expert_group_count;
+        let mut group_scores = (0..self.config.expert_group_count)
+            .map(|group| {
+                let start = group * experts_per_group;
+                let mut scores = selection_scores[start..start + experts_per_group].to_vec();
+                scores.sort_by(|left, right| right.total_cmp(left));
+                scores.into_iter().take(2).sum::<f32>()
+            })
+            .enumerate()
+            .collect::<Vec<_>>();
+        group_scores.sort_by(|(left_group, left), (right_group, right)| {
+            right
+                .total_cmp(left)
+                .then_with(|| left_group.cmp(right_group))
+        });
+        let selected_groups = group_scores
+            .into_iter()
+            .take(self.config.selected_expert_group_count)
+            .map(|(group, _)| group)
+            .collect::<Vec<_>>();
+        let mut selected = selection_scores
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(expert, _)| selected_groups.contains(&(expert / experts_per_group)))
+            .collect::<Vec<_>>();
+        selected.sort_by(|(left_expert, left), (right_expert, right)| {
+            right
+                .total_cmp(left)
+                .then_with(|| left_expert.cmp(right_expert))
+        });
+        selected.truncate(self.config.experts_per_token);
+
+        let normalizer = if self.config.renormalize {
+            let sum = selected
+                .iter()
+                .map(|(expert, _)| probabilities[*expert])
+                .sum::<f32>();
+            if !sum.is_finite() || sum <= 0.0 {
+                return Err(CpuReferenceDenseDecoderError::Execution(
+                    "MoE routed probability normalization is invalid".to_string(),
+                ));
+            }
+            sum
+        } else {
+            1.0
+        };
+        let mut output = vec![0.0; hidden.len()];
+        for (expert, _) in selected {
+            let expert_output = self.experts[expert].forward(
+                hidden,
+                self.config.expert_intermediate_size,
+                activation,
+            )?;
+            let weight = probabilities[expert] / normalizer * self.config.routed_scaling_factor;
+            for (output, expert_value) in output.iter_mut().zip(expert_output) {
+                *output += weight * expert_value;
+            }
+        }
+        if let Some(shared_expert) = &self.shared_expert {
+            let intermediate_size = self
+                .config
+                .expert_intermediate_size
+                .checked_mul(self.config.shared_expert_count)
+                .ok_or_else(|| {
+                    CpuReferenceDenseDecoderError::Execution(
+                        "shared expert intermediate size overflowed".to_string(),
+                    )
+                })?;
+            let shared = shared_expert.forward(hidden, intermediate_size, activation)?;
+            for (output, shared_value) in output.iter_mut().zip(shared) {
+                *output += shared_value;
+            }
+        }
+        Ok(output)
+    }
+}
+
+#[derive(Debug)]
+struct MultiLatentAttentionWeights {
+    query: FloatMatrix,
+    kv_a: FloatMatrix,
+    kv_a_norm: Vec<f32>,
+    kv_b: FloatMatrix,
+    output: FloatMatrix,
+}
+
+#[derive(Clone, Copy)]
+struct MultiLatentAttentionForwardContext<'a> {
+    cache_layer_index: usize,
+    position: usize,
+    output_slot: CachePageId,
+    sequence_slots: &'a [CachePageId],
+    config: HybridFullAttentionConfig,
+    rms_norm_eps: f32,
+    rope_theta: f32,
+}
+
+impl MultiLatentAttentionWeights {
+    fn load(
+        artifacts: &LocalModelArtifacts,
+        names: &HybridMultiLatentAttentionWeightNames,
+        hidden_size: usize,
+        config: HybridFullAttentionConfig,
+    ) -> Result<Self, CpuReferenceDenseDecoderError> {
+        let HybridFullAttentionConfig::MultiLatent {
+            num_attention_heads,
+            kv_lora_rank,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            value_head_dim,
+            ..
+        } = config
+        else {
+            return Err(CpuReferenceDenseDecoderError::Unsupported(
+                "MLA weights require a multi-latent attention plan".to_string(),
+            ));
+        };
+        let query_head_dim = qk_nope_head_dim
+            .checked_add(qk_rope_head_dim)
+            .ok_or_else(|| {
+                CpuReferenceDenseDecoderError::Unsupported(
+                    "MLA query head size overflowed".to_string(),
+                )
+            })?;
+        let query_size = checked_product(num_attention_heads, query_head_dim, "MLA query")?;
+        let kv_a_size = kv_lora_rank.checked_add(qk_rope_head_dim).ok_or_else(|| {
+            CpuReferenceDenseDecoderError::Unsupported(
+                "MLA compressed KV size overflowed".to_string(),
+            )
+        })?;
+        let expanded_head_dim = qk_nope_head_dim
+            .checked_add(value_head_dim)
+            .ok_or_else(|| {
+                CpuReferenceDenseDecoderError::Unsupported(
+                    "MLA expanded KV head size overflowed".to_string(),
+                )
+            })?;
+        let expanded_size =
+            checked_product(num_attention_heads, expanded_head_dim, "MLA expanded KV")?;
+        let output_size = checked_product(num_attention_heads, value_head_dim, "MLA output")?;
+        Ok(Self {
+            query: FloatMatrix::load(artifacts, &names.query_weight, query_size, hidden_size)?,
+            kv_a: FloatMatrix::load(artifacts, &names.kv_a_weight, kv_a_size, hidden_size)?,
+            kv_a_norm: load_vector(artifacts, &names.kv_a_norm, kv_lora_rank)?,
+            kv_b: FloatMatrix::load(artifacts, &names.kv_b_weight, expanded_size, kv_lora_rank)?,
+            output: FloatMatrix::load(artifacts, &names.output_weight, hidden_size, output_size)?,
+        })
+    }
+
+    fn forward(
+        &self,
+        hidden: &[f32],
+        kv_cache: &mut CpuReferenceKvCache,
+        context: MultiLatentAttentionForwardContext<'_>,
+    ) -> Result<Vec<f32>, CpuReferenceDenseDecoderError> {
+        let MultiLatentAttentionForwardContext {
+            cache_layer_index,
+            position,
+            output_slot,
+            sequence_slots,
+            config,
+            rms_norm_eps,
+            rope_theta,
+        } = context;
+        let HybridFullAttentionConfig::MultiLatent {
+            num_attention_heads,
+            kv_lora_rank,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            value_head_dim,
+            skip_rope,
+        } = config
+        else {
+            return Err(CpuReferenceDenseDecoderError::Execution(
+                "MLA weights were paired with a multi-head attention plan".to_string(),
+            ));
+        };
+        let query_head_dim = qk_nope_head_dim + qk_rope_head_dim;
+        let query = self.query.project(hidden, 1)?;
+        let compressed = self.kv_a.project(hidden, 1)?;
+        let latent = apply_normalization(
+            &compressed[..kv_lora_rank],
+            &self.kv_a_norm,
+            1,
+            kv_lora_rank,
+            rms_norm_eps,
+            CpuNormalization::Standard,
+        )?;
+        let mut rope_key = compressed[kv_lora_rank..].to_vec();
+        let mut query_nope = Vec::with_capacity(num_attention_heads * qk_nope_head_dim);
+        let mut query_rope = Vec::with_capacity(num_attention_heads * qk_rope_head_dim);
+        for head in 0..num_attention_heads {
+            let offset = head * query_head_dim;
+            query_nope.extend_from_slice(&query[offset..offset + qk_nope_head_dim]);
+            query_rope
+                .extend_from_slice(&query[offset + qk_nope_head_dim..offset + query_head_dim]);
+        }
+        if !skip_rope {
+            apply_partial_neox_rope_inplace(
+                &mut query_rope,
+                num_attention_heads,
+                qk_rope_head_dim,
+                qk_rope_head_dim,
+                position,
+                rope_theta,
+            )
+            .map_err(kernel_error)?;
+            apply_partial_neox_rope_inplace(
+                &mut rope_key,
+                1,
+                qk_rope_head_dim,
+                qk_rope_head_dim,
+                position,
+                rope_theta,
+            )
+            .map_err(kernel_error)?;
+        }
+        let mut cache_key = latent.clone();
+        cache_key.extend_from_slice(&rope_key);
+        kv_cache.write(cache_layer_index, output_slot, cache_key, latent.clone())?;
+        let (cached_keys, cached_latents) = kv_cache.gather(cache_layer_index, sequence_slots)?;
+        let key_width = kv_lora_rank + qk_rope_head_dim;
+        let expanded_head_dim = qk_nope_head_dim + value_head_dim;
+        let mut attention = vec![0.0; num_attention_heads * value_head_dim];
+        let scale = (query_head_dim as f32).sqrt().recip();
+        for head in 0..num_attention_heads {
+            let query_nope_offset = head * qk_nope_head_dim;
+            let query_rope_offset = head * qk_rope_head_dim;
+            let mut scores = Vec::with_capacity(sequence_slots.len());
+            let mut expanded_values = Vec::with_capacity(sequence_slots.len() * value_head_dim);
+            for token in 0..sequence_slots.len() {
+                let latent_offset = token * kv_lora_rank;
+                let expanded = self.kv_b.project(
+                    &cached_latents[latent_offset..latent_offset + kv_lora_rank],
+                    1,
+                )?;
+                let expanded_offset = head * expanded_head_dim;
+                let key_offset = token * key_width + kv_lora_rank;
+                let nope_score = query_nope
+                    [query_nope_offset..query_nope_offset + qk_nope_head_dim]
+                    .iter()
+                    .zip(&expanded[expanded_offset..expanded_offset + qk_nope_head_dim])
+                    .map(|(query, key)| query * key)
+                    .sum::<f32>();
+                let rope_score = query_rope
+                    [query_rope_offset..query_rope_offset + qk_rope_head_dim]
+                    .iter()
+                    .zip(&cached_keys[key_offset..key_offset + qk_rope_head_dim])
+                    .map(|(query, key)| query * key)
+                    .sum::<f32>();
+                scores.push((nope_score + rope_score) * scale);
+                expanded_values.extend_from_slice(
+                    &expanded
+                        [expanded_offset + qk_nope_head_dim..expanded_offset + expanded_head_dim],
+                );
+            }
+            let probabilities = normalized_exponentials(&scores)?;
+            let output_offset = head * value_head_dim;
+            for (token, probability) in probabilities.into_iter().enumerate() {
+                for dimension in 0..value_head_dim {
+                    attention[output_offset + dimension] +=
+                        probability * expanded_values[token * value_head_dim + dimension];
+                }
+            }
+        }
+        self.output.project(&attention, 1)
+    }
+}
+
+#[derive(Debug)]
+struct KeyGatedDeltaWeights {
+    a_log: Vec<f32>,
+    dt_bias: Vec<f32>,
+    query: FloatMatrix,
+    key: FloatMatrix,
+    value: FloatMatrix,
+    beta: FloatMatrix,
+    forget_a: FloatMatrix,
+    forget_b: FloatMatrix,
+    gate_a: FloatMatrix,
+    gate_b: FloatMatrix,
+    conv_weight: Vec<f32>,
+    output_norm: Vec<f32>,
+    output: FloatMatrix,
+}
+
+impl KeyGatedDeltaWeights {
+    fn load(
+        artifacts: &LocalModelArtifacts,
+        names: &KeyGatedDeltaWeightNames,
+        hidden_size: usize,
+        config: HybridLinearAttentionConfig,
+    ) -> Result<Self, CpuReferenceDenseDecoderError> {
+        let HybridLinearAttentionConfig::KeyGatedDelta {
+            conv_kernel_dim,
+            key_head_dim,
+            value_head_dim,
+            num_heads,
+        } = config
+        else {
+            return Err(CpuReferenceDenseDecoderError::Unsupported(
+                "KDA weights require a key-gated delta attention plan".to_string(),
+            ));
+        };
+        let key_size = checked_product(num_heads, key_head_dim, "KDA key")?;
+        let value_size = checked_product(num_heads, value_head_dim, "KDA value")?;
+        let query_conv = load_tensor(
+            artifacts,
+            &names.query_conv_weight,
+            &[key_size, conv_kernel_dim],
+        )?;
+        let key_conv = load_tensor(
+            artifacts,
+            &names.key_conv_weight,
+            &[key_size, conv_kernel_dim],
+        )?;
+        let value_conv = load_tensor(
+            artifacts,
+            &names.value_conv_weight,
+            &[value_size, conv_kernel_dim],
+        )?;
+        let mut conv_weight =
+            Vec::with_capacity(query_conv.len() + key_conv.len() + value_conv.len());
+        conv_weight.extend(query_conv);
+        conv_weight.extend(key_conv);
+        conv_weight.extend(value_conv);
+        Ok(Self {
+            a_log: load_tensor(artifacts, &names.a_log, &[1, 1, num_heads, 1])?,
+            dt_bias: load_vector(artifacts, &names.dt_bias, key_size)?,
+            query: FloatMatrix::load(artifacts, &names.query_weight, key_size, hidden_size)?,
+            key: FloatMatrix::load(artifacts, &names.key_weight, key_size, hidden_size)?,
+            value: FloatMatrix::load(artifacts, &names.value_weight, value_size, hidden_size)?,
+            beta: FloatMatrix::load(artifacts, &names.beta_weight, num_heads, hidden_size)?,
+            forget_a: FloatMatrix::load(
+                artifacts,
+                &names.forget_a_weight,
+                key_head_dim,
+                hidden_size,
+            )?,
+            forget_b: FloatMatrix::load(artifacts, &names.forget_b_weight, key_size, key_head_dim)?,
+            gate_a: FloatMatrix::load(artifacts, &names.gate_a_weight, key_head_dim, hidden_size)?,
+            gate_b: FloatMatrix::load(artifacts, &names.gate_b_weight, value_size, key_head_dim)?,
+            conv_weight,
+            output_norm: load_vector(artifacts, &names.output_norm, value_head_dim)?,
+            output: FloatMatrix::load(artifacts, &names.output_weight, hidden_size, value_size)?,
+        })
+    }
+
+    fn forward(
+        &self,
+        hidden: &[f32],
+        state: &mut LinearAttentionLayerState,
+        config: HybridLinearAttentionConfig,
+        rms_norm_eps: f32,
+    ) -> Result<Vec<f32>, CpuReferenceDenseDecoderError> {
+        let HybridLinearAttentionConfig::KeyGatedDelta {
+            conv_kernel_dim,
+            key_head_dim,
+            value_head_dim,
+            num_heads,
+        } = config
+        else {
+            return Err(CpuReferenceDenseDecoderError::Execution(
+                "KDA weights were paired with gated-delta net attention".to_string(),
+            ));
+        };
+        let key_size = num_heads * key_head_dim;
+        let value_size = num_heads * value_head_dim;
+        let mut qkv = self.query.project(hidden, 1)?;
+        qkv.extend(self.key.project(hidden, 1)?);
+        qkv.extend(self.value.project(hidden, 1)?);
+        let mut qkv = causal_depthwise_conv1d_step(
+            &qkv,
+            &self.conv_weight,
+            &mut state.conv,
+            key_size * 2 + value_size,
+            conv_kernel_dim,
+        )
+        .map_err(kernel_error)?;
+        for value in &mut qkv {
+            *value *= 1.0 / (1.0 + (-*value).exp());
+        }
+        let mut query = qkv[..key_size].to_vec();
+        let mut key = qkv[key_size..key_size * 2].to_vec();
+        let value = &qkv[key_size * 2..];
+        l2_normalize_heads(
+            &mut query,
+            num_heads,
+            key_head_dim,
+            (key_head_dim as f32).sqrt().recip(),
+        )?;
+        l2_normalize_heads(&mut key, num_heads, key_head_dim, 1.0)?;
+
+        let raw_forget = self
+            .forget_b
+            .project(&self.forget_a.project(hidden, 1)?, 1)?;
+        let decay = raw_forget
+            .iter()
+            .zip(&self.dt_bias)
+            .enumerate()
+            .map(|(index, (raw, bias))| {
+                let head = index / key_head_dim;
+                (-self.a_log[head].exp() * softplus(*raw + *bias)).exp()
+            })
+            .collect::<Vec<_>>();
+        let beta = self
+            .beta
+            .project(hidden, 1)?
+            .into_iter()
+            .map(|value| 1.0 / (1.0 + (-value).exp()))
+            .collect::<Vec<_>>();
+        let core = key_gated_delta_rule_step(
+            &query,
+            &key,
+            value,
+            &decay,
+            &beta,
+            &mut state.recurrent,
+            KeyGatedDeltaRuleShape {
+                head_count: num_heads,
+                key_head_dim,
+                value_head_dim,
+            },
+        )
+        .map_err(kernel_error)?;
+        let mut normalized = rms_norm(
+            &core,
+            &self.output_norm,
+            num_heads,
+            value_head_dim,
+            rms_norm_eps,
+        )
+        .map_err(kernel_error)?;
+        let gate = self.gate_b.project(&self.gate_a.project(hidden, 1)?, 1)?;
+        for (value, gate) in normalized.iter_mut().zip(gate) {
+            *value *= 1.0 / (1.0 + (-gate).exp());
+        }
+        self.output.project(&normalized, 1)
+    }
+}
+
+fn normalized_exponentials(values: &[f32]) -> Result<Vec<f32>, CpuReferenceDenseDecoderError> {
+    let maximum = values
+        .iter()
+        .copied()
+        .max_by(f32::total_cmp)
+        .ok_or_else(|| {
+            CpuReferenceDenseDecoderError::Execution(
+                "cannot normalize an empty probability vector".to_string(),
+            )
+        })?;
+    let mut probabilities = values
+        .iter()
+        .map(|value| (*value - maximum).exp())
+        .collect::<Vec<_>>();
+    let normalizer = probabilities.iter().sum::<f32>();
+    if !normalizer.is_finite() || normalizer <= 0.0 {
+        return Err(CpuReferenceDenseDecoderError::Execution(
+            "probability normalization is invalid".to_string(),
+        ));
+    }
+    for probability in &mut probabilities {
+        *probability /= normalizer;
+    }
+    Ok(probabilities)
+}
+
 #[derive(Debug)]
 struct GatedDeltaNetWeights {
     a_log: Vec<f32>,
@@ -460,47 +1155,68 @@ impl GatedDeltaNetWeights {
     fn load(
         artifacts: &LocalModelArtifacts,
         names: &GatedDeltaNetWeightNames,
-        plan: &HybridDecoderExecutionPlan,
-        conv_dim: usize,
-        linear_value_size: usize,
+        hidden_size: usize,
+        config: HybridLinearAttentionConfig,
     ) -> Result<Self, CpuReferenceDenseDecoderError> {
+        let HybridLinearAttentionConfig::GatedDeltaNet {
+            conv_kernel_dim,
+            key_head_dim,
+            value_head_dim,
+            num_key_heads,
+            num_value_heads,
+        } = config
+        else {
+            return Err(CpuReferenceDenseDecoderError::Unsupported(
+                "GDN weights require a gated-delta linear attention plan".to_string(),
+            ));
+        };
+        let linear_key_size = checked_product(num_key_heads, key_head_dim, "linear key")?;
+        let linear_value_size = checked_product(num_value_heads, value_head_dim, "linear value")?;
+        let conv_dim = linear_key_size
+            .checked_mul(2)
+            .and_then(|size| size.checked_add(linear_value_size))
+            .ok_or_else(|| {
+                CpuReferenceDenseDecoderError::Unsupported(
+                    "linear convolution size overflowed".to_string(),
+                )
+            })?;
         Ok(Self {
-            a_log: load_vector(artifacts, &names.a_log, plan.linear_num_value_heads)?,
+            a_log: load_vector(artifacts, &names.a_log, num_value_heads)?,
             conv1d_weight: load_tensor(
                 artifacts,
                 &names.conv1d_weight,
-                &[conv_dim, 1, plan.linear_conv_kernel_dim],
+                &[conv_dim, 1, conv_kernel_dim],
             )?,
-            dt_bias: load_vector(artifacts, &names.dt_bias, plan.linear_num_value_heads)?,
+            dt_bias: load_vector(artifacts, &names.dt_bias, num_value_heads)?,
             in_proj_a: FloatMatrix::load(
                 artifacts,
                 &names.in_proj_a_weight,
-                plan.linear_num_value_heads,
-                plan.hidden_size,
+                num_value_heads,
+                hidden_size,
             )?,
             in_proj_b: FloatMatrix::load(
                 artifacts,
                 &names.in_proj_b_weight,
-                plan.linear_num_value_heads,
-                plan.hidden_size,
+                num_value_heads,
+                hidden_size,
             )?,
             in_proj_qkv: FloatMatrix::load(
                 artifacts,
                 &names.in_proj_qkv_weight,
                 conv_dim,
-                plan.hidden_size,
+                hidden_size,
             )?,
             in_proj_z: FloatMatrix::load(
                 artifacts,
                 &names.in_proj_z_weight,
                 linear_value_size,
-                plan.hidden_size,
+                hidden_size,
             )?,
-            norm_weight: load_vector(artifacts, &names.norm_weight, plan.linear_value_head_dim)?,
+            norm_weight: load_vector(artifacts, &names.norm_weight, value_head_dim)?,
             output: FloatMatrix::load(
                 artifacts,
                 &names.output_weight,
-                plan.hidden_size,
+                hidden_size,
                 linear_value_size,
             )?,
         })
@@ -510,46 +1226,46 @@ impl GatedDeltaNetWeights {
         &self,
         hidden: &[f32],
         state: &mut LinearAttentionLayerState,
-        plan: &HybridDecoderExecutionPlan,
+        config: HybridLinearAttentionConfig,
+        rms_norm_eps: f32,
     ) -> Result<Vec<f32>, CpuReferenceDenseDecoderError> {
+        let HybridLinearAttentionConfig::GatedDeltaNet {
+            conv_kernel_dim,
+            key_head_dim,
+            value_head_dim,
+            num_key_heads,
+            num_value_heads,
+        } = config
+        else {
+            return Err(CpuReferenceDenseDecoderError::Execution(
+                "GDN weights were paired with key-gated delta attention".to_string(),
+            ));
+        };
         let mut qkv = self.in_proj_qkv.project(hidden, 1)?;
         qkv = causal_depthwise_conv1d_step(
             &qkv,
             &self.conv1d_weight,
             &mut state.conv,
             qkv.len(),
-            plan.linear_conv_kernel_dim,
+            conv_kernel_dim,
         )
         .map_err(kernel_error)?;
         for value in &mut qkv {
             *value *= 1.0 / (1.0 + (-*value).exp());
         }
 
-        let key_size = checked_product(
-            plan.linear_num_key_heads,
-            plan.linear_key_head_dim,
-            "linear key",
-        )?;
-        let value_size = checked_product(
-            plan.linear_num_value_heads,
-            plan.linear_value_head_dim,
-            "linear value",
-        )?;
+        let key_size = checked_product(num_key_heads, key_head_dim, "linear key")?;
+        let value_size = checked_product(num_value_heads, value_head_dim, "linear value")?;
         let mut query = qkv[..key_size].to_vec();
         let mut key = qkv[key_size..key_size * 2].to_vec();
         let value = &qkv[key_size * 2..key_size * 2 + value_size];
         l2_normalize_heads(
             &mut query,
-            plan.linear_num_key_heads,
-            plan.linear_key_head_dim,
-            (plan.linear_key_head_dim as f32).sqrt().recip(),
+            num_key_heads,
+            key_head_dim,
+            (key_head_dim as f32).sqrt().recip(),
         )?;
-        l2_normalize_heads(
-            &mut key,
-            plan.linear_num_key_heads,
-            plan.linear_key_head_dim,
-            1.0,
-        )?;
+        l2_normalize_heads(&mut key, num_key_heads, key_head_dim, 1.0)?;
 
         let a = self.in_proj_a.project(hidden, 1)?;
         let b = self.in_proj_b.project(hidden, 1)?;
@@ -574,19 +1290,19 @@ impl GatedDeltaNetWeights {
             &beta,
             &mut state.recurrent,
             GatedDeltaRuleShape {
-                key_head_count: plan.linear_num_key_heads,
-                value_head_count: plan.linear_num_value_heads,
-                key_head_dim: plan.linear_key_head_dim,
-                value_head_dim: plan.linear_value_head_dim,
+                key_head_count: num_key_heads,
+                value_head_count: num_value_heads,
+                key_head_dim,
+                value_head_dim,
             },
         )
         .map_err(kernel_error)?;
         let mut normalized = rms_norm(
             &core,
             &self.norm_weight,
-            plan.linear_num_value_heads,
-            plan.linear_value_head_dim,
-            plan.rms_norm_eps,
+            num_value_heads,
+            value_head_dim,
+            rms_norm_eps,
         )
         .map_err(kernel_error)?;
         let z = self.in_proj_z.project(hidden, 1)?;
@@ -606,12 +1322,36 @@ struct HybridRequestState {
 impl HybridRequestState {
     fn new(
         layer_count: usize,
-        conv_kernel_dim: usize,
-        key_head_count: usize,
-        value_head_count: usize,
-        key_head_dim: usize,
-        value_head_dim: usize,
+        config: HybridLinearAttentionConfig,
     ) -> Result<Self, CpuReferenceDenseDecoderError> {
+        let (conv_kernel_dim, key_head_count, value_head_count, key_head_dim, value_head_dim) =
+            match config {
+                HybridLinearAttentionConfig::GatedDeltaNet {
+                    conv_kernel_dim,
+                    key_head_dim,
+                    value_head_dim,
+                    num_key_heads,
+                    num_value_heads,
+                } => (
+                    conv_kernel_dim,
+                    num_key_heads,
+                    num_value_heads,
+                    key_head_dim,
+                    value_head_dim,
+                ),
+                HybridLinearAttentionConfig::KeyGatedDelta {
+                    conv_kernel_dim,
+                    key_head_dim,
+                    value_head_dim,
+                    num_heads,
+                } => (
+                    conv_kernel_dim,
+                    num_heads,
+                    num_heads,
+                    key_head_dim,
+                    value_head_dim,
+                ),
+            };
         let conv_dim = key_head_count
             .checked_mul(key_head_dim)
             .and_then(|size| size.checked_mul(2))

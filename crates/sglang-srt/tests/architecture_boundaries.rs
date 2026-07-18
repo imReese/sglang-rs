@@ -89,6 +89,7 @@ fn model_adapters_do_not_select_runtime_backend_providers() {
     for adapter in [
         include_str!("../src/models/qwen.rs"),
         include_str!("../src/models/qwen3_5.rs"),
+        include_str!("../src/models/kimi_linear.rs"),
         include_str!("../src/models/deepseek.rs"),
         include_str!("../src/models/glm.rs"),
     ] {

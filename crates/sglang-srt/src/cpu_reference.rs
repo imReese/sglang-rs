@@ -8,7 +8,7 @@ use sglang_kernel::cpu::{
 
 use crate::backend::{RuntimeCapability, RuntimeDtype};
 use crate::cache::CachePageId;
-use crate::kv_cache::PagedKvCacheLayout;
+use crate::kv_cache::{KvCacheDtype, PagedKvCacheLayout};
 use crate::model_artifacts::{LocalModelArtifacts, ModelArtifactError};
 use crate::model_executor::{
     ModelForwardError, ModelForwardOutput, ModelWorkerBatch, validate_model_worker_batch,
@@ -702,24 +702,41 @@ impl FloatMatrix {
 pub(crate) struct CpuReferenceKvCache {
     layout: PagedKvCacheLayout,
     layers: Vec<HashMap<usize, KvSlot>>,
-    kv_width: usize,
+    key_width: usize,
+    value_width: usize,
 }
 
 impl CpuReferenceKvCache {
     pub(crate) fn new(layout: PagedKvCacheLayout) -> Result<Self, CpuReferenceDenseDecoderError> {
         let runtime = layout.runtime();
-        let kv_width = runtime
-            .kv_heads
-            .checked_mul(runtime.head_dim)
-            .ok_or_else(|| {
-                CpuReferenceDenseDecoderError::Unsupported(
-                    "CPU reference KV width overflowed".to_string(),
-                )
-            })?;
+        if runtime.dtype != KvCacheDtype::Float32 {
+            return Err(CpuReferenceDenseDecoderError::Unsupported(format!(
+                "CPU reference KV cache requires f32 storage, received {:?}",
+                runtime.dtype
+            )));
+        }
+        let key_bytes = layout.tensor_token_size_bytes(0).map_err(|error| {
+            CpuReferenceDenseDecoderError::Unsupported(format!(
+                "invalid CPU reference key tensor layout: {error}"
+            ))
+        })?;
+        let value_bytes = layout.tensor_token_size_bytes(1).map_err(|error| {
+            CpuReferenceDenseDecoderError::Unsupported(format!(
+                "invalid CPU reference value tensor layout: {error}"
+            ))
+        })?;
+        if !key_bytes.is_multiple_of(std::mem::size_of::<f32>())
+            || !value_bytes.is_multiple_of(std::mem::size_of::<f32>())
+        {
+            return Err(CpuReferenceDenseDecoderError::Unsupported(format!(
+                "CPU reference KV tensor byte widths {key_bytes}/{value_bytes} are not f32 aligned"
+            )));
+        }
         Ok(Self {
             layout,
             layers: (0..runtime.num_layers).map(|_| HashMap::new()).collect(),
-            kv_width,
+            key_width: key_bytes / std::mem::size_of::<f32>(),
+            value_width: value_bytes / std::mem::size_of::<f32>(),
         })
     }
 
@@ -730,12 +747,13 @@ impl CpuReferenceKvCache {
         key: Vec<f32>,
         value: Vec<f32>,
     ) -> Result<(), CpuReferenceDenseDecoderError> {
-        if key.len() != self.kv_width || value.len() != self.kv_width {
+        if key.len() != self.key_width || value.len() != self.value_width {
             return Err(CpuReferenceDenseDecoderError::Execution(format!(
-                "KV write width {}/{} does not match expected {}",
+                "KV write width {}/{} does not match expected {}/{}",
                 key.len(),
                 value.len(),
-                self.kv_width
+                self.key_width,
+                self.value_width
             )));
         }
         let layer = self.layers.get_mut(layer_index).ok_or_else(|| {
@@ -757,11 +775,14 @@ impl CpuReferenceKvCache {
                 "KV cache layer {layer_index} is out of range"
             ))
         })?;
-        let capacity = slots.len().checked_mul(self.kv_width).ok_or_else(|| {
+        let key_capacity = slots.len().checked_mul(self.key_width).ok_or_else(|| {
             CpuReferenceDenseDecoderError::Execution("KV gather size overflowed".to_string())
         })?;
-        let mut keys = Vec::with_capacity(capacity);
-        let mut values = Vec::with_capacity(capacity);
+        let value_capacity = slots.len().checked_mul(self.value_width).ok_or_else(|| {
+            CpuReferenceDenseDecoderError::Execution("KV gather size overflowed".to_string())
+        })?;
+        let mut keys = Vec::with_capacity(key_capacity);
+        let mut values = Vec::with_capacity(value_capacity);
         for slot in slots {
             let entry = layer.get(&slot.as_usize()).ok_or_else(|| {
                 CpuReferenceDenseDecoderError::Execution(format!(
