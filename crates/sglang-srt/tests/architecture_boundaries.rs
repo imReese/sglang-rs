@@ -103,12 +103,15 @@ fn cuda_backend_components_do_not_branch_on_model_names() {
     let dense = include_str!("../src/cuda_dense_decoder.rs");
     let hybrid = include_str!("../src/cuda_hybrid_decoder.rs");
     let mla = include_str!("../src/cuda_mla.rs");
+    let moe = include_str!("../src/cuda_moe.rs");
     for source in [
         include_str!("../src/backend_model.rs"),
         include_str!("../src/cuda_execution_resources.rs"),
         include_str!("../src/cuda_transformer.rs"),
+        include_str!("../src/moe.rs"),
         hybrid,
         mla,
+        moe,
     ] {
         for model_name in ["Kimi", "Qwen", "DeepSeek", "GlmMoe", "GLM"] {
             assert!(
@@ -120,5 +123,7 @@ fn cuda_backend_components_do_not_branch_on_model_names() {
     assert!(dense.contains("CudaBf16DenseFeedForward"));
     assert!(hybrid.contains("CudaBf16DenseFeedForward"));
     assert!(hybrid.contains("CudaBf16MultiLatentAttention"));
+    assert!(hybrid.contains("CudaBf16MixtureOfExperts"));
     assert!(mla.contains("CudaPagedAttentionForward"));
+    assert!(moe.contains("MoeRouter"));
 }

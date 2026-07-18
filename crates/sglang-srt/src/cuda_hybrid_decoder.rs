@@ -15,6 +15,7 @@ use crate::backend::{CapabilityStatus, CudaBackend, RuntimeCapability, RuntimeDt
 use crate::cuda_attention::CudaBf16PagedAttentionExecutor;
 use crate::cuda_execution_resources::CudaExecutionResources;
 use crate::cuda_mla::{CudaBf16MultiLatentAttention, CudaMultiLatentAttentionForward};
+use crate::cuda_moe::CudaBf16MixtureOfExperts;
 use crate::cuda_recurrent_state::CudaRecurrentLayerState;
 use crate::cuda_transformer::{
     CudaBf16DenseFeedForward, CudaBf16Matrix, CudaExecutorError, add, allocate_bf16, allocate_f32,
@@ -92,12 +93,6 @@ impl CudaBf16HybridDecoder {
                         missing.insert("CUDA MLA typed execution config".to_string());
                     }
                 }
-            }
-            if matches!(
-                layer.feed_forward,
-                HybridFeedForward::MixtureOfExperts { .. }
-            ) {
-                missing.insert("CUDA mixture-of-experts feed-forward component".to_string());
             }
         }
         missing.into_iter().collect()
@@ -331,12 +326,11 @@ impl CudaBf16HybridDecoder {
                         self.plan.hidden_size,
                         self.plan.rms_norm_eps,
                     )?;
-                    let feed_forward = layer.feed_forward.forward(
+                    let feed_forward = layer.feed_forward.forward_single(
                         &self.blas,
                         &self.dense_kernels,
                         self.backend.context(),
                         &normalized,
-                        1,
                         self.plan.hidden_size,
                     )?;
                     hidden = add(
@@ -397,7 +391,7 @@ struct CudaHybridLayer {
     input_norm: CudaDeviceAllocation,
     mixer: CudaHybridMixer,
     post_attention_norm: CudaDeviceAllocation,
-    feed_forward: CudaBf16DenseFeedForward,
+    feed_forward: CudaHybridFeedForward,
 }
 
 impl CudaHybridLayer {
@@ -441,15 +435,26 @@ impl CudaHybridLayer {
                 ));
             }
         };
-        let HybridFeedForward::Dense {
-            intermediate_size,
-            weights: feed_forward_names,
-        } = &names.feed_forward
-        else {
-            return Err(CudaExecutorError::Unsupported(
-                "CUDA hybrid layer loader received an unimplemented feed-forward component"
-                    .to_string(),
-            ));
+        let feed_forward = match &names.feed_forward {
+            HybridFeedForward::Dense {
+                intermediate_size,
+                weights,
+            } => CudaHybridFeedForward::Dense(Box::new(CudaBf16DenseFeedForward::load(
+                artifacts,
+                context,
+                weights,
+                plan.hidden_size,
+                *intermediate_size,
+            )?)),
+            HybridFeedForward::MixtureOfExperts { config, weights } => {
+                CudaHybridFeedForward::MixtureOfExperts(Box::new(CudaBf16MixtureOfExperts::load(
+                    artifacts,
+                    context,
+                    config,
+                    weights,
+                    plan.hidden_size,
+                )?))
+            }
         };
         Ok(Self {
             input_norm: upload_required_bf16(
@@ -465,13 +470,7 @@ impl CudaHybridLayer {
                 &names.post_attention_norm,
                 plan.hidden_size,
             )?,
-            feed_forward: CudaBf16DenseFeedForward::load(
-                artifacts,
-                context,
-                feed_forward_names,
-                plan.hidden_size,
-                *intermediate_size,
-            )?,
+            feed_forward,
         })
     }
 }
@@ -485,6 +484,31 @@ enum CudaHybridMixer {
         cache_layer_index: usize,
         component: Box<CudaBf16MultiLatentAttention>,
     },
+}
+
+enum CudaHybridFeedForward {
+    Dense(Box<CudaBf16DenseFeedForward>),
+    MixtureOfExperts(Box<CudaBf16MixtureOfExperts>),
+}
+
+impl CudaHybridFeedForward {
+    fn forward_single(
+        &self,
+        blas: &CudaBlas,
+        kernels: &CudaBf16DenseKernels,
+        context: &CudaContext,
+        hidden: &CudaDeviceAllocation,
+        hidden_size: usize,
+    ) -> Result<CudaDeviceAllocation, CudaExecutorError> {
+        match self {
+            Self::Dense(component) => {
+                component.forward(blas, kernels, context, hidden, 1, hidden_size)
+            }
+            Self::MixtureOfExperts(component) => {
+                component.forward_single(blas, kernels, context, hidden)
+            }
+        }
+    }
 }
 
 pub(crate) struct CudaBf16KeyGatedDelta {

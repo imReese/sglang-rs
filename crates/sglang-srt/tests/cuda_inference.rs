@@ -80,6 +80,68 @@ async fn cuda_qwen3_uses_the_shared_dense_decoder_and_runtime_kv_pool() {
     fs::remove_dir_all(model_dir).expect("temp model directory should be removed");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a CUDA device, NVIDIA driver, NVRTC, and cuBLAS with BF16 support"]
+async fn cuda_kimi_linear_uses_shared_kda_mla_moe_and_runtime_kv_pool() {
+    let device_ordinal = cuda_test_device_ordinal();
+    let backend = CudaBackend::initialize(device_ordinal).expect("CUDA backend should initialize");
+    assert!(
+        backend
+            .capabilities()
+            .supported_dtypes
+            .contains(&sglang_srt::backend::RuntimeDtype::Bf16),
+        "CUDA acceptance device must support BF16"
+    );
+    drop(backend);
+
+    let model_dir = temp_model_dir("cuda-hybrid-kda-mla-moe-http");
+    write_kimi_linear_artifacts(&model_dir);
+    let mut args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_dir.to_str().expect("temp model path should be utf-8"),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--page-size",
+        "4",
+        "--num-reserved-decode-tokens",
+        "32",
+    ])
+    .expect("server args should parse");
+    args.base_gpu_id = device_ordinal;
+    let service = build_bootstrap_http_router_service(&args);
+    let addr = unused_local_addr();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let generated = post_json_with_retry(
+        addr,
+        "/generate",
+        r#"{"text":"hello","sampling_params":{"max_new_tokens":2}}"#,
+    )
+    .await;
+
+    assert_eq!(generated["output_ids"], serde_json::json!([2, 1]));
+    assert_eq!(generated["usage"]["prompt_tokens"], 1);
+    assert_eq!(generated["usage"]["completion_tokens"], 2);
+
+    shutdown_tx
+        .send(())
+        .expect("CUDA hybrid HTTP server should still be running");
+    server
+        .await
+        .expect("CUDA hybrid HTTP server task should join")
+        .expect("CUDA hybrid HTTP server should stop cleanly");
+    fs::remove_dir_all(model_dir).expect("temp model directory should be removed");
+}
+
 fn write_qwen3_dense_artifacts(model_dir: &Path) {
     fs::create_dir_all(model_dir).expect("temp model directory should be created");
     fs::write(
@@ -162,6 +224,149 @@ fn write_qwen3_dense_artifacts(model_dir: &Path) {
     }
     write_safetensors_file(&model_dir.join("model.safetensors"), &tensors, &payload)
         .expect("Qwen3 weights should be written");
+}
+
+fn write_kimi_linear_artifacts(model_dir: &Path) {
+    fs::create_dir_all(model_dir).expect("temp model directory should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "architectures": ["KimiLinearForCausalLM"],
+  "model_type": "kimi_linear",
+  "vocab_size": 3,
+  "model_max_length": 32,
+  "num_hidden_layers": 2,
+  "hidden_size": 2,
+  "intermediate_size": 2,
+  "num_attention_heads": 1,
+  "num_key_value_heads": 1,
+  "hidden_act": "silu",
+  "rms_norm_eps": 0.00001,
+  "rope_theta": 10000.0,
+  "rope_scaling": null,
+  "tie_word_embeddings": false,
+  "q_lora_rank": null,
+  "kv_lora_rank": 2,
+  "qk_nope_head_dim": 2,
+  "qk_rope_head_dim": 2,
+  "v_head_dim": 2,
+  "mla_use_nope": true,
+  "moe_intermediate_size": 2,
+  "moe_renormalize": true,
+  "moe_router_activation_func": "sigmoid",
+  "num_experts": 1,
+  "num_experts_per_token": 1,
+  "num_shared_experts": 1,
+  "routed_scaling_factor": 1.0,
+  "first_k_dense_replace": 1,
+  "moe_layer_freq": 1,
+  "use_grouped_topk": true,
+  "num_expert_group": 1,
+  "topk_group": 1,
+  "num_nextn_predict_layers": 0,
+  "linear_attn_config": {
+    "head_dim": 2,
+    "num_heads": 1,
+    "short_conv_kernel_size": 2,
+    "kda_layers": [1],
+    "full_attn_layers": [2]
+  }
+}"#,
+    )
+    .expect("hybrid config should be written");
+    fs::write(
+        model_dir.join("tokenizer.json"),
+        word_level_tokenizer_json(),
+    )
+    .expect("hybrid tokenizer should be written");
+
+    let mut descriptors: Vec<(String, Vec<usize>, Vec<f32>)> = vec![
+        (
+            "model.embed_tokens.weight".to_string(),
+            vec![3, 2],
+            vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
+        ),
+        ("model.norm.weight".to_string(), vec![2], vec![1.0; 2]),
+        (
+            "lm_head.weight".to_string(),
+            vec![3, 2],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0],
+        ),
+    ];
+    let mut add_tensor = |name: String, shape: Vec<usize>, value: f32| {
+        descriptors.push((name, shape.clone(), vec![value; shape.iter().product()]));
+    };
+    for layer_id in 0..2 {
+        let prefix = format!("model.layers.{layer_id}");
+        add_tensor(format!("{prefix}.input_layernorm.weight"), vec![2], 1.0);
+        add_tensor(
+            format!("{prefix}.post_attention_layernorm.weight"),
+            vec![2],
+            1.0,
+        );
+    }
+    for (suffix, shape) in [
+        ("self_attn.A_log", vec![1, 1, 1, 1]),
+        ("self_attn.dt_bias", vec![2]),
+        ("self_attn.q_proj.weight", vec![2, 2]),
+        ("self_attn.k_proj.weight", vec![2, 2]),
+        ("self_attn.v_proj.weight", vec![2, 2]),
+        ("self_attn.b_proj.weight", vec![1, 2]),
+        ("self_attn.f_a_proj.weight", vec![2, 2]),
+        ("self_attn.f_b_proj.weight", vec![2, 2]),
+        ("self_attn.g_a_proj.weight", vec![2, 2]),
+        ("self_attn.g_b_proj.weight", vec![2, 2]),
+        ("self_attn.q_conv1d.weight", vec![2, 2]),
+        ("self_attn.k_conv1d.weight", vec![2, 2]),
+        ("self_attn.v_conv1d.weight", vec![2, 2]),
+        ("self_attn.o_proj.weight", vec![2, 2]),
+        ("mlp.gate_proj.weight", vec![2, 2]),
+        ("mlp.up_proj.weight", vec![2, 2]),
+        ("mlp.down_proj.weight", vec![2, 2]),
+    ] {
+        add_tensor(format!("model.layers.0.{suffix}"), shape, 0.0);
+    }
+    add_tensor(
+        "model.layers.0.self_attn.o_norm.weight".to_string(),
+        vec![2],
+        1.0,
+    );
+    for (suffix, shape) in [
+        ("self_attn.q_proj.weight", vec![4, 2]),
+        ("self_attn.kv_a_proj_with_mqa.weight", vec![4, 2]),
+        ("self_attn.kv_b_proj.weight", vec![4, 2]),
+        ("self_attn.o_proj.weight", vec![2, 2]),
+        ("mlp.gate.weight", vec![1, 2]),
+        ("mlp.gate.e_score_correction_bias", vec![1]),
+        ("mlp.experts.0.w1.weight", vec![2, 2]),
+        ("mlp.experts.0.w2.weight", vec![2, 2]),
+        ("mlp.experts.0.w3.weight", vec![2, 2]),
+        ("mlp.shared_experts.gate_proj.weight", vec![2, 2]),
+        ("mlp.shared_experts.up_proj.weight", vec![2, 2]),
+        ("mlp.shared_experts.down_proj.weight", vec![2, 2]),
+    ] {
+        add_tensor(format!("model.layers.1.{suffix}"), shape, 0.0);
+    }
+    add_tensor(
+        "model.layers.1.self_attn.kv_a_layernorm.weight".to_string(),
+        vec![2],
+        1.0,
+    );
+
+    let mut payload = Vec::new();
+    let mut tensors = Vec::new();
+    for (name, shape, values) in &descriptors {
+        let start = payload.len();
+        payload.extend(values.iter().flat_map(|value| value.to_le_bytes()));
+        tensors.push((
+            name.as_str(),
+            "F32",
+            shape.as_slice(),
+            [start, payload.len()],
+        ));
+    }
+    write_safetensors_file(&model_dir.join("model.safetensors"), &tensors, &payload)
+        .expect("hybrid weights should be written");
 }
 
 fn write_safetensors_file(

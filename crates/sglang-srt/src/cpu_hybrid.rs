@@ -23,8 +23,9 @@ use crate::models::{
     HybridDecoderLayerKind, HybridDecoderLayerWeightNames, HybridFeedForward,
     HybridFullAttentionConfig, HybridFullAttentionWeightNames, HybridLinearAttentionConfig,
     HybridMultiLatentAttentionWeightNames, KeyGatedDeltaWeightNames, ModelDefinition,
-    MoeFeedForwardConfig, MoeFeedForwardWeightNames, RecurrentStateLayout, RouterActivation,
+    MoeFeedForwardConfig, MoeFeedForwardWeightNames, RecurrentStateLayout,
 };
+use crate::moe::MoeRouter;
 use crate::runtime_kv_cache::{RuntimeKvCache, RuntimeKvCacheMetadata};
 use crate::transfer::KvCacheTransferError;
 use crate::types::RequestId;
@@ -615,9 +616,8 @@ impl HybridFeedForwardWeights {
 
 #[derive(Debug)]
 struct MoeFeedForwardWeights {
-    config: MoeFeedForwardConfig,
+    router: MoeRouter,
     gate: FloatMatrix,
-    correction_bias: Option<Vec<f32>>,
     experts: Vec<DenseFeedForwardWeights>,
     shared_expert: Option<DenseFeedForwardWeights>,
 }
@@ -629,35 +629,6 @@ impl MoeFeedForwardWeights {
         names: &MoeFeedForwardWeightNames,
         hidden_size: usize,
     ) -> Result<Self, CpuReferenceDenseDecoderError> {
-        if config.routed_expert_count == 0
-            || config.experts_per_token == 0
-            || config.experts_per_token > config.routed_expert_count
-        {
-            return Err(CpuReferenceDenseDecoderError::Unsupported(format!(
-                "invalid MoE routed expert geometry: {} experts with top-k {}",
-                config.routed_expert_count, config.experts_per_token
-            )));
-        }
-        if config.expert_group_count == 0
-            || !config
-                .routed_expert_count
-                .is_multiple_of(config.expert_group_count)
-            || config.selected_expert_group_count == 0
-            || config.selected_expert_group_count > config.expert_group_count
-        {
-            return Err(CpuReferenceDenseDecoderError::Unsupported(format!(
-                "invalid MoE expert grouping: {} experts across {} groups selecting {}",
-                config.routed_expert_count,
-                config.expert_group_count,
-                config.selected_expert_group_count
-            )));
-        }
-        if !config.routed_scaling_factor.is_finite() || config.routed_scaling_factor <= 0.0 {
-            return Err(CpuReferenceDenseDecoderError::Unsupported(format!(
-                "MoE routed scaling factor {} must be finite and positive",
-                config.routed_scaling_factor
-            )));
-        }
         if names.experts.len() != config.routed_expert_count {
             return Err(CpuReferenceDenseDecoderError::Unsupported(format!(
                 "MoE weight map has {} experts but config requires {}",
@@ -665,6 +636,13 @@ impl MoeFeedForwardWeights {
                 config.routed_expert_count
             )));
         }
+        let correction_bias = names
+            .correction_bias
+            .as_deref()
+            .map(|name| load_vector(artifacts, name, config.routed_expert_count))
+            .transpose()?;
+        let router = MoeRouter::new(config.clone(), correction_bias)
+            .map_err(|error| CpuReferenceDenseDecoderError::Unsupported(error.to_string()))?;
         let experts = names
             .experts
             .iter()
@@ -709,18 +687,13 @@ impl MoeFeedForwardWeights {
             )?),
         };
         Ok(Self {
-            config: config.clone(),
+            router,
             gate: FloatMatrix::load(
                 artifacts,
                 &names.gate_weight,
                 config.routed_expert_count,
                 hidden_size,
             )?,
-            correction_bias: names
-                .correction_bias
-                .as_deref()
-                .map(|name| load_vector(artifacts, name, config.routed_expert_count))
-                .transpose()?,
             experts,
             shared_expert,
         })
@@ -732,88 +705,26 @@ impl MoeFeedForwardWeights {
         activation: crate::models::DenseDecoderActivation,
     ) -> Result<Vec<f32>, CpuReferenceDenseDecoderError> {
         let logits = self.gate.project(hidden, 1)?;
-        let probabilities = match self.config.router_activation {
-            RouterActivation::Sigmoid => logits
-                .iter()
-                .map(|value| 1.0 / (1.0 + (-value).exp()))
-                .collect::<Vec<_>>(),
-            RouterActivation::Softmax => normalized_exponentials(&logits)?,
-        };
-        let selection_scores = probabilities
-            .iter()
-            .enumerate()
-            .map(|(expert, probability)| {
-                probability
-                    + self
-                        .correction_bias
-                        .as_ref()
-                        .map_or(0.0, |bias| bias[expert])
-            })
-            .collect::<Vec<_>>();
-        let experts_per_group = self.config.routed_expert_count / self.config.expert_group_count;
-        let mut group_scores = (0..self.config.expert_group_count)
-            .map(|group| {
-                let start = group * experts_per_group;
-                let mut scores = selection_scores[start..start + experts_per_group].to_vec();
-                scores.sort_by(|left, right| right.total_cmp(left));
-                scores.into_iter().take(2).sum::<f32>()
-            })
-            .enumerate()
-            .collect::<Vec<_>>();
-        group_scores.sort_by(|(left_group, left), (right_group, right)| {
-            right
-                .total_cmp(left)
-                .then_with(|| left_group.cmp(right_group))
-        });
-        let selected_groups = group_scores
-            .into_iter()
-            .take(self.config.selected_expert_group_count)
-            .map(|(group, _)| group)
-            .collect::<Vec<_>>();
-        let mut selected = selection_scores
-            .iter()
-            .copied()
-            .enumerate()
-            .filter(|(expert, _)| selected_groups.contains(&(expert / experts_per_group)))
-            .collect::<Vec<_>>();
-        selected.sort_by(|(left_expert, left), (right_expert, right)| {
-            right
-                .total_cmp(left)
-                .then_with(|| left_expert.cmp(right_expert))
-        });
-        selected.truncate(self.config.experts_per_token);
-
-        let normalizer = if self.config.renormalize {
-            let sum = selected
-                .iter()
-                .map(|(expert, _)| probabilities[*expert])
-                .sum::<f32>();
-            if !sum.is_finite() || sum <= 0.0 {
-                return Err(CpuReferenceDenseDecoderError::Execution(
-                    "MoE routed probability normalization is invalid".to_string(),
-                ));
-            }
-            sum
-        } else {
-            1.0
-        };
+        let selected = self
+            .router
+            .route(&logits)
+            .map_err(|error| CpuReferenceDenseDecoderError::Execution(error.to_string()))?;
+        let config = self.router.config();
         let mut output = vec![0.0; hidden.len()];
-        for (expert, _) in selected {
-            let expert_output = self.experts[expert].forward(
+        for routed in selected {
+            let expert_output = self.experts[routed.index].forward(
                 hidden,
-                self.config.expert_intermediate_size,
+                config.expert_intermediate_size,
                 activation,
             )?;
-            let weight = probabilities[expert] / normalizer * self.config.routed_scaling_factor;
             for (output, expert_value) in output.iter_mut().zip(expert_output) {
-                *output += weight * expert_value;
+                *output += routed.weight * expert_value;
             }
         }
         if let Some(shared_expert) = &self.shared_expert {
-            let intermediate_size = self
-                .config
+            let intermediate_size = config
                 .expert_intermediate_size
-                .checked_mul(self.config.shared_expert_count)
+                .checked_mul(config.shared_expert_count)
                 .ok_or_else(|| {
                     CpuReferenceDenseDecoderError::Execution(
                         "shared expert intermediate size overflowed".to_string(),

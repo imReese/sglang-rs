@@ -875,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn cuda_hybrid_preflight_reports_only_unimplemented_kimi_components() {
+    fn cuda_hybrid_preflight_accepts_shared_kimi_components() {
         let kimi = ModelRegistry
             .definition(Path::new("/models/kimi"), &kimi_linear_config())
             .expect("Kimi Linear definition");
@@ -883,20 +883,8 @@ mod tests {
         let missing = crate::cuda_hybrid_decoder::CudaBf16HybridDecoder::missing_components(&kimi);
 
         assert!(
-            missing
-                .iter()
-                .all(|component| !component.contains("multi-latent-attention"))
-        );
-        assert!(
-            missing
-                .iter()
-                .any(|component| component.contains("mixture-of-experts"))
-        );
-        assert!(missing.iter().all(|component| !component.contains("KDA")));
-        assert!(
-            missing
-                .iter()
-                .all(|component| !component.contains("dense feed-forward"))
+            missing.is_empty(),
+            "unexpected missing components: {missing:?}"
         );
     }
 

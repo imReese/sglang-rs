@@ -21,6 +21,7 @@ const BF16_BYTES: usize = 2;
 #[derive(Debug)]
 pub(crate) enum CudaExecutorError {
     Unsupported(String),
+    Execution(String),
     Shape(String),
     MissingTensor(String),
     ModelArtifact(ModelArtifactError),
@@ -41,6 +42,7 @@ impl fmt::Display for CudaExecutorError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unsupported(message) => write!(formatter, "unsupported CUDA executor: {message}"),
+            Self::Execution(message) => write!(formatter, "CUDA executor failed: {message}"),
             Self::Shape(message) => write!(formatter, "CUDA executor shape error: {message}"),
             Self::MissingTensor(name) => {
                 write!(formatter, "CUDA executor tensor {name} is missing")
@@ -405,7 +407,7 @@ fn f32_values_to_bf16_bytes(values: &[f32]) -> Vec<u8> {
         .collect()
 }
 
-fn read_required_f32_values(
+pub(crate) fn read_required_f32_values(
     artifacts: &LocalModelArtifacts,
     name: &str,
     expected_elements: usize,

@@ -85,9 +85,13 @@ jobs:
           cuda_recurrent_state::tests::cuda_recurrent_state_reuses_and_clears_request_slots --
           --ignored --nocapture --test-threads=1
 
-      - name: Run CUDA linear-attention state acceptance
+      - name: Run CUDA hybrid transformer primitive acceptance
         run: >-
-          cargo test -p sglang-kernel --locked --test cuda_linear_attention --
+          cargo test -p sglang-kernel --locked
+          --test cuda_hybrid_kernels
+          --test cuda_linear_attention
+          --test cuda_mla
+          --test cuda_moe --
           --ignored --nocapture --test-threads=1
 
       - name: Run CUDA HTTP inference acceptance

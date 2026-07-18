@@ -128,6 +128,21 @@ extern "C" __global__ void sglang_add_bf16(
       __bfloat162float(left[index]) + __bfloat162float(right[index]));
 }
 
+extern "C" __global__ void sglang_weighted_accumulate_bf16(
+    __nv_bfloat16* accumulator,
+    const __nv_bfloat16* source,
+    unsigned long long element_count,
+    float weight) {
+  const unsigned long long index =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= element_count) {
+    return;
+  }
+  accumulator[index] = __float2bfloat16_rn(
+      __bfloat162float(accumulator[index]) +
+      weight * __bfloat162float(source[index]));
+}
+
 extern "C" __global__ void sglang_silu_mul_bf16(
     const __nv_bfloat16* gate,
     const __nv_bfloat16* up,
@@ -184,6 +199,7 @@ pub enum CudaBf16KernelError {
     ZeroDimension(&'static str),
     InvalidEpsilon(f32),
     InvalidTheta(f32),
+    InvalidWeight(f32),
     OddHeadDimension(usize),
     ShapeOverflow,
     DimensionTooLarge {
@@ -223,6 +239,10 @@ impl fmt::Display for CudaBf16KernelError {
             Self::InvalidTheta(theta) => write!(
                 formatter,
                 "CUDA BF16 RoPE theta must be finite and positive, got {theta}"
+            ),
+            Self::InvalidWeight(weight) => write!(
+                formatter,
+                "CUDA BF16 accumulation weight must be finite and non-negative, got {weight}"
             ),
             Self::OddHeadDimension(head_dim) => write!(
                 formatter,
@@ -275,6 +295,7 @@ pub struct CudaBf16DenseKernels {
     add_bias: CudaFunction,
     neox_rope: CudaFunction,
     add: CudaFunction,
+    weighted_accumulate: CudaFunction,
     silu_mul: CudaFunction,
     gather_rows: CudaFunction,
     error_flag: CudaDeviceAllocation,
@@ -307,6 +328,7 @@ impl CudaBf16DenseKernels {
             add_bias: module.get_function("sglang_add_bias_bf16")?,
             neox_rope: module.get_function("sglang_neox_rope_bf16")?,
             add: module.get_function("sglang_add_bf16")?,
+            weighted_accumulate: module.get_function("sglang_weighted_accumulate_bf16")?,
             silu_mul: module.get_function("sglang_silu_mul_bf16")?,
             gather_rows: module.get_function("sglang_gather_rows_bf16")?,
             _module: module,
@@ -509,6 +531,32 @@ impl CudaBf16DenseKernels {
         self.launch_elementwise(&self.silu_mul, element_count, &mut arguments)
     }
 
+    pub fn weighted_accumulate(
+        &self,
+        accumulator: &mut CudaDeviceAllocation,
+        source: &CudaDeviceAllocation,
+        element_count: usize,
+        weight: f32,
+    ) -> Result<(), CudaBf16KernelError> {
+        validate_nonzero(&[("element_count", element_count)])?;
+        if !weight.is_finite() || weight < 0.0 {
+            return Err(CudaBf16KernelError::InvalidWeight(weight));
+        }
+        self.validate_devices(&[("accumulator", accumulator), ("source", source)])?;
+        let tensor_bytes = checked_bytes(element_count, BF16_BYTES)?;
+        let mut accumulator_ptr = accumulator.device_ptr_at(0, tensor_bytes)?;
+        let mut source_ptr = source.device_ptr_at(0, tensor_bytes)?;
+        let mut element_count_u64 = dimension_u64("element_count", element_count)?;
+        let mut weight = weight;
+        let mut arguments = [
+            argument_pointer(&mut accumulator_ptr),
+            argument_pointer(&mut source_ptr),
+            argument_pointer(&mut element_count_u64),
+            argument_pointer(&mut weight),
+        ];
+        self.launch_elementwise(&self.weighted_accumulate, element_count, &mut arguments)
+    }
+
     pub fn gather_rows(
         &mut self,
         input: &CudaDeviceAllocation,
@@ -665,6 +713,7 @@ mod tests {
             "sglang_add_bias_bf16",
             "sglang_neox_rope_bf16",
             "sglang_add_bf16",
+            "sglang_weighted_accumulate_bf16",
             "sglang_silu_mul_bf16",
             "sglang_gather_rows_bf16",
         ] {
