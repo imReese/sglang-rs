@@ -14,18 +14,19 @@ use crate::model_runtime::{
     validate_runtime_support,
 };
 use crate::models::{
-    DEEPSEEK_V3_ADAPTER, DEEPSEEK_V4_ADAPTER, GLM_MOE_DSA_ADAPTER, KIMI_LINEAR_ADAPTER,
-    ModelAdapter, ModelAdapterError, ModelDefinition, QWEN2_ADAPTER, QWEN3_5_ADAPTER,
-    QWEN3_ADAPTER,
+    DEEPSEEK_V3_ADAPTER, DEEPSEEK_V4_ADAPTER, GLM_MOE_DSA_ADAPTER, KIMI_K25_ADAPTER,
+    KIMI_LINEAR_ADAPTER, ModelAdapter, ModelAdapterError, ModelDefinition, QWEN2_ADAPTER,
+    QWEN3_5_ADAPTER, QWEN3_ADAPTER,
 };
 use crate::runtime_kv_cache::RuntimeKvCacheMetadata;
 use crate::transfer::{KvCacheMemoryProvider, KvCacheTransferError, TransferableKvCacheMemory};
 use crate::worker::WorkerWeightUpdateRequest;
 
-static MODEL_ADAPTERS: [&'static dyn ModelAdapter; 7] = [
+static MODEL_ADAPTERS: [&'static dyn ModelAdapter; 8] = [
     &DEEPSEEK_V3_ADAPTER,
     &DEEPSEEK_V4_ADAPTER,
     &GLM_MOE_DSA_ADAPTER,
+    &KIMI_K25_ADAPTER,
     &QWEN2_ADAPTER,
     &QWEN3_ADAPTER,
     &QWEN3_5_ADAPTER,
@@ -572,6 +573,22 @@ mod tests {
         .expect("valid Kimi-K2-compatible DeepSeek V3 config")
     }
 
+    fn kimi_k25_config() -> HfModelConfig {
+        HfModelConfig::from_json_value(json!({
+            "model_type": "kimi_k25",
+            "architectures": ["KimiK25ForConditionalGeneration"],
+            "encoder_only": false,
+            "language_only": false,
+            "quantization_config": null,
+            "vision_config": {
+                "model_type": "kimi_k25",
+                "hidden_size": 4
+            },
+            "text_config": deepseek_v3_kimi_k2_config().raw_document().clone()
+        }))
+        .expect("valid unquantized Kimi K2.5 config")
+    }
+
     fn qwen_config() -> HfModelConfig {
         HfModelConfig::from_json_value(json!({
             "model_type": "qwen2",
@@ -785,6 +802,80 @@ mod tests {
         ));
         validate_runtime_support(&deepseek, cpu_reference_backend().as_ref(), 1)
             .expect("CPU reference backend should execute the shared pure MLA/MoE plan");
+    }
+
+    #[test]
+    fn kimi_k25_is_a_thin_adapter_over_the_shared_deepseek_v3_plan() {
+        let kimi = ModelRegistry
+            .definition(
+                Path::new("/models/kimi-k2.5-unquantized"),
+                &kimi_k25_config(),
+            )
+            .expect("Kimi K2.5 adapter should build the shared language definition");
+        let deepseek = ModelRegistry
+            .definition(
+                Path::new("/models/deepseek-v3"),
+                &deepseek_v3_kimi_k2_config(),
+            )
+            .expect("DeepSeek V3 definition");
+
+        assert_eq!(kimi.architecture(), "KimiK25ForConditionalGeneration");
+        assert_eq!(kimi.model_type(), Some("kimi_k25"));
+        assert_eq!(kimi.execution(), deepseek.execution());
+        assert_eq!(kimi.kv_cache_layout(), deepseek.kv_cache_layout());
+        assert_eq!(kimi.cache_architecture(), deepseek.cache_architecture());
+        assert!(kimi.recurrent_state_layout().is_none());
+
+        let kimi_plan = kimi.hybrid_decoder().expect("Kimi shared MLA/MoE plan");
+        let deepseek_plan = deepseek
+            .hybrid_decoder()
+            .expect("DeepSeek shared MLA/MoE plan");
+        assert_eq!(kimi_plan.full_attention, deepseek_plan.full_attention);
+        assert_eq!(kimi_plan.activation, deepseek_plan.activation);
+        assert_eq!(
+            kimi_plan.weights.token_embeddings,
+            "language_model.model.embed_tokens.weight"
+        );
+        assert_eq!(
+            kimi_plan.weights.final_norm,
+            "language_model.model.norm.weight"
+        );
+        assert_eq!(
+            kimi_plan.weights.lm_head.as_deref(),
+            Some("language_model.lm_head.weight")
+        );
+        assert!(
+            kimi_plan
+                .weights
+                .layers
+                .iter()
+                .all(|layer| { layer.input_norm.starts_with("language_model.model.layers.") })
+        );
+        validate_runtime_support(&kimi, cpu_reference_backend().as_ref(), 1)
+            .expect("CPU reference backend should execute the shared Kimi text plan");
+    }
+
+    #[test]
+    fn kimi_k25_compressed_checkpoint_fails_during_adapter_loading() {
+        let mut value = kimi_k25_config().raw_document().clone();
+        value["quantization_config"] = json!({
+            "quant_method": "compressed-tensors",
+            "format": "pack-quantized"
+        });
+        let config = HfModelConfig::from_json_value(value).expect("routing config should parse");
+
+        let error = ModelRegistry
+            .definition(Path::new("/models/kimi-k2.5-compressed"), &config)
+            .expect_err("unsupported Kimi quantization must fail before backend initialization");
+
+        assert!(matches!(
+            error,
+            ModelRegistryError::InvalidAdapterConfig {
+                architecture: "KimiK25ForConditionalGeneration",
+                ref message,
+                ..
+            } if message.contains("compressed-tensors support is required")
+        ));
     }
 
     #[test]

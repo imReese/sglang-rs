@@ -1,5 +1,6 @@
 mod deepseek;
 mod glm;
+mod kimi_k25;
 mod kimi_linear;
 mod mla_moe_weights;
 mod qwen;
@@ -17,6 +18,7 @@ use crate::model_artifacts::{
 
 pub(crate) use deepseek::{DEEPSEEK_V3_ADAPTER, DEEPSEEK_V4_ADAPTER};
 pub(crate) use glm::GLM_MOE_DSA_ADAPTER;
+pub(crate) use kimi_k25::KIMI_K25_ADAPTER;
 pub(crate) use kimi_linear::KIMI_LINEAR_ADAPTER;
 pub(crate) use qwen::{QWEN2_ADAPTER, QWEN3_ADAPTER};
 pub(crate) use qwen3_5::QWEN3_5_ADAPTER;

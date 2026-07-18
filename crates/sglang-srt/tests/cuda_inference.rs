@@ -145,6 +145,27 @@ async fn cuda_kimi_linear_uses_shared_kda_mla_moe_and_runtime_kv_pool() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a CUDA device, NVIDIA driver, NVRTC, and cuBLAS with BF16 support"]
 async fn cuda_deepseek_v3_uses_shared_mla_moe_and_runtime_kv_pool() {
+    assert_cuda_deepseek_v3_family_generation(
+        "cuda-deepseek-v3-mla-moe-http",
+        write_deepseek_v3_artifacts,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a CUDA device, NVIDIA driver, NVRTC, and cuBLAS with BF16 support"]
+async fn cuda_kimi_k25_text_uses_shared_deepseek_v3_runtime_and_kv_pool() {
+    assert_cuda_deepseek_v3_family_generation(
+        "cuda-kimi-k25-text-mla-moe-http",
+        write_kimi_k25_artifacts,
+    )
+    .await;
+}
+
+async fn assert_cuda_deepseek_v3_family_generation(
+    model_dir_name: &str,
+    write_artifacts: fn(&Path),
+) {
     let device_ordinal = cuda_test_device_ordinal();
     let backend = CudaBackend::initialize(device_ordinal).expect("CUDA backend should initialize");
     assert!(
@@ -156,8 +177,8 @@ async fn cuda_deepseek_v3_uses_shared_mla_moe_and_runtime_kv_pool() {
     );
     drop(backend);
 
-    let model_dir = temp_model_dir("cuda-deepseek-v3-mla-moe-http");
-    write_deepseek_v3_artifacts(&model_dir);
+    let model_dir = temp_model_dir(model_dir_name);
+    write_artifacts(&model_dir);
     let mut args = ServerArgs::parse_from([
         "serve",
         "--model-path",
@@ -196,11 +217,11 @@ async fn cuda_deepseek_v3_uses_shared_mla_moe_and_runtime_kv_pool() {
 
     shutdown_tx
         .send(())
-        .expect("CUDA DeepSeek V3 HTTP server should still be running");
+        .expect("CUDA MLA/MoE HTTP server should still be running");
     server
         .await
-        .expect("CUDA DeepSeek V3 HTTP server task should join")
-        .expect("CUDA DeepSeek V3 HTTP server should stop cleanly");
+        .expect("CUDA MLA/MoE HTTP server task should join")
+        .expect("CUDA MLA/MoE HTTP server should stop cleanly");
     fs::remove_dir_all(model_dir).expect("temp model directory should be removed");
 }
 
@@ -484,15 +505,90 @@ fn write_deepseek_v3_artifacts(model_dir: &Path) {
     )
     .expect("DeepSeek V3 tokenizer should be written");
 
+    write_deepseek_v3_family_weights(model_dir, "model", "lm_head.weight", "DeepSeek V3");
+}
+
+fn write_kimi_k25_artifacts(model_dir: &Path) {
+    fs::create_dir_all(model_dir).expect("temp model directory should be created");
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+  "architectures": ["KimiK25ForConditionalGeneration"],
+  "model_type": "kimi_k25",
+  "encoder_only": false,
+  "language_only": false,
+  "quantization_config": null,
+  "vision_config": {
+    "model_type": "kimi_k25",
+    "hidden_size": 4
+  },
+  "text_config": {
+    "architectures": ["DeepseekV3ForCausalLM"],
+    "model_type": "kimi_k2",
+    "vocab_size": 3,
+    "max_position_embeddings": 32,
+    "num_hidden_layers": 2,
+    "hidden_size": 2,
+    "intermediate_size": 2,
+    "num_attention_heads": 1,
+    "hidden_act": "silu",
+    "rms_norm_eps": 0.00001,
+    "rope_theta": 10000.0,
+    "rope_scaling": null,
+    "attention_bias": false,
+    "tie_word_embeddings": false,
+    "q_lora_rank": 2,
+    "kv_lora_rank": 2,
+    "qk_nope_head_dim": 1,
+    "qk_rope_head_dim": 2,
+    "v_head_dim": 2,
+    "moe_intermediate_size": 2,
+    "n_routed_experts": 1,
+    "n_shared_experts": 1,
+    "num_experts_per_tok": 1,
+    "routed_scaling_factor": 1.0,
+    "first_k_dense_replace": 1,
+    "moe_layer_freq": 1,
+    "n_group": 1,
+    "topk_group": 1,
+    "norm_topk_prob": true,
+    "scoring_func": "sigmoid",
+    "topk_method": "noaux_tc",
+    "num_nextn_predict_layers": 0,
+    "quantization_config": null
+  }
+}"#,
+    )
+    .expect("Kimi K2.5 config should be written");
+    fs::write(
+        model_dir.join("tokenizer.json"),
+        word_level_tokenizer_json(),
+    )
+    .expect("Kimi K2.5 tokenizer should be written");
+
+    write_deepseek_v3_family_weights(
+        model_dir,
+        "language_model.model",
+        "language_model.lm_head.weight",
+        "Kimi K2.5",
+    );
+}
+
+fn write_deepseek_v3_family_weights(
+    model_dir: &Path,
+    model_prefix: &str,
+    lm_head: &str,
+    checkpoint_name: &str,
+) {
     let mut descriptors: Vec<(String, Vec<usize>, Vec<f32>)> = vec![
         (
-            "model.embed_tokens.weight".to_string(),
+            format!("{model_prefix}.embed_tokens.weight"),
             vec![3, 2],
             vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
         ),
-        ("model.norm.weight".to_string(), vec![2], vec![1.0; 2]),
+        (format!("{model_prefix}.norm.weight"), vec![2], vec![1.0; 2]),
         (
-            "lm_head.weight".to_string(),
+            lm_head.to_string(),
             vec![3, 2],
             vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0],
         ),
@@ -501,7 +597,7 @@ fn write_deepseek_v3_artifacts(model_dir: &Path) {
         descriptors.push((name, shape.clone(), vec![value; shape.iter().product()]));
     };
     for layer_id in 0..2 {
-        let prefix = format!("model.layers.{layer_id}");
+        let prefix = format!("{model_prefix}.layers.{layer_id}");
         add_tensor(format!("{prefix}.input_layernorm.weight"), vec![2], 1.0);
         add_tensor(
             format!("{prefix}.post_attention_layernorm.weight"),
@@ -522,7 +618,7 @@ fn write_deepseek_v3_artifacts(model_dir: &Path) {
     }
     for suffix in ["gate_proj", "up_proj", "down_proj"] {
         add_tensor(
-            format!("model.layers.0.mlp.{suffix}.weight"),
+            format!("{model_prefix}.layers.0.mlp.{suffix}.weight"),
             vec![2, 2],
             0.0,
         );
@@ -537,7 +633,7 @@ fn write_deepseek_v3_artifacts(model_dir: &Path) {
         ("shared_experts.up_proj.weight", vec![2, 2]),
         ("shared_experts.down_proj.weight", vec![2, 2]),
     ] {
-        add_tensor(format!("model.layers.1.mlp.{suffix}"), shape, 0.0);
+        add_tensor(format!("{model_prefix}.layers.1.mlp.{suffix}"), shape, 0.0);
     }
 
     let mut payload = Vec::new();
@@ -553,7 +649,7 @@ fn write_deepseek_v3_artifacts(model_dir: &Path) {
         ));
     }
     write_safetensors_file(&model_dir.join("model.safetensors"), &tensors, &payload)
-        .expect("DeepSeek V3 weights should be written");
+        .unwrap_or_else(|error| panic!("{checkpoint_name} weights should be written: {error}"));
 }
 
 fn write_safetensors_file(

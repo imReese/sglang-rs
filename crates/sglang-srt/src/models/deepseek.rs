@@ -115,84 +115,85 @@ fn build_deepseek_v3_definition(
             format!("invalid DeepSeek V3 MLA/MoE config document: {error}"),
         )
     })?;
-    reject_unsupported_deepseek_v3_features(&config)?;
+    build_deepseek_v3_definition_for_adapter(
+        hf_config,
+        config,
+        DeepSeekV3DefinitionSpec {
+            architecture: DEEPSEEK_V3_ARCHITECTURE,
+            model_prefix: "model",
+            lm_head: "lm_head.weight",
+        },
+    )
+}
 
-    let vocab_size = required_usize(DEEPSEEK_V3_ARCHITECTURE, "vocab_size", config.vocab_size)?;
-    let hidden_size = required_usize(DEEPSEEK_V3_ARCHITECTURE, "hidden_size", config.hidden_size)?;
-    let dense_intermediate_size = required_usize(
-        DEEPSEEK_V3_ARCHITECTURE,
-        "intermediate_size",
-        config.intermediate_size,
-    )?;
-    let num_layers = required_usize(
-        DEEPSEEK_V3_ARCHITECTURE,
-        "num_hidden_layers",
-        config.num_hidden_layers,
-    )?;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct DeepSeekV3DefinitionSpec {
+    pub(super) architecture: &'static str,
+    pub(super) model_prefix: &'static str,
+    pub(super) lm_head: &'static str,
+}
+
+pub(super) fn build_deepseek_v3_definition_for_adapter(
+    hf_config: &HfModelConfig,
+    config: MlaMoeConfig,
+    spec: DeepSeekV3DefinitionSpec,
+) -> Result<ModelDefinition, ModelAdapterError> {
+    let architecture = spec.architecture;
+    reject_unsupported_deepseek_v3_features(architecture, &config)?;
+
+    let vocab_size = required_usize(architecture, "vocab_size", config.vocab_size)?;
+    let hidden_size = required_usize(architecture, "hidden_size", config.hidden_size)?;
+    let dense_intermediate_size =
+        required_usize(architecture, "intermediate_size", config.intermediate_size)?;
+    let num_layers = required_usize(architecture, "num_hidden_layers", config.num_hidden_layers)?;
     let num_attention_heads = required_usize(
-        DEEPSEEK_V3_ARCHITECTURE,
+        architecture,
         "num_attention_heads",
         config.num_attention_heads,
     )?;
     let query = match config.q_lora_rank {
         Some(0) => {
             return Err(ModelAdapterError::invalid(
-                DEEPSEEK_V3_ARCHITECTURE,
+                architecture,
                 "q_lora_rank must be non-zero when present",
             ));
         }
         Some(rank) => MultiLatentQueryConfig::LowRank { rank },
         None => MultiLatentQueryConfig::Direct,
     };
-    let kv_lora_rank = required_usize(
-        DEEPSEEK_V3_ARCHITECTURE,
-        "kv_lora_rank",
-        config.kv_lora_rank,
-    )?;
-    let qk_nope_head_dim = required_usize(
-        DEEPSEEK_V3_ARCHITECTURE,
-        "qk_nope_head_dim",
-        config.qk_nope_head_dim,
-    )?;
-    let qk_rope_head_dim = required_usize(
-        DEEPSEEK_V3_ARCHITECTURE,
-        "qk_rope_head_dim",
-        config.qk_rope_head_dim,
-    )?;
-    let value_head_dim = required_usize(DEEPSEEK_V3_ARCHITECTURE, "v_head_dim", config.v_head_dim)?;
-    let routed_expert_count = required_usize(
-        DEEPSEEK_V3_ARCHITECTURE,
-        "n_routed_experts",
-        config.n_routed_experts,
-    )?;
+    let kv_lora_rank = required_usize(architecture, "kv_lora_rank", config.kv_lora_rank)?;
+    let qk_nope_head_dim =
+        required_usize(architecture, "qk_nope_head_dim", config.qk_nope_head_dim)?;
+    let qk_rope_head_dim =
+        required_usize(architecture, "qk_rope_head_dim", config.qk_rope_head_dim)?;
+    let value_head_dim = required_usize(architecture, "v_head_dim", config.v_head_dim)?;
+    let routed_expert_count =
+        required_usize(architecture, "n_routed_experts", config.n_routed_experts)?;
     let experts_per_token = required_usize(
-        DEEPSEEK_V3_ARCHITECTURE,
+        architecture,
         "num_experts_per_tok",
         config.num_experts_per_tok,
     )?;
     let expert_intermediate_size = required_usize(
-        DEEPSEEK_V3_ARCHITECTURE,
+        architecture,
         "moe_intermediate_size",
         config.moe_intermediate_size,
     )?;
     let first_dense_layer_count = config.first_k_dense_replace.unwrap_or(0);
     if first_dense_layer_count > num_layers {
         return Err(ModelAdapterError::invalid(
-            DEEPSEEK_V3_ARCHITECTURE,
+            architecture,
             "first_k_dense_replace exceeds num_hidden_layers",
         ));
     }
-    let moe_layer_frequency = required_usize(
-        DEEPSEEK_V3_ARCHITECTURE,
-        "moe_layer_freq",
-        config.moe_layer_freq,
-    )?;
-    let expert_group_count = required_usize(DEEPSEEK_V3_ARCHITECTURE, "n_group", config.n_group)?;
+    let moe_layer_frequency =
+        required_usize(architecture, "moe_layer_freq", config.moe_layer_freq)?;
+    let expert_group_count = required_usize(architecture, "n_group", config.n_group)?;
     let selected_expert_group_count =
-        required_usize(DEEPSEEK_V3_ARCHITECTURE, "topk_group", config.topk_group)?;
+        required_usize(architecture, "topk_group", config.topk_group)?;
     if experts_per_token > routed_expert_count {
         return Err(ModelAdapterError::invalid(
-            DEEPSEEK_V3_ARCHITECTURE,
+            architecture,
             format!(
                 "num_experts_per_tok ({experts_per_token}) exceeds n_routed_experts ({routed_expert_count})"
             ),
@@ -202,7 +203,7 @@ fn build_deepseek_v3_definition(
         || selected_expert_group_count > expert_group_count
     {
         return Err(ModelAdapterError::invalid(
-            DEEPSEEK_V3_ARCHITECTURE,
+            architecture,
             "n_routed_experts must divide evenly into n_group and topk_group must not exceed n_group",
         ));
     }
@@ -211,13 +212,13 @@ fn build_deepseek_v3_definition(
         Some("softmax") => RouterActivation::Softmax,
         Some(scoring) => {
             return Err(ModelAdapterError::invalid(
-                DEEPSEEK_V3_ARCHITECTURE,
+                architecture,
                 format!("unsupported scoring_func {scoring}"),
             ));
         }
         None => {
             return Err(ModelAdapterError::missing_field(
-                DEEPSEEK_V3_ARCHITECTURE,
+                architecture,
                 "scoring_func",
             ));
         }
@@ -227,33 +228,29 @@ fn build_deepseek_v3_definition(
         Some("greedy" | "group_limited_greedy") => false,
         Some(method) => {
             return Err(ModelAdapterError::invalid(
-                DEEPSEEK_V3_ARCHITECTURE,
+                architecture,
                 format!("unsupported topk_method {method}"),
             ));
         }
         None => {
             return Err(ModelAdapterError::missing_field(
-                DEEPSEEK_V3_ARCHITECTURE,
+                architecture,
                 "topk_method",
             ));
         }
     };
-    let renormalize = config.norm_topk_prob.ok_or_else(|| {
-        ModelAdapterError::missing_field(DEEPSEEK_V3_ARCHITECTURE, "norm_topk_prob")
-    })?;
+    let renormalize = config
+        .norm_topk_prob
+        .ok_or_else(|| ModelAdapterError::missing_field(architecture, "norm_topk_prob"))?;
     let routed_scaling_factor = positive_float(
-        DEEPSEEK_V3_ARCHITECTURE,
+        architecture,
         "routed_scaling_factor",
         config.routed_scaling_factor,
     )?;
-    let rms_norm_eps = positive_float(
-        DEEPSEEK_V3_ARCHITECTURE,
-        "rms_norm_eps",
-        config.rms_norm_eps,
-    )?;
-    let rope_theta = positive_float(DEEPSEEK_V3_ARCHITECTURE, "rope_theta", config.rope_theta)?;
+    let rms_norm_eps = positive_float(architecture, "rms_norm_eps", config.rms_norm_eps)?;
+    let rope_theta = positive_float(architecture, "rope_theta", config.rope_theta)?;
     let max_position_embeddings = required_usize(
-        DEEPSEEK_V3_ARCHITECTURE,
+        architecture,
         "max_position_embeddings",
         config.max_position_embeddings,
     )?;
@@ -278,6 +275,8 @@ fn build_deepseek_v3_definition(
         query,
         has_correction_bias,
         tied_embeddings: config.tie_word_embeddings.unwrap_or(false),
+        model_prefix: spec.model_prefix,
+        lm_head: spec.lm_head,
     });
     let plan = HybridDecoderExecutionPlan {
         vocab_size,
@@ -299,17 +298,16 @@ fn build_deepseek_v3_definition(
         activation: DenseDecoderActivation::Silu,
         weights,
     };
-    let topology = deepseek_v3_checkpoint_topology(&plan)?;
+    let topology = deepseek_v3_checkpoint_topology(architecture, &plan)?;
     let mla_key_width = checked_add(
-        DEEPSEEK_V3_ARCHITECTURE,
+        architecture,
         kv_lora_rank,
         qk_rope_head_dim,
         "MLA key width",
     )?;
     let kv_cache_layout =
-        KvCacheModelLayout::tensor_pair(num_layers, 1, mla_key_width, 1, kv_lora_rank).map_err(
-            |error| ModelAdapterError::invalid(DEEPSEEK_V3_ARCHITECTURE, error.to_string()),
-        )?;
+        KvCacheModelLayout::tensor_pair(num_layers, 1, mla_key_width, 1, kv_lora_rank)
+            .map_err(|error| ModelAdapterError::invalid(architecture, error.to_string()))?;
     let execution = ModelExecutionArchitecture::Transformer {
         attention: AttentionArchitecture::MultiLatent {
             num_attention_heads,
@@ -326,7 +324,7 @@ fn build_deepseek_v3_definition(
     };
 
     ModelDefinition::new(
-        DEEPSEEK_V3_ARCHITECTURE,
+        architecture,
         hf_config,
         execution,
         vec![RuntimeDtype::F32, RuntimeDtype::Bf16],
@@ -337,16 +335,19 @@ fn build_deepseek_v3_definition(
     .with_hybrid_decoder(plan)
 }
 
-fn reject_unsupported_deepseek_v3_features(config: &MlaMoeConfig) -> Result<(), ModelAdapterError> {
+fn reject_unsupported_deepseek_v3_features(
+    architecture: &'static str,
+    config: &MlaMoeConfig,
+) -> Result<(), ModelAdapterError> {
     if config.hidden_act.as_deref() != Some("silu") {
         return Err(ModelAdapterError::invalid(
-            DEEPSEEK_V3_ARCHITECTURE,
+            architecture,
             format!("hidden_act must be silu; found {:?}", config.hidden_act),
         ));
     }
     if config.attention_bias.unwrap_or(false) {
         return Err(ModelAdapterError::invalid(
-            DEEPSEEK_V3_ARCHITECTURE,
+            architecture,
             "attention_bias=true is not implemented by the shared MLA component",
         ));
     }
@@ -356,7 +357,7 @@ fn reject_unsupported_deepseek_v3_features(config: &MlaMoeConfig) -> Result<(), 
         .is_some_and(|value| !value.is_null())
     {
         return Err(ModelAdapterError::invalid(
-            DEEPSEEK_V3_ARCHITECTURE,
+            architecture,
             "rope_scaling/YaRN is not implemented by the shared MLA component",
         ));
     }
@@ -366,13 +367,13 @@ fn reject_unsupported_deepseek_v3_features(config: &MlaMoeConfig) -> Result<(), 
         .is_some_and(|value| !value.is_null())
     {
         return Err(ModelAdapterError::invalid(
-            DEEPSEEK_V3_ARCHITECTURE,
+            architecture,
             "quantized DeepSeek/Kimi checkpoints are not implemented; an unquantized checkpoint is required",
         ));
     }
     if config.num_nextn_predict_layers.unwrap_or(0) != 0 {
         return Err(ModelAdapterError::invalid(
-            DEEPSEEK_V3_ARCHITECTURE,
+            architecture,
             "next-token prediction layers are not implemented",
         ));
     }
@@ -389,6 +390,8 @@ struct DeepSeekV3WeightLayout<'a> {
     query: MultiLatentQueryConfig,
     has_correction_bias: bool,
     tied_embeddings: bool,
+    model_prefix: &'a str,
+    lm_head: &'a str,
 }
 
 fn deepseek_v3_weight_names(layout: DeepSeekV3WeightLayout<'_>) -> HybridDecoderWeightNames {
@@ -401,10 +404,12 @@ fn deepseek_v3_weight_names(layout: DeepSeekV3WeightLayout<'_>) -> HybridDecoder
         query,
         has_correction_bias,
         tied_embeddings,
+        model_prefix,
+        lm_head,
     } = layout;
     let layers = (0..num_layers)
         .map(|layer_id| {
-            let prefix = format!("model.layers.{layer_id}");
+            let prefix = format!("{model_prefix}.layers.{layer_id}");
             let mixer = HybridDecoderLayerKind::MultiLatentAttention {
                 cache_layer_index: layer_id,
                 weights: HybridMultiLatentAttentionWeightNames {
@@ -474,14 +479,15 @@ fn deepseek_v3_weight_names(layout: DeepSeekV3WeightLayout<'_>) -> HybridDecoder
         })
         .collect();
     HybridDecoderWeightNames {
-        token_embeddings: "model.embed_tokens.weight".to_string(),
-        final_norm: "model.norm.weight".to_string(),
-        lm_head: (!tied_embeddings).then(|| "lm_head.weight".to_string()),
+        token_embeddings: format!("{model_prefix}.embed_tokens.weight"),
+        final_norm: format!("{model_prefix}.norm.weight"),
+        lm_head: (!tied_embeddings).then(|| lm_head.to_string()),
         layers,
     }
 }
 
 fn deepseek_v3_checkpoint_topology(
+    architecture: &'static str,
     plan: &HybridDecoderExecutionPlan,
 ) -> Result<CheckpointTopology, ModelAdapterError> {
     let HybridFullAttentionConfig::MultiLatent {
@@ -495,42 +501,42 @@ fn deepseek_v3_checkpoint_topology(
     } = plan.full_attention
     else {
         return Err(ModelAdapterError::invalid(
-            DEEPSEEK_V3_ARCHITECTURE,
+            architecture,
             "DeepSeek V3 checkpoint topology requires MLA",
         ));
     };
     let query_head_dim = checked_add(
-        DEEPSEEK_V3_ARCHITECTURE,
+        architecture,
         qk_nope_head_dim,
         qk_rope_head_dim,
         "MLA query head",
     )?;
     let query_size = checked_product(
-        DEEPSEEK_V3_ARCHITECTURE,
+        architecture,
         num_attention_heads,
         query_head_dim,
         "MLA query",
     )?;
     let compressed_kv_size = checked_add(
-        DEEPSEEK_V3_ARCHITECTURE,
+        architecture,
         kv_lora_rank,
         qk_rope_head_dim,
         "MLA compressed KV",
     )?;
     let expanded_head_dim = checked_add(
-        DEEPSEEK_V3_ARCHITECTURE,
+        architecture,
         qk_nope_head_dim,
         value_head_dim,
         "MLA expanded KV head",
     )?;
     let expanded_kv_size = checked_product(
-        DEEPSEEK_V3_ARCHITECTURE,
+        architecture,
         num_attention_heads,
         expanded_head_dim,
         "MLA expanded KV",
     )?;
     let attention_output_size = checked_product(
-        DEEPSEEK_V3_ARCHITECTURE,
+        architecture,
         num_attention_heads,
         value_head_dim,
         "MLA output",
@@ -556,7 +562,7 @@ fn deepseek_v3_checkpoint_topology(
         ]);
         let HybridDecoderLayerKind::MultiLatentAttention { weights, .. } = &layer.mixer else {
             return Err(ModelAdapterError::invalid(
-                DEEPSEEK_V3_ARCHITECTURE,
+                architecture,
                 "DeepSeek V3 decoder plan contains a non-MLA mixer",
             ));
         };
@@ -581,7 +587,7 @@ fn deepseek_v3_checkpoint_topology(
             ]),
             _ => {
                 return Err(ModelAdapterError::invalid(
-                    DEEPSEEK_V3_ARCHITECTURE,
+                    architecture,
                     "MLA query config does not match its checkpoint weight mapping",
                 ));
             }
@@ -631,7 +637,7 @@ fn deepseek_v3_checkpoint_topology(
                 }
                 if let Some(shared) = &weights.shared_expert {
                     let shared_intermediate_size = checked_product(
-                        DEEPSEEK_V3_ARCHITECTURE,
+                        architecture,
                         config.expert_intermediate_size,
                         config.shared_expert_count,
                         "shared expert intermediate",

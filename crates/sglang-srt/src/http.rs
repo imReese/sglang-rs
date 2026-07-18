@@ -3870,6 +3870,25 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn text_runtime_rejects_multimodal_chat_content() {
+        let error = chat_template_input_from_payload(&json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe this image"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
+                ]
+            }]
+        }))
+        .expect_err("a text-only runtime must reject image content before generation");
+
+        assert_eq!(
+            error,
+            "multimodal chat content is not supported by this text runtime"
+        );
+    }
+
+    #[test]
     fn generate_payload_accepts_routed_dp_rank_for_text_request() {
         let request = http_generate_payload_to_router_request(json!({
             "text": "hello",
