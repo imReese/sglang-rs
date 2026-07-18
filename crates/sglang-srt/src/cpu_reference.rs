@@ -19,7 +19,7 @@ use crate::models::{
     DenseDecoderLayerWeightNames, FeedForwardArchitecture, ModelDefinition,
     ModelExecutionArchitecture,
 };
-use crate::runtime_kv_cache::ActiveKvCache;
+use crate::runtime_kv_cache::{ActiveKvCache, RuntimeKvCache};
 use crate::transfer::{KvCacheTransferError, TransferableKvCacheMemory};
 
 #[derive(Debug)]
@@ -176,7 +176,7 @@ impl CpuReferenceDenseDecoder {
     }
 }
 
-impl BackendModelExecutor<CpuReferenceKvCache> for CpuReferenceDenseDecoder {
+impl BackendModelExecutor<RuntimeKvCache<CpuReferenceKvCache>> for CpuReferenceDenseDecoder {
     fn runtime_capability(&self) -> RuntimeCapability {
         CpuReferenceDenseDecoder::runtime_capability(self)
     }
@@ -188,8 +188,9 @@ impl BackendModelExecutor<CpuReferenceKvCache> for CpuReferenceDenseDecoder {
     fn forward(
         &mut self,
         batch: &ModelWorkerBatch,
-        kv_cache: &mut CpuReferenceKvCache,
+        resources: &mut RuntimeKvCache<CpuReferenceKvCache>,
     ) -> Result<ModelForwardOutput, ModelForwardError> {
+        let kv_cache = resources.allocation_mut();
         validate_batch(batch).map_err(model_forward_error)?;
         let mut logits = Vec::with_capacity(batch.request_ids().len());
         for request_index in 0..batch.request_ids().len() {

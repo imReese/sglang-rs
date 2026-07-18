@@ -404,6 +404,46 @@ pub(crate) struct HybridDecoderExecutionPlan {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RecurrentStateLayout {
+    pub layer_count: usize,
+    pub conv_kernel_dim: usize,
+    pub key_head_count: usize,
+    pub value_head_count: usize,
+    pub key_head_dim: usize,
+    pub value_head_dim: usize,
+}
+
+impl RecurrentStateLayout {
+    pub fn conv_elements_per_layer(self) -> Option<usize> {
+        self.key_head_count
+            .checked_mul(self.key_head_dim)
+            .and_then(|size| size.checked_mul(2))
+            .and_then(|key_size| {
+                self.value_head_count
+                    .checked_mul(self.value_head_dim)
+                    .and_then(|value_size| key_size.checked_add(value_size))
+            })
+            .and_then(|width| {
+                self.conv_kernel_dim
+                    .checked_sub(1)
+                    .and_then(|history| width.checked_mul(history))
+            })
+    }
+
+    pub fn temporal_elements_per_layer(self) -> Option<usize> {
+        self.value_head_count
+            .checked_mul(self.key_head_dim)
+            .and_then(|size| size.checked_mul(self.value_head_dim))
+    }
+
+    pub fn elements_per_request(self) -> Option<usize> {
+        self.conv_elements_per_layer()?
+            .checked_add(self.temporal_elements_per_layer()?)?
+            .checked_mul(self.layer_count)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModelCacheArchitecture {
     None,
     PagedKv,
@@ -473,6 +513,7 @@ pub struct ModelDefinition {
     execution: ModelExecutionArchitecture,
     supported_dtypes: Vec<RuntimeDtype>,
     kv_cache_layout: Option<KvCacheModelLayout>,
+    recurrent_state_layout: Option<RecurrentStateLayout>,
     cache_architecture: ModelCacheArchitecture,
     dense_decoder: Option<DenseDecoderExecutionPlan>,
     hybrid_decoder: Option<HybridDecoderExecutionPlan>,
@@ -497,6 +538,7 @@ impl ModelDefinition {
             execution,
             supported_dtypes,
             kv_cache_layout,
+            recurrent_state_layout: None,
             cache_architecture: if kv_cache_layout.is_some() {
                 ModelCacheArchitecture::PagedKv
             } else {
@@ -542,6 +584,42 @@ impl ModelDefinition {
             })
             .count();
         let recurrent_state_layer_count = plan.weights.layers.len() - full_attention_layer_count;
+        let (conv_kernel_dim, key_head_count, value_head_count, key_head_dim, value_head_dim) =
+            match plan.linear_attention {
+                HybridLinearAttentionConfig::GatedDeltaNet {
+                    conv_kernel_dim,
+                    key_head_dim,
+                    value_head_dim,
+                    num_key_heads,
+                    num_value_heads,
+                } => (
+                    conv_kernel_dim,
+                    num_key_heads,
+                    num_value_heads,
+                    key_head_dim,
+                    value_head_dim,
+                ),
+                HybridLinearAttentionConfig::KeyGatedDelta {
+                    conv_kernel_dim,
+                    key_head_dim,
+                    value_head_dim,
+                    num_heads,
+                } => (
+                    conv_kernel_dim,
+                    num_heads,
+                    num_heads,
+                    key_head_dim,
+                    value_head_dim,
+                ),
+            };
+        self.recurrent_state_layout = Some(RecurrentStateLayout {
+            layer_count: recurrent_state_layer_count,
+            conv_kernel_dim,
+            key_head_count,
+            value_head_count,
+            key_head_dim,
+            value_head_dim,
+        });
         self.cache_architecture = ModelCacheArchitecture::HybridState {
             full_attention_layer_count,
             recurrent_state_layer_count,
@@ -591,6 +669,10 @@ impl ModelDefinition {
 
     pub fn kv_cache_layout(&self) -> Option<KvCacheModelLayout> {
         self.kv_cache_layout
+    }
+
+    pub fn recurrent_state_layout(&self) -> Option<RecurrentStateLayout> {
+        self.recurrent_state_layout
     }
 
     pub fn cache_architecture(&self) -> ModelCacheArchitecture {

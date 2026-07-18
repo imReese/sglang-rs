@@ -1,7 +1,7 @@
 use crate::backend::{
     CudaBackend, RuntimeBackend, RuntimeCapability, RuntimeDevicePlacement, RuntimeDtype,
 };
-use crate::cpu_hybrid::CpuReferenceHybridDecoder;
+use crate::cpu_hybrid::{CpuHybridExecutionResources, CpuReferenceHybridDecoder};
 use crate::cpu_reference::{CpuReferenceDenseDecoder, CpuReferenceKvCache};
 use crate::cuda_dense_decoder::CudaBf16DenseDecoder;
 use crate::cuda_kv_cache::allocate_cuda_kv_cache;
@@ -213,12 +213,21 @@ fn create_cpu_model_runtime(
         ModelExecutionArchitecture::Transformer { .. } if definition.hybrid_decoder().is_some() => {
             let executor = CpuReferenceHybridDecoder::load(definition, artifacts)
                 .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?;
-            Ok(Box::new(BackendExecutionBundle::new(executor, kv_cache)))
+            let recurrent_state_layout = definition.recurrent_state_layout().ok_or_else(|| {
+                ModelRuntimeLoadError::MissingCapabilities(vec![
+                    "model recurrent-state layout".to_string(),
+                ])
+            })?;
+            let resources = CpuHybridExecutionResources::new(kv_cache, recurrent_state_layout)
+                .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?;
+            Ok(Box::new(BackendExecutionBundle::new(executor, resources)))
         }
         ModelExecutionArchitecture::Transformer { .. } if definition.dense_decoder().is_some() => {
             let executor = CpuReferenceDenseDecoder::load(definition, artifacts)
                 .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?;
-            Ok(Box::new(BackendExecutionBundle::new(executor, kv_cache)))
+            Ok(Box::new(BackendExecutionBundle::from_kv_cache(
+                executor, kv_cache,
+            )))
         }
         ModelExecutionArchitecture::Transformer {
             attention,
@@ -264,7 +273,9 @@ fn create_cuda_model_runtime(
             )?;
             let executor = CudaBf16DenseDecoder::load(definition, artifacts, backend)
                 .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?;
-            Ok(Box::new(BackendExecutionBundle::new(executor, kv_cache)))
+            Ok(Box::new(BackendExecutionBundle::from_kv_cache(
+                executor, kv_cache,
+            )))
         }
         ModelExecutionArchitecture::Transformer {
             attention,

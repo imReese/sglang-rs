@@ -23,6 +23,7 @@ use crate::models::{
     AttentionArchitecture, DenseDecoderExecutionPlan, DenseDecoderLayerWeightNames,
     FeedForwardArchitecture, ModelDefinition, ModelExecutionArchitecture,
 };
+use crate::runtime_kv_cache::RuntimeKvCache;
 
 const BF16_BYTES: usize = 2;
 
@@ -549,7 +550,7 @@ struct CudaDenseLayerForward<'a> {
     kv_storage: &'a mut CudaKvStorage,
 }
 
-impl BackendModelExecutor<KvCachePool<CudaKvStorage>> for CudaBf16DenseDecoder {
+impl BackendModelExecutor<RuntimeKvCache<KvCachePool<CudaKvStorage>>> for CudaBf16DenseDecoder {
     fn runtime_capability(&self) -> RuntimeCapability {
         CudaBf16DenseDecoder::runtime_capability(self)
     }
@@ -561,8 +562,9 @@ impl BackendModelExecutor<KvCachePool<CudaKvStorage>> for CudaBf16DenseDecoder {
     fn forward(
         &mut self,
         batch: &ModelWorkerBatch,
-        kv_pool: &mut KvCachePool<CudaKvStorage>,
+        resources: &mut RuntimeKvCache<KvCachePool<CudaKvStorage>>,
     ) -> Result<ModelForwardOutput, ModelForwardError> {
+        let kv_pool = resources.allocation_mut();
         let kv_layout = kv_pool.layout();
         let kv_storage = kv_pool.storage_mut();
         self.forward_batch(batch, kv_layout, kv_storage)

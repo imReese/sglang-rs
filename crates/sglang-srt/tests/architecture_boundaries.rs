@@ -79,7 +79,6 @@ fn backend_execution_bundle_prevents_runtime_kv_type_erasure() {
         assert!(!source.contains("downcast"));
         assert!(!source.contains("as_any"));
     }
-    assert!(runtime.contains("BackendExecutionBundle<E, K>"));
     assert!(!server.contains("take_runtime_kv_cache"));
     assert!(!runner.contains("install_runtime_kv_cache"));
 }

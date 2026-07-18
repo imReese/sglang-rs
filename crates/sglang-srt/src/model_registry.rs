@@ -757,6 +757,13 @@ mod tests {
                 recurrent_state_layer_count: 3,
             }
         );
+        let recurrent = qwen3_5
+            .recurrent_state_layout()
+            .expect("Qwen3.5 recurrent-state layout");
+        assert_eq!(recurrent.layer_count, 3);
+        assert_eq!(recurrent.conv_elements_per_layer(), Some(18_432));
+        assert_eq!(recurrent.temporal_elements_per_layer(), Some(262_144));
+        assert_eq!(recurrent.elements_per_request(), Some(841_728));
         assert_eq!(
             qwen3_5
                 .kv_cache_layout()
@@ -803,6 +810,13 @@ mod tests {
                 recurrent_state_layer_count: 1,
             }
         );
+        let recurrent = kimi
+            .recurrent_state_layout()
+            .expect("Kimi recurrent-state layout");
+        assert_eq!(recurrent.layer_count, 1);
+        assert_eq!(recurrent.conv_elements_per_layer(), Some(6));
+        assert_eq!(recurrent.temporal_elements_per_layer(), Some(4));
+        assert_eq!(recurrent.elements_per_request(), Some(10));
         let layout = kimi.kv_cache_layout().expect("Kimi MLA KV layout");
         assert_eq!(layout.num_layers, 1);
         assert_eq!(

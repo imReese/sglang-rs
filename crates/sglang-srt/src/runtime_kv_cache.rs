@@ -28,6 +28,10 @@ where
         self.allocation.layout()
     }
 
+    pub(crate) fn backend(&self) -> RuntimeBackend {
+        self.allocation.backend()
+    }
+
     pub(crate) fn allocation_mut(&mut self) -> &mut K {
         &mut self.allocation
     }
@@ -59,4 +63,13 @@ where
 
 pub(crate) trait RuntimeKvCacheMetadata {
     fn active_kv_cache_layout(&self) -> Option<PagedKvCacheLayout>;
+}
+
+impl<K> RuntimeKvCacheMetadata for RuntimeKvCache<K>
+where
+    K: ActiveKvCache,
+{
+    fn active_kv_cache_layout(&self) -> Option<PagedKvCacheLayout> {
+        Some(self.layout())
+    }
 }

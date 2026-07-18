@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use nexus_transfer::{KvCacheMemoryProvider, TransferableKvCacheMemory};
 use sglang_kernel::cpu::{
     GatedDeltaRuleShape, KeyGatedDeltaRuleShape, apply_partial_neox_rope_inplace,
     causal_depthwise_conv1d_step, gated_delta_rule_step, key_gated_delta_rule_step, rms_norm,
@@ -16,15 +17,117 @@ use crate::cpu_reference::{
 };
 use crate::model_artifacts::LocalModelArtifacts;
 use crate::model_executor::{ModelForwardError, ModelForwardOutput, ModelWorkerBatch};
-use crate::model_runtime::BackendModelExecutor;
+use crate::model_runtime::{BackendExecutionResources, BackendModelExecutor};
 use crate::models::{
     DecoderNormalization, GatedDeltaNetWeightNames, HybridDecoderExecutionPlan,
     HybridDecoderLayerKind, HybridDecoderLayerWeightNames, HybridFeedForward,
     HybridFullAttentionConfig, HybridFullAttentionWeightNames, HybridLinearAttentionConfig,
     HybridMultiLatentAttentionWeightNames, KeyGatedDeltaWeightNames, ModelDefinition,
-    MoeFeedForwardConfig, MoeFeedForwardWeightNames, RouterActivation,
+    MoeFeedForwardConfig, MoeFeedForwardWeightNames, RecurrentStateLayout, RouterActivation,
 };
+use crate::runtime_kv_cache::{RuntimeKvCache, RuntimeKvCacheMetadata};
+use crate::transfer::KvCacheTransferError;
 use crate::types::RequestId;
+
+#[derive(Debug)]
+pub(crate) struct CpuHybridExecutionResources {
+    active_kv_cache: RuntimeKvCache<CpuReferenceKvCache>,
+    recurrent_state: CpuHybridStatePool,
+}
+
+impl CpuHybridExecutionResources {
+    pub(crate) fn new(
+        active_kv_cache: CpuReferenceKvCache,
+        recurrent_state_layout: RecurrentStateLayout,
+    ) -> Result<Self, CpuReferenceDenseDecoderError> {
+        Ok(Self {
+            active_kv_cache: RuntimeKvCache::new(active_kv_cache),
+            recurrent_state: CpuHybridStatePool::new(recurrent_state_layout)?,
+        })
+    }
+
+    fn parts_mut(&mut self) -> (&mut CpuReferenceKvCache, &mut CpuHybridStatePool) {
+        (
+            self.active_kv_cache.allocation_mut(),
+            &mut self.recurrent_state,
+        )
+    }
+}
+
+impl KvCacheMemoryProvider for CpuHybridExecutionResources {
+    type Error = KvCacheTransferError;
+
+    fn transferable_kv_cache_memory(&self) -> Result<TransferableKvCacheMemory, Self::Error> {
+        self.active_kv_cache.transferable_kv_cache_memory()
+    }
+}
+
+impl RuntimeKvCacheMetadata for CpuHybridExecutionResources {
+    fn active_kv_cache_layout(&self) -> Option<crate::kv_cache::PagedKvCacheLayout> {
+        self.active_kv_cache.active_kv_cache_layout()
+    }
+}
+
+impl BackendExecutionResources for CpuHybridExecutionResources {
+    fn runtime_backend(&self) -> crate::backend::RuntimeBackend {
+        crate::backend::RuntimeBackend::Cpu
+    }
+
+    fn recurrent_state_layout(&self) -> Option<RecurrentStateLayout> {
+        Some(self.recurrent_state.layout())
+    }
+}
+
+#[derive(Debug)]
+struct CpuHybridStatePool {
+    layout: RecurrentStateLayout,
+    requests: HashMap<String, HybridRequestState>,
+}
+
+impl CpuHybridStatePool {
+    fn new(layout: RecurrentStateLayout) -> Result<Self, CpuReferenceDenseDecoderError> {
+        if layout.layer_count == 0
+            || layout.conv_elements_per_layer().is_none()
+            || layout.temporal_elements_per_layer().is_none()
+            || layout.elements_per_request().is_none()
+        {
+            return Err(CpuReferenceDenseDecoderError::Unsupported(
+                "hybrid recurrent state layout is empty or overflowed".to_string(),
+            ));
+        }
+        Ok(Self {
+            layout,
+            requests: HashMap::new(),
+        })
+    }
+
+    fn layout(&self) -> RecurrentStateLayout {
+        self.layout
+    }
+
+    fn request_state_mut(
+        &mut self,
+        request_id: &RequestId,
+        position: usize,
+    ) -> Result<&mut HybridRequestState, CpuReferenceDenseDecoderError> {
+        match self.requests.entry(request_id.as_str().to_string()) {
+            std::collections::hash_map::Entry::Vacant(entry) if position == 0 => {
+                Ok(entry.insert(HybridRequestState::new(self.layout)?))
+            }
+            std::collections::hash_map::Entry::Vacant(_) => {
+                Err(CpuReferenceDenseDecoderError::Execution(format!(
+                    "hybrid request {} has no recurrent state at position {position}; prefix-state restoration is not available",
+                    request_id.as_str()
+                )))
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
+        }
+    }
+
+    fn complete_request(&mut self, request_id: &RequestId) {
+        self.requests.remove(request_id.as_str());
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct CpuReferenceHybridDecoder {
@@ -33,7 +136,6 @@ pub(crate) struct CpuReferenceHybridDecoder {
     final_norm: Vec<f32>,
     lm_head: Option<FloatMatrix>,
     layers: Vec<HybridDecoderLayerWeights>,
-    request_states: HashMap<String, HybridRequestState>,
 }
 
 impl CpuReferenceHybridDecoder {
@@ -75,7 +177,6 @@ impl CpuReferenceHybridDecoder {
             final_norm,
             lm_head,
             layers,
-            request_states: HashMap::new(),
         })
     }
 
@@ -89,7 +190,7 @@ impl CpuReferenceHybridDecoder {
 
     fn forward_token(
         &mut self,
-        kv_cache: &mut CpuReferenceKvCache,
+        resources: &mut CpuHybridExecutionResources,
         request_id: &RequestId,
         token_id: u32,
         position: usize,
@@ -109,29 +210,8 @@ impl CpuReferenceHybridDecoder {
             )));
         }
 
-        let recurrent_layer_count = self
-            .layers
-            .iter()
-            .filter(|layer| {
-                matches!(
-                    layer.mixer,
-                    HybridMixerWeights::GatedDeltaNet { .. }
-                        | HybridMixerWeights::KeyGatedDelta { .. }
-                )
-            })
-            .count();
-        let request_state = match self.request_states.entry(request_id.as_str().to_string()) {
-            std::collections::hash_map::Entry::Vacant(entry) if position == 0 => entry.insert(
-                HybridRequestState::new(recurrent_layer_count, self.plan.linear_attention)?,
-            ),
-            std::collections::hash_map::Entry::Vacant(_) => {
-                return Err(CpuReferenceDenseDecoderError::Execution(format!(
-                    "hybrid request {} has no recurrent state at position {position}; prefix-state restoration is not available",
-                    request_id.as_str()
-                )));
-            }
-            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-        };
+        let (kv_cache, state_pool) = resources.parts_mut();
+        let request_state = state_pool.request_state_mut(request_id, position)?;
         if request_state.next_position != position {
             return Err(CpuReferenceDenseDecoderError::Execution(format!(
                 "hybrid request {} expected position {} but received {position}",
@@ -256,7 +336,7 @@ impl CpuReferenceHybridDecoder {
     }
 }
 
-impl BackendModelExecutor<CpuReferenceKvCache> for CpuReferenceHybridDecoder {
+impl BackendModelExecutor<CpuHybridExecutionResources> for CpuReferenceHybridDecoder {
     fn runtime_capability(&self) -> RuntimeCapability {
         CpuReferenceHybridDecoder::runtime_capability(self)
     }
@@ -268,7 +348,7 @@ impl BackendModelExecutor<CpuReferenceKvCache> for CpuReferenceHybridDecoder {
     fn forward(
         &mut self,
         batch: &ModelWorkerBatch,
-        kv_cache: &mut CpuReferenceKvCache,
+        resources: &mut CpuHybridExecutionResources,
     ) -> Result<ModelForwardOutput, ModelForwardError> {
         validate_batch(batch).map_err(model_forward_error)?;
         let mut logits = Vec::with_capacity(batch.request_ids().len());
@@ -290,7 +370,7 @@ impl BackendModelExecutor<CpuReferenceKvCache> for CpuReferenceHybridDecoder {
             for input_index in input_offset..input_offset + input_count {
                 request_logits = Some(
                     self.forward_token(
-                        kv_cache,
+                        resources,
                         &batch.request_ids()[request_index],
                         batch.input_ids()[input_index],
                         batch.positions()[input_index],
@@ -309,8 +389,12 @@ impl BackendModelExecutor<CpuReferenceKvCache> for CpuReferenceHybridDecoder {
         ModelForwardOutput::new(logits)
     }
 
-    fn complete_request(&mut self, request_id: &RequestId) {
-        self.request_states.remove(request_id.as_str());
+    fn complete_request(
+        &mut self,
+        resources: &mut CpuHybridExecutionResources,
+        request_id: &RequestId,
+    ) {
+        resources.recurrent_state.complete_request(request_id);
     }
 }
 
@@ -1320,70 +1404,20 @@ struct HybridRequestState {
 }
 
 impl HybridRequestState {
-    fn new(
-        layer_count: usize,
-        config: HybridLinearAttentionConfig,
-    ) -> Result<Self, CpuReferenceDenseDecoderError> {
-        let (conv_kernel_dim, key_head_count, value_head_count, key_head_dim, value_head_dim) =
-            match config {
-                HybridLinearAttentionConfig::GatedDeltaNet {
-                    conv_kernel_dim,
-                    key_head_dim,
-                    value_head_dim,
-                    num_key_heads,
-                    num_value_heads,
-                } => (
-                    conv_kernel_dim,
-                    num_key_heads,
-                    num_value_heads,
-                    key_head_dim,
-                    value_head_dim,
-                ),
-                HybridLinearAttentionConfig::KeyGatedDelta {
-                    conv_kernel_dim,
-                    key_head_dim,
-                    value_head_dim,
-                    num_heads,
-                } => (
-                    conv_kernel_dim,
-                    num_heads,
-                    num_heads,
-                    key_head_dim,
-                    value_head_dim,
-                ),
-            };
-        let conv_dim = key_head_count
-            .checked_mul(key_head_dim)
-            .and_then(|size| size.checked_mul(2))
-            .and_then(|size| {
-                value_head_count
-                    .checked_mul(value_head_dim)
-                    .and_then(|value_size| size.checked_add(value_size))
-            })
-            .ok_or_else(|| {
-                CpuReferenceDenseDecoderError::Unsupported(
-                    "hybrid convolution state size overflowed".to_string(),
-                )
-            })?;
-        let conv_state_size = conv_kernel_dim
-            .checked_sub(1)
-            .and_then(|history| history.checked_mul(conv_dim))
-            .ok_or_else(|| {
-                CpuReferenceDenseDecoderError::Unsupported(
-                    "hybrid convolution state size overflowed".to_string(),
-                )
-            })?;
-        let recurrent_state_size = value_head_count
-            .checked_mul(key_head_dim)
-            .and_then(|size| size.checked_mul(value_head_dim))
-            .ok_or_else(|| {
-                CpuReferenceDenseDecoderError::Unsupported(
-                    "hybrid recurrent state size overflowed".to_string(),
-                )
-            })?;
+    fn new(layout: RecurrentStateLayout) -> Result<Self, CpuReferenceDenseDecoderError> {
+        let conv_state_size = layout.conv_elements_per_layer().ok_or_else(|| {
+            CpuReferenceDenseDecoderError::Unsupported(
+                "hybrid convolution state size overflowed".to_string(),
+            )
+        })?;
+        let recurrent_state_size = layout.temporal_elements_per_layer().ok_or_else(|| {
+            CpuReferenceDenseDecoderError::Unsupported(
+                "hybrid recurrent state size overflowed".to_string(),
+            )
+        })?;
         Ok(Self {
             next_position: 0,
-            recurrent_layers: (0..layer_count)
+            recurrent_layers: (0..layout.layer_count)
                 .map(|_| LinearAttentionLayerState {
                     conv: vec![0.0; conv_state_size],
                     recurrent: vec![0.0; recurrent_state_size],
@@ -1427,5 +1461,55 @@ fn softplus(value: f32) -> f32 {
         value
     } else {
         value.exp().ln_1p()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CpuHybridStatePool;
+    use crate::models::RecurrentStateLayout;
+    use crate::types::RequestId;
+
+    fn state_layout() -> RecurrentStateLayout {
+        RecurrentStateLayout {
+            layer_count: 2,
+            conv_kernel_dim: 3,
+            key_head_count: 2,
+            value_head_count: 2,
+            key_head_dim: 4,
+            value_head_dim: 4,
+        }
+    }
+
+    #[test]
+    fn backend_owned_hybrid_state_survives_decode_and_is_released_on_completion() {
+        let mut pool = CpuHybridStatePool::new(state_layout()).expect("valid state pool");
+        let request_id = RequestId::from("hybrid-state-lifecycle");
+
+        let initial = pool
+            .request_state_mut(&request_id, 0)
+            .expect("prefill allocates request state");
+        initial.next_position = 1;
+        initial.recurrent_layers[0].conv[0] = 3.0;
+        initial.recurrent_layers[0].recurrent[0] = 5.0;
+
+        let decode = pool
+            .request_state_mut(&request_id, 1)
+            .expect("decode reuses backend-owned request state");
+        assert_eq!(decode.recurrent_layers[0].conv[0], 3.0);
+        assert_eq!(decode.recurrent_layers[0].recurrent[0], 5.0);
+
+        pool.complete_request(&request_id);
+        let error = pool
+            .request_state_mut(&request_id, 1)
+            .expect_err("completed state must not remain addressable");
+        assert!(error.to_string().contains("has no recurrent state"));
+
+        let reused = pool
+            .request_state_mut(&request_id, 0)
+            .expect("a new request may reuse the identifier after completion");
+        assert_eq!(reused.next_position, 0);
+        assert_eq!(reused.recurrent_layers[0].conv[0], 0.0);
+        assert_eq!(reused.recurrent_layers[0].recurrent[0], 0.0);
     }
 }
