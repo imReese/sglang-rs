@@ -11,6 +11,7 @@ pub mod cublas;
 pub mod cuda;
 pub mod cuda_attention;
 pub mod cuda_bf16_kernels;
+pub mod cuda_hybrid_kernels;
 pub mod cuda_kernels;
 pub mod cuda_kv_kernels;
 pub mod cuda_linear_attention;
