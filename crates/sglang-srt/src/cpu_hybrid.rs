@@ -2,9 +2,10 @@ use std::collections::HashMap;
 
 use nexus_transfer::{KvCacheMemoryProvider, TransferableKvCacheMemory};
 use sglang_kernel::cpu::{
-    GatedDeltaRuleShape, KeyGatedDeltaRuleShape, apply_partial_neox_rope_inplace,
-    causal_depthwise_conv1d_step, gated_delta_rule_step, key_gated_delta_rule_step, rms_norm,
+    GatedDeltaRuleShape, KeyGatedDeltaRuleShape, causal_depthwise_conv1d_step,
+    gated_delta_rule_step, key_gated_delta_rule_step, rms_norm,
 };
+use sglang_kernel::rotary::apply_rotary_embedding_inplace;
 
 use crate::backend::{RuntimeCapability, RuntimeDtype};
 use crate::cache::CachePageId;
@@ -263,6 +264,7 @@ impl CpuReferenceHybridDecoder {
                         head_dim,
                         rotary_dim,
                         output_gate,
+                        rotary_embedding,
                     } = self.plan.full_attention
                     else {
                         return Err(CpuReferenceDenseDecoderError::Execution(
@@ -286,7 +288,7 @@ impl CpuReferenceHybridDecoder {
                                 output_gate,
                             },
                             rms_norm_eps: self.plan.rms_norm_eps,
-                            rope_theta: self.plan.rope_theta,
+                            rotary_embedding,
                             qk_normalization: normalization_kind,
                         },
                     )?
@@ -328,7 +330,6 @@ impl CpuReferenceHybridDecoder {
                         sequence_slots: &sequence_slots[..=position],
                         config: self.plan.full_attention,
                         rms_norm_eps: self.plan.rms_norm_eps,
-                        rope_theta: self.plan.rope_theta,
                     },
                 )?,
                 HybridMixerWeights::KeyGatedDelta {
@@ -927,7 +928,6 @@ struct MultiLatentAttentionForwardContext<'a> {
     sequence_slots: &'a [CachePageId],
     config: HybridFullAttentionConfig,
     rms_norm_eps: f32,
-    rope_theta: f32,
 }
 
 impl MultiLatentAttentionWeights {
@@ -1002,7 +1002,6 @@ impl MultiLatentAttentionWeights {
             sequence_slots,
             config,
             rms_norm_eps,
-            rope_theta,
         } = context;
         let HybridFullAttentionConfig::MultiLatent {
             num_attention_heads,
@@ -1012,6 +1011,7 @@ impl MultiLatentAttentionWeights {
             qk_rope_head_dim,
             value_head_dim,
             skip_rope,
+            rotary_embedding,
         } = config
         else {
             return Err(CpuReferenceDenseDecoderError::Execution(
@@ -1039,24 +1039,24 @@ impl MultiLatentAttentionWeights {
                 .extend_from_slice(&query[offset + qk_nope_head_dim..offset + query_head_dim]);
         }
         if !skip_rope {
-            apply_partial_neox_rope_inplace(
+            apply_rotary_embedding_inplace(
                 &mut query_rope,
                 num_attention_heads,
                 qk_rope_head_dim,
                 qk_rope_head_dim,
                 position,
-                rope_theta,
+                rotary_embedding,
             )
-            .map_err(kernel_error)?;
-            apply_partial_neox_rope_inplace(
+            .map_err(|error| CpuReferenceDenseDecoderError::Execution(error.to_string()))?;
+            apply_rotary_embedding_inplace(
                 &mut rope_key,
                 1,
                 qk_rope_head_dim,
                 qk_rope_head_dim,
                 position,
-                rope_theta,
+                rotary_embedding,
             )
-            .map_err(kernel_error)?;
+            .map_err(|error| CpuReferenceDenseDecoderError::Execution(error.to_string()))?;
         }
         let mut cache_key = latent.clone();
         cache_key.extend_from_slice(&rope_key);
@@ -1065,7 +1065,7 @@ impl MultiLatentAttentionWeights {
         let key_width = kv_lora_rank + qk_rope_head_dim;
         let expanded_head_dim = qk_nope_head_dim + value_head_dim;
         let mut attention = vec![0.0; num_attention_heads * value_head_dim];
-        let scale = (query_head_dim as f32).sqrt().recip();
+        let scale = rotary_embedding.mla_attention_scale((query_head_dim as f32).sqrt().recip());
         for head in 0..num_attention_heads {
             let query_nope_offset = head * qk_nope_head_dim;
             let query_rope_offset = head * qk_rope_head_dim;

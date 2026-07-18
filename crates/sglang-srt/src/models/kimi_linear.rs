@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use serde::Deserialize;
+use sglang_kernel::rotary::{RotaryEmbeddingConfig, RotaryEmbeddingStyle};
 
 use crate::backend::RuntimeDtype;
 use crate::kv_cache::KvCacheModelLayout;
@@ -264,6 +265,15 @@ fn build_definition(hf_config: &HfModelConfig) -> Result<ModelDefinition, ModelA
         "model_max_length",
         config.model_max_length,
     )?;
+    let rotary_embedding =
+        RotaryEmbeddingConfig::standard(rope_theta, RotaryEmbeddingStyle::Interleaved)
+            .and_then(|rotary| {
+                rotary.validate(qk_rope_head_dim)?;
+                Ok(rotary)
+            })
+            .map_err(|error| {
+                ModelAdapterError::invalid(KIMI_LINEAR_ARCHITECTURE, error.to_string())
+            })?;
 
     let linear = config.linear_attn_config.as_ref().ok_or_else(|| {
         ModelAdapterError::missing_field(KIMI_LINEAR_ARCHITECTURE, "linear_attn_config")
@@ -331,7 +341,6 @@ fn build_definition(hf_config: &HfModelConfig) -> Result<ModelDefinition, ModelA
         hidden_size,
         max_position_embeddings,
         rms_norm_eps,
-        rope_theta,
         normalization: DecoderNormalization::Rms,
         full_attention: HybridFullAttentionConfig::MultiLatent {
             num_attention_heads,
@@ -341,6 +350,7 @@ fn build_definition(hf_config: &HfModelConfig) -> Result<ModelDefinition, ModelA
             qk_rope_head_dim,
             value_head_dim,
             skip_rope: true,
+            rotary_embedding,
         },
         linear_attention: Some(HybridLinearAttentionConfig::KeyGatedDelta {
             conv_kernel_dim: linear_conv_kernel_dim,

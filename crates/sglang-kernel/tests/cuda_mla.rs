@@ -28,6 +28,14 @@ fn upload_u64(context: &CudaContext, values: &[u64]) -> CudaDeviceAllocation {
     upload(context, &bytes)
 }
 
+fn upload_f32(context: &CudaContext, values: &[f32]) -> CudaDeviceAllocation {
+    let bytes = values
+        .iter()
+        .flat_map(|value| value.to_ne_bytes())
+        .collect::<Vec<_>>();
+    upload(context, &bytes)
+}
+
 fn upload(context: &CudaContext, bytes: &[u8]) -> CudaDeviceAllocation {
     let mut allocation = context.allocate(bytes.len()).expect("CUDA allocation");
     allocation.copy_from_host(0, bytes).expect("CUDA upload");
@@ -98,6 +106,7 @@ fn cuda_absorbed_mla_primitives_match_reference_geometry() {
         ],
     );
     let positions = upload_u64(&context, &[7]);
+    let rope_inverse_frequencies = upload_f32(&context, &[1.0]);
 
     let query = upload_bf16(&context, &[2.0, 3.0, 4.0, 5.0]);
     let mut prepared_query = zeroed_bf16(&context, 4);
@@ -106,9 +115,11 @@ fn cuda_absorbed_mla_primitives_match_reference_geometry() {
             query: &query,
             kv_b_weight: &kv_b,
             positions: &positions,
+            rope_inverse_frequencies: &rope_inverse_frequencies,
             output: &mut prepared_query,
             shape,
-            rope_theta: 10_000.0,
+            rope_magnitude_scale: 1.0,
+            rope_interleaved: true,
             skip_rope: true,
         })
         .expect("prepare MLA query");
@@ -116,6 +127,30 @@ fn cuda_absorbed_mla_primitives_match_reference_geometry() {
         &download_bf16(&prepared_query, 4),
         &[2.0, 3.0, 4.0, 5.0],
         0.01,
+    );
+    kernels
+        .prepare_query(CudaMlaPrepareQuery {
+            query: &query,
+            kv_b_weight: &kv_b,
+            positions: &positions,
+            rope_inverse_frequencies: &rope_inverse_frequencies,
+            output: &mut prepared_query,
+            shape,
+            rope_magnitude_scale: 0.5,
+            rope_interleaved: true,
+            skip_rope: false,
+        })
+        .expect("prepare interleaved MLA query");
+    let (sine, cosine) = 7.0_f32.sin_cos();
+    assert_close(
+        &download_bf16(&prepared_query, 4),
+        &[
+            2.0,
+            3.0,
+            (4.0 * cosine - 5.0 * sine) * 0.5,
+            (5.0 * cosine + 4.0 * sine) * 0.5,
+        ],
+        0.03,
     );
 
     let compressed = upload_bf16(&context, &[1.0, 1.0, 6.0, 7.0]);
@@ -127,11 +162,13 @@ fn cuda_absorbed_mla_primitives_match_reference_geometry() {
             compressed_kv: &compressed,
             kv_norm_weight: &norm,
             positions: &positions,
+            rope_inverse_frequencies: &rope_inverse_frequencies,
             cache_key: &mut cache_key,
             cache_value: &mut cache_value,
             shape,
             rms_norm_epsilon: 1e-6,
-            rope_theta: 10_000.0,
+            rope_magnitude_scale: 1.0,
+            rope_interleaved: true,
             skip_rope: true,
         })
         .expect("prepare compressed MLA cache");

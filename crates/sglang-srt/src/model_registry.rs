@@ -504,6 +504,7 @@ mod tests {
         MultiLatentQueryWeightNames,
     };
     use serde_json::json;
+    use sglang_kernel::rotary::{RotaryEmbeddingScaling, RotaryEmbeddingStyle};
 
     fn cpu_reference_backend() -> Box<dyn crate::model_runtime::InitializedRuntimeBackend> {
         let placement =
@@ -787,6 +788,14 @@ mod tests {
             Some([16, 8])
         );
         let plan = deepseek.hybrid_decoder().expect("shared component plan");
+        let HybridFullAttentionConfig::MultiLatent {
+            rotary_embedding, ..
+        } = plan.full_attention
+        else {
+            panic!("DeepSeek V3 should use shared MLA")
+        };
+        assert_eq!(rotary_embedding.style(), RotaryEmbeddingStyle::Interleaved);
+        assert_eq!(rotary_embedding.scaling(), RotaryEmbeddingScaling::Default);
         assert!(plan.linear_attention.is_none());
         assert!(plan.weights.layers.iter().all(|layer| matches!(
             layer.mixer,
@@ -860,6 +869,17 @@ mod tests {
         let mut value = kimi_k25_config().raw_document().clone();
         value["text_config"]["hidden_size"] = json!(32);
         value["text_config"]["moe_intermediate_size"] = json!(32);
+        value["text_config"]["max_position_embeddings"] = json!(262_144);
+        value["text_config"]["rope_theta"] = json!(50_000.0);
+        value["text_config"]["rope_scaling"] = json!({
+            "type": "yarn",
+            "factor": 64.0,
+            "original_max_position_embeddings": 4096,
+            "beta_fast": 32.0,
+            "beta_slow": 1.0,
+            "mscale": 1.0,
+            "mscale_all_dim": 1.0
+        });
         value["text_config"]["quantization_config"] = json!({
             "quant_method": "compressed-tensors",
             "format": "pack-quantized",
@@ -907,6 +927,20 @@ mod tests {
             config.routed_expert_weight_format,
             crate::models::RoutedExpertWeightFormat::CompressedTensorsInt4 { group_size: 32 }
         );
+        let HybridFullAttentionConfig::MultiLatent {
+            rotary_embedding, ..
+        } = plan.full_attention
+        else {
+            panic!("Kimi K2.5 should use shared MLA")
+        };
+        assert_eq!(rotary_embedding.style(), RotaryEmbeddingStyle::Interleaved);
+        assert!(matches!(
+            rotary_embedding.scaling(),
+            RotaryEmbeddingScaling::Yarn(scaling)
+                if scaling.factor == 64.0
+                    && scaling.original_max_position_embeddings == 4096
+                    && scaling.apply_attention_scale
+        ));
         assert!(
             definition
                 .checkpoint_topology()
@@ -914,6 +948,27 @@ mod tests {
                 .iter()
                 .any(|tensor| tensor.name().ends_with("experts.0.w1.weight_packed"))
         );
+    }
+
+    #[test]
+    fn kimi_k25_rejects_unknown_rope_scaling_before_backend_initialization() {
+        let mut value = kimi_k25_config().raw_document().clone();
+        value["text_config"]["rope_scaling"] = json!({
+            "type": "linear",
+            "factor": 4.0,
+            "original_max_position_embeddings": 32
+        });
+        let config = HfModelConfig::from_json_value(value).expect("routing config should parse");
+
+        let error = ModelRegistry
+            .definition(Path::new("/models/kimi-k2.5-linear-rope"), &config)
+            .expect_err("unknown MLA RoPE must fail during adapter loading");
+
+        assert!(matches!(
+            error,
+            ModelRegistryError::InvalidAdapterConfig { ref message, .. }
+                if message.contains("supports only rope_scaling type yarn/deepseek_yarn")
+        ));
     }
 
     #[test]
@@ -1022,6 +1077,15 @@ mod tests {
                 .num_layers,
             1
         );
+        let plan = qwen3_5.hybrid_decoder().expect("Qwen3.5 hybrid plan");
+        let HybridFullAttentionConfig::MultiHead {
+            rotary_embedding, ..
+        } = plan.full_attention
+        else {
+            panic!("Qwen3.5 should use shared multi-head attention")
+        };
+        assert_eq!(rotary_embedding.style(), RotaryEmbeddingStyle::Neox);
+        assert_eq!(rotary_embedding.scaling(), RotaryEmbeddingScaling::Default);
         let backend = cpu_reference_backend();
         validate_runtime_support(&qwen3_5, backend.as_ref(), 1)
             .expect("CPU reference backend should execute a shared hybrid decoder plan");

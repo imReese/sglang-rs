@@ -5,6 +5,7 @@ use sglang_kernel::cuda_mla::{
     CudaBf16MlaKernels, CudaBf16MlaShape, CudaMlaExpandOutput, CudaMlaPrepareCache,
     CudaMlaPrepareQuery,
 };
+use sglang_kernel::rotary::{RotaryEmbeddingConfig, RotaryEmbeddingStyle};
 
 use crate::cache::CachePageId;
 use crate::cuda_attention::{
@@ -13,7 +14,7 @@ use crate::cuda_attention::{
 use crate::cuda_kv_cache::CudaKvStorage;
 use crate::cuda_transformer::{
     CudaBf16Matrix, CudaExecutorError, allocate_bf16, checked_product, linear, rms_norm,
-    upload_required_bf16, upload_usize_as_u64,
+    upload_f32_values, upload_required_bf16, upload_usize_as_u64,
 };
 use crate::kv_cache::PagedKvCacheLayout;
 use crate::model_artifacts::LocalModelArtifacts;
@@ -29,6 +30,10 @@ pub(crate) struct CudaBf16MultiLatentAttention {
     kv_a_norm: CudaDeviceAllocation,
     kv_b: CudaBf16Matrix,
     output: CudaBf16Matrix,
+    rope_inverse_frequencies: CudaDeviceAllocation,
+    rope_magnitude_scale: f32,
+    rope_interleaved: bool,
+    attention_scale: f32,
 }
 
 enum CudaBf16MlaQuery {
@@ -116,7 +121,6 @@ pub(crate) struct CudaMultiLatentAttentionForward<'a> {
     pub(crate) kv_layout: PagedKvCacheLayout,
     pub(crate) kv_storage: &'a mut CudaKvStorage,
     pub(crate) rms_norm_epsilon: f32,
-    pub(crate) rope_theta: f32,
 }
 
 impl CudaBf16MultiLatentAttention {
@@ -128,6 +132,11 @@ impl CudaBf16MultiLatentAttention {
         config: HybridFullAttentionConfig,
     ) -> Result<Self, CudaExecutorError> {
         let shape = CudaMultiLatentAttentionShape::new(hidden_size, config)?;
+        let rotary_embedding = multi_latent_rotary_embedding(config)?;
+        let inverse_frequencies = rotary_embedding
+            .inverse_frequencies(shape.qk_rope_head_dim)
+            .map_err(|error| CudaExecutorError::Unsupported(error.to_string()))?;
+        let rope_inverse_frequencies = upload_f32_values(context, &inverse_frequencies)?;
         Ok(Self {
             query: CudaBf16MlaQuery::load(
                 artifacts,
@@ -164,6 +173,11 @@ impl CudaBf16MultiLatentAttention {
                 hidden_size,
                 shape.output_size,
             )?,
+            rope_inverse_frequencies,
+            rope_magnitude_scale: rotary_embedding.magnitude_scale(),
+            rope_interleaved: rotary_embedding.style() == RotaryEmbeddingStyle::Interleaved,
+            attention_scale: rotary_embedding
+                .mla_attention_scale((shape.query_head_dim as f32).sqrt().recip()),
             shape,
         })
     }
@@ -186,7 +200,6 @@ impl CudaBf16MultiLatentAttention {
             kv_layout,
             kv_storage,
             rms_norm_epsilon,
-            rope_theta,
         } = launch;
         if sequence_slots.get(position) != Some(&output_slot) {
             return Err(CudaExecutorError::Shape(format!(
@@ -220,20 +233,24 @@ impl CudaBf16MultiLatentAttention {
             query: &query,
             kv_b_weight: self.kv_b.allocation(),
             positions: &positions,
+            rope_inverse_frequencies: &self.rope_inverse_frequencies,
             output: &mut prepared_query,
             shape: kernel_shape,
-            rope_theta,
+            rope_magnitude_scale: self.rope_magnitude_scale,
+            rope_interleaved: self.rope_interleaved,
             skip_rope: self.shape.skip_rope,
         })?;
         kernels.prepare_cache(CudaMlaPrepareCache {
             compressed_kv: &compressed_kv,
             kv_norm_weight: &self.kv_a_norm,
             positions: &positions,
+            rope_inverse_frequencies: &self.rope_inverse_frequencies,
             cache_key: &mut cache_key,
             cache_value: &mut cache_value,
             shape: kernel_shape,
             rms_norm_epsilon,
-            rope_theta,
+            rope_magnitude_scale: self.rope_magnitude_scale,
+            rope_interleaved: self.rope_interleaved,
             skip_rope: self.shape.skip_rope,
         })?;
         kv_storage.write_tensor_slot_from_device(
@@ -271,7 +288,7 @@ impl CudaBf16MultiLatentAttention {
             queries: &prepared_query,
             queries_offset: 0,
             query_head_count: self.shape.head_count,
-            scale: (self.shape.query_head_dim as f32).sqrt().recip(),
+            scale: self.attention_scale,
             output: &mut latent_attention,
             output_offset: 0,
         })?;
@@ -290,6 +307,19 @@ impl CudaBf16MultiLatentAttention {
             self.shape.output_size,
             &self.output,
         )
+    }
+}
+
+fn multi_latent_rotary_embedding(
+    config: HybridFullAttentionConfig,
+) -> Result<RotaryEmbeddingConfig, CudaExecutorError> {
+    match config {
+        HybridFullAttentionConfig::MultiLatent {
+            rotary_embedding, ..
+        } => Ok(rotary_embedding),
+        HybridFullAttentionConfig::MultiHead { .. } => Err(CudaExecutorError::Unsupported(
+            "CUDA MLA component requires a multi-latent rotary embedding config".to_string(),
+        )),
     }
 }
 
@@ -324,6 +354,7 @@ impl CudaMultiLatentAttentionShape {
             qk_rope_head_dim,
             value_head_dim,
             skip_rope,
+            rotary_embedding: _,
         } = config
         else {
             return Err(CudaExecutorError::Unsupported(
@@ -401,6 +432,11 @@ mod tests {
                 qk_rope_head_dim: 4,
                 value_head_dim: 5,
                 skip_rope: false,
+                rotary_embedding: RotaryEmbeddingConfig::standard(
+                    10_000.0,
+                    RotaryEmbeddingStyle::Interleaved,
+                )
+                .expect("test RoPE should be valid"),
             },
         )
         .expect("valid MLA shape");

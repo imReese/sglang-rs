@@ -431,7 +431,7 @@ pub(crate) fn read_required_f32_values(
     Ok(tensor.decode_f32_values()?)
 }
 
-fn upload_f32_values(
+pub(crate) fn upload_f32_values(
     context: &CudaContext,
     values: &[f32],
 ) -> Result<CudaDeviceAllocation, CudaExecutorError> {

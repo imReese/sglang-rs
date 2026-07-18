@@ -9,6 +9,8 @@ mod qwen3_5;
 use std::fmt;
 use std::path::Path;
 
+use sglang_kernel::rotary::RotaryEmbeddingConfig;
+
 use crate::backend::{RuntimeDtype, RuntimeRequirements};
 use crate::kv_cache::KvCacheModelLayout;
 use crate::model_artifacts::{
@@ -298,7 +300,7 @@ pub(crate) enum MultiLatentQueryConfig {
     LowRank { rank: usize },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum HybridFullAttentionConfig {
     MultiHead {
         num_attention_heads: usize,
@@ -306,6 +308,7 @@ pub(crate) enum HybridFullAttentionConfig {
         head_dim: usize,
         rotary_dim: usize,
         output_gate: bool,
+        rotary_embedding: RotaryEmbeddingConfig,
     },
     MultiLatent {
         num_attention_heads: usize,
@@ -315,6 +318,7 @@ pub(crate) enum HybridFullAttentionConfig {
         qk_rope_head_dim: usize,
         value_head_dim: usize,
         skip_rope: bool,
+        rotary_embedding: RotaryEmbeddingConfig,
     },
 }
 
@@ -432,7 +436,6 @@ pub(crate) struct HybridDecoderExecutionPlan {
     pub(crate) hidden_size: usize,
     pub(crate) max_position_embeddings: usize,
     pub(crate) rms_norm_eps: f32,
-    pub(crate) rope_theta: f32,
     pub(crate) normalization: DecoderNormalization,
     pub(crate) full_attention: HybridFullAttentionConfig,
     pub(crate) linear_attention: Option<HybridLinearAttentionConfig>,

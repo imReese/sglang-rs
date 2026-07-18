@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use serde::Deserialize;
+use sglang_kernel::rotary::{RotaryEmbeddingConfig, RotaryEmbeddingStyle, YarnScalingConfig};
 
 use crate::backend::RuntimeDtype;
 use crate::kv_cache::KvCacheModelLayout;
@@ -56,11 +57,55 @@ pub(super) struct MlaMoeConfig {
     pub(super) rms_norm_eps: Option<f64>,
     pub(super) rope_theta: Option<f64>,
     pub(super) rope_scaling: Option<serde_json::Value>,
+    pub(super) rope_interleave: Option<bool>,
     pub(super) hidden_act: Option<String>,
     pub(super) tie_word_embeddings: Option<bool>,
     pub(super) attention_bias: Option<bool>,
     pub(super) num_nextn_predict_layers: Option<usize>,
     pub(super) quantization_config: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeepSeekYarnConfig {
+    #[serde(rename = "type")]
+    rope_type_alias: Option<String>,
+    rope_type: Option<String>,
+    factor: f64,
+    original_max_position_embeddings: usize,
+    #[serde(default = "default_yarn_beta_fast")]
+    beta_fast: f64,
+    #[serde(default = "default_yarn_beta_slow")]
+    beta_slow: f64,
+    #[serde(default = "default_one")]
+    extrapolation_factor: f64,
+    #[serde(default = "default_one")]
+    attn_factor: f64,
+    #[serde(default = "default_one")]
+    mscale: f64,
+    #[serde(default)]
+    mscale_all_dim: f64,
+    #[serde(default = "default_true")]
+    apply_yarn_scaling: bool,
+    #[serde(default = "default_true")]
+    apply_scale: bool,
+    truncate: Option<bool>,
+}
+
+fn default_yarn_beta_fast() -> f64 {
+    32.0
+}
+
+fn default_yarn_beta_slow() -> f64 {
+    1.0
+}
+
+fn default_one() -> f64 {
+    1.0
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl MlaMoeConfig {
@@ -260,6 +305,13 @@ pub(super) fn build_deepseek_v3_definition_for_adapter(
         "max_position_embeddings",
         config.max_position_embeddings,
     )?;
+    let rotary_embedding = deepseek_rotary_embedding(
+        architecture,
+        &config,
+        rope_theta,
+        qk_rope_head_dim,
+        max_position_embeddings,
+    )?;
     let shared_expert_count = config.n_shared_experts.unwrap_or(0);
     let moe_config = MoeFeedForwardConfig {
         routed_expert_count,
@@ -290,7 +342,6 @@ pub(super) fn build_deepseek_v3_definition_for_adapter(
         hidden_size,
         max_position_embeddings,
         rms_norm_eps,
-        rope_theta,
         normalization: DecoderNormalization::Rms,
         full_attention: HybridFullAttentionConfig::MultiLatent {
             num_attention_heads,
@@ -300,6 +351,7 @@ pub(super) fn build_deepseek_v3_definition_for_adapter(
             qk_rope_head_dim,
             value_head_dim,
             skip_rope: false,
+            rotary_embedding,
         },
         linear_attention: None,
         activation: DenseDecoderActivation::Silu,
@@ -359,16 +411,6 @@ fn reject_unsupported_deepseek_v3_features(
             "attention_bias=true is not implemented by the shared MLA component",
         ));
     }
-    if config
-        .rope_scaling
-        .as_ref()
-        .is_some_and(|value| !value.is_null())
-    {
-        return Err(ModelAdapterError::invalid(
-            architecture,
-            "rope_scaling/YaRN is not implemented by the shared MLA component",
-        ));
-    }
     let has_quantization = config
         .quantization_config
         .as_ref()
@@ -396,6 +438,114 @@ fn reject_unsupported_deepseek_v3_features(
         ));
     }
     Ok(())
+}
+
+fn deepseek_rotary_embedding(
+    architecture: &'static str,
+    config: &MlaMoeConfig,
+    theta: f32,
+    rotary_dim: usize,
+    max_position_embeddings: usize,
+) -> Result<RotaryEmbeddingConfig, ModelAdapterError> {
+    let style = if config.rope_interleave.unwrap_or(true) {
+        RotaryEmbeddingStyle::Interleaved
+    } else {
+        RotaryEmbeddingStyle::Neox
+    };
+    let Some(value) = config
+        .rope_scaling
+        .as_ref()
+        .filter(|value| !value.is_null())
+    else {
+        return RotaryEmbeddingConfig::standard(theta, style)
+            .and_then(|rotary| {
+                rotary.validate(rotary_dim)?;
+                Ok(rotary)
+            })
+            .map_err(|error| ModelAdapterError::invalid(architecture, error.to_string()));
+    };
+    let yarn: DeepSeekYarnConfig =
+        serde_path_to_error::deserialize(value.clone()).map_err(|error| {
+            ModelAdapterError::invalid(
+                architecture,
+                format!("invalid shared MLA YaRN config: {error}"),
+            )
+        })?;
+    let rope_types = [yarn.rope_type_alias.as_deref(), yarn.rope_type.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if rope_types.is_empty()
+        || rope_types
+            .iter()
+            .any(|rope_type| !matches!(*rope_type, "yarn" | "deepseek_yarn"))
+    {
+        return Err(ModelAdapterError::invalid(
+            architecture,
+            "shared MLA supports only rope_scaling type yarn/deepseek_yarn",
+        ));
+    }
+    if yarn.truncate == Some(false) {
+        return Err(ModelAdapterError::invalid(
+            architecture,
+            "shared MLA YaRN requires truncate=true to match community DeepSeek execution",
+        ));
+    }
+    let scaled_limit = yarn.original_max_position_embeddings as f64 * yarn.factor;
+    if !scaled_limit.is_finite() || max_position_embeddings as f64 > scaled_limit {
+        return Err(ModelAdapterError::invalid(
+            architecture,
+            format!(
+                "max_position_embeddings {max_position_embeddings} exceeds YaRN scaled limit {scaled_limit}"
+            ),
+        ));
+    }
+    let rotary = RotaryEmbeddingConfig::yarn(
+        theta,
+        style,
+        YarnScalingConfig {
+            factor: checked_f32(architecture, "rope_scaling.factor", yarn.factor)?,
+            original_max_position_embeddings: yarn.original_max_position_embeddings,
+            beta_fast: checked_f32(architecture, "rope_scaling.beta_fast", yarn.beta_fast)?,
+            beta_slow: checked_f32(architecture, "rope_scaling.beta_slow", yarn.beta_slow)?,
+            extrapolation_factor: checked_f32(
+                architecture,
+                "rope_scaling.extrapolation_factor",
+                yarn.extrapolation_factor,
+            )?,
+            attention_factor: checked_f32(
+                architecture,
+                "rope_scaling.attn_factor",
+                yarn.attn_factor,
+            )?,
+            mscale: checked_f32(architecture, "rope_scaling.mscale", yarn.mscale)?,
+            mscale_all_dim: checked_f32(
+                architecture,
+                "rope_scaling.mscale_all_dim",
+                yarn.mscale_all_dim,
+            )?,
+            apply_attention_scale: yarn.apply_yarn_scaling && yarn.apply_scale,
+        },
+    )
+    .map_err(|error| ModelAdapterError::invalid(architecture, error.to_string()))?;
+    rotary
+        .validate(rotary_dim)
+        .map_err(|error| ModelAdapterError::invalid(architecture, error.to_string()))?;
+    Ok(rotary)
+}
+
+fn checked_f32(
+    architecture: &'static str,
+    field: &'static str,
+    value: f64,
+) -> Result<f32, ModelAdapterError> {
+    if !value.is_finite() || value < f32::MIN as f64 || value > f32::MAX as f64 {
+        return Err(ModelAdapterError::invalid(
+            architecture,
+            format!("{field} must be finite and representable as f32"),
+        ));
+    }
+    Ok(value as f32)
 }
 
 #[derive(Clone, Copy)]

@@ -360,7 +360,6 @@ impl CudaBf16HybridDecoder {
                                 kv_layout,
                                 kv_storage: active_kv_cache.storage_mut(),
                                 rms_norm_epsilon: self.plan.rms_norm_eps,
-                                rope_theta: self.plan.rope_theta,
                             })?
                         }
                     };

@@ -11,18 +11,11 @@ const CUDA_MLA_SOURCE: &str = r#"
 #include <cuda_bf16.h>
 #include <math.h>
 
-__device__ float sglang_rope_frequency(
-    unsigned int pair_index,
-    unsigned int rotary_dim,
-    float theta) {
-  return powf(theta, -2.0f * static_cast<float>(pair_index) /
-                          static_cast<float>(rotary_dim));
-}
-
 extern "C" __global__ void sglang_mla_prepare_query_bf16(
     const __nv_bfloat16* query,
     const __nv_bfloat16* kv_b_weight,
     const unsigned long long* positions,
+    const float* rope_inverse_frequencies,
     __nv_bfloat16* prepared_query,
     unsigned long long row_count,
     unsigned int head_count,
@@ -30,7 +23,8 @@ extern "C" __global__ void sglang_mla_prepare_query_bf16(
     unsigned int qk_nope_head_dim,
     unsigned int qk_rope_head_dim,
     unsigned int value_head_dim,
-    float rope_theta,
+    float rope_magnitude_scale,
+    unsigned int rope_interleaved,
     unsigned int skip_rope) {
   const unsigned long long row = blockIdx.x;
   const unsigned int head = blockIdx.y;
@@ -61,23 +55,26 @@ extern "C" __global__ void sglang_mla_prepare_query_bf16(
 
   const unsigned int half_rope = qk_rope_head_dim / 2;
   for (unsigned int pair = threadIdx.x; pair < half_rope; pair += blockDim.x) {
+    const unsigned int first_rope = rope_interleaved ? pair * 2 : pair;
+    const unsigned int second_rope =
+        rope_interleaved ? pair * 2 + 1 : half_rope + pair;
     const float first = __bfloat162float(
-        query[query_offset + qk_nope_head_dim + pair]);
+        query[query_offset + qk_nope_head_dim + first_rope]);
     const float second = __bfloat162float(
-        query[query_offset + qk_nope_head_dim + half_rope + pair]);
+        query[query_offset + qk_nope_head_dim + second_rope]);
     float output_first = first;
     float output_second = second;
     if (!skip_rope) {
       const float angle = static_cast<float>(positions[row]) *
-                          sglang_rope_frequency(pair, qk_rope_head_dim, rope_theta);
+                          rope_inverse_frequencies[pair];
       const float cosine = cosf(angle);
       const float sine = sinf(angle);
-      output_first = first * cosine - second * sine;
-      output_second = second * cosine + first * sine;
+      output_first = (first * cosine - second * sine) * rope_magnitude_scale;
+      output_second = (second * cosine + first * sine) * rope_magnitude_scale;
     }
-    prepared_query[prepared_offset + kv_lora_rank + pair] =
+    prepared_query[prepared_offset + kv_lora_rank + first_rope] =
         __float2bfloat16_rn(output_first);
-    prepared_query[prepared_offset + kv_lora_rank + half_rope + pair] =
+    prepared_query[prepared_offset + kv_lora_rank + second_rope] =
         __float2bfloat16_rn(output_second);
   }
 }
@@ -86,13 +83,15 @@ extern "C" __global__ void sglang_mla_prepare_cache_bf16(
     const __nv_bfloat16* compressed_kv,
     const __nv_bfloat16* kv_norm_weight,
     const unsigned long long* positions,
+    const float* rope_inverse_frequencies,
     __nv_bfloat16* cache_key,
     __nv_bfloat16* cache_value,
     unsigned long long row_count,
     unsigned int kv_lora_rank,
     unsigned int qk_rope_head_dim,
     float rms_norm_epsilon,
-    float rope_theta,
+    float rope_magnitude_scale,
+    unsigned int rope_interleaved,
     unsigned int skip_rope) {
   const unsigned long long row = blockIdx.x;
   if (row >= row_count) {
@@ -130,23 +129,26 @@ extern "C" __global__ void sglang_mla_prepare_cache_bf16(
 
   const unsigned int half_rope = qk_rope_head_dim / 2;
   for (unsigned int pair = threadIdx.x; pair < half_rope; pair += blockDim.x) {
+    const unsigned int first_rope = rope_interleaved ? pair * 2 : pair;
+    const unsigned int second_rope =
+        rope_interleaved ? pair * 2 + 1 : half_rope + pair;
     const float first = __bfloat162float(
-        compressed_kv[input_offset + kv_lora_rank + pair]);
+        compressed_kv[input_offset + kv_lora_rank + first_rope]);
     const float second = __bfloat162float(
-        compressed_kv[input_offset + kv_lora_rank + half_rope + pair]);
+        compressed_kv[input_offset + kv_lora_rank + second_rope]);
     float output_first = first;
     float output_second = second;
     if (!skip_rope) {
       const float angle = static_cast<float>(positions[row]) *
-                          sglang_rope_frequency(pair, qk_rope_head_dim, rope_theta);
+                          rope_inverse_frequencies[pair];
       const float cosine = cosf(angle);
       const float sine = sinf(angle);
-      output_first = first * cosine - second * sine;
-      output_second = second * cosine + first * sine;
+      output_first = (first * cosine - second * sine) * rope_magnitude_scale;
+      output_second = (second * cosine + first * sine) * rope_magnitude_scale;
     }
-    cache_key[input_offset + kv_lora_rank + pair] =
+    cache_key[input_offset + kv_lora_rank + first_rope] =
         __float2bfloat16_rn(output_first);
-    cache_key[input_offset + kv_lora_rank + half_rope + pair] =
+    cache_key[input_offset + kv_lora_rank + second_rope] =
         __float2bfloat16_rn(output_second);
   }
 }
@@ -189,6 +191,7 @@ extern "C" __global__ void sglang_mla_expand_output_bf16(
 
 const CUDA_BLOCK_SIZE: u32 = 256;
 const BF16_BYTES: usize = 2;
+const F32_BYTES: usize = 4;
 const U64_BYTES: usize = 8;
 const MINIMUM_BF16_COMPUTE_CAPABILITY: CudaComputeCapability = CudaComputeCapability::new(8, 0);
 
@@ -334,9 +337,11 @@ pub struct CudaMlaPrepareQuery<'a> {
     pub query: &'a CudaDeviceAllocation,
     pub kv_b_weight: &'a CudaDeviceAllocation,
     pub positions: &'a CudaDeviceAllocation,
+    pub rope_inverse_frequencies: &'a CudaDeviceAllocation,
     pub output: &'a mut CudaDeviceAllocation,
     pub shape: CudaBf16MlaShape,
-    pub rope_theta: f32,
+    pub rope_magnitude_scale: f32,
+    pub rope_interleaved: bool,
     pub skip_rope: bool,
 }
 
@@ -344,11 +349,13 @@ pub struct CudaMlaPrepareCache<'a> {
     pub compressed_kv: &'a CudaDeviceAllocation,
     pub kv_norm_weight: &'a CudaDeviceAllocation,
     pub positions: &'a CudaDeviceAllocation,
+    pub rope_inverse_frequencies: &'a CudaDeviceAllocation,
     pub cache_key: &'a mut CudaDeviceAllocation,
     pub cache_value: &'a mut CudaDeviceAllocation,
     pub shape: CudaBf16MlaShape,
     pub rms_norm_epsilon: f32,
-    pub rope_theta: f32,
+    pub rope_magnitude_scale: f32,
+    pub rope_interleaved: bool,
     pub skip_rope: bool,
 }
 
@@ -390,17 +397,20 @@ impl CudaBf16MlaKernels {
             query,
             kv_b_weight,
             positions,
+            rope_inverse_frequencies,
             output,
             shape,
-            rope_theta,
+            rope_magnitude_scale,
+            rope_interleaved,
             skip_rope,
         } = launch;
         let shape = shape.validate()?;
-        validate_positive("rope_theta", rope_theta)?;
+        validate_positive("rope_magnitude_scale", rope_magnitude_scale)?;
         self.validate_devices(&[
             ("query", query),
             ("kv_b_weight", kv_b_weight),
             ("positions", positions),
+            ("rope_inverse_frequencies", rope_inverse_frequencies),
             ("output", output),
         ])?;
         let mut query_ptr = query.device_ptr_at(
@@ -421,6 +431,8 @@ impl CudaBf16MlaKernels {
         )?;
         let mut positions_ptr =
             positions.device_ptr_at(0, checked_product(shape.row_count, U64_BYTES)?)?;
+        let mut rope_inverse_frequencies_ptr = rope_inverse_frequencies
+            .device_ptr_at(0, checked_product(shape.qk_rope_head_dim / 2, F32_BYTES)?)?;
         let mut output_ptr = output.device_ptr_at(
             0,
             bf16_bytes(product3(
@@ -430,12 +442,14 @@ impl CudaBf16MlaKernels {
             )?)?,
         )?;
         let mut values = KernelShapeValues::new(shape)?;
-        let mut rope_theta_value = rope_theta;
+        let mut rope_magnitude_scale_value = rope_magnitude_scale;
+        let mut rope_interleaved_value = u32::from(rope_interleaved);
         let mut skip_rope_value = u32::from(skip_rope);
         let mut arguments = [
             pointer(&mut query_ptr),
             pointer(&mut weight_ptr),
             pointer(&mut positions_ptr),
+            pointer(&mut rope_inverse_frequencies_ptr),
             pointer(&mut output_ptr),
             pointer(&mut values.row_count),
             pointer(&mut values.head_count),
@@ -443,7 +457,8 @@ impl CudaBf16MlaKernels {
             pointer(&mut values.qk_nope_head_dim),
             pointer(&mut values.qk_rope_head_dim),
             pointer(&mut values.value_head_dim),
-            pointer(&mut rope_theta_value),
+            pointer(&mut rope_magnitude_scale_value),
+            pointer(&mut rope_interleaved_value),
             pointer(&mut skip_rope_value),
         ];
         self.launch_2d(&self.prepare_query, shape, 0, &mut arguments)
@@ -454,20 +469,23 @@ impl CudaBf16MlaKernels {
             compressed_kv,
             kv_norm_weight,
             positions,
+            rope_inverse_frequencies,
             cache_key,
             cache_value,
             shape,
             rms_norm_epsilon,
-            rope_theta,
+            rope_magnitude_scale,
+            rope_interleaved,
             skip_rope,
         } = launch;
         let shape = shape.validate()?;
         validate_positive("rms_norm_epsilon", rms_norm_epsilon)?;
-        validate_positive("rope_theta", rope_theta)?;
+        validate_positive("rope_magnitude_scale", rope_magnitude_scale)?;
         self.validate_devices(&[
             ("compressed_kv", compressed_kv),
             ("kv_norm_weight", kv_norm_weight),
             ("positions", positions),
+            ("rope_inverse_frequencies", rope_inverse_frequencies),
             ("cache_key", cache_key),
             ("cache_value", cache_value),
         ])?;
@@ -478,25 +496,30 @@ impl CudaBf16MlaKernels {
         let mut norm_ptr = kv_norm_weight.device_ptr_at(0, bf16_bytes(shape.kv_lora_rank)?)?;
         let mut positions_ptr =
             positions.device_ptr_at(0, checked_product(shape.row_count, U64_BYTES)?)?;
+        let mut rope_inverse_frequencies_ptr = rope_inverse_frequencies
+            .device_ptr_at(0, checked_product(shape.qk_rope_head_dim / 2, F32_BYTES)?)?;
         let mut cache_key_ptr = cache_key.device_ptr_at(0, bf16_bytes(compressed_elements)?)?;
         let mut cache_value_ptr = cache_value.device_ptr_at(0, bf16_bytes(latent_elements)?)?;
         let mut row_count = dimension_u64("row_count", shape.row_count)?;
         let mut kv_lora_rank = dimension_u32("kv_lora_rank", shape.kv_lora_rank)?;
         let mut qk_rope_head_dim = dimension_u32("qk_rope_head_dim", shape.qk_rope_head_dim)?;
         let mut epsilon_value = rms_norm_epsilon;
-        let mut rope_theta_value = rope_theta;
+        let mut rope_magnitude_scale_value = rope_magnitude_scale;
+        let mut rope_interleaved_value = u32::from(rope_interleaved);
         let mut skip_rope_value = u32::from(skip_rope);
         let mut arguments = [
             pointer(&mut compressed_ptr),
             pointer(&mut norm_ptr),
             pointer(&mut positions_ptr),
+            pointer(&mut rope_inverse_frequencies_ptr),
             pointer(&mut cache_key_ptr),
             pointer(&mut cache_value_ptr),
             pointer(&mut row_count),
             pointer(&mut kv_lora_rank),
             pointer(&mut qk_rope_head_dim),
             pointer(&mut epsilon_value),
-            pointer(&mut rope_theta_value),
+            pointer(&mut rope_magnitude_scale_value),
+            pointer(&mut rope_interleaved_value),
             pointer(&mut skip_rope_value),
         ];
         unsafe {
@@ -717,5 +740,8 @@ mod tests {
         }
         assert!(CUDA_MLA_SOURCE.contains("kv_lora_rank"));
         assert!(CUDA_MLA_SOURCE.contains("rsqrtf"));
+        assert!(CUDA_MLA_SOURCE.contains("rope_inverse_frequencies"));
+        assert!(CUDA_MLA_SOURCE.contains("rope_interleaved ? pair * 2"));
+        assert!(CUDA_MLA_SOURCE.contains("rope_magnitude_scale"));
     }
 }

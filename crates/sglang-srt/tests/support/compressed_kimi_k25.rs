@@ -182,7 +182,7 @@ const CONFIG: &str = r#"{
     "architectures": ["DeepseekV3ForCausalLM"],
     "model_type": "kimi_k2",
     "vocab_size": 3,
-    "max_position_embeddings": 32,
+    "max_position_embeddings": 128,
     "num_hidden_layers": 2,
     "hidden_size": 32,
     "intermediate_size": 2,
@@ -190,7 +190,12 @@ const CONFIG: &str = r#"{
     "hidden_act": "silu",
     "rms_norm_eps": 0.00001,
     "rope_theta": 10000.0,
-    "rope_scaling": null,
+    "rope_scaling": {
+      "type": "yarn", "factor": 4.0,
+      "original_max_position_embeddings": 32,
+      "beta_fast": 32.0, "beta_slow": 1.0,
+      "mscale": 1.0, "mscale_all_dim": 1.0
+    },
     "attention_bias": false,
     "tie_word_embeddings": false,
     "q_lora_rank": 2,

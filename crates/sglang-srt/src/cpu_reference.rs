@@ -2,8 +2,11 @@ use std::collections::HashMap;
 use std::fmt;
 
 use sglang_kernel::cpu::{
-    GroupedQueryAttentionShape, apply_partial_neox_rope_inplace, gemma_rms_norm,
-    grouped_query_attention, linear, rms_norm, silu_and_mul,
+    GroupedQueryAttentionShape, gemma_rms_norm, grouped_query_attention, linear, rms_norm,
+    silu_and_mul,
+};
+use sglang_kernel::rotary::{
+    RotaryEmbeddingConfig, RotaryEmbeddingStyle, apply_rotary_embedding_inplace,
 };
 
 use crate::backend::{RuntimeCapability, RuntimeDtype};
@@ -139,6 +142,13 @@ impl CpuReferenceDenseDecoder {
         }
 
         let mut hidden = self.token_embeddings.row(token_id)?;
+        let rotary_embedding =
+            RotaryEmbeddingConfig::standard(self.plan.rope_theta, RotaryEmbeddingStyle::Neox)
+                .and_then(|rotary| {
+                    rotary.validate(self.head_dim)?;
+                    Ok(rotary)
+                })
+                .map_err(|error| CpuReferenceDenseDecoderError::Execution(error.to_string()))?;
         for layer_index in 0..self.layers.len() {
             hidden = forward_layer(
                 &self.layers[layer_index],
@@ -157,7 +167,7 @@ impl CpuReferenceDenseDecoder {
                         head_dim: self.head_dim,
                     },
                     rms_norm_eps: self.plan.rms_norm_eps,
-                    rope_theta: self.plan.rope_theta,
+                    rotary_embedding,
                     activation: self.plan.activation,
                 },
             )?;
@@ -240,7 +250,7 @@ struct DenseDecoderForwardContext<'a> {
     sequence_slots: &'a [CachePageId],
     shape: DenseDecoderShape,
     rms_norm_eps: f32,
-    rope_theta: f32,
+    rotary_embedding: RotaryEmbeddingConfig,
     activation: DenseDecoderActivation,
 }
 
@@ -257,7 +267,7 @@ fn forward_layer(
         sequence_slots,
         shape,
         rms_norm_eps,
-        rope_theta,
+        rotary_embedding,
         activation,
     } = context;
     let normalized = rms_norm(
@@ -285,7 +295,7 @@ fn forward_layer(
                 output_gate: false,
             },
             rms_norm_eps,
-            rope_theta,
+            rotary_embedding,
             qk_normalization: CpuNormalization::Standard,
         },
     )?;
@@ -364,7 +374,7 @@ pub(crate) struct FullAttentionForwardContext<'a> {
     pub(crate) sequence_slots: &'a [CachePageId],
     pub(crate) shape: FullAttentionShape,
     pub(crate) rms_norm_eps: f32,
-    pub(crate) rope_theta: f32,
+    pub(crate) rotary_embedding: RotaryEmbeddingConfig,
     pub(crate) qk_normalization: CpuNormalization,
 }
 
@@ -442,7 +452,7 @@ pub(crate) fn forward_full_attention(
         sequence_slots,
         shape,
         rms_norm_eps,
-        rope_theta,
+        rotary_embedding,
         qk_normalization,
     } = context;
     let projected_query = weights.query.project(hidden, 1)?;
@@ -494,24 +504,24 @@ pub(crate) fn forward_full_attention(
             qk_normalization,
         )?;
     }
-    apply_partial_neox_rope_inplace(
+    apply_rotary_embedding_inplace(
         &mut query,
         shape.query_head_count,
         shape.head_dim,
         shape.rotary_dim,
         position,
-        rope_theta,
+        rotary_embedding,
     )
-    .map_err(kernel_error)?;
-    apply_partial_neox_rope_inplace(
+    .map_err(|error| CpuReferenceDenseDecoderError::Execution(error.to_string()))?;
+    apply_rotary_embedding_inplace(
         &mut key,
         shape.kv_head_count,
         shape.head_dim,
         shape.rotary_dim,
         position,
-        rope_theta,
+        rotary_embedding,
     )
-    .map_err(kernel_error)?;
+    .map_err(|error| CpuReferenceDenseDecoderError::Execution(error.to_string()))?;
     kv_cache.write(cache_layer_index, output_slot, key, value)?;
     let (keys, values) = kv_cache.gather(cache_layer_index, sequence_slots)?;
     let mut attention = grouped_query_attention(

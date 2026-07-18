@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use serde::Deserialize;
+use sglang_kernel::rotary::{RotaryEmbeddingConfig, RotaryEmbeddingStyle};
 
 use crate::backend::RuntimeDtype;
 use crate::kv_cache::KvCacheModelLayout;
@@ -229,6 +230,13 @@ fn build_definition(hf_config: &HfModelConfig) -> Result<ModelDefinition, ModelA
             ),
         ));
     }
+    let rotary_embedding =
+        RotaryEmbeddingConfig::standard(rope_theta as f32, RotaryEmbeddingStyle::Neox)
+            .and_then(|rotary| {
+                rotary.validate(rotary_dim)?;
+                Ok(rotary)
+            })
+            .map_err(|error| ModelAdapterError::invalid(QWEN3_5_ARCHITECTURE, error.to_string()))?;
 
     let layer_types = resolve_layer_types(&config, num_layers)?;
     let full_attention_layer_count = layer_types
@@ -272,7 +280,6 @@ fn build_definition(hf_config: &HfModelConfig) -> Result<ModelDefinition, ModelA
         hidden_size,
         max_position_embeddings,
         rms_norm_eps,
-        rope_theta: rope_theta as f32,
         normalization: DecoderNormalization::GemmaRms,
         full_attention: HybridFullAttentionConfig::MultiHead {
             num_attention_heads,
@@ -280,6 +287,7 @@ fn build_definition(hf_config: &HfModelConfig) -> Result<ModelDefinition, ModelA
             head_dim: attention_head_dim,
             rotary_dim,
             output_gate: config.attn_output_gate.unwrap_or(true),
+            rotary_embedding,
         },
         linear_attention: Some(HybridLinearAttentionConfig::GatedDeltaNet {
             conv_kernel_dim: linear_conv_kernel_dim,
