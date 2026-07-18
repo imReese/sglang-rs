@@ -79,6 +79,12 @@ jobs:
           cargo test -p sglang-srt --locked --test cuda_backend --
           --ignored --nocapture --test-threads=1
 
+      - name: Run CUDA recurrent-state resource acceptance
+        run: >-
+          cargo test -p sglang-srt --locked --lib
+          cuda_recurrent_state::tests::cuda_recurrent_state_reuses_and_clears_request_slots --
+          --ignored --nocapture --test-threads=1
+
       - name: Run CUDA linear-attention state acceptance
         run: >-
           cargo test -p sglang-kernel --locked --test cuda_linear_attention --

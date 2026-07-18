@@ -4,6 +4,7 @@ use crate::backend::{
 use crate::cpu_hybrid::{CpuHybridExecutionResources, CpuReferenceHybridDecoder};
 use crate::cpu_reference::{CpuReferenceDenseDecoder, CpuReferenceKvCache};
 use crate::cuda_dense_decoder::CudaBf16DenseDecoder;
+use crate::cuda_execution_resources::CudaExecutionResources;
 use crate::cuda_kv_cache::allocate_cuda_kv_cache;
 use crate::kv_cache::{KvCacheDtype, KvCacheRuntimeLayout, PagedKvCacheLayout};
 use crate::model_artifacts::LocalModelArtifacts;
@@ -273,9 +274,8 @@ fn create_cuda_model_runtime(
             )?;
             let executor = CudaBf16DenseDecoder::load(definition, artifacts, backend)
                 .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?;
-            Ok(Box::new(BackendExecutionBundle::from_kv_cache(
-                executor, kv_cache,
-            )))
+            let resources = CudaExecutionResources::new(kv_cache, None);
+            Ok(Box::new(BackendExecutionBundle::new(executor, resources)))
         }
         ModelExecutionArchitecture::Transformer {
             attention,

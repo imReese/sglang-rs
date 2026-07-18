@@ -872,6 +872,26 @@ impl CudaDeviceAllocation {
         })
     }
 
+    pub fn fill_range(
+        &mut self,
+        offset: usize,
+        byte_len: usize,
+        value: u8,
+    ) -> Result<(), CudaError> {
+        let device_ptr = self.device_ptr_at(offset, byte_len)?;
+        if byte_len == 0 {
+            return Ok(());
+        }
+        self.context.with_current(|| {
+            self.context.inner.driver.check(
+                unsafe {
+                    (self.context.inner.driver.inner.api.memset_d8)(device_ptr, value, byte_len)
+                },
+                "cuMemsetD8_v2",
+            )
+        })
+    }
+
     pub fn device_ptr_at(&self, offset: usize, byte_len: usize) -> Result<CuDevicePtr, CudaError> {
         if !self.active {
             return Err(CudaError::FreedAllocation);
@@ -1213,6 +1233,30 @@ mod tests {
                 .copy_to_host(0, &mut output)
                 .expect_err("freed allocation must reject access"),
             CudaError::FreedAllocation
+        );
+    }
+
+    #[test]
+    fn allocation_range_fill_rejects_out_of_bounds_before_cuda() {
+        let _test_guard = CUDA_TEST_LOCK
+            .lock()
+            .expect("CUDA test lock should be held");
+        EVENTS.lock().expect("events lock should be held").clear();
+        let driver = fake_driver();
+        let context = driver
+            .retain_primary_context(0)
+            .expect("fake context should retain");
+        let mut allocation = context.allocate(16).expect("allocation should succeed");
+
+        assert_eq!(
+            allocation
+                .fill_range(12, 5, 0)
+                .expect_err("out-of-bounds range fill must fail"),
+            CudaError::AllocationOutOfBounds {
+                offset: 12,
+                byte_len: 5,
+                allocation_byte_len: 16,
+            }
         );
     }
 

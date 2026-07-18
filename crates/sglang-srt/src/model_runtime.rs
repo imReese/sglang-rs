@@ -17,6 +17,7 @@ pub(crate) trait BackendExecutionResources:
     KvCacheMemoryProvider<Error = KvCacheTransferError> + RuntimeKvCacheMetadata + fmt::Debug + Send
 {
     fn runtime_backend(&self) -> RuntimeBackend;
+    fn complete_request(&mut self, request_id: &RequestId);
 
     fn recurrent_state_layout(&self) -> Option<crate::models::RecurrentStateLayout> {
         None
@@ -30,6 +31,8 @@ where
     fn runtime_backend(&self) -> RuntimeBackend {
         self.backend()
     }
+
+    fn complete_request(&mut self, _request_id: &RequestId) {}
 }
 
 pub(crate) trait BackendModelExecutor<R>: fmt::Debug + Send
@@ -43,7 +46,6 @@ where
         batch: &ModelWorkerBatch,
         resources: &mut R,
     ) -> Result<ModelForwardOutput, ModelForwardError>;
-    fn complete_request(&mut self, _resources: &mut R, _request_id: &RequestId) {}
     fn update_weights_from_disk(
         &mut self,
         _request: &WorkerWeightUpdateRequest,
@@ -123,8 +125,7 @@ where
     }
 
     fn complete_request(&mut self, request_id: &RequestId) {
-        self.executor
-            .complete_request(&mut self.resources, request_id);
+        self.resources.complete_request(request_id);
     }
 
     fn update_weights_from_disk(

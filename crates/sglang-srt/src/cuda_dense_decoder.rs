@@ -10,8 +10,9 @@ use crate::cuda_attention::{
     CudaBf16PagedAttentionExecutor, CudaPagedAttentionError, CudaPagedAttentionForward,
     CudaPagedAttentionMetadata,
 };
+use crate::cuda_execution_resources::CudaExecutionResources;
 use crate::cuda_kv_cache::{CudaKvSlotScatterLaunch, CudaKvStorage, CudaKvStorageError};
-use crate::kv_cache::{KvCachePool, PagedKvCacheLayout};
+use crate::kv_cache::PagedKvCacheLayout;
 use crate::model_artifacts::{
     LocalModelArtifacts, ModelArtifactError, SafetensorsTensorDecodeError,
 };
@@ -23,7 +24,6 @@ use crate::models::{
     AttentionArchitecture, DenseDecoderExecutionPlan, DenseDecoderLayerWeightNames,
     FeedForwardArchitecture, ModelDefinition, ModelExecutionArchitecture,
 };
-use crate::runtime_kv_cache::RuntimeKvCache;
 
 const BF16_BYTES: usize = 2;
 
@@ -550,7 +550,7 @@ struct CudaDenseLayerForward<'a> {
     kv_storage: &'a mut CudaKvStorage,
 }
 
-impl BackendModelExecutor<RuntimeKvCache<KvCachePool<CudaKvStorage>>> for CudaBf16DenseDecoder {
+impl BackendModelExecutor<CudaExecutionResources> for CudaBf16DenseDecoder {
     fn runtime_capability(&self) -> RuntimeCapability {
         CudaBf16DenseDecoder::runtime_capability(self)
     }
@@ -562,9 +562,9 @@ impl BackendModelExecutor<RuntimeKvCache<KvCachePool<CudaKvStorage>>> for CudaBf
     fn forward(
         &mut self,
         batch: &ModelWorkerBatch,
-        resources: &mut RuntimeKvCache<KvCachePool<CudaKvStorage>>,
+        resources: &mut CudaExecutionResources,
     ) -> Result<ModelForwardOutput, ModelForwardError> {
-        let kv_pool = resources.allocation_mut();
+        let kv_pool = resources.active_kv_cache_mut();
         let kv_layout = kv_pool.layout();
         let kv_storage = kv_pool.storage_mut();
         self.forward_batch(batch, kv_layout, kv_storage)

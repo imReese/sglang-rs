@@ -73,6 +73,10 @@ impl BackendExecutionResources for CpuHybridExecutionResources {
         crate::backend::RuntimeBackend::Cpu
     }
 
+    fn complete_request(&mut self, request_id: &RequestId) {
+        self.recurrent_state.complete_request(request_id);
+    }
+
     fn recurrent_state_layout(&self) -> Option<RecurrentStateLayout> {
         Some(self.recurrent_state.layout())
     }
@@ -387,14 +391,6 @@ impl BackendModelExecutor<CpuHybridExecutionResources> for CpuReferenceHybridDec
             })?);
         }
         ModelForwardOutput::new(logits)
-    }
-
-    fn complete_request(
-        &mut self,
-        resources: &mut CpuHybridExecutionResources,
-        request_id: &RequestId,
-    ) {
-        resources.recurrent_state.complete_request(request_id);
     }
 }
 
