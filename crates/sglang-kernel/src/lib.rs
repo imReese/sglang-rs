@@ -13,6 +13,7 @@ pub mod cuda_attention;
 pub mod cuda_bf16_kernels;
 pub mod cuda_kernels;
 pub mod cuda_kv_kernels;
+pub mod cuda_linear_attention;
 pub mod nvrtc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -79,6 +79,11 @@ jobs:
           cargo test -p sglang-srt --locked --test cuda_backend --
           --ignored --nocapture --test-threads=1
 
+      - name: Run CUDA linear-attention state acceptance
+        run: >-
+          cargo test -p sglang-kernel --locked --test cuda_linear_attention --
+          --ignored --nocapture --test-threads=1
+
       - name: Run CUDA HTTP inference acceptance
         run: >-
           cargo test -p sglang-srt --locked --test cuda_inference --
