@@ -296,6 +296,7 @@ impl CudaBf16HybridDecoder {
                             component.forward(CudaMultiLatentAttentionForward {
                                 context: self.backend.context(),
                                 blas: &self.blas,
+                                dense_kernels: &self.dense_kernels,
                                 kernels,
                                 attention,
                                 hidden: &normalized,

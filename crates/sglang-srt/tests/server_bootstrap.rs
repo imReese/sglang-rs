@@ -2145,7 +2145,7 @@ fn write_complete_kimi_linear_checkpoint(model_dir: &std::path::Path) {
   "rope_theta": 10000.0,
   "rope_scaling": null,
   "tie_word_embeddings": false,
-  "q_lora_rank": null,
+  "q_lora_rank": 2,
   "kv_lora_rank": 2,
   "qk_nope_head_dim": 2,
   "qk_rope_head_dim": 2,
@@ -2234,7 +2234,8 @@ fn write_complete_kimi_linear_checkpoint(model_dir: &std::path::Path) {
             1.0,
         );
         for (suffix, shape) in [
-            ("self_attn.q_proj.weight", vec![4, 2]),
+            ("self_attn.q_a_proj.weight", vec![2, 2]),
+            ("self_attn.q_b_proj.weight", vec![4, 2]),
             ("self_attn.kv_a_proj_with_mqa.weight", vec![4, 2]),
             ("self_attn.kv_b_proj.weight", vec![4, 2]),
             ("self_attn.o_proj.weight", vec![2, 2]),
@@ -2249,6 +2250,11 @@ fn write_complete_kimi_linear_checkpoint(model_dir: &std::path::Path) {
         ] {
             add_tensor(format!("model.layers.1.{suffix}"), shape, 0.0);
         }
+        add_tensor(
+            "model.layers.1.self_attn.q_a_layernorm.weight".to_string(),
+            vec![2],
+            1.0,
+        );
         add_tensor(
             "model.layers.1.self_attn.kv_a_layernorm.weight".to_string(),
             vec![2],

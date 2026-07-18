@@ -14,7 +14,8 @@ use super::{
     HybridFeedForward, HybridFullAttentionConfig, HybridLinearAttentionConfig,
     HybridMultiLatentAttentionWeightNames, KeyGatedDeltaWeightNames, ModelAdapter,
     ModelAdapterError, ModelDefinition, ModelExecutionArchitecture, MoeFeedForwardConfig,
-    MoeFeedForwardWeightNames, RouterActivation, required_usize,
+    MoeFeedForwardWeightNames, MultiLatentQueryConfig, MultiLatentQueryWeightNames,
+    RouterActivation, required_usize,
 };
 
 pub(crate) const KIMI_LINEAR_ARCHITECTURE: &str = "KimiLinearForCausalLM";
@@ -117,12 +118,6 @@ fn build_definition(hf_config: &HfModelConfig) -> Result<ModelDefinition, ModelA
             "rope_scaling is not implemented by the shared MLA component",
         ));
     }
-    if config.q_lora_rank.is_some() {
-        return Err(ModelAdapterError::invalid(
-            KIMI_LINEAR_ARCHITECTURE,
-            "q_lora_rank is not implemented; Kimi Linear requires the direct q_proj path",
-        ));
-    }
     if config.mla_use_nope != Some(true) {
         return Err(ModelAdapterError::invalid(
             KIMI_LINEAR_ARCHITECTURE,
@@ -138,6 +133,16 @@ fn build_definition(hf_config: &HfModelConfig) -> Result<ModelDefinition, ModelA
 
     let vocab_size = required_usize(KIMI_LINEAR_ARCHITECTURE, "vocab_size", config.vocab_size)?;
     let hidden_size = required_usize(KIMI_LINEAR_ARCHITECTURE, "hidden_size", config.hidden_size)?;
+    let mla_query = match config.q_lora_rank {
+        Some(0) => {
+            return Err(ModelAdapterError::invalid(
+                KIMI_LINEAR_ARCHITECTURE,
+                "q_lora_rank must be non-zero when present",
+            ));
+        }
+        Some(rank) => MultiLatentQueryConfig::LowRank { rank },
+        None => MultiLatentQueryConfig::Direct,
+    };
     let dense_intermediate_size = required_usize(
         KIMI_LINEAR_ARCHITECTURE,
         "intermediate_size",
@@ -311,10 +316,13 @@ fn build_definition(hf_config: &HfModelConfig) -> Result<ModelDefinition, ModelA
     let weights = weight_names(
         num_layers,
         &kda_layers,
-        first_dense_layer_count,
-        moe_layer_frequency,
-        dense_intermediate_size,
-        &moe_config,
+        FeedForwardWeightLayout {
+            first_dense_layer_count,
+            moe_layer_frequency,
+            dense_intermediate_size,
+            moe_config: &moe_config,
+        },
+        mla_query,
         config.tie_word_embeddings == Some(true),
     );
     let plan = HybridDecoderExecutionPlan {
@@ -326,6 +334,7 @@ fn build_definition(hf_config: &HfModelConfig) -> Result<ModelDefinition, ModelA
         normalization: DecoderNormalization::Rms,
         full_attention: HybridFullAttentionConfig::MultiLatent {
             num_attention_heads,
+            query: mla_query,
             kv_lora_rank,
             qk_nope_head_dim,
             qk_rope_head_dim,
@@ -442,15 +451,27 @@ fn positive_float(field: &str, value: Option<f64>) -> Result<f32, ModelAdapterEr
     Ok(value as f32)
 }
 
-fn weight_names(
-    num_layers: usize,
-    kda_layers: &BTreeSet<usize>,
+#[derive(Clone, Copy)]
+struct FeedForwardWeightLayout<'a> {
     first_dense_layer_count: usize,
     moe_layer_frequency: usize,
     dense_intermediate_size: usize,
-    moe_config: &MoeFeedForwardConfig,
+    moe_config: &'a MoeFeedForwardConfig,
+}
+
+fn weight_names(
+    num_layers: usize,
+    kda_layers: &BTreeSet<usize>,
+    feed_forward: FeedForwardWeightLayout<'_>,
+    mla_query: MultiLatentQueryConfig,
     tied_embeddings: bool,
 ) -> HybridDecoderWeightNames {
+    let FeedForwardWeightLayout {
+        first_dense_layer_count,
+        moe_layer_frequency,
+        dense_intermediate_size,
+        moe_config,
+    } = feed_forward;
     let mut cache_layer_index = 0;
     let mut state_layer_index = 0;
     let layers = (0..num_layers)
@@ -485,7 +506,18 @@ fn weight_names(
                 HybridDecoderLayerKind::MultiLatentAttention {
                     cache_layer_index: index,
                     weights: HybridMultiLatentAttentionWeightNames {
-                        query_weight: format!("{prefix}.self_attn.q_proj.weight"),
+                        query: match mla_query {
+                            MultiLatentQueryConfig::Direct => MultiLatentQueryWeightNames::Direct {
+                                weight: format!("{prefix}.self_attn.q_proj.weight"),
+                            },
+                            MultiLatentQueryConfig::LowRank { .. } => {
+                                MultiLatentQueryWeightNames::LowRank {
+                                    a_weight: format!("{prefix}.self_attn.q_a_proj.weight"),
+                                    a_norm: format!("{prefix}.self_attn.q_a_layernorm.weight"),
+                                    b_weight: format!("{prefix}.self_attn.q_b_proj.weight"),
+                                }
+                            }
+                        },
                         kv_a_weight: format!("{prefix}.self_attn.kv_a_proj_with_mqa.weight"),
                         kv_a_norm: format!("{prefix}.self_attn.kv_a_layernorm.weight"),
                         kv_b_weight: format!("{prefix}.self_attn.kv_b_proj.weight"),
@@ -552,6 +584,7 @@ fn checkpoint_topology(
 ) -> Result<CheckpointTopology, ModelAdapterError> {
     let HybridFullAttentionConfig::MultiLatent {
         num_attention_heads,
+        query: full_attention_query,
         kv_lora_rank,
         qk_nope_head_dim,
         qk_rope_head_dim,
@@ -605,25 +638,53 @@ fn checkpoint_topology(
             CheckpointTensorRequirement::with_shape(&layer.post_attention_norm, [plan.hidden_size]),
         ]);
         match &layer.mixer {
-            HybridDecoderLayerKind::MultiLatentAttention { weights, .. } => tensors.extend([
-                CheckpointTensorRequirement::with_shape(
-                    &weights.query_weight,
-                    [query_size, plan.hidden_size],
-                ),
-                CheckpointTensorRequirement::with_shape(
-                    &weights.kv_a_weight,
-                    [compressed_kv_size, plan.hidden_size],
-                ),
-                CheckpointTensorRequirement::with_shape(&weights.kv_a_norm, [kv_lora_rank]),
-                CheckpointTensorRequirement::with_shape(
-                    &weights.kv_b_weight,
-                    [expanded_kv_size, kv_lora_rank],
-                ),
-                CheckpointTensorRequirement::with_shape(
-                    &weights.output_weight,
-                    [plan.hidden_size, attention_output_size],
-                ),
-            ]),
+            HybridDecoderLayerKind::MultiLatentAttention { weights, .. } => {
+                match (&full_attention_query, &weights.query) {
+                    (
+                        MultiLatentQueryConfig::Direct,
+                        MultiLatentQueryWeightNames::Direct { weight },
+                    ) => tensors.push(CheckpointTensorRequirement::with_shape(
+                        weight,
+                        [query_size, plan.hidden_size],
+                    )),
+                    (
+                        MultiLatentQueryConfig::LowRank { rank },
+                        MultiLatentQueryWeightNames::LowRank {
+                            a_weight,
+                            a_norm,
+                            b_weight,
+                        },
+                    ) => tensors.extend([
+                        CheckpointTensorRequirement::with_shape(
+                            a_weight,
+                            [*rank, plan.hidden_size],
+                        ),
+                        CheckpointTensorRequirement::with_shape(a_norm, [*rank]),
+                        CheckpointTensorRequirement::with_shape(b_weight, [query_size, *rank]),
+                    ]),
+                    _ => {
+                        return Err(ModelAdapterError::invalid(
+                            KIMI_LINEAR_ARCHITECTURE,
+                            "MLA query config does not match its checkpoint weight mapping",
+                        ));
+                    }
+                }
+                tensors.extend([
+                    CheckpointTensorRequirement::with_shape(
+                        &weights.kv_a_weight,
+                        [compressed_kv_size, plan.hidden_size],
+                    ),
+                    CheckpointTensorRequirement::with_shape(&weights.kv_a_norm, [kv_lora_rank]),
+                    CheckpointTensorRequirement::with_shape(
+                        &weights.kv_b_weight,
+                        [expanded_kv_size, kv_lora_rank],
+                    ),
+                    CheckpointTensorRequirement::with_shape(
+                        &weights.output_weight,
+                        [plan.hidden_size, attention_output_size],
+                    ),
+                ]);
+            }
             HybridDecoderLayerKind::KeyGatedDelta { weights, .. } => tensors.extend([
                 CheckpointTensorRequirement::with_shape(
                     &weights.a_log,

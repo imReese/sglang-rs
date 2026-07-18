@@ -232,8 +232,20 @@ pub(crate) struct HybridFullAttentionWeightNames {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MultiLatentQueryWeightNames {
+    Direct {
+        weight: String,
+    },
+    LowRank {
+        a_weight: String,
+        a_norm: String,
+        b_weight: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HybridMultiLatentAttentionWeightNames {
-    pub(crate) query_weight: String,
+    pub(crate) query: MultiLatentQueryWeightNames,
     pub(crate) kv_a_weight: String,
     pub(crate) kv_a_norm: String,
     pub(crate) kv_b_weight: String,
@@ -279,6 +291,12 @@ pub(crate) enum DecoderNormalization {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MultiLatentQueryConfig {
+    Direct,
+    LowRank { rank: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HybridFullAttentionConfig {
     MultiHead {
         num_attention_heads: usize,
@@ -289,6 +307,7 @@ pub(crate) enum HybridFullAttentionConfig {
     },
     MultiLatent {
         num_attention_heads: usize,
+        query: MultiLatentQueryConfig,
         kv_lora_rank: usize,
         qk_nope_head_dim: usize,
         qk_rope_head_dim: usize,

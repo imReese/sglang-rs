@@ -23,7 +23,8 @@ use crate::models::{
     HybridDecoderLayerKind, HybridDecoderLayerWeightNames, HybridFeedForward,
     HybridFullAttentionConfig, HybridFullAttentionWeightNames, HybridLinearAttentionConfig,
     HybridMultiLatentAttentionWeightNames, KeyGatedDeltaWeightNames, ModelDefinition,
-    MoeFeedForwardConfig, MoeFeedForwardWeightNames, RecurrentStateLayout,
+    MoeFeedForwardConfig, MoeFeedForwardWeightNames, MultiLatentQueryConfig,
+    MultiLatentQueryWeightNames, RecurrentStateLayout,
 };
 use crate::moe::MoeRouter;
 use crate::runtime_kv_cache::{RuntimeKvCache, RuntimeKvCacheMetadata};
@@ -741,11 +742,84 @@ impl MoeFeedForwardWeights {
 
 #[derive(Debug)]
 struct MultiLatentAttentionWeights {
-    query: FloatMatrix,
+    query: MultiLatentQueryWeights,
     kv_a: FloatMatrix,
     kv_a_norm: Vec<f32>,
     kv_b: FloatMatrix,
     output: FloatMatrix,
+}
+
+#[derive(Debug)]
+enum MultiLatentQueryWeights {
+    Direct(FloatMatrix),
+    LowRank {
+        a: FloatMatrix,
+        norm: Vec<f32>,
+        b: FloatMatrix,
+    },
+}
+
+impl MultiLatentQueryWeights {
+    fn load(
+        artifacts: &LocalModelArtifacts,
+        names: &MultiLatentQueryWeightNames,
+        config: MultiLatentQueryConfig,
+        hidden_size: usize,
+        query_size: usize,
+    ) -> Result<Self, CpuReferenceDenseDecoderError> {
+        match (config, names) {
+            (MultiLatentQueryConfig::Direct, MultiLatentQueryWeightNames::Direct { weight }) => {
+                Ok(Self::Direct(FloatMatrix::load(
+                    artifacts,
+                    weight,
+                    query_size,
+                    hidden_size,
+                )?))
+            }
+            (
+                MultiLatentQueryConfig::LowRank { rank },
+                MultiLatentQueryWeightNames::LowRank {
+                    a_weight,
+                    a_norm,
+                    b_weight,
+                },
+            ) if rank > 0 => Ok(Self::LowRank {
+                a: FloatMatrix::load(artifacts, a_weight, rank, hidden_size)?,
+                norm: load_vector(artifacts, a_norm, rank)?,
+                b: FloatMatrix::load(artifacts, b_weight, query_size, rank)?,
+            }),
+            (MultiLatentQueryConfig::LowRank { rank: 0 }, _) => {
+                Err(CpuReferenceDenseDecoderError::Unsupported(
+                    "MLA query LoRA rank must be non-zero".to_string(),
+                ))
+            }
+            _ => Err(CpuReferenceDenseDecoderError::Unsupported(
+                "MLA query config does not match its checkpoint weight mapping".to_string(),
+            )),
+        }
+    }
+
+    fn project(
+        &self,
+        hidden: &[f32],
+        rms_norm_eps: f32,
+    ) -> Result<Vec<f32>, CpuReferenceDenseDecoderError> {
+        match self {
+            Self::Direct(weight) => weight.project(hidden, 1),
+            Self::LowRank { a, norm, b } => {
+                let latent = a.project(hidden, 1)?;
+                let latent = apply_normalization(
+                    &latent,
+                    norm,
+                    1,
+                    norm.len(),
+                    rms_norm_eps,
+                    CpuNormalization::Standard,
+                )?;
+                b.project(&latent, 1)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -768,6 +842,7 @@ impl MultiLatentAttentionWeights {
     ) -> Result<Self, CpuReferenceDenseDecoderError> {
         let HybridFullAttentionConfig::MultiLatent {
             num_attention_heads,
+            query: query_config,
             kv_lora_rank,
             qk_nope_head_dim,
             qk_rope_head_dim,
@@ -803,7 +878,13 @@ impl MultiLatentAttentionWeights {
             checked_product(num_attention_heads, expanded_head_dim, "MLA expanded KV")?;
         let output_size = checked_product(num_attention_heads, value_head_dim, "MLA output")?;
         Ok(Self {
-            query: FloatMatrix::load(artifacts, &names.query_weight, query_size, hidden_size)?,
+            query: MultiLatentQueryWeights::load(
+                artifacts,
+                &names.query,
+                query_config,
+                hidden_size,
+                query_size,
+            )?,
             kv_a: FloatMatrix::load(artifacts, &names.kv_a_weight, kv_a_size, hidden_size)?,
             kv_a_norm: load_vector(artifacts, &names.kv_a_norm, kv_lora_rank)?,
             kv_b: FloatMatrix::load(artifacts, &names.kv_b_weight, expanded_size, kv_lora_rank)?,
@@ -828,6 +909,7 @@ impl MultiLatentAttentionWeights {
         } = context;
         let HybridFullAttentionConfig::MultiLatent {
             num_attention_heads,
+            query: _,
             kv_lora_rank,
             qk_nope_head_dim,
             qk_rope_head_dim,
@@ -840,7 +922,7 @@ impl MultiLatentAttentionWeights {
             ));
         };
         let query_head_dim = qk_nope_head_dim + qk_rope_head_dim;
-        let query = self.query.project(hidden, 1)?;
+        let query = self.query.project(hidden, rms_norm_eps)?;
         let compressed = self.kv_a.project(hidden, 1)?;
         let latent = apply_normalization(
             &compressed[..kv_lora_rank],
@@ -1373,7 +1455,8 @@ fn softplus(value: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::CpuHybridStatePool;
+    use super::{CpuHybridStatePool, MultiLatentQueryWeights};
+    use crate::cpu_reference::FloatMatrix;
     use crate::models::RecurrentStateLayout;
     use crate::types::RequestId;
 
@@ -1418,5 +1501,20 @@ mod tests {
         assert_eq!(reused.next_position, 0);
         assert_eq!(reused.recurrent_layers[0].conv[0], 0.0);
         assert_eq!(reused.recurrent_layers[0].recurrent[0], 0.0);
+    }
+
+    #[test]
+    fn low_rank_mla_query_applies_projection_normalization_and_expansion() {
+        let query = MultiLatentQueryWeights::LowRank {
+            a: FloatMatrix::from_values(2, 2, vec![1.0, 1.0, 1.0, -1.0]),
+            norm: vec![2.0, 3.0],
+            b: FloatMatrix::from_values(3, 2, vec![1.0, 0.0, 0.0, 1.0, 1.0, -1.0]),
+        };
+
+        let projected = query
+            .project(&[2.0, 0.0], 0.0)
+            .expect("valid low-rank MLA query should project");
+
+        assert_eq!(projected, vec![2.0, 3.0, -1.0]);
     }
 }

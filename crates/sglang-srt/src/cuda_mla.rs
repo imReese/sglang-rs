@@ -1,5 +1,6 @@
 use sglang_kernel::cublas::CudaBlas;
 use sglang_kernel::cuda::{CudaContext, CudaDeviceAllocation};
+use sglang_kernel::cuda_bf16_kernels::CudaBf16DenseKernels;
 use sglang_kernel::cuda_mla::{
     CudaBf16MlaKernels, CudaBf16MlaShape, CudaMlaExpandOutput, CudaMlaPrepareCache,
     CudaMlaPrepareQuery,
@@ -11,25 +12,100 @@ use crate::cuda_attention::{
 };
 use crate::cuda_kv_cache::CudaKvStorage;
 use crate::cuda_transformer::{
-    CudaBf16Matrix, CudaExecutorError, allocate_bf16, checked_product, linear,
+    CudaBf16Matrix, CudaExecutorError, allocate_bf16, checked_product, linear, rms_norm,
     upload_required_bf16, upload_usize_as_u64,
 };
 use crate::kv_cache::PagedKvCacheLayout;
 use crate::model_artifacts::LocalModelArtifacts;
-use crate::models::{HybridFullAttentionConfig, HybridMultiLatentAttentionWeightNames};
+use crate::models::{
+    HybridFullAttentionConfig, HybridMultiLatentAttentionWeightNames, MultiLatentQueryConfig,
+    MultiLatentQueryWeightNames,
+};
 
 pub(crate) struct CudaBf16MultiLatentAttention {
     shape: CudaMultiLatentAttentionShape,
-    query: CudaBf16Matrix,
+    query: CudaBf16MlaQuery,
     kv_a: CudaBf16Matrix,
     kv_a_norm: CudaDeviceAllocation,
     kv_b: CudaBf16Matrix,
     output: CudaBf16Matrix,
 }
 
+enum CudaBf16MlaQuery {
+    Direct(CudaBf16Matrix),
+    LowRank {
+        a: CudaBf16Matrix,
+        norm: CudaDeviceAllocation,
+        b: CudaBf16Matrix,
+        rank: usize,
+    },
+}
+
+impl CudaBf16MlaQuery {
+    fn load(
+        artifacts: &LocalModelArtifacts,
+        context: &CudaContext,
+        names: &MultiLatentQueryWeightNames,
+        config: MultiLatentQueryConfig,
+        hidden_size: usize,
+        query_size: usize,
+    ) -> Result<Self, CudaExecutorError> {
+        match (config, names) {
+            (MultiLatentQueryConfig::Direct, MultiLatentQueryWeightNames::Direct { weight }) => {
+                Ok(Self::Direct(CudaBf16Matrix::load(
+                    artifacts,
+                    context,
+                    weight,
+                    query_size,
+                    hidden_size,
+                )?))
+            }
+            (
+                MultiLatentQueryConfig::LowRank { rank },
+                MultiLatentQueryWeightNames::LowRank {
+                    a_weight,
+                    a_norm,
+                    b_weight,
+                },
+            ) if rank > 0 => Ok(Self::LowRank {
+                a: CudaBf16Matrix::load(artifacts, context, a_weight, rank, hidden_size)?,
+                norm: upload_required_bf16(artifacts, context, a_norm, rank)?,
+                b: CudaBf16Matrix::load(artifacts, context, b_weight, query_size, rank)?,
+                rank,
+            }),
+            (MultiLatentQueryConfig::LowRank { rank: 0 }, _) => Err(CudaExecutorError::Shape(
+                "CUDA MLA query LoRA rank must be non-zero".to_string(),
+            )),
+            _ => Err(CudaExecutorError::Shape(
+                "CUDA MLA query config does not match its checkpoint weight mapping".to_string(),
+            )),
+        }
+    }
+
+    fn forward(
+        &self,
+        blas: &CudaBlas,
+        kernels: &CudaBf16DenseKernels,
+        context: &CudaContext,
+        hidden: &CudaDeviceAllocation,
+        hidden_size: usize,
+        rms_norm_epsilon: f32,
+    ) -> Result<CudaDeviceAllocation, CudaExecutorError> {
+        match self {
+            Self::Direct(weight) => linear(blas, context, hidden, 1, hidden_size, weight),
+            Self::LowRank { a, norm, b, rank } => {
+                let latent = linear(blas, context, hidden, 1, hidden_size, a)?;
+                let latent = rms_norm(kernels, context, &latent, norm, 1, *rank, rms_norm_epsilon)?;
+                linear(blas, context, &latent, 1, *rank, b)
+            }
+        }
+    }
+}
+
 pub(crate) struct CudaMultiLatentAttentionForward<'a> {
     pub(crate) context: &'a CudaContext,
     pub(crate) blas: &'a CudaBlas,
+    pub(crate) dense_kernels: &'a CudaBf16DenseKernels,
     pub(crate) kernels: &'a CudaBf16MlaKernels,
     pub(crate) attention: &'a mut CudaBf16PagedAttentionExecutor,
     pub(crate) hidden: &'a CudaDeviceAllocation,
@@ -53,12 +129,13 @@ impl CudaBf16MultiLatentAttention {
     ) -> Result<Self, CudaExecutorError> {
         let shape = CudaMultiLatentAttentionShape::new(hidden_size, config)?;
         Ok(Self {
-            query: CudaBf16Matrix::load(
+            query: CudaBf16MlaQuery::load(
                 artifacts,
                 context,
-                &names.query_weight,
-                shape.query_size,
+                &names.query,
+                shape.query,
                 hidden_size,
+                shape.query_size,
             )?,
             kv_a: CudaBf16Matrix::load(
                 artifacts,
@@ -98,6 +175,7 @@ impl CudaBf16MultiLatentAttention {
         let CudaMultiLatentAttentionForward {
             context,
             blas,
+            dense_kernels,
             kernels,
             attention,
             hidden,
@@ -117,13 +195,13 @@ impl CudaBf16MultiLatentAttention {
             )));
         }
         let active_sequence = &sequence_slots[..=position];
-        let query = linear(
+        let query = self.query.forward(
             blas,
+            dense_kernels,
             context,
             hidden,
-            1,
             self.shape.hidden_size,
-            &self.query,
+            rms_norm_epsilon,
         )?;
         let compressed_kv = linear(blas, context, hidden, 1, self.shape.hidden_size, &self.kv_a)?;
         let positions = upload_usize_as_u64(context, "MLA positions", &[position])?;
@@ -219,6 +297,7 @@ impl CudaBf16MultiLatentAttention {
 struct CudaMultiLatentAttentionShape {
     hidden_size: usize,
     head_count: usize,
+    query: MultiLatentQueryConfig,
     kv_lora_rank: usize,
     qk_nope_head_dim: usize,
     qk_rope_head_dim: usize,
@@ -239,6 +318,7 @@ impl CudaMultiLatentAttentionShape {
     ) -> Result<Self, CudaExecutorError> {
         let HybridFullAttentionConfig::MultiLatent {
             num_attention_heads,
+            query,
             kv_lora_rank,
             qk_nope_head_dim,
             qk_rope_head_dim,
@@ -274,6 +354,7 @@ impl CudaMultiLatentAttentionShape {
         Ok(Self {
             hidden_size,
             head_count: num_attention_heads,
+            query,
             kv_lora_rank,
             qk_nope_head_dim,
             qk_rope_head_dim,
@@ -314,6 +395,7 @@ mod tests {
             64,
             HybridFullAttentionConfig::MultiLatent {
                 num_attention_heads: 4,
+                query: MultiLatentQueryConfig::Direct,
                 kv_lora_rank: 8,
                 qk_nope_head_dim: 6,
                 qk_rope_head_dim: 4,

@@ -496,7 +496,9 @@ fn runtime_error(
 mod tests {
     use super::*;
     use crate::models::{
-        AttentionArchitecture, FeedForwardArchitecture, ModelExecutionArchitecture,
+        AttentionArchitecture, FeedForwardArchitecture, HybridDecoderLayerKind,
+        HybridFullAttentionConfig, ModelExecutionArchitecture, MultiLatentQueryConfig,
+        MultiLatentQueryWeightNames,
     };
     use serde_json::json;
 
@@ -650,6 +652,12 @@ mod tests {
             }
         }))
         .expect("valid Kimi Linear config")
+    }
+
+    fn kimi_linear_query_lora_config() -> HfModelConfig {
+        let mut value = kimi_linear_config().raw_document().clone();
+        value["q_lora_rank"] = json!(2);
+        HfModelConfig::from_json_value(value).expect("valid Kimi Linear query LoRA config")
     }
 
     #[test]
@@ -846,6 +854,33 @@ mod tests {
         let backend = cpu_reference_backend();
         validate_runtime_support(&kimi, backend.as_ref(), 1)
             .expect("CPU reference backend should execute the shared Kimi component plan");
+    }
+
+    #[test]
+    fn kimi_query_lora_uses_the_shared_mla_projection_component() {
+        let kimi = ModelRegistry
+            .definition(
+                Path::new("/models/kimi-linear-query-lora"),
+                &kimi_linear_query_lora_config(),
+            )
+            .expect("Kimi Linear query LoRA definition");
+        let plan = kimi.hybrid_decoder().expect("shared hybrid plan");
+
+        assert!(matches!(
+            plan.full_attention,
+            HybridFullAttentionConfig::MultiLatent {
+                query: MultiLatentQueryConfig::LowRank { rank: 2 },
+                ..
+            }
+        ));
+        assert!(matches!(
+            &plan.weights.layers[1].mixer,
+            HybridDecoderLayerKind::MultiLatentAttention { weights, .. }
+                if matches!(
+                    &weights.query,
+                    MultiLatentQueryWeightNames::LowRank { .. }
+                )
+        ));
     }
 
     #[test]

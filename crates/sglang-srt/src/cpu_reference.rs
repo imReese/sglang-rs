@@ -641,6 +641,17 @@ pub(crate) struct FloatMatrix {
 }
 
 impl FloatMatrix {
+    #[cfg(test)]
+    pub(crate) fn from_values(rows: usize, columns: usize, values: Vec<f32>) -> Self {
+        assert_eq!(values.len(), rows * columns);
+        Self {
+            rows,
+            columns,
+            values,
+            bias: None,
+        }
+    }
+
     pub(crate) fn load(
         artifacts: &LocalModelArtifacts,
         tensor_name: &str,
