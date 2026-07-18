@@ -258,6 +258,7 @@ impl BootstrapForwardModel {
                         slot_capacity: args.num_reserved_decode_tokens,
                         page_size: args.page_size,
                     }),
+                    recurrent_state_slot_capacity: args.max_running_requests.unwrap_or(256),
                 },
             )
             .map(|registered| Self { registered })
@@ -871,6 +872,32 @@ mod tests {
                 if missing.iter().any(|item| item.contains("multi-latent attention"))
                     && missing.iter().any(|item| item.contains("mixture-of-experts"))
         ));
+    }
+
+    #[test]
+    fn cuda_hybrid_preflight_reports_only_unimplemented_kimi_components() {
+        let kimi = ModelRegistry
+            .definition(Path::new("/models/kimi"), &kimi_linear_config())
+            .expect("Kimi Linear definition");
+
+        let missing = crate::cuda_hybrid_decoder::CudaBf16HybridDecoder::missing_components(&kimi);
+
+        assert!(
+            missing
+                .iter()
+                .any(|component| component.contains("multi-latent-attention"))
+        );
+        assert!(
+            missing
+                .iter()
+                .any(|component| component.contains("mixture-of-experts"))
+        );
+        assert!(missing.iter().all(|component| !component.contains("KDA")));
+        assert!(
+            missing
+                .iter()
+                .all(|component| !component.contains("dense feed-forward"))
+        );
     }
 
     #[test]

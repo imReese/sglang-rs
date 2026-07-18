@@ -201,6 +201,7 @@ pub(crate) struct ModelRuntimeConfig {
     pub(crate) tensor_parallel_size: usize,
     pub(crate) device_placement: crate::backend::RuntimeDevicePlacement,
     pub(crate) kv_cache: Option<KvCacheAllocationConfig>,
+    pub(crate) recurrent_state_slot_capacity: usize,
 }
 
 #[derive(Debug)]

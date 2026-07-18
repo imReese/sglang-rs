@@ -5,7 +5,9 @@ use crate::cpu_hybrid::{CpuHybridExecutionResources, CpuReferenceHybridDecoder};
 use crate::cpu_reference::{CpuReferenceDenseDecoder, CpuReferenceKvCache};
 use crate::cuda_dense_decoder::CudaBf16DenseDecoder;
 use crate::cuda_execution_resources::CudaExecutionResources;
+use crate::cuda_hybrid_decoder::CudaBf16HybridDecoder;
 use crate::cuda_kv_cache::allocate_cuda_kv_cache;
+use crate::cuda_recurrent_state::CudaRecurrentStateStorage;
 use crate::kv_cache::{KvCacheDtype, KvCacheRuntimeLayout, PagedKvCacheLayout};
 use crate::model_artifacts::LocalModelArtifacts;
 use crate::model_executor::KvCacheAllocationConfig;
@@ -277,6 +279,28 @@ fn create_cuda_model_runtime(
             let resources = CudaExecutionResources::new(kv_cache, None);
             Ok(Box::new(BackendExecutionBundle::new(executor, resources)))
         }
+        ModelExecutionArchitecture::Transformer { .. } if definition.hybrid_decoder().is_some() => {
+            let kv_cache = allocate_cuda_active_kv_cache(
+                definition,
+                &backend,
+                required_kv_cache_config(config)?,
+            )?;
+            let recurrent_layout = definition.recurrent_state_layout().ok_or_else(|| {
+                ModelRuntimeLoadError::MissingCapabilities(vec![
+                    "model recurrent-state layout".to_string(),
+                ])
+            })?;
+            let recurrent_state = CudaRecurrentStateStorage::allocate(
+                backend.context(),
+                recurrent_layout,
+                config.recurrent_state_slot_capacity,
+            )
+            .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?;
+            let executor = CudaBf16HybridDecoder::load(definition, artifacts, backend)
+                .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?;
+            let resources = CudaExecutionResources::new(kv_cache, Some(recurrent_state));
+            Ok(Box::new(BackendExecutionBundle::new(executor, resources)))
+        }
         ModelExecutionArchitecture::Transformer {
             attention,
             feed_forward,
@@ -371,7 +395,7 @@ fn validate_cuda_model_runtime(
 ) -> Vec<String> {
     let mut missing = Vec::new();
     let capability = backend.capabilities();
-    if definition.dense_decoder().is_none() {
+    if definition.dense_decoder().is_none() && definition.hybrid_decoder().is_none() {
         let ModelExecutionArchitecture::Transformer {
             attention,
             feed_forward,
@@ -383,6 +407,12 @@ fn validate_cuda_model_runtime(
         ));
         missing.push("runtime-owned KV cache allocation".to_string());
         return missing;
+    }
+    if definition.hybrid_decoder().is_some() {
+        missing.extend(CudaBf16HybridDecoder::missing_components(definition));
+        if definition.recurrent_state_layout().is_none() {
+            missing.push("model recurrent-state layout".to_string());
+        }
     }
     if !capability.supported_dtypes.contains(&RuntimeDtype::Bf16) {
         missing.push("CUDA BF16 compute capability 8.0 or newer".to_string());

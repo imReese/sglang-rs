@@ -74,6 +74,52 @@ extern "C" __global__ void sglang_causal_conv1d_update_bf16(
       input[element];
 }
 
+extern "C" __global__ void sglang_causal_conv1d_update_segment_bf16(
+    const __nv_bfloat16* input,
+    const __nv_bfloat16* weight,
+    __nv_bfloat16* state,
+    const unsigned int* state_indices,
+    __nv_bfloat16* output,
+    unsigned long long batch_size,
+    unsigned int channels,
+    unsigned int kernel_size,
+    unsigned int state_slot_channels,
+    unsigned int state_channel_offset) {
+  const unsigned long long element =
+      static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const unsigned long long element_count = batch_size * channels;
+  if (element >= element_count) {
+    return;
+  }
+
+  const unsigned long long batch = element / channels;
+  const unsigned int channel = element % channels;
+  const unsigned int history = kernel_size - 1;
+  const unsigned long long slot = state_indices[batch];
+  const unsigned long long state_base =
+      slot * history * state_slot_channels + state_channel_offset + channel;
+  const unsigned long long weight_base =
+      static_cast<unsigned long long>(channel) * kernel_size;
+
+  float value = __bfloat162float(weight[weight_base + history]) *
+      __bfloat162float(input[element]);
+  for (unsigned int step = 0; step < history; ++step) {
+    value += __bfloat162float(weight[weight_base + step]) *
+        __bfloat162float(state[state_base +
+            static_cast<unsigned long long>(step) * state_slot_channels]);
+  }
+  output[element] = __float2bfloat16_rn(value);
+
+  for (unsigned int step = 0; step + 1 < history; ++step) {
+    state[state_base + static_cast<unsigned long long>(step) * state_slot_channels] =
+        state[state_base +
+            static_cast<unsigned long long>(step + 1) * state_slot_channels];
+  }
+  state[state_base +
+      static_cast<unsigned long long>(history - 1) * state_slot_channels] =
+      input[element];
+}
+
 extern "C" __global__ void sglang_key_gated_delta_decode_bf16_f32_state(
     const __nv_bfloat16* query,
     const __nv_bfloat16* key,
@@ -187,6 +233,73 @@ impl CudaCausalConv1dShape {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Causal-convolution geometry for one contiguous channel segment inside a
+/// larger recurrent state slot.
+pub struct CudaCausalConv1dSegmentShape {
+    pub batch_size: usize,
+    pub state_slot_count: usize,
+    pub channels: usize,
+    pub kernel_size: usize,
+    pub state_slot_channels: usize,
+    pub state_channel_offset: usize,
+}
+
+impl CudaCausalConv1dSegmentShape {
+    fn validate(self) -> Result<(), CudaLinearAttentionError> {
+        validate_nonzero(&[
+            ("batch_size", self.batch_size),
+            ("state_slot_count", self.state_slot_count),
+            ("channels", self.channels),
+            ("state_slot_channels", self.state_slot_channels),
+        ])?;
+        if self.kernel_size < 2 {
+            return Err(CudaLinearAttentionError::InvalidKernelSize(
+                self.kernel_size,
+            ));
+        }
+        let segment_end = self
+            .state_channel_offset
+            .checked_add(self.channels)
+            .ok_or(CudaLinearAttentionError::ShapeOverflow)?;
+        if segment_end > self.state_slot_channels {
+            return Err(CudaLinearAttentionError::InvalidStateSegment {
+                channel_offset: self.state_channel_offset,
+                channels: self.channels,
+                state_slot_channels: self.state_slot_channels,
+            });
+        }
+        for (dimension, value) in [
+            ("state_slot_count", self.state_slot_count),
+            ("channels", self.channels),
+            ("kernel_size", self.kernel_size),
+            ("state_slot_channels", self.state_slot_channels),
+            ("state_channel_offset", self.state_channel_offset),
+        ] {
+            dimension_u32(dimension, value)?;
+        }
+        self.input_elements()?;
+        self.weight_elements()?;
+        self.state_elements()?;
+        Ok(())
+    }
+
+    fn input_elements(self) -> Result<usize, CudaLinearAttentionError> {
+        checked_product(self.batch_size, self.channels)
+    }
+
+    fn weight_elements(self) -> Result<usize, CudaLinearAttentionError> {
+        checked_product(self.channels, self.kernel_size)
+    }
+
+    fn state_elements(self) -> Result<usize, CudaLinearAttentionError> {
+        checked_product(
+            checked_product(self.state_slot_count, self.kernel_size - 1)?,
+            self.state_slot_channels,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// KDA decode geometry with temporal state laid out as
 /// `[state_slot, head, value_head_dim, key_head_dim]`.
 pub struct CudaKeyGatedDeltaShape {
@@ -255,6 +368,20 @@ pub struct CudaCausalConv1dLaunch<'a> {
     pub shape: CudaCausalConv1dShape,
 }
 
+pub struct CudaCausalConv1dSegmentLaunch<'a> {
+    pub input: &'a CudaDeviceAllocation,
+    pub input_offset: usize,
+    pub weight: &'a CudaDeviceAllocation,
+    pub weight_offset: usize,
+    pub state: &'a mut CudaDeviceAllocation,
+    pub state_offset: usize,
+    pub state_indices: &'a CudaDeviceAllocation,
+    pub state_indices_offset: usize,
+    pub output: &'a mut CudaDeviceAllocation,
+    pub output_offset: usize,
+    pub shape: CudaCausalConv1dSegmentShape,
+}
+
 pub struct CudaKeyGatedDeltaLaunch<'a> {
     pub query: &'a CudaDeviceAllocation,
     pub query_offset: usize,
@@ -288,6 +415,11 @@ pub enum CudaLinearAttentionError {
     },
     ZeroDimension(&'static str),
     InvalidKernelSize(usize),
+    InvalidStateSegment {
+        channel_offset: usize,
+        channels: usize,
+        state_slot_channels: usize,
+    },
     ShapeOverflow,
     DimensionTooLarge {
         dimension: &'static str,
@@ -333,6 +465,14 @@ impl fmt::Display for CudaLinearAttentionError {
             Self::InvalidKernelSize(kernel_size) => write!(
                 formatter,
                 "CUDA causal convolution kernel_size must be at least 2, got {kernel_size}"
+            ),
+            Self::InvalidStateSegment {
+                channel_offset,
+                channels,
+                state_slot_channels,
+            } => write!(
+                formatter,
+                "CUDA causal convolution state segment offset {channel_offset} with {channels} channels exceeds slot width {state_slot_channels}"
             ),
             Self::ShapeOverflow => {
                 formatter.write_str("CUDA linear-attention tensor shape overflowed")
@@ -389,6 +529,7 @@ pub struct CudaBf16LinearAttentionKernels {
     _module: CudaModule,
     validate_state_indices: CudaFunction,
     causal_conv1d_update: CudaFunction,
+    causal_conv1d_update_segment: CudaFunction,
     key_gated_delta_decode: CudaFunction,
     error_flag: CudaDeviceAllocation,
 }
@@ -417,6 +558,8 @@ impl CudaBf16LinearAttentionKernels {
             context: context.clone(),
             validate_state_indices: module.get_function("sglang_validate_linear_state_indices")?,
             causal_conv1d_update: module.get_function("sglang_causal_conv1d_update_bf16")?,
+            causal_conv1d_update_segment: module
+                .get_function("sglang_causal_conv1d_update_segment_bf16")?,
             key_gated_delta_decode: module
                 .get_function("sglang_key_gated_delta_decode_bf16_f32_state")?,
             _module: module,
@@ -493,6 +636,86 @@ impl CudaBf16LinearAttentionKernels {
         ];
         self.launch_elementwise(
             &self.causal_conv1d_update,
+            shape.input_elements()?,
+            &mut arguments,
+        )
+    }
+
+    pub fn causal_conv1d_update_segment(
+        &mut self,
+        launch: CudaCausalConv1dSegmentLaunch<'_>,
+    ) -> Result<(), CudaLinearAttentionError> {
+        let CudaCausalConv1dSegmentLaunch {
+            input,
+            input_offset,
+            weight,
+            weight_offset,
+            state,
+            state_offset,
+            state_indices,
+            state_indices_offset,
+            output,
+            output_offset,
+            shape,
+        } = launch;
+        shape.validate()?;
+        self.validate_devices(&[
+            ("input", input),
+            ("weight", weight),
+            ("state", state),
+            ("state_indices", state_indices),
+            ("output", output),
+        ])?;
+        validate_alignment(&[
+            ("input", input_offset, BF16_BYTES),
+            ("weight", weight_offset, BF16_BYTES),
+            ("state", state_offset, BF16_BYTES),
+            ("state_indices", state_indices_offset, U32_BYTES),
+            ("output", output_offset, BF16_BYTES),
+        ])?;
+        self.validate_state_indices(
+            state_indices,
+            state_indices_offset,
+            shape.batch_size,
+            shape.state_slot_count,
+        )?;
+
+        let input_bytes = checked_bytes(shape.input_elements()?, BF16_BYTES)?;
+        let mut input_ptr = input.device_ptr_at(input_offset, input_bytes)?;
+        let mut weight_ptr = weight.device_ptr_at(
+            weight_offset,
+            checked_bytes(shape.weight_elements()?, BF16_BYTES)?,
+        )?;
+        let mut state_ptr = state.device_ptr_at(
+            state_offset,
+            checked_bytes(shape.state_elements()?, BF16_BYTES)?,
+        )?;
+        let mut state_indices_ptr = state_indices.device_ptr_at(
+            state_indices_offset,
+            checked_bytes(shape.batch_size, U32_BYTES)?,
+        )?;
+        let mut output_ptr = output.device_ptr_at(output_offset, input_bytes)?;
+        let mut batch_size = dimension_u64("batch_size", shape.batch_size)?;
+        let mut channels = dimension_u32("channels", shape.channels)?;
+        let mut kernel_size = dimension_u32("kernel_size", shape.kernel_size)?;
+        let mut state_slot_channels =
+            dimension_u32("state_slot_channels", shape.state_slot_channels)?;
+        let mut state_channel_offset =
+            dimension_u32("state_channel_offset", shape.state_channel_offset)?;
+        let mut arguments = [
+            argument_pointer(&mut input_ptr),
+            argument_pointer(&mut weight_ptr),
+            argument_pointer(&mut state_ptr),
+            argument_pointer(&mut state_indices_ptr),
+            argument_pointer(&mut output_ptr),
+            argument_pointer(&mut batch_size),
+            argument_pointer(&mut channels),
+            argument_pointer(&mut kernel_size),
+            argument_pointer(&mut state_slot_channels),
+            argument_pointer(&mut state_channel_offset),
+        ];
+        self.launch_elementwise(
+            &self.causal_conv1d_update_segment,
             shape.input_elements()?,
             &mut arguments,
         )
@@ -761,6 +984,26 @@ mod tests {
         assert!(matches!(
             overflow.validate(),
             Err(CudaLinearAttentionError::ShapeOverflow)
+        ));
+    }
+
+    #[test]
+    fn segmented_causal_conv_rejects_channels_outside_state_slot() {
+        let shape = CudaCausalConv1dSegmentShape {
+            batch_size: 1,
+            state_slot_count: 2,
+            channels: 4,
+            kernel_size: 3,
+            state_slot_channels: 8,
+            state_channel_offset: 6,
+        };
+        assert!(matches!(
+            shape.validate(),
+            Err(CudaLinearAttentionError::InvalidStateSegment {
+                channel_offset: 6,
+                channels: 4,
+                state_slot_channels: 8,
+            })
         ));
     }
 

@@ -5,8 +5,9 @@ use sglang_kernel::cpu::{
 };
 use sglang_kernel::cuda::{CudaContext, CudaDeviceAllocation, CudaDriver};
 use sglang_kernel::cuda_linear_attention::{
-    CudaBf16LinearAttentionKernels, CudaCausalConv1dLaunch, CudaCausalConv1dShape,
-    CudaKeyGatedDeltaLaunch, CudaKeyGatedDeltaShape, CudaLinearAttentionError,
+    CudaBf16LinearAttentionKernels, CudaCausalConv1dLaunch, CudaCausalConv1dSegmentLaunch,
+    CudaCausalConv1dSegmentShape, CudaCausalConv1dShape, CudaKeyGatedDeltaLaunch,
+    CudaKeyGatedDeltaShape, CudaLinearAttentionError,
 };
 
 fn cuda_test_device_ordinal() -> usize {
@@ -269,6 +270,52 @@ fn cuda_kda_decode_updates_slot_owned_conv_and_temporal_state() {
         &conv_reference_state,
         0.0,
     );
+
+    let segment_shape = CudaCausalConv1dSegmentShape {
+        batch_size: 2,
+        state_slot_count: 4,
+        channels: 2,
+        kernel_size: 3,
+        state_slot_channels: 5,
+        state_channel_offset: 1,
+    };
+    let segment_input = device_allocation(&context, &bf16_bytes(&[2.0, -1.0, 0.5, 3.0]));
+    let segment_weight = device_allocation(&context, &bf16_bytes(&[0.0, 0.0, 1.0, 0.0, 0.0, -0.5]));
+    let segment_state_elements = segment_shape.state_slot_count
+        * (segment_shape.kernel_size - 1)
+        * segment_shape.state_slot_channels;
+    let mut segment_state =
+        zeroed_device_allocation(&context, segment_state_elements * size_of::<u16>());
+    let mut segment_output = zeroed_device_allocation(
+        &context,
+        segment_shape.batch_size * segment_shape.channels * size_of::<u16>(),
+    );
+    kernels
+        .causal_conv1d_update_segment(CudaCausalConv1dSegmentLaunch {
+            input: &segment_input,
+            input_offset: 0,
+            weight: &segment_weight,
+            weight_offset: 0,
+            state: &mut segment_state,
+            state_offset: 0,
+            state_indices: &state_indices_device,
+            state_indices_offset: 0,
+            output: &mut segment_output,
+            output_offset: 0,
+            shape: segment_shape,
+        })
+        .expect("segmented CUDA convolution should update its state channel range");
+    assert_close(&copy_bf16(&segment_output, 4), &[2.0, 0.5, 0.5, -1.5], 0.0);
+    let segment_state = copy_bf16(&segment_state, segment_state_elements);
+    for (batch, slot) in state_indices.iter().enumerate() {
+        let final_history_offset = (*slot as usize * (segment_shape.kernel_size - 1) + 1)
+            * segment_shape.state_slot_channels
+            + segment_shape.state_channel_offset;
+        assert_eq!(
+            &segment_state[final_history_offset..final_history_offset + 2],
+            &if batch == 0 { [2.0, -1.0] } else { [0.5, 3.0] }
+        );
+    }
 
     let kda_shape = CudaKeyGatedDeltaShape {
         batch_size: 2,

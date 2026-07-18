@@ -3,13 +3,17 @@ use std::fmt;
 use sglang_kernel::cublas::{CudaBlas, CudaBlasError};
 use sglang_kernel::cuda::{CudaContext, CudaDeviceAllocation, CudaError};
 use sglang_kernel::cuda_bf16_kernels::{CudaBf16DenseKernels, CudaBf16KernelError};
+use sglang_kernel::cuda_hybrid_kernels::CudaHybridKernelError;
 use sglang_kernel::cuda_kv_kernels::CudaKvPairCopyError;
+use sglang_kernel::cuda_linear_attention::CudaLinearAttentionError;
 
 use crate::cuda_attention::CudaPagedAttentionError;
 use crate::cuda_kv_cache::CudaKvStorageError;
+use crate::cuda_recurrent_state::CudaRecurrentStateError;
 use crate::model_artifacts::{
     LocalModelArtifacts, ModelArtifactError, SafetensorsTensorDecodeError,
 };
+use crate::models::DenseFeedForwardWeightNames;
 
 const BF16_BYTES: usize = 2;
 
@@ -23,9 +27,12 @@ pub(crate) enum CudaExecutorError {
     Cuda(CudaError),
     CudaBlas(CudaBlasError),
     Kernel(CudaBf16KernelError),
+    HybridKernel(CudaHybridKernelError),
+    LinearAttention(CudaLinearAttentionError),
     Attention(CudaPagedAttentionError),
     KvCache(CudaKvStorageError),
     KvCopy(CudaKvPairCopyError),
+    RecurrentState(CudaRecurrentStateError),
 }
 
 impl fmt::Display for CudaExecutorError {
@@ -47,9 +54,18 @@ impl fmt::Display for CudaExecutorError {
             }
             Self::CudaBlas(error) => write!(formatter, "CUDA executor cuBLAS failed: {error}"),
             Self::Kernel(error) => write!(formatter, "CUDA executor kernel failed: {error}"),
+            Self::HybridKernel(error) => {
+                write!(formatter, "CUDA executor hybrid kernel failed: {error}")
+            }
+            Self::LinearAttention(error) => {
+                write!(formatter, "CUDA executor linear attention failed: {error}")
+            }
             Self::Attention(error) => write!(formatter, "CUDA executor attention failed: {error}"),
             Self::KvCache(error) => write!(formatter, "CUDA executor KV cache failed: {error}"),
             Self::KvCopy(error) => write!(formatter, "CUDA executor KV scatter failed: {error}"),
+            Self::RecurrentState(error) => {
+                write!(formatter, "CUDA executor recurrent state failed: {error}")
+            }
         }
     }
 }
@@ -71,9 +87,12 @@ error_conversion!(SafetensorsTensorDecodeError, TensorDecode);
 error_conversion!(CudaError, Cuda);
 error_conversion!(CudaBlasError, CudaBlas);
 error_conversion!(CudaBf16KernelError, Kernel);
+error_conversion!(CudaHybridKernelError, HybridKernel);
+error_conversion!(CudaLinearAttentionError, LinearAttention);
 error_conversion!(CudaPagedAttentionError, Attention);
 error_conversion!(CudaKvStorageError, KvCache);
 error_conversion!(CudaKvPairCopyError, KvCopy);
+error_conversion!(CudaRecurrentStateError, RecurrentState);
 
 pub(crate) struct CudaBf16Matrix {
     allocation: CudaDeviceAllocation,
@@ -99,6 +118,81 @@ impl CudaBf16Matrix {
 
     pub(crate) fn allocation(&self) -> &CudaDeviceAllocation {
         &self.allocation
+    }
+}
+
+pub(crate) struct CudaBf16DenseFeedForward {
+    intermediate_size: usize,
+    gate: CudaBf16Matrix,
+    up: CudaBf16Matrix,
+    down: CudaBf16Matrix,
+}
+
+impl CudaBf16DenseFeedForward {
+    pub(crate) fn load(
+        artifacts: &LocalModelArtifacts,
+        context: &CudaContext,
+        names: &DenseFeedForwardWeightNames,
+        hidden_size: usize,
+        intermediate_size: usize,
+    ) -> Result<Self, CudaExecutorError> {
+        if hidden_size == 0 || intermediate_size == 0 {
+            return Err(CudaExecutorError::Shape(format!(
+                "dense feed-forward sizes must be non-zero, got hidden={hidden_size}, intermediate={intermediate_size}"
+            )));
+        }
+        Ok(Self {
+            intermediate_size,
+            gate: CudaBf16Matrix::load(
+                artifacts,
+                context,
+                &names.gate_weight,
+                intermediate_size,
+                hidden_size,
+            )?,
+            up: CudaBf16Matrix::load(
+                artifacts,
+                context,
+                &names.up_weight,
+                intermediate_size,
+                hidden_size,
+            )?,
+            down: CudaBf16Matrix::load(
+                artifacts,
+                context,
+                &names.down_weight,
+                hidden_size,
+                intermediate_size,
+            )?,
+        })
+    }
+
+    pub(crate) fn forward(
+        &self,
+        blas: &CudaBlas,
+        kernels: &CudaBf16DenseKernels,
+        context: &CudaContext,
+        hidden: &CudaDeviceAllocation,
+        row_count: usize,
+        hidden_size: usize,
+    ) -> Result<CudaDeviceAllocation, CudaExecutorError> {
+        let gate = linear(blas, context, hidden, row_count, hidden_size, &self.gate)?;
+        let up = linear(blas, context, hidden, row_count, hidden_size, &self.up)?;
+        let element_count = checked_product(
+            row_count,
+            self.intermediate_size,
+            "feed-forward intermediate",
+        )?;
+        let mut activated = allocate_bf16(context, element_count)?;
+        kernels.silu_mul(&gate, &up, &mut activated, element_count)?;
+        linear(
+            blas,
+            context,
+            &activated,
+            row_count,
+            self.intermediate_size,
+            &self.down,
+        )
     }
 }
 
@@ -178,6 +272,14 @@ pub(crate) fn allocate_bf16(
     Ok(context.allocate(byte_len)?)
 }
 
+pub(crate) fn allocate_f32(
+    context: &CudaContext,
+    element_count: usize,
+) -> Result<CudaDeviceAllocation, CudaExecutorError> {
+    let byte_len = checked_product(element_count, 4, "F32 allocation")?;
+    Ok(context.allocate(byte_len)?)
+}
+
 pub(crate) fn upload_required_bf16(
     artifacts: &LocalModelArtifacts,
     context: &CudaContext,
@@ -215,6 +317,16 @@ pub(crate) fn upload_optional_bf16(
 ) -> Result<Option<CudaDeviceAllocation>, CudaExecutorError> {
     name.map(|name| upload_required_bf16(artifacts, context, name, expected_elements))
         .transpose()
+}
+
+pub(crate) fn upload_required_f32(
+    artifacts: &LocalModelArtifacts,
+    context: &CudaContext,
+    name: &str,
+    expected_elements: usize,
+) -> Result<CudaDeviceAllocation, CudaExecutorError> {
+    let values = read_required_f32_values(artifacts, name, expected_elements)?;
+    upload_f32_values(context, &values)
 }
 
 pub(crate) fn upload_u32(
@@ -282,6 +394,41 @@ fn f32_values_to_bf16_bytes(values: &[f32]) -> Vec<u8> {
             ((bits.wrapping_add(rounding_bias) >> 16) as u16).to_ne_bytes()
         })
         .collect()
+}
+
+fn read_required_f32_values(
+    artifacts: &LocalModelArtifacts,
+    name: &str,
+    expected_elements: usize,
+) -> Result<Vec<f32>, CudaExecutorError> {
+    let tensor = artifacts
+        .safetensors()
+        .read_tensor(name)?
+        .ok_or_else(|| CudaExecutorError::MissingTensor(name.to_string()))?;
+    if !matches!(tensor.metadata.dtype.as_str(), "F32" | "F16" | "BF16") {
+        return Err(CudaExecutorError::Unsupported(format!(
+            "tensor {name} uses checkpoint dtype {}; the BF16 executor currently accepts unquantized F32, F16, or BF16 weights and does not apply quantized weight scales",
+            tensor.metadata.dtype
+        )));
+    }
+    if tensor.element_count() != expected_elements {
+        return Err(CudaExecutorError::Shape(format!(
+            "tensor {name} has {} elements, expected {expected_elements}",
+            tensor.element_count()
+        )));
+    }
+    Ok(tensor.decode_f32_values()?)
+}
+
+fn upload_f32_values(
+    context: &CudaContext,
+    values: &[f32],
+) -> Result<CudaDeviceAllocation, CudaExecutorError> {
+    let bytes = values
+        .iter()
+        .flat_map(|value| value.to_ne_bytes())
+        .collect::<Vec<_>>();
+    upload_bytes(context, &bytes)
 }
 
 pub(crate) fn checked_product(

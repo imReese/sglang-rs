@@ -12,9 +12,9 @@ use crate::cuda_attention::{
 use crate::cuda_execution_resources::CudaExecutionResources;
 use crate::cuda_kv_cache::{CudaKvSlotScatterLaunch, CudaKvStorage};
 use crate::cuda_transformer::{
-    CudaBf16Matrix, CudaExecutorError, add, add_optional_bias, allocate_bf16, checked_product,
-    download_bf16, linear, rms_norm, upload_optional_bf16, upload_required_bf16, upload_u32,
-    upload_usize_as_u64,
+    CudaBf16DenseFeedForward, CudaBf16Matrix, CudaExecutorError, add, add_optional_bias,
+    allocate_bf16, checked_product, download_bf16, linear, rms_norm, upload_optional_bf16,
+    upload_required_bf16, upload_u32, upload_usize_as_u64,
 };
 use crate::kv_cache::PagedKvCacheLayout;
 use crate::model_artifacts::LocalModelArtifacts;
@@ -24,7 +24,8 @@ use crate::model_executor::{
 use crate::model_runtime::BackendModelExecutor;
 use crate::models::{
     AttentionArchitecture, DenseDecoderExecutionPlan, DenseDecoderLayerWeightNames,
-    FeedForwardArchitecture, ModelDefinition, ModelExecutionArchitecture,
+    DenseFeedForwardWeightNames, FeedForwardArchitecture, ModelDefinition,
+    ModelExecutionArchitecture,
 };
 
 type CudaDenseDecoderError = CudaExecutorError;
@@ -406,37 +407,13 @@ impl CudaBf16DenseDecoder {
             self.shape.hidden_size,
             self.plan.rms_norm_eps,
         )?;
-        let gate = linear(
+        let feed_forward = layer.feed_forward.forward(
             &self.blas,
+            &self.kernels,
             self.backend.context(),
             &normalized,
             row_count,
             self.shape.hidden_size,
-            &layer.gate,
-        )?;
-        let up = linear(
-            &self.blas,
-            self.backend.context(),
-            &normalized,
-            row_count,
-            self.shape.hidden_size,
-            &layer.up,
-        )?;
-        let intermediate_elements = checked_product(
-            row_count,
-            self.shape.intermediate_size,
-            "feed-forward intermediate",
-        )?;
-        let mut activated = allocate_bf16(self.backend.context(), intermediate_elements)?;
-        self.kernels
-            .silu_mul(&gate, &up, &mut activated, intermediate_elements)?;
-        let feed_forward = linear(
-            &self.blas,
-            self.backend.context(),
-            &activated,
-            row_count,
-            self.shape.intermediate_size,
-            &layer.down,
         )?;
         add(
             &self.kernels,
@@ -557,9 +534,7 @@ struct CudaDenseDecoderLayer {
     output: CudaBf16Matrix,
     output_bias: Option<CudaDeviceAllocation>,
     post_attention_norm: CudaDeviceAllocation,
-    gate: CudaBf16Matrix,
-    up: CudaBf16Matrix,
-    down: CudaBf16Matrix,
+    feed_forward: CudaBf16DenseFeedForward,
 }
 
 impl CudaDenseDecoderLayer {
@@ -646,24 +621,14 @@ impl CudaDenseDecoderLayer {
                 &names.post_attention_norm,
                 shape.hidden_size,
             )?,
-            gate: CudaBf16Matrix::load(
+            feed_forward: CudaBf16DenseFeedForward::load(
                 artifacts,
                 context,
-                &names.gate_weight,
-                shape.intermediate_size,
-                shape.hidden_size,
-            )?,
-            up: CudaBf16Matrix::load(
-                artifacts,
-                context,
-                &names.up_weight,
-                shape.intermediate_size,
-                shape.hidden_size,
-            )?,
-            down: CudaBf16Matrix::load(
-                artifacts,
-                context,
-                &names.down_weight,
+                &DenseFeedForwardWeightNames {
+                    gate_weight: names.gate_weight.clone(),
+                    up_weight: names.up_weight.clone(),
+                    down_weight: names.down_weight.clone(),
+                },
                 shape.hidden_size,
                 shape.intermediate_size,
             )?,

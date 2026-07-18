@@ -97,3 +97,24 @@ fn model_adapters_do_not_select_runtime_backend_providers() {
         assert!(!adapter.contains("RuntimeBackend::"));
     }
 }
+
+#[test]
+fn cuda_backend_components_do_not_branch_on_model_names() {
+    let dense = include_str!("../src/cuda_dense_decoder.rs");
+    let hybrid = include_str!("../src/cuda_hybrid_decoder.rs");
+    for source in [
+        include_str!("../src/backend_model.rs"),
+        include_str!("../src/cuda_execution_resources.rs"),
+        include_str!("../src/cuda_transformer.rs"),
+        hybrid,
+    ] {
+        for model_name in ["Kimi", "Qwen", "DeepSeek", "GlmMoe", "GLM"] {
+            assert!(
+                !source.contains(model_name),
+                "CUDA backend component contains model branch {model_name}"
+            );
+        }
+    }
+    assert!(dense.contains("CudaBf16DenseFeedForward"));
+    assert!(hybrid.contains("CudaBf16DenseFeedForward"));
+}

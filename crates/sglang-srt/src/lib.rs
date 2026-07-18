@@ -7,6 +7,7 @@ mod cpu_reference;
 pub mod cuda_attention;
 mod cuda_dense_decoder;
 mod cuda_execution_resources;
+mod cuda_hybrid_decoder;
 pub mod cuda_kv_cache;
 pub mod cuda_recurrent_state;
 mod cuda_transformer;

@@ -29,6 +29,18 @@ impl CudaExecutionResources {
     pub(crate) fn active_kv_cache_mut(&mut self) -> &mut KvCachePool<CudaKvStorage> {
         self.active_kv_cache.allocation_mut()
     }
+
+    pub(crate) fn execution_memory_mut(
+        &mut self,
+    ) -> (
+        &mut KvCachePool<CudaKvStorage>,
+        Option<&mut CudaRecurrentStateStorage>,
+    ) {
+        (
+            self.active_kv_cache.allocation_mut(),
+            self.recurrent_state.as_mut(),
+        )
+    }
 }
 
 impl KvCacheMemoryProvider for CudaExecutionResources {
