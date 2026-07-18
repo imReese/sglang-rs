@@ -9,6 +9,7 @@ mod cuda_dense_decoder;
 mod cuda_execution_resources;
 pub mod cuda_kv_cache;
 pub mod cuda_recurrent_state;
+mod cuda_transformer;
 pub mod engine;
 pub mod engine_info_bootstrap;
 pub mod grpc;
