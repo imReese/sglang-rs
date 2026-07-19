@@ -7,6 +7,7 @@ use sglang_kernel::cuda_hybrid_kernels::CudaHybridKernelError;
 use sglang_kernel::cuda_kv_kernels::CudaKvPairCopyError;
 use sglang_kernel::cuda_linear_attention::CudaLinearAttentionError;
 use sglang_kernel::cuda_mla::CudaMlaKernelError;
+use sglang_kernel::nccl::NcclError;
 
 use crate::cuda_attention::CudaPagedAttentionError;
 use crate::cuda_kv_cache::CudaKvStorageError;
@@ -15,6 +16,9 @@ use crate::model_artifacts::{
     LocalModelArtifacts, ModelArtifactError, SafetensorsTensorDecodeError,
 };
 use crate::models::DenseFeedForwardWeightNames;
+use crate::parallel::TensorPartition;
+use crate::tensor_partition::read_tensor_axis_partition;
+use crate::transformer_parallel::DenseTensorParallelPlan;
 
 const BF16_BYTES: usize = 2;
 
@@ -36,6 +40,7 @@ pub(crate) enum CudaExecutorError {
     KvCache(CudaKvStorageError),
     KvCopy(CudaKvPairCopyError),
     RecurrentState(CudaRecurrentStateError),
+    Nccl(NcclError),
 }
 
 impl fmt::Display for CudaExecutorError {
@@ -76,6 +81,7 @@ impl fmt::Display for CudaExecutorError {
             Self::RecurrentState(error) => {
                 write!(formatter, "CUDA executor recurrent state failed: {error}")
             }
+            Self::Nccl(error) => write!(formatter, "CUDA executor NCCL failed: {error}"),
         }
     }
 }
@@ -104,6 +110,7 @@ error_conversion!(CudaPagedAttentionError, Attention);
 error_conversion!(CudaKvStorageError, KvCache);
 error_conversion!(CudaKvPairCopyError, KvCopy);
 error_conversion!(CudaRecurrentStateError, RecurrentState);
+error_conversion!(NcclError, Nccl);
 
 pub(crate) struct CudaBf16Matrix {
     allocation: CudaDeviceAllocation,
@@ -129,6 +136,41 @@ impl CudaBf16Matrix {
 
     pub(crate) fn allocation(&self) -> &CudaDeviceAllocation {
         &self.allocation
+    }
+
+    pub(crate) fn load_axis_partition(
+        artifacts: &LocalModelArtifacts,
+        context: &CudaContext,
+        name: &str,
+        rows: usize,
+        columns: usize,
+        axis: usize,
+        partition: TensorPartition,
+    ) -> Result<Self, CudaExecutorError> {
+        if partition.partition_count() == 1 {
+            return Self::load(artifacts, context, name, rows, columns);
+        }
+        let expected_shape = [rows, columns];
+        let local_extent = partition
+            .range(*expected_shape.get(axis).ok_or_else(|| {
+                CudaExecutorError::Shape(format!("matrix {name} has no partition axis {axis}"))
+            })?)
+            .map_err(|error| CudaExecutorError::Shape(error.to_string()))?
+            .len();
+        let mut local_shape = expected_shape;
+        local_shape[axis] = local_extent;
+        Ok(Self {
+            allocation: upload_required_bf16_axis_partition(
+                artifacts,
+                context,
+                name,
+                &expected_shape,
+                axis,
+                partition,
+            )?,
+            rows: local_shape[0],
+            columns: local_shape[1],
+        })
     }
 }
 
@@ -204,6 +246,47 @@ impl CudaBf16DenseFeedForward {
             self.intermediate_size,
             &self.down,
         )
+    }
+
+    pub(crate) fn load_tensor_parallel(
+        artifacts: &LocalModelArtifacts,
+        context: &CudaContext,
+        names: &DenseFeedForwardWeightNames,
+        hidden_size: usize,
+        global_intermediate_size: usize,
+        plan: DenseTensorParallelPlan,
+    ) -> Result<Self, CudaExecutorError> {
+        let local_intermediate_size = plan.local_intermediate_size();
+        Ok(Self {
+            intermediate_size: local_intermediate_size,
+            gate: CudaBf16Matrix::load_axis_partition(
+                artifacts,
+                context,
+                &names.gate_weight,
+                global_intermediate_size,
+                hidden_size,
+                0,
+                plan.intermediate_partition(),
+            )?,
+            up: CudaBf16Matrix::load_axis_partition(
+                artifacts,
+                context,
+                &names.up_weight,
+                global_intermediate_size,
+                hidden_size,
+                0,
+                plan.intermediate_partition(),
+            )?,
+            down: CudaBf16Matrix::load_axis_partition(
+                artifacts,
+                context,
+                &names.down_weight,
+                hidden_size,
+                global_intermediate_size,
+                1,
+                plan.intermediate_partition(),
+            )?,
+        })
     }
 }
 
@@ -328,6 +411,61 @@ pub(crate) fn upload_optional_bf16(
 ) -> Result<Option<CudaDeviceAllocation>, CudaExecutorError> {
     name.map(|name| upload_required_bf16(artifacts, context, name, expected_elements))
         .transpose()
+}
+
+pub(crate) fn upload_optional_bf16_partition(
+    artifacts: &LocalModelArtifacts,
+    context: &CudaContext,
+    name: Option<&str>,
+    expected_elements: usize,
+    partition: TensorPartition,
+) -> Result<Option<CudaDeviceAllocation>, CudaExecutorError> {
+    if partition.partition_count() == 1 {
+        return upload_optional_bf16(artifacts, context, name, expected_elements);
+    }
+    name.map(|name| {
+        upload_required_bf16_axis_partition(
+            artifacts,
+            context,
+            name,
+            &[expected_elements],
+            0,
+            partition,
+        )
+    })
+    .transpose()
+}
+
+fn upload_required_bf16_axis_partition(
+    artifacts: &LocalModelArtifacts,
+    context: &CudaContext,
+    name: &str,
+    expected_shape: &[usize],
+    axis: usize,
+    partition: TensorPartition,
+) -> Result<CudaDeviceAllocation, CudaExecutorError> {
+    let span = artifacts
+        .safetensors()
+        .tensor_span(name)?
+        .ok_or_else(|| CudaExecutorError::MissingTensor(name.to_string()))?;
+    if span.metadata.shape != expected_shape {
+        return Err(CudaExecutorError::Shape(format!(
+            "tensor {name} has shape {:?}, expected {expected_shape:?}",
+            span.metadata.shape
+        )));
+    }
+    let tensor = read_tensor_axis_partition(&span, axis, partition)?;
+    if !matches!(tensor.metadata.dtype.as_str(), "F32" | "F16" | "BF16") {
+        return Err(CudaExecutorError::Unsupported(format!(
+            "tensor {name} uses checkpoint dtype {}; the BF16 executor currently accepts unquantized F32, F16, or BF16 weights and does not apply quantized weight scales",
+            tensor.metadata.dtype
+        )));
+    }
+    let values = tensor.decode_f32_values()?;
+    let bytes = f32_values_to_bf16_bytes(&values);
+    let mut allocation = context.allocate(bytes.len())?;
+    allocation.copy_from_host(0, &bytes)?;
+    Ok(allocation)
 }
 
 pub(crate) fn upload_required_f32(

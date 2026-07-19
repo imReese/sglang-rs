@@ -21,6 +21,20 @@ fn cuda_test_device_ordinal() -> usize {
         .expect("SGLANG_CUDA_TEST_DEVICE must be a CUDA device ordinal")
 }
 
+fn cuda_test_devices() -> [usize; 2] {
+    if let Ok(devices) = std::env::var("SGLANG_CUDA_TEST_DEVICES") {
+        let devices = devices
+            .split(',')
+            .map(str::trim)
+            .map(|value| value.parse::<usize>().expect("CUDA device ordinal"))
+            .collect::<Vec<_>>();
+        return devices
+            .try_into()
+            .expect("SGLANG_CUDA_TEST_DEVICES must contain exactly two ordinals");
+    }
+    [0, cuda_test_device_ordinal()]
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a CUDA device, NVIDIA driver, NVRTC, and cuBLAS with BF16 support"]
 async fn cuda_qwen3_uses_the_shared_dense_decoder_and_runtime_kv_pool() {
@@ -80,6 +94,77 @@ async fn cuda_qwen3_uses_the_shared_dense_decoder_and_runtime_kv_pool() {
         .await
         .expect("CUDA Qwen3 HTTP server task should join")
         .expect("CUDA Qwen3 HTTP server should stop cleanly");
+    fs::remove_dir_all(model_dir).expect("temp model directory should be removed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires two CUDA devices, the NVIDIA driver, NCCL, NVRTC, and cuBLAS with BF16 support"]
+async fn cuda_qwen3_runs_two_rank_tensor_parallel_inference() {
+    let [first_device, second_device] = cuda_test_devices();
+    assert!(
+        second_device > first_device,
+        "SGLANG_CUDA_TEST_DEVICES must contain two ascending ordinals"
+    );
+    for device_ordinal in [first_device, second_device] {
+        let backend =
+            CudaBackend::initialize(device_ordinal).expect("CUDA backend should initialize");
+        assert!(
+            backend
+                .capabilities()
+                .supported_dtypes
+                .contains(&sglang_srt::backend::RuntimeDtype::Bf16),
+            "CUDA acceptance devices must support BF16"
+        );
+    }
+
+    let model_dir = temp_model_dir("cuda-qwen3-dense-tensor-parallel-http");
+    write_qwen3_dense_artifacts(&model_dir);
+    let mut args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_dir.to_str().expect("temp model path should be utf-8"),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--tp-size",
+        "2",
+        "--page-size",
+        "4",
+        "--num-reserved-decode-tokens",
+        "32",
+    ])
+    .expect("server args should parse");
+    args.base_gpu_id = first_device;
+    args.gpu_id_step = second_device - first_device;
+    let service = build_bootstrap_http_router_service(&args);
+    let addr = unused_local_addr();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(addr, service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let generated = post_json_with_retry(
+        addr,
+        "/generate",
+        r#"{"text":"hello","sampling_params":{"max_new_tokens":2}}"#,
+    )
+    .await;
+
+    assert_eq!(generated["output_ids"], serde_json::json!([2, 1]));
+    assert_eq!(generated["usage"]["prompt_tokens"], 1);
+    assert_eq!(generated["usage"]["completion_tokens"], 2);
+
+    shutdown_tx
+        .send(())
+        .expect("CUDA tensor parallel HTTP server should still be running");
+    server
+        .await
+        .expect("CUDA tensor parallel HTTP server task should join")
+        .expect("CUDA tensor parallel HTTP server should stop cleanly");
     fs::remove_dir_all(model_dir).expect("temp model directory should be removed");
 }
 
@@ -247,9 +332,9 @@ fn write_qwen3_dense_artifacts(model_dir: &Path) {
   "model_type": "qwen3",
   "vocab_size": 3,
   "num_hidden_layers": 1,
-  "hidden_size": 2,
-  "intermediate_size": 2,
-  "num_attention_heads": 1,
+  "hidden_size": 4,
+  "intermediate_size": 4,
+  "num_attention_heads": 2,
   "num_key_value_heads": 1,
   "head_dim": 2,
   "hidden_act": "silu",
@@ -270,46 +355,54 @@ fn write_qwen3_dense_artifacts(model_dir: &Path) {
     let descriptors: Vec<(&str, &[usize], Vec<f32>)> = vec![
         (
             "model.embed_tokens.weight",
-            &[3, 2],
-            vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
+            &[3, 4],
+            vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
         ),
-        ("model.norm.weight", &[2], vec![1.0, 1.0]),
+        ("model.norm.weight", &[4], vec![1.0; 4]),
         (
             "lm_head.weight",
-            &[3, 2],
-            vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0],
+            &[3, 4],
+            vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
         ),
         (
             "model.layers.0.self_attn.q_proj.weight",
-            &[2, 2],
-            vec![0.0; 4],
+            &[4, 4],
+            vec![0.0; 16],
         ),
         ("model.layers.0.self_attn.q_norm.weight", &[2], vec![1.0; 2]),
         (
             "model.layers.0.self_attn.k_proj.weight",
-            &[2, 2],
-            vec![0.0; 4],
+            &[2, 4],
+            vec![0.0; 8],
         ),
         ("model.layers.0.self_attn.k_norm.weight", &[2], vec![1.0; 2]),
         (
             "model.layers.0.self_attn.v_proj.weight",
-            &[2, 2],
-            vec![0.0; 4],
+            &[2, 4],
+            vec![0.0; 8],
         ),
         (
             "model.layers.0.self_attn.o_proj.weight",
-            &[2, 2],
-            vec![0.0; 4],
+            &[4, 4],
+            vec![0.0; 16],
         ),
-        ("model.layers.0.input_layernorm.weight", &[2], vec![1.0; 2]),
+        ("model.layers.0.input_layernorm.weight", &[4], vec![1.0; 4]),
         (
             "model.layers.0.post_attention_layernorm.weight",
-            &[2],
-            vec![1.0; 2],
+            &[4],
+            vec![1.0; 4],
         ),
-        ("model.layers.0.mlp.gate_proj.weight", &[2, 2], vec![0.0; 4]),
-        ("model.layers.0.mlp.up_proj.weight", &[2, 2], vec![0.0; 4]),
-        ("model.layers.0.mlp.down_proj.weight", &[2, 2], vec![0.0; 4]),
+        (
+            "model.layers.0.mlp.gate_proj.weight",
+            &[4, 4],
+            vec![0.0; 16],
+        ),
+        ("model.layers.0.mlp.up_proj.weight", &[4, 4], vec![0.0; 16]),
+        (
+            "model.layers.0.mlp.down_proj.weight",
+            &[4, 4],
+            vec![0.0; 16],
+        ),
     ];
     let mut payload = Vec::new();
     let mut tensors = Vec::new();

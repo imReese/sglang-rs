@@ -10,8 +10,7 @@ use crate::model_executor::{
     ForwardModel, KvCacheAllocationConfig, ModelForwardError, ModelForwardOutput, ModelWorkerBatch,
 };
 use crate::model_runtime::{
-    LoadedModelRuntime, ModelRuntimeConfig, ModelRuntimeLoadError, validate_runtime_parallelism,
-    validate_runtime_support,
+    LoadedModelRuntime, ModelRuntimeConfig, ModelRuntimeLoadError, validate_runtime_support,
 };
 use crate::models::{
     DEEPSEEK_V3_ADAPTER, DEEPSEEK_V4_ADAPTER, GLM_MOE_DSA_ADAPTER, KIMI_K25_ADAPTER,
@@ -220,12 +219,6 @@ impl BootstrapForwardModel {
     pub(crate) fn from_server_args(args: &ServerArgs) -> Result<Self, ModelRegistryError> {
         let requested_backend = RuntimeBackend::parse(&args.device)
             .ok_or_else(|| ModelRegistryError::InvalidDevice(args.device.clone()))?;
-        validate_runtime_parallelism(args.tp_size).map_err(|message| {
-            ModelRegistryError::BackendInitialization {
-                requested: requested_backend,
-                message,
-            }
-        })?;
         let artifacts = LocalModelArtifacts::from_model_path(&args.model_path)?;
         let ranks_per_node = args.tp_size.checked_div(args.nnodes).ok_or_else(|| {
             ModelRegistryError::BackendInitialization {
@@ -256,6 +249,8 @@ impl BootstrapForwardModel {
                 requested_backend,
                 ModelRuntimeConfig {
                     tensor_parallel_size: args.tp_size,
+                    tensor_parallel_node_count: args.nnodes,
+                    tensor_parallel_node_rank: args.node_rank,
                     device_placement,
                     kv_cache: Some(KvCacheAllocationConfig {
                         slot_capacity: args.num_reserved_decode_tokens,

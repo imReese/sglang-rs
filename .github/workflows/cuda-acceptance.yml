@@ -26,6 +26,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
   SGLANG_CUDA_TEST_DEVICE: "1"
+  SGLANG_CUDA_TEST_DEVICES: "0,1"
 
 jobs:
   cuda:
@@ -64,6 +65,17 @@ jobs:
             echo "::error::CUDA acceptance requires nonzero device ordinal ${SGLANG_CUDA_TEST_DEVICE}; configure a multi-GPU runner."
             exit 1
           }
+          IFS=',' read -ra CUDA_TEST_DEVICES <<< "${SGLANG_CUDA_TEST_DEVICES}"
+          if [[ "${#CUDA_TEST_DEVICES[@]}" -ne 2 ]]; then
+            echo "::error::SGLANG_CUDA_TEST_DEVICES must contain exactly two ordinals."
+            exit 1
+          fi
+          for ordinal in "${CUDA_TEST_DEVICES[@]}"; do
+            nvidia-smi --query-gpu=index --format=csv,noheader | grep -Fx "${ordinal}" >/dev/null || {
+              echo "::error::CUDA tensor-parallel acceptance requires device ordinal ${ordinal}."
+              exit 1
+            }
+          done
 
       - name: Install Rust toolchain
         shell: bash

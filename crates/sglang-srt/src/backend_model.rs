@@ -8,7 +8,8 @@ use crate::cuda_execution_resources::CudaExecutionResources;
 use crate::cuda_hybrid_decoder::CudaBf16HybridDecoder;
 use crate::cuda_kv_cache::allocate_cuda_kv_cache;
 use crate::cuda_recurrent_state::CudaRecurrentStateStorage;
-use crate::kv_cache::{KvCacheDtype, KvCacheRuntimeLayout, PagedKvCacheLayout};
+use crate::cuda_tensor_parallel::CudaTensorParallelDenseRuntime;
+use crate::kv_cache::{KvCacheDtype, KvCacheModelLayout, KvCacheRuntimeLayout, PagedKvCacheLayout};
 use crate::model_artifacts::LocalModelArtifacts;
 use crate::model_executor::KvCacheAllocationConfig;
 use crate::model_runtime::{
@@ -164,9 +165,9 @@ impl InitializedRuntimeBackend for CpuReferenceBackend {
     fn validate_model_runtime(
         &self,
         definition: &ModelDefinition,
-        _tensor_parallel_size: usize,
+        tensor_parallel_size: usize,
     ) -> Vec<String> {
-        validate_cpu_model_runtime(definition)
+        validate_cpu_model_runtime(definition, tensor_parallel_size)
     }
 
     fn create_model_runtime(
@@ -265,6 +266,12 @@ fn create_cuda_model_runtime(
 ) -> Result<Box<dyn BackendExecutionRuntime>, ModelRuntimeLoadError> {
     match definition.execution() {
         ModelExecutionArchitecture::Transformer { .. } if definition.dense_decoder().is_some() => {
+            if config.tensor_parallel_size > 1 {
+                return CudaTensorParallelDenseRuntime::launch(
+                    definition, artifacts, backend, config,
+                )
+                .map(|runtime| Box::new(runtime) as Box<dyn BackendExecutionRuntime>);
+            }
             let kv_cache = allocate_cuda_active_kv_cache(
                 definition,
                 &backend,
@@ -276,6 +283,11 @@ fn create_cuda_model_runtime(
             Ok(Box::new(BackendExecutionBundle::new(executor, resources)))
         }
         ModelExecutionArchitecture::Transformer { .. } if definition.hybrid_decoder().is_some() => {
+            if config.tensor_parallel_size > 1 {
+                return Err(ModelRuntimeLoadError::MissingCapabilities(vec![
+                    "CUDA tensor parallel executor for the shared hybrid decoder".to_string(),
+                ]));
+            }
             let kv_cache = allocate_cuda_active_kv_cache(
                 definition,
                 &backend,
@@ -324,12 +336,20 @@ fn paged_kv_cache_layout(
     dtype: KvCacheDtype,
     config: KvCacheAllocationConfig,
 ) -> Result<PagedKvCacheLayout, ModelRuntimeLoadError> {
-    validate_cache_config(config)?;
     let model_layout = definition.kv_cache_layout().ok_or_else(|| {
         ModelRuntimeLoadError::MissingCapabilities(vec![
             "model paged KV cache geometry".to_string(),
         ])
     })?;
+    paged_kv_cache_layout_for_model(model_layout, dtype, config)
+}
+
+pub(crate) fn paged_kv_cache_layout_for_model(
+    model_layout: KvCacheModelLayout,
+    dtype: KvCacheDtype,
+    config: KvCacheAllocationConfig,
+) -> Result<PagedKvCacheLayout, ModelRuntimeLoadError> {
+    validate_cache_config(config)?;
     let bytes_per_token = model_layout
         .token_size_bytes(dtype)
         .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?;
@@ -363,7 +383,15 @@ fn paged_kv_cache_layout(
     layout.map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))
 }
 
-fn validate_cpu_model_runtime(definition: &ModelDefinition) -> Vec<String> {
+fn validate_cpu_model_runtime(
+    definition: &ModelDefinition,
+    tensor_parallel_size: usize,
+) -> Vec<String> {
+    if tensor_parallel_size > 1 {
+        return vec![format!(
+            "CPU reference backend supports only tp_size=1 (requested {tensor_parallel_size})"
+        )];
+    }
     match definition.execution() {
         ModelExecutionArchitecture::Transformer { .. }
             if definition.dense_decoder().is_some() || definition.hybrid_decoder().is_some() =>
@@ -387,7 +415,7 @@ fn validate_cpu_model_runtime(definition: &ModelDefinition) -> Vec<String> {
 fn validate_cuda_model_runtime(
     definition: &ModelDefinition,
     backend: &CudaBackend,
-    _tensor_parallel_size: usize,
+    tensor_parallel_size: usize,
 ) -> Vec<String> {
     let mut missing = Vec::new();
     let capability = backend.capabilities();
@@ -412,6 +440,16 @@ fn validate_cuda_model_runtime(
     }
     if !capability.supported_dtypes.contains(&RuntimeDtype::Bf16) {
         missing.push("CUDA BF16 compute capability 8.0 or newer".to_string());
+    }
+    if tensor_parallel_size > 1 {
+        if definition.dense_decoder().is_none() || definition.hybrid_decoder().is_some() {
+            missing.push(
+                "CUDA tensor parallel executor for the shared dense decoder; hybrid and MLA/MoE tensor parallel execution are not implemented"
+                    .to_string(),
+            );
+        } else if let Err(error) = sglang_kernel::nccl::NcclLibrary::load() {
+            missing.push(format!("NCCL collective backend: {error}"));
+        }
     }
     missing
 }

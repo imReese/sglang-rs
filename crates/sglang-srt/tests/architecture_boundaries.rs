@@ -107,7 +107,9 @@ fn cuda_backend_components_do_not_branch_on_model_names() {
     for source in [
         include_str!("../src/backend_model.rs"),
         include_str!("../src/cuda_execution_resources.rs"),
+        include_str!("../src/cuda_tensor_parallel.rs"),
         include_str!("../src/cuda_transformer.rs"),
+        include_str!("../src/transformer_parallel.rs"),
         include_str!("../src/moe.rs"),
         hybrid,
         mla,

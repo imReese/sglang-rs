@@ -548,8 +548,19 @@ impl ModelExecutionArchitecture {
 
     fn validate_tensor_parallel(self, tensor_parallel_size: usize) -> Result<(), String> {
         match self {
-            Self::Transformer { attention, .. } => {
-                attention.validate_tensor_parallel(tensor_parallel_size)
+            Self::Transformer {
+                attention,
+                feed_forward,
+            } => {
+                attention.validate_tensor_parallel(tensor_parallel_size)?;
+                if let FeedForwardArchitecture::Dense { intermediate_size } = feed_forward
+                    && !intermediate_size.is_multiple_of(tensor_parallel_size)
+                {
+                    return Err(format!(
+                        "dense feed-forward intermediate size {intermediate_size} must be divisible by tensor parallel size {tensor_parallel_size}"
+                    ));
+                }
+                Ok(())
             }
         }
     }

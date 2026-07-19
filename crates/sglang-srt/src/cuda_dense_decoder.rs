@@ -4,6 +4,7 @@ use sglang_kernel::cublas::CudaBlas;
 use sglang_kernel::cuda::{CudaContext, CudaDeviceAllocation};
 use sglang_kernel::cuda_bf16_kernels::CudaBf16DenseKernels;
 use sglang_kernel::cuda_kv_kernels::CudaKvPairCopyKernels;
+use sglang_kernel::nccl::NcclCommunicator;
 
 use crate::backend::{CapabilityStatus, CudaBackend, RuntimeCapability, RuntimeDtype};
 use crate::cuda_attention::{
@@ -14,7 +15,7 @@ use crate::cuda_kv_cache::{CudaKvSlotScatterLaunch, CudaKvStorage};
 use crate::cuda_transformer::{
     CudaBf16DenseFeedForward, CudaBf16Matrix, CudaExecutorError, add, add_optional_bias,
     allocate_bf16, checked_product, download_bf16, linear, rms_norm, upload_optional_bf16,
-    upload_required_bf16, upload_u32, upload_usize_as_u64,
+    upload_optional_bf16_partition, upload_required_bf16, upload_u32, upload_usize_as_u64,
 };
 use crate::kv_cache::PagedKvCacheLayout;
 use crate::model_artifacts::LocalModelArtifacts;
@@ -27,6 +28,8 @@ use crate::models::{
     DenseFeedForwardWeightNames, FeedForwardArchitecture, ModelDefinition,
     ModelExecutionArchitecture,
 };
+use crate::parallel::{TensorParallelRank, TensorParallelTopology};
+use crate::transformer_parallel::DenseTensorParallelPlan;
 
 type CudaDenseDecoderError = CudaExecutorError;
 
@@ -42,6 +45,8 @@ pub(crate) struct CudaBf16DenseDecoder {
     final_norm: CudaDeviceAllocation,
     lm_head: Option<CudaBf16Matrix>,
     layers: Vec<CudaDenseDecoderLayer>,
+    rank: TensorParallelRank,
+    communicator: Option<NcclCommunicator>,
 }
 
 impl fmt::Debug for CudaBf16DenseDecoder {
@@ -49,6 +54,7 @@ impl fmt::Debug for CudaBf16DenseDecoder {
         formatter
             .debug_struct("CudaBf16DenseDecoder")
             .field("device", self.backend.device())
+            .field("rank", &self.rank)
             .field("shape", &self.shape)
             .finish_non_exhaustive()
     }
@@ -60,12 +66,45 @@ impl CudaBf16DenseDecoder {
         artifacts: &LocalModelArtifacts,
         backend: CudaBackend,
     ) -> Result<Self, CudaDenseDecoderError> {
+        let topology = TensorParallelTopology::new(1, 1, 0, backend.device().ordinal, 1)
+            .map_err(|error| CudaDenseDecoderError::Shape(error.to_string()))?;
+        Self::load_tensor_parallel(
+            definition,
+            artifacts,
+            backend,
+            topology.local_ranks()[0],
+            None,
+        )
+    }
+
+    pub(crate) fn load_tensor_parallel(
+        definition: &ModelDefinition,
+        artifacts: &LocalModelArtifacts,
+        backend: CudaBackend,
+        rank: TensorParallelRank,
+        communicator: Option<NcclCommunicator>,
+    ) -> Result<Self, CudaDenseDecoderError> {
+        if backend.device().ordinal != rank.device_ordinal() {
+            return Err(CudaDenseDecoderError::Shape(format!(
+                "tensor parallel rank {} is assigned CUDA device {}, but backend initialized device {}",
+                rank.global_rank(),
+                rank.device_ordinal(),
+                backend.device().ordinal
+            )));
+        }
+        if rank.world_size() > 1 && communicator.is_none() {
+            return Err(CudaDenseDecoderError::Unsupported(format!(
+                "tensor parallel rank {} / {} requires an initialized collective backend",
+                rank.global_rank(),
+                rank.world_size()
+            )));
+        }
         let plan = definition.dense_decoder().cloned().ok_or_else(|| {
             CudaDenseDecoderError::Unsupported(
                 "model definition has no shared dense decoder execution plan".to_string(),
             )
         })?;
-        let shape = CudaDenseDecoderShape::from_definition(definition, &plan)?;
+        let shape = CudaDenseDecoderShape::from_definition(definition, &plan, rank)?;
         let compute_capability = backend.device().compute_capability;
         let blas = CudaBlas::load(backend.context())?;
         let kernels = CudaBf16DenseKernels::compile(backend.context(), compute_capability)?;
@@ -104,7 +143,14 @@ impl CudaBf16DenseDecoder {
             .weights
             .layers
             .iter()
-            .map(|names| CudaDenseDecoderLayer::load(artifacts, backend.context(), names, shape))
+            .map(|names| {
+                CudaDenseDecoderLayer::load_tensor_parallel(
+                    artifacts,
+                    backend.context(),
+                    names,
+                    shape,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
@@ -119,6 +165,8 @@ impl CudaBf16DenseDecoder {
             final_norm,
             lm_head,
             layers,
+            rank,
+            communicator,
         })
     }
 
@@ -128,8 +176,16 @@ impl CudaBf16DenseDecoder {
         capability.supports_forward = true;
         capability.supported_dtypes = vec![RuntimeDtype::Bf16];
         capability.attention_backends = vec!["cuda-paged-bf16"];
-        capability.tensor_parallel = CapabilityStatus::Unsupported;
+        capability.tensor_parallel = CapabilityStatus::Supported;
         capability
+    }
+
+    pub(crate) fn local_kv_head_count(&self) -> usize {
+        self.shape.kv_head_count
+    }
+
+    pub(crate) fn shutdown_collective(&mut self) {
+        self.communicator.take();
     }
 
     fn forward_batch(
@@ -384,6 +440,10 @@ impl CudaBf16DenseDecoder {
             self.shape.query_size,
             &layer.output,
         )?;
+        self.all_reduce_if_needed(
+            &mut projected_attention,
+            checked_product(row_count, self.shape.hidden_size, "attention projection")?,
+        )?;
         add_optional_bias(
             &self.kernels,
             &mut projected_attention,
@@ -407,13 +467,17 @@ impl CudaBf16DenseDecoder {
             self.shape.hidden_size,
             self.plan.rms_norm_eps,
         )?;
-        let feed_forward = layer.feed_forward.forward(
+        let mut feed_forward = layer.feed_forward.forward(
             &self.blas,
             &self.kernels,
             self.backend.context(),
             &normalized,
             row_count,
             self.shape.hidden_size,
+        )?;
+        self.all_reduce_if_needed(
+            &mut feed_forward,
+            checked_product(row_count, self.shape.hidden_size, "feed-forward projection")?,
         )?;
         add(
             &self.kernels,
@@ -440,6 +504,26 @@ impl CudaBf16DenseDecoder {
             width,
             self.plan.rms_norm_eps,
         )
+    }
+
+    fn all_reduce_if_needed(
+        &self,
+        allocation: &mut CudaDeviceAllocation,
+        element_count: usize,
+    ) -> Result<(), CudaDenseDecoderError> {
+        if self.rank.world_size() == 1 {
+            return Ok(());
+        }
+        self.communicator
+            .as_ref()
+            .ok_or_else(|| {
+                CudaDenseDecoderError::Execution(format!(
+                    "tensor parallel rank {} lost its collective backend",
+                    self.rank.global_rank()
+                ))
+            })?
+            .all_reduce_bf16_sum_in_place(allocation, element_count)?;
+        Ok(())
     }
 }
 
@@ -479,18 +563,22 @@ impl BackendModelExecutor<CudaExecutionResources> for CudaBf16DenseDecoder {
 #[derive(Clone, Copy, Debug)]
 struct CudaDenseDecoderShape {
     hidden_size: usize,
-    intermediate_size: usize,
+    global_intermediate_size: usize,
     query_head_count: usize,
     kv_head_count: usize,
     head_dim: usize,
     query_size: usize,
     kv_size: usize,
+    global_query_size: usize,
+    global_kv_size: usize,
+    parallel: DenseTensorParallelPlan,
 }
 
 impl CudaDenseDecoderShape {
     fn from_definition(
         definition: &ModelDefinition,
         plan: &DenseDecoderExecutionPlan,
+        rank: TensorParallelRank,
     ) -> Result<Self, CudaDenseDecoderError> {
         let ModelExecutionArchitecture::Transformer {
             attention:
@@ -507,16 +595,25 @@ impl CudaDenseDecoderShape {
                     .to_string(),
             ));
         };
-        let query_size = checked_product(num_attention_heads, head_dim, "query width")?;
-        let kv_size = checked_product(num_key_value_heads, head_dim, "KV width")?;
+        let parallel = DenseTensorParallelPlan::from_execution(definition.execution(), rank)
+            .map_err(|error| CudaDenseDecoderError::Shape(error.to_string()))?;
+        let global_query_size = checked_product(num_attention_heads, head_dim, "query width")?;
+        let global_kv_size = checked_product(num_key_value_heads, head_dim, "KV width")?;
         Ok(Self {
             hidden_size: plan.hidden_size,
-            intermediate_size,
-            query_head_count: num_attention_heads,
-            kv_head_count: num_key_value_heads,
+            global_intermediate_size: intermediate_size,
+            query_head_count: parallel.local_query_head_count(),
+            kv_head_count: parallel.local_kv_head_count(),
             head_dim,
-            query_size,
-            kv_size,
+            query_size: parallel
+                .local_query_size()
+                .map_err(|error| CudaDenseDecoderError::Shape(error.to_string()))?,
+            kv_size: parallel
+                .local_kv_size()
+                .map_err(|error| CudaDenseDecoderError::Shape(error.to_string()))?,
+            global_query_size,
+            global_kv_size,
+            parallel,
         })
     }
 }
@@ -538,7 +635,7 @@ struct CudaDenseDecoderLayer {
 }
 
 impl CudaDenseDecoderLayer {
-    fn load(
+    fn load_tensor_parallel(
         artifacts: &LocalModelArtifacts,
         context: &CudaContext,
         names: &DenseDecoderLayerWeightNames,
@@ -551,18 +648,21 @@ impl CudaDenseDecoderLayer {
                 &names.input_norm,
                 shape.hidden_size,
             )?,
-            query: CudaBf16Matrix::load(
+            query: CudaBf16Matrix::load_axis_partition(
                 artifacts,
                 context,
                 &names.query_weight,
-                shape.query_size,
+                shape.global_query_size,
                 shape.hidden_size,
+                0,
+                shape.parallel.query_partition(),
             )?,
-            query_bias: upload_optional_bf16(
+            query_bias: upload_optional_bf16_partition(
                 artifacts,
                 context,
                 names.query_bias.as_deref(),
-                shape.query_size,
+                shape.global_query_size,
+                shape.parallel.query_partition(),
             )?,
             query_norm: upload_optional_bf16(
                 artifacts,
@@ -570,18 +670,21 @@ impl CudaDenseDecoderLayer {
                 names.query_norm.as_deref(),
                 shape.head_dim,
             )?,
-            key: CudaBf16Matrix::load(
+            key: CudaBf16Matrix::load_axis_partition(
                 artifacts,
                 context,
                 &names.key_weight,
-                shape.kv_size,
+                shape.global_kv_size,
                 shape.hidden_size,
+                0,
+                shape.parallel.kv_partition(),
             )?,
-            key_bias: upload_optional_bf16(
+            key_bias: upload_optional_bf16_partition(
                 artifacts,
                 context,
                 names.key_bias.as_deref(),
-                shape.kv_size,
+                shape.global_kv_size,
+                shape.parallel.kv_partition(),
             )?,
             key_norm: upload_optional_bf16(
                 artifacts,
@@ -589,25 +692,30 @@ impl CudaDenseDecoderLayer {
                 names.key_norm.as_deref(),
                 shape.head_dim,
             )?,
-            value: CudaBf16Matrix::load(
+            value: CudaBf16Matrix::load_axis_partition(
                 artifacts,
                 context,
                 &names.value_weight,
-                shape.kv_size,
+                shape.global_kv_size,
                 shape.hidden_size,
+                0,
+                shape.parallel.kv_partition(),
             )?,
-            value_bias: upload_optional_bf16(
+            value_bias: upload_optional_bf16_partition(
                 artifacts,
                 context,
                 names.value_bias.as_deref(),
-                shape.kv_size,
+                shape.global_kv_size,
+                shape.parallel.kv_partition(),
             )?,
-            output: CudaBf16Matrix::load(
+            output: CudaBf16Matrix::load_axis_partition(
                 artifacts,
                 context,
                 &names.output_weight,
                 shape.hidden_size,
-                shape.query_size,
+                shape.global_query_size,
+                1,
+                shape.parallel.query_partition(),
             )?,
             output_bias: upload_optional_bf16(
                 artifacts,
@@ -621,7 +729,7 @@ impl CudaDenseDecoderLayer {
                 &names.post_attention_norm,
                 shape.hidden_size,
             )?,
-            feed_forward: CudaBf16DenseFeedForward::load(
+            feed_forward: CudaBf16DenseFeedForward::load_tensor_parallel(
                 artifacts,
                 context,
                 &DenseFeedForwardWeightNames {
@@ -630,7 +738,8 @@ impl CudaDenseDecoderLayer {
                     down_weight: names.down_weight.clone(),
                 },
                 shape.hidden_size,
-                shape.intermediate_size,
+                shape.global_intermediate_size,
+                shape.parallel,
             )?,
         })
     }

@@ -199,6 +199,8 @@ pub(crate) trait InitializedRuntimeBackend: Send {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ModelRuntimeConfig {
     pub(crate) tensor_parallel_size: usize,
+    pub(crate) tensor_parallel_node_count: usize,
+    pub(crate) tensor_parallel_node_rank: usize,
     pub(crate) device_placement: crate::backend::RuntimeDevicePlacement,
     pub(crate) kv_cache: Option<KvCacheAllocationConfig>,
     pub(crate) recurrent_state_slot_capacity: usize,
@@ -353,12 +355,10 @@ pub(crate) fn validate_runtime_support(
 }
 
 pub(crate) fn validate_runtime_parallelism(tensor_parallel_size: usize) -> Result<(), String> {
-    match tensor_parallel_size {
-        0 => Err("tensor parallel size must be positive".to_string()),
-        1 => Ok(()),
-        requested => Err(format!(
-            "tensor parallel execution requires a WorkerGroup, rank lifecycle, and collective backend; the runtime currently supports tp_size=1 (requested {requested})"
-        )),
+    if tensor_parallel_size == 0 {
+        Err("tensor parallel size must be positive".to_string())
+    } else {
+        Ok(())
     }
 }
 

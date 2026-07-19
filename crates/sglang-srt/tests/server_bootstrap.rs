@@ -257,13 +257,16 @@ fn bootstrap_cuda_device_rejects_missing_model_without_fallback() {
 }
 
 #[test]
-fn bootstrap_rejects_tensor_parallel_before_loading_model_artifacts() {
+fn cpu_reference_rejects_tensor_parallel_at_runtime_preflight() {
+    let model_dir = temp_model_dir("cpu-reference-tensor-parallel");
+    fs::create_dir_all(&model_dir).expect("temp model dir should be created");
+    write_complete_qwen3_checkpoint(&model_dir);
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
-        "missing-model",
+        model_dir.to_str().expect("temp model dir should be utf-8"),
         "--device",
-        "cuda",
+        "cpu",
         "--tp-size",
         "2",
         "--grpc-mode",
@@ -271,24 +274,22 @@ fn bootstrap_rejects_tensor_parallel_before_loading_model_artifacts() {
     .expect("args should parse");
 
     let error = match try_build_bootstrap_grpc_router_service(&args) {
-        Ok(_) => panic!("tensor parallel must fail before model artifacts are loaded"),
+        Ok(_) => panic!("CPU reference runtime must reject tensor parallel execution"),
         Err(error) => error,
     };
 
     assert!(
         matches!(
             error,
-            ServerLaunchError::ModelRegistry(ModelRegistryError::BackendInitialization {
-                requested: sglang_srt::backend::RuntimeBackend::Cuda,
-                ref message,
-            }) if message.contains("WorkerGroup")
-                && message.contains("rank lifecycle")
-                && message.contains("collective backend")
-                && message.contains("tp_size=1")
-                && message.contains("requested 2")
+            ServerLaunchError::ModelRegistry(ModelRegistryError::MissingCapabilities {
+                backend: sglang_srt::backend::RuntimeBackend::Cpu,
+                ref missing,
+                ..
+            }) if missing.iter().any(|capability| capability.contains("CPU reference backend supports only tp_size=1"))
         ),
         "unexpected error: {error:?}"
     );
+    fs::remove_dir_all(model_dir).expect("temp model dir should be removed");
 }
 
 #[test]
@@ -1885,9 +1886,9 @@ fn write_complete_qwen3_checkpoint(model_dir: &std::path::Path) {
   "model_type": "qwen3",
   "vocab_size": 3,
   "num_hidden_layers": 1,
-  "hidden_size": 2,
-  "intermediate_size": 2,
-  "num_attention_heads": 1,
+  "hidden_size": 4,
+  "intermediate_size": 4,
+  "num_attention_heads": 2,
   "num_key_value_heads": 1,
   "head_dim": 2,
   "hidden_act": "silu",
@@ -1909,19 +1910,19 @@ fn write_complete_qwen3_checkpoint(model_dir: &std::path::Path) {
     let descriptors: Vec<(&str, Vec<usize>, Vec<f32>)> = vec![
         (
             "model.embed_tokens.weight",
-            vec![3, 2],
-            vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0],
+            vec![3, 4],
+            vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
         ),
-        ("model.norm.weight", vec![2], vec![1.0, 1.0]),
+        ("model.norm.weight", vec![4], vec![1.0; 4]),
         (
             "lm_head.weight",
-            vec![3, 2],
-            vec![0.0, 0.0, 0.0, 1.0, 1.0, 0.0],
+            vec![3, 4],
+            vec![0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
         ),
         (
             "model.layers.0.self_attn.q_proj.weight",
-            vec![2, 2],
-            vec![0.0; 4],
+            vec![4, 4],
+            vec![0.0; 16],
         ),
         (
             "model.layers.0.self_attn.q_norm.weight",
@@ -1930,8 +1931,8 @@ fn write_complete_qwen3_checkpoint(model_dir: &std::path::Path) {
         ),
         (
             "model.layers.0.self_attn.k_proj.weight",
-            vec![2, 2],
-            vec![0.0; 4],
+            vec![2, 4],
+            vec![0.0; 8],
         ),
         (
             "model.layers.0.self_attn.k_norm.weight",
@@ -1940,38 +1941,38 @@ fn write_complete_qwen3_checkpoint(model_dir: &std::path::Path) {
         ),
         (
             "model.layers.0.self_attn.v_proj.weight",
-            vec![2, 2],
-            vec![0.0; 4],
+            vec![2, 4],
+            vec![0.0; 8],
         ),
         (
             "model.layers.0.self_attn.o_proj.weight",
-            vec![2, 2],
-            vec![0.0; 4],
+            vec![4, 4],
+            vec![0.0; 16],
         ),
         (
             "model.layers.0.input_layernorm.weight",
-            vec![2],
-            vec![1.0; 2],
+            vec![4],
+            vec![1.0; 4],
         ),
         (
             "model.layers.0.post_attention_layernorm.weight",
-            vec![2],
-            vec![1.0; 2],
+            vec![4],
+            vec![1.0; 4],
         ),
         (
             "model.layers.0.mlp.gate_proj.weight",
-            vec![2, 2],
-            vec![0.0; 4],
+            vec![4, 4],
+            vec![0.0; 16],
         ),
         (
             "model.layers.0.mlp.up_proj.weight",
-            vec![2, 2],
-            vec![0.0; 4],
+            vec![4, 4],
+            vec![0.0; 16],
         ),
         (
             "model.layers.0.mlp.down_proj.weight",
-            vec![2, 2],
-            vec![0.0; 4],
+            vec![4, 4],
+            vec![0.0; 16],
         ),
     ];
     let mut payload = Vec::new();
