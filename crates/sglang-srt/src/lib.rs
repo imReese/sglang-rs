@@ -31,6 +31,7 @@ mod openai_embedding;
 mod openai_id;
 mod openai_rerank;
 mod openai_score;
+pub mod parallel;
 pub mod pd_bootstrap;
 mod profile;
 pub mod proto;

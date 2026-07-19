@@ -99,6 +99,11 @@ jobs:
           cargo test -p sglang-kernel --locked --test cuda_nccl --
           --ignored --nocapture --test-threads=1
 
+      - name: Run tensor-parallel worker group acceptance
+        run: >-
+          cargo test -p sglang-srt --locked --test cuda_worker_group --
+          --ignored --nocapture --test-threads=1
+
       - name: Run CUDA HTTP inference acceptance
         run: >-
           cargo test -p sglang-srt --locked --test cuda_inference --
