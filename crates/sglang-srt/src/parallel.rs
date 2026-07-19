@@ -197,6 +197,168 @@ impl fmt::Display for ParallelTopologyError {
 
 impl std::error::Error for ParallelTopologyError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TensorPartition {
+    partition_count: usize,
+    partition_index: usize,
+}
+
+impl TensorPartition {
+    pub fn new(
+        partition_count: usize,
+        partition_index: usize,
+    ) -> Result<Self, TensorPartitionError> {
+        if partition_count == 0 {
+            return Err(TensorPartitionError::ZeroPartitionCount);
+        }
+        if partition_index >= partition_count {
+            return Err(TensorPartitionError::InvalidPartitionIndex {
+                partition_index,
+                partition_count,
+            });
+        }
+        Ok(Self {
+            partition_count,
+            partition_index,
+        })
+    }
+
+    pub fn for_rank(rank: TensorParallelRank) -> Self {
+        Self {
+            partition_count: rank.world_size,
+            partition_index: rank.global_rank,
+        }
+    }
+
+    pub fn for_replicated_shards(
+        rank: TensorParallelRank,
+        shard_count: usize,
+    ) -> Result<Self, TensorPartitionError> {
+        if shard_count == 0 {
+            return Err(TensorPartitionError::ZeroPartitionCount);
+        }
+        if shard_count > rank.world_size {
+            return Err(TensorPartitionError::ShardCountExceedsWorldSize {
+                shard_count,
+                world_size: rank.world_size,
+            });
+        }
+        if !rank.world_size.is_multiple_of(shard_count) {
+            return Err(TensorPartitionError::WorldSizeNotDivisibleByShardCount {
+                world_size: rank.world_size,
+                shard_count,
+            });
+        }
+        let replicas_per_shard = rank.world_size / shard_count;
+        Self::new(shard_count, rank.global_rank / replicas_per_shard)
+    }
+
+    pub fn partition_count(self) -> usize {
+        self.partition_count
+    }
+
+    pub fn partition_index(self) -> usize {
+        self.partition_index
+    }
+
+    pub fn range(self, extent: usize) -> Result<std::ops::Range<usize>, TensorPartitionError> {
+        if !extent.is_multiple_of(self.partition_count) {
+            return Err(TensorPartitionError::ExtentNotDivisible {
+                extent,
+                partition_count: self.partition_count,
+            });
+        }
+        let partition_len = extent / self.partition_count;
+        let start = self.partition_index.checked_mul(partition_len).ok_or(
+            TensorPartitionError::PartitionRangeOverflow {
+                extent,
+                partition_count: self.partition_count,
+                partition_index: self.partition_index,
+            },
+        )?;
+        let end = start.checked_add(partition_len).ok_or(
+            TensorPartitionError::PartitionRangeOverflow {
+                extent,
+                partition_count: self.partition_count,
+                partition_index: self.partition_index,
+            },
+        )?;
+        Ok(start..end)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TensorPartitionError {
+    ZeroPartitionCount,
+    InvalidPartitionIndex {
+        partition_index: usize,
+        partition_count: usize,
+    },
+    ShardCountExceedsWorldSize {
+        shard_count: usize,
+        world_size: usize,
+    },
+    WorldSizeNotDivisibleByShardCount {
+        world_size: usize,
+        shard_count: usize,
+    },
+    ExtentNotDivisible {
+        extent: usize,
+        partition_count: usize,
+    },
+    PartitionRangeOverflow {
+        extent: usize,
+        partition_count: usize,
+        partition_index: usize,
+    },
+}
+
+impl fmt::Display for TensorPartitionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroPartitionCount => formatter.write_str("partition count must be positive"),
+            Self::InvalidPartitionIndex {
+                partition_index,
+                partition_count,
+            } => write!(
+                formatter,
+                "partition index {partition_index} must be smaller than partition count {partition_count}"
+            ),
+            Self::ShardCountExceedsWorldSize {
+                shard_count,
+                world_size,
+            } => write!(
+                formatter,
+                "replicated shard count {shard_count} exceeds tensor parallel world size {world_size}"
+            ),
+            Self::WorldSizeNotDivisibleByShardCount {
+                world_size,
+                shard_count,
+            } => write!(
+                formatter,
+                "tensor parallel world size {world_size} must be divisible by replicated shard count {shard_count}"
+            ),
+            Self::ExtentNotDivisible {
+                extent,
+                partition_count,
+            } => write!(
+                formatter,
+                "tensor extent {extent} must be divisible by partition count {partition_count}"
+            ),
+            Self::PartitionRangeOverflow {
+                extent,
+                partition_count,
+                partition_index,
+            } => write!(
+                formatter,
+                "partition range overflowed for extent {extent}, partition count {partition_count}, and partition index {partition_index}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TensorPartitionError {}
+
 pub trait RankWorker: Send + 'static {
     type Command: Clone + Send + 'static;
     type Output: Send + 'static;
@@ -759,6 +921,42 @@ mod tests {
         assert_eq!(
             TensorParallelTopology::new(2, 1, 0, 0, 0),
             Err(ParallelTopologyError::ZeroDeviceOrdinalStep)
+        );
+    }
+
+    #[test]
+    fn tensor_partition_maps_standard_and_replicated_rank_slices() {
+        let topology = TensorParallelTopology::new(8, 1, 0, 0, 1).expect("topology");
+        let rank_five = topology.local_ranks()[5];
+
+        let standard = TensorPartition::for_rank(rank_five);
+        assert_eq!(standard.range(64).expect("standard range"), 40..48);
+
+        let replicated =
+            TensorPartition::for_replicated_shards(rank_five, 2).expect("replicated KV shard");
+        assert_eq!(replicated.partition_count(), 2);
+        assert_eq!(replicated.partition_index(), 1);
+        assert_eq!(replicated.range(16).expect("replicated range"), 8..16);
+    }
+
+    #[test]
+    fn tensor_partition_rejects_uneven_or_invalid_shards() {
+        let rank = TensorParallelTopology::new(4, 1, 0, 0, 1)
+            .expect("topology")
+            .local_ranks()[3];
+        assert_eq!(
+            TensorPartition::for_rank(rank).range(10),
+            Err(TensorPartitionError::ExtentNotDivisible {
+                extent: 10,
+                partition_count: 4,
+            })
+        );
+        assert_eq!(
+            TensorPartition::for_replicated_shards(rank, 3),
+            Err(TensorPartitionError::WorldSizeNotDivisibleByShardCount {
+                world_size: 4,
+                shard_count: 3,
+            })
         );
     }
 

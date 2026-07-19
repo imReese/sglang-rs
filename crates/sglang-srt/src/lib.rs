@@ -41,6 +41,7 @@ pub mod runtime_kv_cache;
 pub mod scheduler;
 pub mod server;
 mod serving_metrics;
+pub mod tensor_partition;
 pub mod tokenizer;
 pub mod transfer;
 mod transfer_backend_factory;
