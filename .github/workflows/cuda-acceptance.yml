@@ -94,6 +94,11 @@ jobs:
           --test cuda_moe --
           --ignored --nocapture --test-threads=1
 
+      - name: Run two-rank NCCL collective acceptance
+        run: >-
+          cargo test -p sglang-kernel --locked --test cuda_nccl --
+          --ignored --nocapture --test-threads=1
+
       - name: Run CUDA HTTP inference acceptance
         run: >-
           cargo test -p sglang-srt --locked --test cuda_inference --
