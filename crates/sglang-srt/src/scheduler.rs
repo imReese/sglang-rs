@@ -269,14 +269,14 @@ pub struct ScheduleBatch {
 }
 
 impl ScheduleBatch {
-    fn prefill(requests: Vec<ScheduledRequest>) -> Self {
+    pub(crate) fn prefill(requests: Vec<ScheduledRequest>) -> Self {
         Self {
             forward_mode: ForwardMode::Prefill,
             requests,
         }
     }
 
-    fn decode(requests: Vec<ScheduledRequest>) -> Self {
+    pub(crate) fn decode(requests: Vec<ScheduledRequest>) -> Self {
         Self {
             forward_mode: ForwardMode::Decode,
             requests,

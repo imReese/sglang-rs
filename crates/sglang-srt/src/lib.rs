@@ -17,6 +17,7 @@ mod cuda_tensor_parallel;
 mod cuda_transformer;
 pub mod engine;
 pub mod engine_info_bootstrap;
+pub mod execution_engine;
 pub mod grpc;
 pub mod grpc_sidecar;
 pub mod http;
