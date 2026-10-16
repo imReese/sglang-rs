@@ -44,7 +44,7 @@ jobs:
         run: |
           set -euo pipefail
           rustup set profile minimal
-          rustup toolchain install stable --component clippy,rustfmt --no-self-update
+          rustup toolchain install 1.96.0 --component clippy,rustfmt --no-self-update
           rustc --version --verbose
           cargo --version --verbose
 
