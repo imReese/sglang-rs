@@ -1,7 +1,22 @@
 # sglang-rs
 
-Rust runtime work for rewriting SGLang while keeping kernel execution behind a
-cross-platform backend boundary.
+A Rust-native inference runtime experiment focused on separating CPU scheduling
+and cache control from asynchronous GPU execution.
+
+> The CPU side decides what should happen; the GPU side executes how and when
+the GPU work happens.
+
+## Architecture
+
+The project is evolving from a Rust rewrite of SGLang into a native runtime
+architecture with a CPU control plane and GPU execution plane. The first target
+is a same-process design using Rust workers/threads; a process boundary is a
+later optimization only if measurement justifies it.
+
+See [`docs/architecture.md`](docs/architecture.md) for the runtime model and
+[`docs/runtime-roadmap.md`](docs/runtime-roadmap.md) for the implementation
+roadmap.
+
 
 The goal is to move Python-heavy runtime work into Rust: request lifecycle
 management, scheduling, prefix-cache matching, tokenization/detokenization
