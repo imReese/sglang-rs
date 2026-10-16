@@ -747,7 +747,7 @@ where
         self.dispatch_batch(batch)
     }
 
-    fn next_decode_batch_with_worker_ready_check(
+    pub fn next_decode_batch_with_worker_ready_check(
         &mut self,
         max_batch_size: usize,
     ) -> Result<ScheduleBatch, SchedulerError> {
@@ -795,29 +795,36 @@ where
         Ok(ScheduleBatch::decode(requests))
     }
 
-    fn dispatch_batch(
+    /// Retire a completed execution on the CPU side.
+    ///
+    /// This is intentionally separate from model execution so an asynchronous
+    /// execution engine can run the forward pass while the scheduler continues
+    /// with CPU-side work.
+    pub fn complete_batch(
         &mut self,
         batch: ScheduleBatch,
+        generated: crate::worker::BatchGeneratedTokens,
     ) -> Result<Vec<ScheduledOutput>, SchedulerError> {
-        let generated = match self.worker.execute_batch(&batch) {
-            Ok(generated) => generated,
-            Err(error) => {
-                self.release_failed_batch_cache_pages(&batch);
-                return Err(error.into());
-            }
-        };
         let forward_mode = batch.forward_mode();
         let requests = batch.into_requests();
         let tokens = generated.into_tokens();
-        let mut outputs = Vec::with_capacity(requests.len());
 
+        if requests.len() != tokens.len() {
+            return Err(SchedulerError::Worker(WorkerExecutionError::Output(
+                crate::worker::WorkerOutputError::BatchSizeMismatch {
+                    request_count: requests.len(),
+                    output_count: tokens.len(),
+                },
+            )));
+        }
+
+        let mut outputs = Vec::with_capacity(requests.len());
         for (mut request, generated_token) in requests.into_iter().zip(tokens) {
             if forward_mode == ForwardMode::Prefill {
                 self.stage_prefill_cache_pages(&request)?;
             }
 
             request.append_output_ids(generated_token.token_ids());
-
             let finished = generated_token.is_finished() || request.reached_max_new_tokens();
 
             if finished {
@@ -833,6 +840,20 @@ where
         }
 
         Ok(outputs)
+    }
+
+    fn dispatch_batch(
+        &mut self,
+        batch: ScheduleBatch,
+    ) -> Result<Vec<ScheduledOutput>, SchedulerError> {
+        let generated = match self.worker.execute_batch(&batch) {
+            Ok(generated) => generated,
+            Err(error) => {
+                self.release_failed_batch_cache_pages(&batch);
+                return Err(error.into());
+            }
+        };
+        self.complete_batch(batch, generated)
     }
 
     fn release_failed_batch_cache_pages(&mut self, batch: &ScheduleBatch) {
