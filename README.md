@@ -1,9 +1,5 @@
 <p align="center">
-  <img src="docs/assets/sglang-logo.svg" width="190" height="58" alt="SGLang">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/rust-logo-white-outline.svg">
-    <img src="docs/assets/rust-logo.svg" width="58" height="58" alt="Rust">
-  </picture>
+  <img src="docs/assets/sglang-rs-logo.svg" width="320" height="58" alt="SGLang Rust">
 </p>
 
 <h1 align="center">sglang-rs</h1>
@@ -14,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/imReese/sglang-rs/actions/workflows/ci.yml"><img src="https://github.com/imReese/sglang-rs/actions/workflows/ci.yml/badge.svg?branch=main" alt="Rust CI"></a>
-  <a href="rust-toolchain.toml"><img src="https://img.shields.io/badge/Rust-1.96.0-7A4F35?logo=rust&amp;logoColor=white" alt="Rust 1.96.0"></a>
+  <a href="rust-toolchain.toml"><img src="https://img.shields.io/badge/Rust-1.96.0-7A4F35" alt="Rust 1.96.0"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-168DA3" alt="License: MIT"></a>
 </p>
 
