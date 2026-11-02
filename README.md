@@ -9,15 +9,20 @@ the GPU work happens.
 ## CPU Reference Demo
 
 The terminal replay below shows this runtime serving the official
-[Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct)
-checkpoint on Linux with `--device cpu`: direct server startup, a health check,
-and an OpenAI-compatible chat request returning `2+2 equals 4.`.
+[Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B)
+checkpoint on macOS arm64 with `--device cpu`. Its 24-layer hybrid decoder
+combines 18 Gated DeltaNet linear-attention layers with 6 full-attention layers.
+The replay includes server startup, a health check, an OpenAI-compatible chat
+request returning `Paris`, and a real token stream returning `1, 2, 3, 4, 5`.
 
-![Qwen2.5-0.5B-Instruct running through the Rust CPU reference server](docs/assets/qwen-cpu-demo.gif)
+![Qwen3.5-0.8B hybrid attention and streaming through the Rust CPU reference server](docs/assets/qwen-cpu-demo.gif)
 
-Idle waits are accelerated in the replay. The recorded request took 21.49 seconds
-(39 input tokens, 8 output tokens); this is a functional CPU reference demo,
-not a performance benchmark or a CUDA/Metal validation.
+Idle waits are shortened; local paths and the port are represented by
+`MODEL_PATH` and `PORT`. The recorded chat request took 12.24 seconds
+(26 input / 4 output tokens). The streaming request took 30.25 seconds
+(29 input / 16 output tokens), with the first content token arriving after
+17.77 seconds. These are actual client-observed timings from a functional
+CPU reference run, not a performance benchmark or CUDA/Metal/P/D validation.
 
 ## Architecture
 
