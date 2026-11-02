@@ -1,5 +1,9 @@
 <p align="center">
-  <img src="docs/assets/sglang-rs-mark.svg" width="88" height="88" alt="sglang-rs logo">
+  <img src="docs/assets/sglang-logo.svg" width="190" height="58" alt="SGLang">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/rust-logo-white-outline.svg">
+    <img src="docs/assets/rust-logo.svg" width="58" height="58" alt="Rust">
+  </picture>
 </p>
 
 <h1 align="center">sglang-rs</h1>
@@ -10,7 +14,6 @@
 
 <p align="center">
   <a href="https://github.com/imReese/sglang-rs/actions/workflows/ci.yml"><img src="https://github.com/imReese/sglang-rs/actions/workflows/ci.yml/badge.svg?branch=main" alt="Rust CI"></a>
-  <a href="#status"><img src="https://img.shields.io/badge/Status-Experimental-D6A343" alt="Status: experimental"></a>
   <a href="rust-toolchain.toml"><img src="https://img.shields.io/badge/Rust-1.96.0-7A4F35?logo=rust&amp;logoColor=white" alt="Rust 1.96.0"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-168DA3" alt="License: MIT"></a>
 </p>
@@ -23,7 +26,7 @@
   <a href="docs/validation.md">Validation</a>
 </p>
 
-An independent implementation targeting [SGLang](https://github.com/sgl-project/sglang) and `sgl-model-gateway` serving contracts. Experimental, not yet production-ready or a drop-in replacement.
+An independent implementation targeting [SGLang](https://github.com/sgl-project/sglang) and `sgl-model-gateway` serving contracts.
 
 ## Demo
 
@@ -77,7 +80,7 @@ curl --fail-with-body --no-buffer \
 
 Use `"stream": false` for a single JSON response. CPU execution is an FP32 correctness reference; keep prompts short. This example reserves 256 KV token slots, not the model's full context capacity. For a download-free Transformer smoke, run [`./scripts/run_cpu_reference_smoke.sh`](scripts/run_cpu_reference_smoke.sh).
 
-## Status
+## Capabilities
 
 | Area | Current scope |
 | --- | --- |
@@ -105,4 +108,4 @@ The workspace contains [`sglang-srt`](crates/sglang-srt) (runtime), [`sglang-ker
 
 ## License
 
-[MIT](LICENSE). External models and dependencies retain their own licenses.
+[MIT](LICENSE). Third-party [artwork](docs/assets/README.md), models, and dependencies retain their own licenses.
