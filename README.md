@@ -2,8 +2,6 @@
   <img src="docs/assets/sglang-rs-logo.svg" width="320" height="58" alt="SGLang Rust">
 </p>
 
-<h1 align="center">sglang-rs</h1>
-
 <p align="center">
   <strong>Rust-native LLM serving with prefill/decode disaggregation.</strong>
 </p>
