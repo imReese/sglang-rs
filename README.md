@@ -1,480 +1,315 @@
 # sglang-rs
 
-A Rust-native inference runtime experiment focused on separating CPU scheduling
-and cache control from asynchronous GPU execution.
+[![Rust CI](https://github.com/imReese/sglang-rs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/imReese/sglang-rs/actions/workflows/ci.yml)
 
-> The CPU side decides what should happen; the GPU side executes how and when
-the GPU work happens.
+A Rust-native LLM serving runtime with shared model execution, paged KV cache
+management, and Mooncake-linked prefill/decode disaggregation.
 
-## CPU Reference Demo
+This is an independent implementation aligned with the serving and routing
+contracts of [SGLang](https://github.com/sgl-project/sglang) and
+`sgl-model-gateway`. The project is under active development and is not yet
+production-ready or a drop-in replacement for community SGLang.
 
-The terminal replay below shows this runtime serving the official
-[Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B)
-checkpoint on macOS arm64 with `--device cpu`. Its 24-layer hybrid decoder
-combines 18 Gated DeltaNet linear-attention layers with 6 full-attention layers.
-The replay includes server startup, a health check, an OpenAI-compatible chat
-request returning `Paris`, and a real token stream returning `1, 2, 3, 4, 5`.
+## Demo
+
+The official [Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B)
+checkpoint running on macOS arm64 through the Rust CPU reference backend.
+Its 24-layer hybrid decoder combines 18 Gated DeltaNet linear-attention
+layers with 6 full-attention layers.
 
 ![Qwen3.5-0.8B hybrid attention and streaming through the Rust CPU reference server](docs/assets/qwen-cpu-demo.gif)
 
-Idle waits are shortened; local paths and the port are represented by
-`MODEL_PATH` and `PORT`. The recorded chat request took 12.24 seconds
-(26 input / 4 output tokens). The streaming request took 30.25 seconds
-(29 input / 16 output tokens), with the first content token arriving after
-17.77 seconds. These are actual client-observed timings from a functional
-CPU reference run, not a performance benchmark or CUDA/Metal/P/D validation.
+The replay shows server startup, health checks, an OpenAI-compatible chat
+response, token-by-token streaming, and graceful shutdown. Idle waits are
+shortened; `MODEL_PATH` and `PORT` replace local paths and the chosen port.
 
-## Architecture
+| Recorded request | Input tokens | Output tokens | End-to-end time | First content token |
+| --- | ---: | ---: | ---: | ---: |
+| Chat: capital of France | 26 | 4 | 12.24 s | Not measured separately |
+| Streaming: count from 1 to 5 | 29 | 16 | 30.25 s | 17.77 s |
 
-The project is evolving from a Rust rewrite of SGLang into a native runtime
-architecture with a CPU control plane and GPU execution plane. The first target
-is a same-process design using Rust workers/threads; a process boundary is a
-later optimization only if measurement justifies it.
+These are client-observed timings from a functional CPU reference run, not a
+performance benchmark or validation of CUDA, Metal, or network P/D transfer.
 
-See [`docs/architecture.md`](docs/architecture.md) for the runtime model and
-[`docs/runtime-roadmap.md`](docs/runtime-roadmap.md) for the implementation
-roadmap.
+## Quick Start
 
+### Build
 
-The goal is to move Python-heavy runtime work into Rust: request lifecycle
-management, scheduling, prefix-cache matching, tokenization/detokenization
-boundaries, and eventually the bridge into the existing SGLang kernel library.
-
-## Project Layout
-
-This repository is organized as an independent Rust workspace rather than a
-mirror of the upstream SGLang source tree. The Rust crates live under
-`crates/`, shared protocol contracts live under `proto/`, and non-Rust runtime
-surfaces will get their own top-level directories as they become real
-integration targets.
-
-The intended long-term layout is:
-
-```text
-sglang-rs/
-  Cargo.toml
-  Cargo.lock
-  rust-toolchain.toml
-
-  proto/
-    sglang/runtime/v1/
-      sglang.proto
-
-  crates/
-    sglang-router/    # Rust router package aligned with sgl-model-gateway PD shape
-    sglang-srt/        # Current runtime crate: router, scheduler, engine, gRPC
-    sglang-core/       # Future shared config/types/errors crate if boundaries grow
-    sglang-kernel/     # Rust kernel backend boundary with CPU references first
-    sglang-python/     # Future PyO3 extension crate for Python integration
-
-  kernels/             # Future native kernel sources and imported upstream pieces
-    cuda/
-    cpu/
-    metal/
-    rocm/
-    musa/
-
-  python/              # Future pure Python package, CLI glue, and Python tests
-    sglang_rs/
-    tests/
-
-  docs/                # Future architecture notes and design docs
-```
-
-`crates/` is the conventional Rust workspace location for packages. Each
-subdirectory is a Rust crate with its own `Cargo.toml`; crates are split only
-when the boundary is useful. For now, `crates/sglang-srt` remains the main crate
-so runtime work can move quickly without premature crate churn.
-
-Native kernels and Python code should not be folded into the current crate by
-default. Kernel backend sources belong under `kernels/`, with
-`crates/sglang-kernel` handling the Rust-side backend abstraction, build/link
-steps, and FFI. Python code belongs under `python/`, while a PyO3 extension
-crate belongs under `crates/sglang-python`. The shared `proto/` directory stays
-at the workspace root because it is a cross-language contract.
-
-## Kernel Reuse Direction
-
-The upstream SGLang repository already has a kernel package under
-`sgl-kernel/`, published as `sglang-kernel` while keeping the Python import path
-as `sgl_kernel`. This repository should align with that name and treat
-`sglang-kernel` as the Rust crate boundary for native execution backends rather
-than naming the crate after one backend such as CUDA.
-
-The first integration target is not to rewrite every kernel in Rust. Instead,
-`crates/sglang-kernel` exposes a small Rust API over kernels needed by the
-runtime and PD path, starting with CPU reference implementations and then
-binding selected upstream implementations through thin FFI layers. The backend
-layout should stay cross-platform:
-
-- CUDA/CUTLASS/FlashInfer kernels for NVIDIA deployments.
-- CPU kernels for explicitly selected local reference and correctness tests.
-- Metal kernels for Apple Silicon development and eventual MLX-backed paths.
-- ROCm/HIP and MUSA-oriented sources where upstream support already exists.
-
-For the PD-disaggregation milestone, the highest-value reuse candidates are KV
-cache transfer/layout helpers, attention/MLA kernels, GEMM and quantization
-kernels, MoE top-k/alignment kernels, elementwise operations such as RMSNorm and
-RoPE, and sampling/grammar helpers. The Rust runtime should depend on traits and
-typed buffers owned by `sglang-kernel`; backend-specific CUDA, CPU, Metal, ROCm,
-or MUSA details should stay behind feature-gated implementations.
-
-## Current Scope
-
-This repository currently contains the first `sglang-srt` runtime crate and the
-`sglang-router` package used to exercise the gateway/router boundary:
-
-- `sglang-kernel`: CPU reference kernels plus a dynamically loaded CUDA Driver
-  backend. The CUDA path does not require a CUDA SDK at Rust compile time; on a
-  GPU host it performs real device discovery, compute-capability queries,
-  primary-context management, memory accounting, and RAII `cuMemAlloc_v2` /
-  `cuMemFree_v2` device allocation. Checked host/device copies and dynamically
-  loaded cuBLAS provides BF16 row-major GEMM for the shared dense decoder
-  without requiring a CUDA SDK at Rust compile time. Dynamically compiled BF16 paged
-  attention consumes scheduler request metadata and reads GQA K/V rows directly
-  from physical slots in the page-major CUDA KV pool.
-- `backend`: runtime capability contracts for compute capability, supported
-  dtypes, attention implementations, tensor parallelism, KV memory
-  registration, Mooncake, RDMA, and NVLink. CUDA dtype support is derived from
-  SM capability rather than product names, while unavailable execution or
-  transport capabilities remain explicit instead of silently falling back.
-- `proto`: the initial `sglang.runtime.v1.SglangService` contract for the
-  native Rust gRPC path in the community roadmap, including typed
-  text/tokenized generation, embedding, classification, tokenization,
-  health/model/load/control-plane RPCs, OpenAI-compatible JSON pass-through
-  RPCs, and admin operations. The crate build script compiles this contract
-  into Tonic/prost Rust types exposed through `sglang_srt::proto`; the root
-  `buf.yaml` enables future proto lint and breaking-change checks once Buf is
-  available in CI.
-- `cli`: `sglang serve`-style argument parsing for `--model-path`/`--model`,
-  `--host`, `--port`, `--tp-size`, `--dp-size`, `--grpc-mode`,
-  `--served-model-name`, `--tokenizer-path`, `--device`, and the upstream PD
-  disaggregation flags, with unknown server args preserved for incremental
-  upstream compatibility. The crate builds both `sglang` and `sglang-rs`
-  binaries so the upstream command shape works.
-- `engine`: text and tokenized request lifecycle glue that drives prefill and
-  decode until completion, with a token stream path that preserves incremental
-  prefill/decode outputs and prefix-cache hit counts for router streaming.
-- `router`: SGLang gateway/router protocol boundary types for tokenized
-  `Generate` requests/responses using the current `tokenized.input_ids: u32`
-  and `chunk`/`complete` stream shape, plus health and model-info responses used
-  during worker registration. `RouterRuntime` adapts these requests into the
-  engine's tokenized generation and streaming paths, preserves PD bootstrap
-  metadata (`bootstrap_host`, `bootstrap_port`, `bootstrap_room`) for downstream
-  worker execution, generates request IDs in Rust when the caller omits one,
-  validates token budgets before scheduler dispatch, maps protocol errors to
-  router status classes for the future gRPC bridge, and exposes `/flush_cache`
-  plus `/update_weights_from_disk`, `/update_weight_version`, `/get_weights_by_name`,
-  `/remote_instance_transfer_engine_info`, `/poll_transfers` with descriptor
-  checksum preservation, `/pause_generation`, `/continue_generation`,
-  `/abort_request`, `/start_profile`, and `/stop_profile` forwarding for gateway
-  control-plane calls. `/abort_request`
-  supports both targeted `rid` aborts and SGLang-compatible `abort_all`.
-  The Rust router also exposes gateway-compatible `/v1/loads` and `/get_loads`
-  worker-load aggregation across HTTP and gRPC workers.
-- `grpc`: gRPC boundary helpers and the initial `GrpcRouterService` adapter for
-  the generated Tonic service trait. It wires tokenized `Generate`,
-  `HealthCheck`, `FlushCache`, `PauseGeneration`, `ContinueGeneration`,
-  `Abort`, `StartProfile`, `StopProfile`, `UpdateWeightsFromDisk`,
-  `UpdateWeightVersion`, and `GetWeightsByName` into `RouterRuntime`, converts
-  router protocol errors to canonical `tonic::Status` codes, and leaves unsupported RPCs as explicit
-  `UNIMPLEMENTED` responses while the runtime surface grows.
-- `server`: bootstrap helpers for launching the Rust gRPC router service from
-  parsed `ServerArgs`, including model metadata propagation and an injectable PD
-  service builder that wraps the bootstrap model runner with
-  `KvTransferModelWorker`, a finite decode KV page pool, and bounded transfer
-  polling. The HTTP launcher also starts the SGLang-compatible engine-info
-  bootstrap service on `--engine-info-bootstrap-port` (default `6789`) and
-  shares that state with `/remote_instance_transfer_engine_info`. The bootstrap
-  launcher validates the requested runtime backend against the loaded model
-  capability before serving, can run the decode-side PD path with the fake
-  transfer backend for local/runtime wiring tests, fails before binding when a
-  requested production transfer backend is unavailable, and wires linked
-  Mooncake to model-owned transferable KV memory when the runtime exposes it.
-- `engine_info_bootstrap`: lightweight HTTP bootstrap service compatible with
-  SGLang's transfer-engine info registration flow. It stores per-rank
-  `session_id` and `weights_info_dict` payloads via
-  `/register_transfer_engine_info` and serves `/get_transfer_engine_info` for
-  remote instance weight-transfer discovery. The SRT HTTP service can expose
-  the same data through the community `/remote_instance_transfer_engine_info`
-  and deprecated `/get_remote_instance_transfer_engine_info` endpoints.
-- `tokenizer`: tokenizer trait plus a temporary byte tokenizer for tests.
-- `transfer`: PD disaggregation mode/backend normalization, including
-  SGLang-compatible `mooncake_tcp` handling, decode bootstrap session tracking,
-  KV delta transfer planning from prepared prefill worker batches, a transfer
-  executor abstraction that drives bootstrap-room status transitions,
-  bootstrap-room-aware Mooncake target resolution, Mooncake KV transfer request
-  construction, per-span descriptor checksums carried into submitted Mooncake
-  batch records, `/poll_transfers` descriptor checksum reporting, local
-  snapshot content checksums for CPU-verifiable KV transfer, batch status
-  polling, and a `KvTransferModelWorker` wrapper that registers PD bootstrap
-  sessions from prefill request metadata and runs transfer as part of scheduler
-  prefill dispatch. It also exposes a
-  decode-side KV-ready predicate used by scheduler decode batching to keep PD
-  decode requests queued until their bootstrap room reaches `Success`, plus
-  engine/router polling hooks and bounded transfer-polling generation entry
-  points for advancing asynchronous Mooncake transfer completions from the
-  control plane before decode resumes. The gRPC adapter can use the same path
-  through a bounded `with_max_transfer_polls` service setting for tokenized and
-  text generate RPCs. The
-  module also contains the Mooncake transfer-engine ABI boundary for memory
-  registration and batch transfer. Registered KV regions carry an explicit
-  device location and are owned by an RAII lease that unregisters them before
-  the model allocation is released. Transfer backend capabilities classify
-  Mooncake as the production path, fake as reference-only, and NIXL/Ascend/Mori
-  as planned targets until real executors are implemented.
-- `scheduler`: waiting queue, prefill/decode batch formation, request stages,
-  uncached-token budgeted prefill batching, decode requeueing,
-  `max_new_tokens` stopping, prefix-cache application, and KV cache page
-  allocation for uncached prefill tokens. Decode batching consults worker
-  readiness before dispatch so PD decode requests do not leave the decode queue
-  before KV transfer is complete. Successful local/ready prefill dispatches
-  publish allocated pages back into RadixCache for future prefix reuse, while
-  asynchronous PD prefill pages are staged and only published after transfer
-  polling observes KV readiness; failed transfers release unpublished decode
-  pages and aborts cancel submitted transfer batches before removing decode
-  requests from the running queue. The dispatch path
-  can run in local PD mode by routing prefill and decode batches to separate
-  worker executors, matching the split execution boundary used by SGLang
-  disaggregation.
-- `model_executor`: prepared model-worker batches with flattened input ids,
-  positions, sequence lengths, request offsets, and prefix cache pages for the
-  future CUDA/model executor boundary. The batch also exposes per-request
-  cached/input token counts so PD prefill workers can treat the uncached prefill
-  span as the future KV-transfer delta. PD bootstrap metadata is carried per
-  request so the later KV transfer implementation has the same context that
-  SGLang attaches to disaggregated requests.
-- `cache`: RadixCache-style token-prefix matching plus a finite KV cache page
-  allocator for page assignment/reuse and safe full reset when no decode request
-  is active.
-- `worker`: batch model worker trait that will become the CUDA/model executor
-  boundary, plus a `PdModelWorkers` wrapper that sends prefill batches to a
-  prefill worker and decode batches to a decode worker.
-- `types`: generation request and response types.
-
-The implementation is intentionally small while the architecture is being
-carved out. Qwen2 and Qwen3 use the shared dense decoder with F32 CPU reference
-execution and BF16 CUDA execution. BF16 GEMM and GQA paged-attention primitives
-are implemented, while MoE CUDA kernels and a production GLM/DeepSeek CUDA
-executor are not implemented yet. PD support
-covers the scheduler/router execution split, bootstrap metadata propagation,
-bounded transfer polling, backend-neutral completion events, and the
-Mooncake-linked transfer-engine boundary with managed memory registration.
-Fake transfer is compiled only for tests or the explicit `test-support`
-feature and cannot be selected by a production launch. The CUDA KV pool
-owns a contiguous allocation laid out as
-`page -> layer -> K/V tensor -> token`, matching SGLang's page-major layout.
-The pool exposes checked tensor locations for attention kernels, while
-Mooncake registers the same physical allocation instead of transfer-owned
-staging memory. Dtype-independent CUDA scatter/gather kernels accept strided
-K/V rows plus scheduler physical-slot indices and write them directly into that
-registered allocation; invalid slot maps fail before launch and are guarded
-again on the device. The BF16 paged-attention kernel uses FP32 online-softmax
-accumulation and reads that same allocation for variable-length prefill and
-decode metadata. It is not yet connected to a complete production GLM/DeepSeek
-MLA/MoE executor, so those models fail at startup on both CPU and CUDA instead
-of serving through a reference or metadata-only path.
-
-`--device auto` follows the community CLI surface. It probes registered
-production backends, currently CUDA, and never falls back to the CPU reference
-backend. A missing or broken CUDA installation, missing cuBLAS, unsupported
-model/backend pair, or unsupported accelerator fails at startup. CPU reference
-execution must be selected explicitly with `--device cpu`.
-Production launch also requires `--model-path` to resolve to a local directory
-or Hugging Face cache snapshot containing safetensors weights. The built-in
-`Space` reference model is available to tests only and is never served by the
-production launcher.
-
-## KV Page Contract
-
-`--page-size` follows the community SGLang CLI and means the number of token
-slots in one physical KV page. `--num-reserved-decode-tokens` is the total token
-slot capacity, so it must be nonzero and divisible by `--page-size`; invalid
-geometry fails during service construction before a server port is bound.
-
-The scheduler allocates global token slots while the radix cache only reuses
-complete physical pages. PD bootstrap metadata and Mooncake transfer requests
-carry physical page indices, so a page is transferred exactly once even though
-the model executor addresses each token slot independently. CPU reference dense
-and hybrid decoders and the CUDA dense decoder use the same logical page
-contract, while each backend owns its physical allocation. Transfer consumes
-the NexusKV descriptor exposed by the active ModelRunner KV pool.
-
-## Development
-
-### Single-Rank P/D Validation
-
-The current Mooncake P/D baseline requires `tp_size=1`, `dp_size=1`, and one
-node. Multi-rank P/D fails before model loading or memory registration; this
-does not disable centralized CUDA tensor parallelism. P/D currently disables
-radix reuse on both workers and transfers the full prompt, so independently
-cached prefixes cannot produce mismatched transfer spans.
-
-Prefill sends the sampled first token and terminal status using community
-SGLang's Mooncake control frames, only after every native KV task has drained.
-Decode waits for both, then runs decode on the received KV without a local
-prefill. SIGINT/SIGTERM stop serving, drain/cancel transfers, free native batch
-IDs, and unregister memory before releasing the active pool. Bootstrap ABORT
-handling stays available during drain. Stop decode workers before prefill
-workers when draining a deployment. Unconfirmed remote writes keep pages
-reserved; destruction that cannot prove safe drain or unregister is fatal,
-not permission to reuse that memory.
-
-Run the Mac numerical oracle and lifecycle tests:
+Install Rust through `rustup`; the checkout pins its toolchain in
+[`rust-toolchain.toml`](rust-toolchain.toml). The default build does not require
+a CUDA SDK or native Mooncake libraries.
 
 ```bash
-cargo test -p sglang-srt --lib nonzero_qwen_pd
-cargo test -p sglang-srt --lib pd_shutdown_tests
-cargo test -p sglang-srt --features test-support \
-  --test mooncake_lifecycle --test pd_bootstrap_server
+git clone https://github.com/imReese/sglang-rs.git
+cd sglang-rs
+cargo build --release --locked --bin sglang-rs
 ```
 
-The oracle runs a complete two-layer, nonzero-weight Qwen3 Transformer for
-four output tokens, compares every logit against centralized execution, and
-detects deliberately corrupted KV. Its host KV copy is test-only, not a
-production transfer backend. Real ZMQ control sockets are exercised locally;
-native CUDA memory registration and network writes still require CUDA hosts.
+The crate also provides the `sglang` binary with the same `serve` command shape.
 
-Run the linked network acceptance on a CUDA host with native Mooncake built:
+### Run Qwen3.5-0.8B on CPU
+
+Download the official safetensors checkpoint with the Hugging Face `hf` CLI,
+or point `MODEL_PATH` at an existing local checkpoint. The revision below is
+the one used for the recorded demo; its weight file is approximately 1.75 GB.
 
 ```bash
-MOONCAKE_BUILD_DIR=/path/to/Mooncake/build SGLANG_CUDA_TEST_DEVICE=1 \
-  cargo test -p sglang-router --features mooncake-link --test proxy \
-  real_srt_pd::router_pd_chat_completes_with_real_cuda_qwen_mooncake_workers \
-  -- --ignored --nocapture --test-threads=1
+export MODEL_PATH="$HOME/.cache/sglang-rs/Qwen3.5-0.8B"
+hf download Qwen/Qwen3.5-0.8B \
+  --revision 2fc06364715b967f1860aea9cf38778875588b17 \
+  --local-dir "$MODEL_PATH"
+
+./target/release/sglang-rs serve \
+  --model-path "$MODEL_PATH" \
+  --served-model-name Qwen3.5-0.8B \
+  --device cpu \
+  --host 127.0.0.1 --port 30000 \
+  --engine-info-bootstrap-port 0 \
+  --num-reserved-decode-tokens 256 \
+  --max-running-requests 1
 ```
 
-This test compares four generated tokens and finish reasons with centralized
-CUDA inference using nonzero Transformer weights. It is part of the optional
-Mooncake CUDA acceptance workflow. Local reference tests do not establish
-RDMA/NVLink correctness or GPU production readiness. NexusKV remains the
-memory descriptor contract here; this is not NexusKV store/offload or a
-NexusKV network executor integration.
+The CPU backend executes in FP32, including conversion from BF16 checkpoint
+weights. It is a reference implementation for correctness and local testing;
+keep prompts short and do not use its latency to estimate accelerator
+performance. This example reserves 256 KV token slots, not the checkpoint's
+full advertised context capacity.
 
-### CI And Checks
-
-GitHub Actions runs `Rust CI` for every pull request and push to `main` on a
-GitHub-hosted Ubuntu runner. It checks formatting, all workspace targets,
-Clippy with warnings denied, and the complete test-support suite. The
-workflow caches Cargo downloads but not `target`, so compiled artifacts remain
-on the disposable hosted runner rather than a developer machine or persistent
-CI cache. Production Rust source containing lint-suppression attributes such as
-`#[allow]` or `#[expect]` also fails this job.
-
-Real CUDA acceptance runs in the separate `CUDA Acceptance` workflow. Register
-a Linux self-hosted runner with the `cuda` label, then start the workflow
-manually. Set the repository variable `ENABLE_CUDA_CI=true` to run it
-automatically after pushes to `main`. The workflow executes the real CUDA
-allocation, KV copy, BF16 GEMM, BF16 paged-attention, cuBLAS inference, and HTTP
-service tests serially and cleans its per-run Cargo target directory when
-finished.
-The first production runner is expected to be B200, but the workflow has no
-product label or product check; A100, H100, and later compatible CUDA devices
-run the same capability-gated tests.
-
-To include native Mooncake registration and linked P/D network transfer, set
-`MOONCAKE_BUILD_DIR` to the Mooncake build directory visible on that runner and
-select the `mooncake` manual input. `ENABLE_MOONCAKE_CI=true` enables the same
-tests for automatic CUDA runs. Missing drivers, NVRTC, cuBLAS, compute
-capability, Mooncake build artifacts, or runner labels stop or queue the
-workflow explicitly; CI never substitutes the CPU reference backend or a fake
-transfer backend.
-
-Run all checks:
+### Send a Request
 
 ```bash
-cargo fmt --all -- --check
-cargo check --workspace --all-targets --locked
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
+curl --fail http://127.0.0.1:30000/health
+
+curl --fail-with-body --no-buffer \
+  http://127.0.0.1:30000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen3.5-0.8B",
+    "messages": [{"role": "user", "content": "Count from 1 to 5, separated by commas. Output only the numbers."}],
+    "temperature": 0,
+    "max_tokens": 16,
+    "stream": true,
+    "chat_template_kwargs": {"enable_thinking": false}
+  }'
 ```
 
-On a MacBook, these tests validate allocator geometry, page-aligned prefix
-reuse, physical-page transfer planning, decode bootstrap metadata, the CPU
-reference backing store, checked CUDA layout arithmetic, batched K/V copy plans,
-physical-slot validation, and causal paged-attention metadata construction
-without requiring a CUDA driver:
+Use `"stream": false` for a single JSON response. The HTTP service also
+provides `/v1/completions`, `/generate`, and `/get_model_info`. Native gRPC
+serving is available with `--grpc-mode`, including an HTTP sidecar for worker
+discovery and control-plane integration. Protocol coverage is incremental;
+unsupported operations return explicit errors.
 
-```bash
-cargo test -p sglang-srt --test cache_allocator \
-  --test scheduler_cache_allocation --test pd_transfer_plan \
-  --test architecture_boundaries --test kv_cache --test cuda_attention
-```
-
-On a CUDA host, validate real page-major allocation, page write/read,
-global token-slot addressing, and the transferable-memory view:
-
-```bash
-cargo test -p sglang-srt --test cuda_backend \
-  cuda_backend_round_trips_page_major_device_kv_memory -- --ignored --nocapture
-```
-
-Validate the BF16 row-major GEMM used by Transformer linear projections:
-
-```bash
-cargo test -p sglang-srt --test cuda_backend \
-  cuda_bf16_gemm_runs_transformer_linear_projection -- --ignored --nocapture
-```
-
-With the CUDA toolkit's NVRTC library available to the dynamic loader, validate
-runtime kernel compilation, RMSNorm, SiLU-mul, and device-to-device physical KV
-slot writes:
-
-```bash
-cargo test -p sglang-srt --test cuda_backend \
-  cuda_runtime_kernels_execute_and_write_kv_slots -- --ignored --nocapture
-```
-
-Validate a batched, strided K/V scatter across physical page boundaries and
-gather it back from the exact allocation exposed to Mooncake:
-
-```bash
-cargo test -p sglang-srt --test cuda_backend \
-  cuda_kv_kernels_scatter_and_gather_batched_physical_slots -- --ignored --nocapture
-```
-
-Validate BF16 GQA paged attention against a CPU numerical reference after K/V
-has been scattered across physical page boundaries. This also asserts that
-attention reads the exact CUDA allocation exposed for Mooncake registration:
-
-```bash
-cargo test -p sglang-srt --test cuda_backend \
-  cuda_bf16_paged_attention_reads_mooncake_registered_physical_kv_slots -- --ignored --nocapture
-```
-
-Validate real safetensors weight upload, cuBLAS logits, token sampling, and the
-HTTP inference service on CUDA:
-
-```bash
-cargo test -p sglang-srt --test cuda_inference \
-  cuda_auto_selects_cublas_for_weight_backed_http_inference -- --ignored --nocapture
-```
-
-With native Mooncake built, validate CUDA KV registration and deregistration:
-
-```bash
-MOONCAKE_BUILD_DIR=/path/to/Mooncake/build \
-  cargo test -p sglang-srt --features mooncake-link --test cuda_backend \
-  cuda_mooncake_registers_real_cuda_kv_memory -- --ignored --nocapture
-```
-
-CUDA is the first production backend and B200 is the first hardware acceptance
-target; the runtime and kernel interfaces do not encode a B200 product check.
-The BF16 GEMM and attention implementations accept CUDA compute capability 8.0
-or newer, which leaves A100 and H100 on the same backend path, but those devices
-are not yet part of the committed hardware acceptance matrix. Metal, ROCm, and
-MUSA execution are not implemented yet. Requesting one of those devices fails
-at startup with the unavailable backend/capability instead of running the CPU
-reference model.
-
-Run a local centralized CPU-reference smoke with a tiny real safetensors model:
+For a small, self-contained Transformer smoke test without downloading a
+pretrained checkpoint:
 
 ```bash
 ./scripts/run_cpu_reference_smoke.sh
 ```
 
-The smoke builds `sglang-rs`, creates a complete one-layer Qwen3 Transformer
-checkpoint, starts one centralized reference server, sends an OpenAI
-completions request, verifies the model-generated `world` token, and then shuts
-the server down. CPU reference execution is not used to claim P/D transfer
-support. Use `KEEP_RUNNING=1` to leave the service running after the request.
+This script creates a complete one-layer Qwen3 checkpoint, starts a centralized
+CPU server, checks its generated token, and stops the server. It is separate
+from the full-model demo above and is not a network transfer test.
+
+## Model and Backend Coverage
+
+`ModelRegistry` selects adapters from Hugging Face `architectures`. Adapters
+parse configuration, map weights, compose shared Transformer components, and
+declare capability requirements. Recognition of an architecture alone does
+not establish that an executable backend exists.
+
+| Hugging Face architecture | Shared components | CPU reference | CUDA implementation |
+| --- | --- | --- | --- |
+| `Qwen2ForCausalLM`, `Qwen3ForCausalLM` | Dense decoder, MHA/GQA | FP32 | BF16; dense tensor-parallel path |
+| `Qwen3_5ForConditionalGeneration` | Gated DeltaNet + full attention | FP32 | BF16; single rank |
+| `DeepseekV3ForCausalLM`, `KimiK25ForConditionalGeneration` | MLA + MoE | FP32 | BF16; single rank |
+| `KimiLinearForCausalLM` | KDA + MLA/MoE | FP32 | BF16; single rank |
+| `GlmMoeDsaForCausalLM`, `DeepseekV4ForCausalLM` | Shared MLA/MoE definitions | No executable path | No executable path |
+
+The table describes implemented execution paths, not full-scale checkpoint
+acceptance. The full Qwen3.5-0.8B checkpoint has been exercised on CPU; other
+paths have focused Transformer fixture tests and, where applicable, opt-in
+CUDA hardware tests. Checkpoint variants and quantization formats are validated
+per adapter. Vision/audio inputs are not supported by these text paths.
+
+GLM DSA remains a thin adapter over shared DeepSeek/MLA-MoE definitions. Until
+its required execution components exist, startup fails with the missing
+capabilities rather than substituting another model.
+
+| Device selection | Behavior |
+| --- | --- |
+| `--device cpu` | Explicit FP32 reference backend; single-rank execution |
+| `--device cuda` | CUDA execution with capability checks and BF16 kernels |
+| `--device auto` | Probes registered production backends, currently CUDA; never falls back to CPU |
+| `--device metal`, `rocm`, or `musa` | No registered execution provider; startup fails explicitly |
+
+CUDA execution requires the NVIDIA driver, NVRTC, and cuBLAS; dense tensor
+parallelism additionally requires NCCL. Device placement uses ordinals and
+rank configuration, not GPU product names. Dense tensor parallelism is
+currently single-node; unavailable topology or component requirements fail
+at startup. The current BF16 execution path
+requires compute capability 8.0 or newer. B200 is the first production
+acceptance target, not a hard-coded runtime or CI requirement.
+
+## Runtime Architecture
+
+```text
+HTTP / gRPC serving
+        |
+Engine / Scheduler / WorkerGroup
+        |
+ModelRunner + backend-owned execution resources
+        |
+Shared dense / hybrid / MLA / MoE components
+        |
+Backend kernels and device memory
+
+ModelRegistry -> model adapter -> ModelDefinition
+Active KV storage -> NexusKV descriptor -> transfer backend
+```
+
+- **Serving and scheduling:** request lifecycle, batch formation, admission,
+  token budgets, completion, and cancellation are independent of model family.
+- **Model execution:** adapters describe models; shared executors run their
+  components. Models do not own separate schedulers or transfer lifecycles.
+- **Backend resources:** providers create compatible executors and execution
+  resources. `ModelRunner` owns the active KV pool; backends allocate its
+  physical memory.
+- **KV and transfer:** scheduling manages logical pages and token slots.
+  Runtime KV storage directly implements NexusKV `KvCacheMemoryProvider`;
+  transfer consumes its `TransferableKvCacheMemory` descriptor.
+- **Kernels:** `sglang-kernel` contains CPU reference primitives and CUDA
+  Driver, NVRTC, cuBLAS, and NCCL bindings. Hardware differences are expressed
+  through capabilities rather than model-specific execution infrastructure.
+
+`--page-size` is the number of token slots per physical KV page.
+`--num-reserved-decode-tokens` is the total slot capacity and must be nonzero
+and divisible by the page size. Invalid geometry fails before serving begins.
+Prefix reuse operates on complete physical pages and is disabled for recurrent
+models until prefix-state restoration is available.
+
+## Prefill/Decode Disaggregation
+
+The production transfer implementation uses native Mooncake FFI and registers
+the active runtime KV allocation. Build it against real Mooncake artifacts:
+
+```bash
+MOONCAKE_BUILD_DIR=/path/to/Mooncake/build \
+  cargo build --release --locked -p sglang-srt \
+  --bin sglang-rs --features mooncake-link
+```
+
+`MOONCAKE_HOME` is an alternative when the artifacts are under its `build/`
+directory. The native libraries and their dependencies must be installed;
+enabling `mooncake-link`, including through `--all-features`, does not work
+without them.
+
+Workers use the community-style `--disaggregation-mode prefill|decode` and
+`--disaggregation-transfer-backend mooncake|mooncake_tcp` flags. Bootstrap
+metadata carries the room and destination KV layout between workers.
+
+Current limits:
+
+- P/D requires `tp_size=1`, `dp_size=1`, `nnodes=1`, and `node_rank=0`.
+  Centralized CUDA dense tensor parallelism is a separate execution path.
+- Both workers disable radix reuse and transfer the full prompt. Decode-side
+  prefix reuse and KV offload requests are rejected at startup.
+- Hybrid models requiring recurrent state, including Qwen3.5 and Kimi Linear,
+  are rejected because KV-only transfer is insufficient.
+- The Mooncake adapter requires one contiguous registered region. This is a
+  Mooncake implementation constraint, not a NexusKV descriptor limitation.
+- NIXL, Ascend, and Mori transfer executors are not implemented. Fake/local
+  snapshot helpers are test-only and cannot be selected by production CLI.
+
+Prefill sends the sampled first token and terminal status after all native KV
+tasks have drained. Decode waits for both before using the received KV; it
+does not repeat prefill locally.
+
+On SIGINT/SIGTERM, the service stops accepting requests, drains or cancels
+transfers, frees native batch IDs, unregisters memory, and then releases model
+resources. Bootstrap ABORT handling remains available during drain. Stop
+decode workers before prefill workers when draining a deployment. Unconfirmed
+writes retain their KV pages; destruction that cannot establish safe drain or
+unregistration is fatal rather than permitting unsafe memory reuse.
+
+**NexusKV integration is currently the memory contract only.** NexusKV
+store/offload integration and a NexusKV network transfer executor are not
+implemented. A host offload tier does not replace the active accelerator KV
+pool.
+
+## Validation
+
+### Local and Hosted CI
+
+The [Rust CI workflow](.github/workflows/ci.yml) runs on Ubuntu and macOS.
+Run the same checks locally:
+
+```bash
+cargo fmt --all -- --check
+cargo check --workspace --all-targets --locked --features sglang-srt/test-support
+cargo clippy --workspace --all-targets --locked --features sglang-srt/test-support -- -D warnings
+cargo test --workspace --locked --features sglang-srt/test-support
+```
+
+Focused P/D correctness and lifecycle checks:
+
+```bash
+cargo test -p sglang-srt --locked --lib nonzero_qwen_pd
+cargo test -p sglang-srt --locked --lib pd_shutdown_tests
+cargo test -p sglang-srt --locked --features test-support \
+  --test mooncake_lifecycle --test pd_bootstrap_server
+```
+
+The numerical oracle runs a complete nonzero-weight Qwen3 Transformer for four
+output tokens, compares every logit with centralized execution, and detects
+deliberately corrupted KV. Its host payload copy is test-only. Local ZMQ
+control tests cover completion and cancellation, but do not validate CUDA
+memory registration, RDMA, or NVLink.
+
+### CUDA and Native Mooncake
+
+The [CUDA Acceptance workflow](.github/workflows/cuda-acceptance.yml) uses a
+Linux self-hosted runner labeled `cuda`, without a GPU product-model label.
+It exercises nonzero device placement, allocation, kernels, inference, and
+two-rank NCCL execution. Its full matrix requires two visible CUDA devices;
+this is an acceptance-test requirement, not a single-rank serving requirement.
+
+Start it manually, or set `ENABLE_CUDA_CI=true` for pushes to `main`. Native
+registration and linked P/D tests additionally require `MOONCAKE_BUILD_DIR`
+and the `mooncake` manual input or `ENABLE_MOONCAKE_CI=true`.
+
+For a single-device allocation and kernel check:
+
+```bash
+SGLANG_CUDA_TEST_DEVICE=0 cargo test -p sglang-srt --locked \
+  --test cuda_backend -- --ignored --nocapture --test-threads=1
+```
+
+For linked P/D acceptance, using a nonzero CUDA ordinal:
+
+```bash
+MOONCAKE_BUILD_DIR=/path/to/Mooncake/build SGLANG_CUDA_TEST_DEVICE=1 \
+  cargo test -p sglang-router --locked --features mooncake-link --test proxy \
+  real_srt_pd::router_pd_chat_completes_with_real_cuda_qwen_mooncake_workers \
+  -- --ignored --nocapture --test-threads=1
+```
+
+The linked test compares four generated tokens and finish reasons with
+centralized CUDA inference. Hardware tests are ignored by ordinary local
+test runs. A passing CPU suite, skipped CUDA job, or successful compilation
+does not establish accelerator or network-transfer acceptance.
+
+## Repository Layout
+
+| Path | Responsibility |
+| --- | --- |
+| [`crates/sglang-srt`](crates/sglang-srt) | Serving, scheduler, model registry, execution, KV cache, and transfer orchestration |
+| [`crates/sglang-kernel`](crates/sglang-kernel) | CPU primitives and CUDA/kernel library bindings |
+| [`crates/sglang-router`](crates/sglang-router) | HTTP/gRPC routing and P/D integration tests; see its [README](crates/sglang-router/README.md) |
+| [`proto`](proto) | Runtime gRPC service definitions |
+| [`scripts`](scripts) | Local smoke and launch scripts |
+| [`.github/workflows`](.github/workflows) | Hosted Rust checks and opt-in CUDA acceptance |
+
+## License
+
+[MIT](LICENSE). External models, native libraries, and other dependencies
+retain their own licenses.
