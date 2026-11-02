@@ -6,6 +6,19 @@ and cache control from asynchronous GPU execution.
 > The CPU side decides what should happen; the GPU side executes how and when
 the GPU work happens.
 
+## CPU Reference Demo
+
+The terminal replay below shows this runtime serving the official
+[Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct)
+checkpoint on Linux with `--device cpu`: direct server startup, a health check,
+and an OpenAI-compatible chat request returning `2+2 equals 4.`.
+
+![Qwen2.5-0.5B-Instruct running through the Rust CPU reference server](docs/assets/qwen-cpu-demo.gif)
+
+Idle waits are accelerated in the replay. The recorded request took 21.49 seconds
+(39 input tokens, 8 output tokens); this is a functional CPU reference demo,
+not a performance benchmark or a CUDA/Metal validation.
+
 ## Architecture
 
 The project is evolving from a Rust rewrite of SGLang into a native runtime
