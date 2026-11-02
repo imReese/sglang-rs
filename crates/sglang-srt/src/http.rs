@@ -1430,6 +1430,16 @@ fn internal_error_json(message: impl Into<String>) -> Response {
         .into_response()
 }
 
+async fn blocking_inference_response(
+    inference: impl FnOnce() -> Response + Send + 'static,
+) -> Response {
+    // Synchronous model execution and transfer control must not block the HTTP reactor.
+    match tokio::task::spawn_blocking(inference).await {
+        Ok(response) => response,
+        Err(error) => internal_error_json(format!("HTTP inference task failed: {error}")),
+    }
+}
+
 async fn generate<T, W>(
     State(service): State<HttpRouterService<T, W>>,
     headers: HeaderMap,
@@ -1474,136 +1484,108 @@ where
             }
         };
     }
-    let mut observation = RequestObservation::new(Arc::clone(&service.metrics));
-    let response = {
-        let mut runtime = service
-            .runtime
-            .lock()
-            .expect("HTTP router runtime lock should be held");
-        match request {
-            HttpGenerateRequest::Text(request) => {
-                if service.max_transfer_polls == 0 {
-                    runtime
-                        .generate_text_stream(request)
-                        .map(HttpGenerateResponse::Single)
-                } else {
-                    runtime
-                        .generate_text_stream_with_transfer_polling(
-                            request,
-                            service.max_transfer_polls,
+    blocking_inference_response(move || {
+        let mut observation = RequestObservation::new(Arc::clone(&service.metrics));
+        let response = {
+            let mut runtime = service
+                .runtime
+                .lock()
+                .expect("HTTP router runtime lock should be held");
+            match request {
+                HttpGenerateRequest::Text(request) => {
+                    if service.max_transfer_polls == 0 {
+                        runtime
+                            .generate_text_stream(request)
+                            .map(HttpGenerateResponse::Single)
+                    } else {
+                        runtime
+                            .generate_text_stream_with_transfer_polling(
+                                request,
+                                service.max_transfer_polls,
+                            )
+                            .map(HttpGenerateResponse::Single)
+                    }
+                }
+                HttpGenerateRequest::BatchText(requests) => {
+                    if stream {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "error": {
+                                    "message": "streaming batched /generate is not supported yet"
+                                }
+                            })),
                         )
-                        .map(HttpGenerateResponse::Single)
-                }
-            }
-            HttpGenerateRequest::BatchText(requests) => {
-                if stream {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({
-                            "error": {
-                                "message": "streaming batched /generate is not supported yet"
-                            }
-                        })),
-                    )
-                        .into_response();
-                }
+                            .into_response();
+                    }
 
-                if service.max_transfer_polls == 0 {
-                    runtime
-                        .generate_text_batch_stream(requests)
-                        .map(HttpGenerateResponse::Batch)
-                } else {
-                    runtime
-                        .generate_text_batch_stream_with_transfer_polling(
-                            requests,
-                            service.max_transfer_polls,
+                    if service.max_transfer_polls == 0 {
+                        runtime
+                            .generate_text_batch_stream(requests)
+                            .map(HttpGenerateResponse::Batch)
+                    } else {
+                        runtime
+                            .generate_text_batch_stream_with_transfer_polling(
+                                requests,
+                                service.max_transfer_polls,
+                            )
+                            .map(HttpGenerateResponse::Batch)
+                    }
+                }
+                HttpGenerateRequest::Tokenized(request) => {
+                    if service.max_transfer_polls == 0 {
+                        runtime
+                            .generate_stream(request)
+                            .map(HttpGenerateResponse::Single)
+                    } else {
+                        runtime
+                            .generate_stream_with_transfer_polling(request, service.max_transfer_polls)
+                            .map(HttpGenerateResponse::Single)
+                    }
+                }
+                HttpGenerateRequest::BatchTokenized(requests) => {
+                    if stream {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "error": {
+                                    "message": "streaming batched /generate is not supported yet"
+                                }
+                            })),
                         )
-                        .map(HttpGenerateResponse::Batch)
-                }
-            }
-            HttpGenerateRequest::Tokenized(request) => {
-                if service.max_transfer_polls == 0 {
-                    runtime
-                        .generate_stream(request)
-                        .map(HttpGenerateResponse::Single)
-                } else {
-                    runtime
-                        .generate_stream_with_transfer_polling(request, service.max_transfer_polls)
-                        .map(HttpGenerateResponse::Single)
-                }
-            }
-            HttpGenerateRequest::BatchTokenized(requests) => {
-                if stream {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({
-                            "error": {
-                                "message": "streaming batched /generate is not supported yet"
-                            }
-                        })),
-                    )
-                        .into_response();
-                }
+                            .into_response();
+                    }
 
-                if service.max_transfer_polls == 0 {
-                    runtime
-                        .generate_batch_stream(requests)
-                        .map(HttpGenerateResponse::Batch)
-                } else {
-                    runtime
-                        .generate_batch_stream_with_transfer_polling(
-                            requests,
-                            service.max_transfer_polls,
-                        )
-                        .map(HttpGenerateResponse::Batch)
+                    if service.max_transfer_polls == 0 {
+                        runtime
+                            .generate_batch_stream(requests)
+                            .map(HttpGenerateResponse::Batch)
+                    } else {
+                        runtime
+                            .generate_batch_stream_with_transfer_polling(
+                                requests,
+                                service.max_transfer_polls,
+                            )
+                            .map(HttpGenerateResponse::Batch)
+                    }
                 }
             }
-        }
-    };
+        };
 
-    match &response {
-        Ok(HttpGenerateResponse::Single(responses)) => {
-            observe_router_responses(&mut observation, responses)
-        }
-        Ok(HttpGenerateResponse::Batch(batch)) => {
-            for responses in batch {
-                observe_router_responses(&mut observation, responses);
+        match &response {
+            Ok(HttpGenerateResponse::Single(responses)) => {
+                observe_router_responses(&mut observation, responses)
             }
-        }
-        Err(_) => {}
-    }
-    observation.finish(response.is_ok());
-    match response {
-        Ok(HttpGenerateResponse::Single(mut responses)) => {
-            let Some(response) = responses.pop() else {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": { "message": "generation produced no response" } })),
-                )
-                    .into_response();
-            };
-            match generate_complete_response_json(response) {
-                Ok(body) => (StatusCode::OK, Json(body)).into_response(),
-                Err(response) => match response.body {
-                    RouterGenerateResponseBody::Chunk(_) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(
-                            json!({ "error": { "message": "non-stream HTTP generate returned a stream chunk" } }),
-                        ),
-                    )
-                        .into_response(),
-                    RouterGenerateResponseBody::Error(error) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({ "error": { "message": error.message } })),
-                    )
-                        .into_response(),
-                    RouterGenerateResponseBody::Complete(_) => unreachable!(),
-                },
+            Ok(HttpGenerateResponse::Batch(batch)) => {
+                for responses in batch {
+                    observe_router_responses(&mut observation, responses);
+                }
             }
+            Err(_) => {}
         }
-        Ok(HttpGenerateResponse::Batch(batch_responses)) => {
-            let mut body = Vec::with_capacity(batch_responses.len());
-            for mut responses in batch_responses {
+        observation.finish(response.is_ok());
+        match response {
+            Ok(HttpGenerateResponse::Single(mut responses)) => {
                 let Some(response) = responses.pop() else {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -1612,34 +1594,65 @@ where
                         .into_response();
                 };
                 match generate_complete_response_json(response) {
-                    Ok(item) => body.push(item),
+                    Ok(body) => (StatusCode::OK, Json(body)).into_response(),
                     Err(response) => match response.body {
-                        RouterGenerateResponseBody::Chunk(_) => {
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(json!({
-                                    "error": {
-                                        "message": "non-stream HTTP generate returned a stream chunk"
-                                    }
-                                })),
-                            )
-                                .into_response();
-                        }
-                        RouterGenerateResponseBody::Error(error) => {
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(json!({ "error": { "message": error.message } })),
-                            )
-                                .into_response();
-                        }
+                        RouterGenerateResponseBody::Chunk(_) => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(
+                                json!({ "error": { "message": "non-stream HTTP generate returned a stream chunk" } }),
+                            ),
+                        )
+                            .into_response(),
+                        RouterGenerateResponseBody::Error(error) => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({ "error": { "message": error.message } })),
+                        )
+                            .into_response(),
                         RouterGenerateResponseBody::Complete(_) => unreachable!(),
                     },
                 }
             }
-            (StatusCode::OK, Json(Value::Array(body))).into_response()
+            Ok(HttpGenerateResponse::Batch(batch_responses)) => {
+                let mut body = Vec::with_capacity(batch_responses.len());
+                for mut responses in batch_responses {
+                    let Some(response) = responses.pop() else {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({ "error": { "message": "generation produced no response" } })),
+                        )
+                            .into_response();
+                    };
+                    match generate_complete_response_json(response) {
+                        Ok(item) => body.push(item),
+                        Err(response) => match response.body {
+                            RouterGenerateResponseBody::Chunk(_) => {
+                                return (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    Json(json!({
+                                        "error": {
+                                            "message": "non-stream HTTP generate returned a stream chunk"
+                                        }
+                                    })),
+                                )
+                                    .into_response();
+                            }
+                            RouterGenerateResponseBody::Error(error) => {
+                                return (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    Json(json!({ "error": { "message": error.message } })),
+                                )
+                                    .into_response();
+                            }
+                            RouterGenerateResponseBody::Complete(_) => unreachable!(),
+                        },
+                    }
+                }
+                (StatusCode::OK, Json(Value::Array(body))).into_response()
+            }
+            Err(error) => router_runtime_error_json(error),
         }
-        Err(error) => router_runtime_error_json(error),
-    }
+    })
+    .await
 }
 
 enum HttpGenerateResponse {
@@ -1848,125 +1861,128 @@ where
         };
     }
 
-    let mut observation = RequestObservation::new(Arc::clone(&service.metrics));
-    let response = {
-        let mut runtime = service
-            .runtime
-            .lock()
-            .expect("HTTP router runtime lock should be held");
-        match request {
-            HttpChatRequest::Single(request) => {
-                if service.max_transfer_polls == 0 {
-                    runtime
-                        .generate_text_stream(*request)
-                        .map(HttpChatResponse::Single)
-                } else {
-                    runtime
-                        .generate_text_stream_with_transfer_polling(
-                            *request,
-                            service.max_transfer_polls,
+    blocking_inference_response(move || {
+        let mut observation = RequestObservation::new(Arc::clone(&service.metrics));
+        let response = {
+            let mut runtime = service
+                .runtime
+                .lock()
+                .expect("HTTP router runtime lock should be held");
+            match request {
+                HttpChatRequest::Single(request) => {
+                    if service.max_transfer_polls == 0 {
+                        runtime
+                            .generate_text_stream(*request)
+                            .map(HttpChatResponse::Single)
+                    } else {
+                        runtime
+                            .generate_text_stream_with_transfer_polling(
+                                *request,
+                                service.max_transfer_polls,
+                            )
+                            .map(HttpChatResponse::Single)
+                    }
+                }
+                HttpChatRequest::Batch(requests) => {
+                    if stream {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "error": {
+                                    "message": "streaming batched /v1/chat/completions is not supported yet"
+                                }
+                            })),
                         )
-                        .map(HttpChatResponse::Single)
+                            .into_response();
+                    }
+
+                    if service.max_transfer_polls == 0 {
+                        runtime
+                            .generate_text_batch_stream(requests)
+                            .map(HttpChatResponse::Batch)
+                    } else {
+                        runtime
+                            .generate_text_batch_stream_with_transfer_polling(
+                                requests,
+                                service.max_transfer_polls,
+                            )
+                            .map(HttpChatResponse::Batch)
+                    }
                 }
             }
-            HttpChatRequest::Batch(requests) => {
-                if stream {
+        };
+
+        match &response {
+            Ok(HttpChatResponse::Single(responses)) => {
+                observe_router_responses(&mut observation, responses)
+            }
+            Ok(HttpChatResponse::Batch(batch)) => {
+                for responses in batch {
+                    observe_router_responses(&mut observation, responses);
+                }
+            }
+            Err(_) => {}
+        }
+        observation.finish(response.is_ok());
+        match response {
+            Ok(HttpChatResponse::Single(mut responses)) => {
+                let Some(response) = responses.pop() else {
                     return (
-                        StatusCode::BAD_REQUEST,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": { "message": "generation produced no response" } })),
+                    )
+                        .into_response();
+                };
+                match response.body {
+                    RouterGenerateResponseBody::Complete(complete) => (
+                        StatusCode::OK,
                         Json(json!({
-                            "error": {
-                                "message": "streaming batched /v1/chat/completions is not supported yet"
+                            "id": openai_response_id("chatcmpl-", &response.request_id),
+                            "object": "chat.completion",
+                            "model": model,
+                            "choices": [{
+                                "index": complete.index,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": complete.text,
+                                },
+                                "finish_reason": complete.finish_reason,
+                            }],
+                            "usage": {
+                                "prompt_tokens": complete.prompt_tokens,
+                                "completion_tokens": complete.completion_tokens,
+                                "cached_tokens": complete.cached_tokens,
                             }
                         })),
                     )
-                        .into_response();
+                        .into_response(),
+                    RouterGenerateResponseBody::Chunk(_) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({
+                            "error": {
+                                "message": "non-stream HTTP chat completion returned a stream chunk"
+                            }
+                        })),
+                    )
+                        .into_response(),
+                    RouterGenerateResponseBody::Error(error) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": { "message": error.message } })),
+                    )
+                        .into_response(),
                 }
-
-                if service.max_transfer_polls == 0 {
-                    runtime
-                        .generate_text_batch_stream(requests)
-                        .map(HttpChatResponse::Batch)
-                } else {
-                    runtime
-                        .generate_text_batch_stream_with_transfer_polling(
-                            requests,
-                            service.max_transfer_polls,
-                        )
-                        .map(HttpChatResponse::Batch)
-                }
             }
-        }
-    };
-
-    match &response {
-        Ok(HttpChatResponse::Single(responses)) => {
-            observe_router_responses(&mut observation, responses)
-        }
-        Ok(HttpChatResponse::Batch(batch)) => {
-            for responses in batch {
-                observe_router_responses(&mut observation, responses);
+            Ok(HttpChatResponse::Batch(batch_responses)) => {
+                http_chat_batch_response_from_router_responses(batch_responses, &model)
             }
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": { "message": error.to_string() } })),
+            )
+                .into_response(),
         }
-        Err(_) => {}
-    }
-    observation.finish(response.is_ok());
-    match response {
-        Ok(HttpChatResponse::Single(mut responses)) => {
-            let Some(response) = responses.pop() else {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": { "message": "generation produced no response" } })),
-                )
-                    .into_response();
-            };
-            match response.body {
-                RouterGenerateResponseBody::Complete(complete) => (
-                    StatusCode::OK,
-                    Json(json!({
-                        "id": openai_response_id("chatcmpl-", &response.request_id),
-                        "object": "chat.completion",
-                        "model": model,
-                        "choices": [{
-                            "index": complete.index,
-                            "message": {
-                                "role": "assistant",
-                                "content": complete.text,
-                            },
-                            "finish_reason": complete.finish_reason,
-                        }],
-                        "usage": {
-                            "prompt_tokens": complete.prompt_tokens,
-                            "completion_tokens": complete.completion_tokens,
-                            "cached_tokens": complete.cached_tokens,
-                        }
-                    })),
-                )
-                    .into_response(),
-                RouterGenerateResponseBody::Chunk(_) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({
-                        "error": {
-                            "message": "non-stream HTTP chat completion returned a stream chunk"
-                        }
-                    })),
-                )
-                    .into_response(),
-                RouterGenerateResponseBody::Error(error) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": { "message": error.message } })),
-                )
-                    .into_response(),
-            }
-        }
-        Ok(HttpChatResponse::Batch(batch_responses)) => {
-            http_chat_batch_response_from_router_responses(batch_responses, &model)
-        }
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": { "message": error.to_string() } })),
-        )
-            .into_response(),
-    }
+    })
+    .await
 }
 
 pub(crate) enum HttpChatRequest {
@@ -2249,30 +2265,35 @@ where
             encoder.encode(response)
         });
     }
-    let mut observation = RequestObservation::new(Arc::clone(&service.metrics));
-    let responses = {
-        let mut runtime = service
-            .runtime
-            .lock()
-            .expect("HTTP router runtime lock should be held");
-        if service.max_transfer_polls == 0 {
-            runtime.generate_text_stream(router_request)
-        } else {
-            runtime.generate_text_stream_with_transfer_polling(
-                router_request,
-                service.max_transfer_polls,
-            )
-        }
-    };
+    blocking_inference_response(move || {
+        let mut observation = RequestObservation::new(Arc::clone(&service.metrics));
+        let responses = {
+            let mut runtime = service
+                .runtime
+                .lock()
+                .expect("HTTP router runtime lock should be held");
+            if service.max_transfer_polls == 0 {
+                runtime.generate_text_stream(router_request)
+            } else {
+                runtime.generate_text_stream_with_transfer_polling(
+                    router_request,
+                    service.max_transfer_polls,
+                )
+            }
+        };
 
-    if let Ok(responses) = &responses {
-        observe_router_responses(&mut observation, responses);
-    }
-    observation.finish(responses.is_ok());
-    match responses {
-        Ok(responses) => http_responses_response_from_router_responses(responses, &response_model),
-        Err(error) => router_runtime_error_json(error),
-    }
+        if let Ok(responses) = &responses {
+            observe_router_responses(&mut observation, responses);
+        }
+        observation.finish(responses.is_ok());
+        match responses {
+            Ok(responses) => {
+                http_responses_response_from_router_responses(responses, &response_model)
+            }
+            Err(error) => router_runtime_error_json(error),
+        }
+    })
+    .await
 }
 
 pub(crate) struct HttpResponsesRequest {
@@ -2662,81 +2683,84 @@ where
         };
     }
 
-    let mut observation = RequestObservation::new(Arc::clone(&service.metrics));
-    let response = {
-        let mut runtime = service
-            .runtime
-            .lock()
-            .expect("HTTP router runtime lock should be held");
-        match request {
-            HttpCompletionRequest::Single(request) => {
-                if service.max_transfer_polls == 0 {
-                    runtime
-                        .generate_text_stream(*request)
-                        .map(HttpCompletionResponse::Single)
-                } else {
-                    runtime
-                        .generate_text_stream_with_transfer_polling(
-                            *request,
-                            service.max_transfer_polls,
+    blocking_inference_response(move || {
+        let mut observation = RequestObservation::new(Arc::clone(&service.metrics));
+        let response = {
+            let mut runtime = service
+                .runtime
+                .lock()
+                .expect("HTTP router runtime lock should be held");
+            match request {
+                HttpCompletionRequest::Single(request) => {
+                    if service.max_transfer_polls == 0 {
+                        runtime
+                            .generate_text_stream(*request)
+                            .map(HttpCompletionResponse::Single)
+                    } else {
+                        runtime
+                            .generate_text_stream_with_transfer_polling(
+                                *request,
+                                service.max_transfer_polls,
+                            )
+                            .map(HttpCompletionResponse::Single)
+                    }
+                }
+                HttpCompletionRequest::Batch(requests) => {
+                    if stream {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "error": {
+                                    "message": "streaming batched /v1/completions is not supported yet"
+                                }
+                            })),
                         )
-                        .map(HttpCompletionResponse::Single)
-                }
-            }
-            HttpCompletionRequest::Batch(requests) => {
-                if stream {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({
-                            "error": {
-                                "message": "streaming batched /v1/completions is not supported yet"
-                            }
-                        })),
-                    )
-                        .into_response();
-                }
+                            .into_response();
+                    }
 
-                if service.max_transfer_polls == 0 {
-                    runtime
-                        .generate_text_batch_stream(requests)
-                        .map(HttpCompletionResponse::Batch)
-                } else {
-                    runtime
-                        .generate_text_batch_stream_with_transfer_polling(
-                            requests,
-                            service.max_transfer_polls,
-                        )
-                        .map(HttpCompletionResponse::Batch)
+                    if service.max_transfer_polls == 0 {
+                        runtime
+                            .generate_text_batch_stream(requests)
+                            .map(HttpCompletionResponse::Batch)
+                    } else {
+                        runtime
+                            .generate_text_batch_stream_with_transfer_polling(
+                                requests,
+                                service.max_transfer_polls,
+                            )
+                            .map(HttpCompletionResponse::Batch)
+                    }
                 }
             }
-        }
-    };
+        };
 
-    match &response {
-        Ok(HttpCompletionResponse::Single(responses)) => {
-            observe_router_responses(&mut observation, responses)
-        }
-        Ok(HttpCompletionResponse::Batch(batch)) => {
-            for responses in batch {
-                observe_router_responses(&mut observation, responses);
+        match &response {
+            Ok(HttpCompletionResponse::Single(responses)) => {
+                observe_router_responses(&mut observation, responses)
             }
+            Ok(HttpCompletionResponse::Batch(batch)) => {
+                for responses in batch {
+                    observe_router_responses(&mut observation, responses);
+                }
+            }
+            Err(_) => {}
         }
-        Err(_) => {}
-    }
-    observation.finish(response.is_ok());
-    match response {
-        Ok(HttpCompletionResponse::Single(responses)) => {
-            http_completion_response_from_router_responses(responses, &model)
+        observation.finish(response.is_ok());
+        match response {
+            Ok(HttpCompletionResponse::Single(responses)) => {
+                http_completion_response_from_router_responses(responses, &model)
+            }
+            Ok(HttpCompletionResponse::Batch(batch_responses)) => {
+                http_completion_batch_response_from_router_responses(batch_responses, &model)
+            }
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": { "message": error.to_string() } })),
+            )
+                .into_response(),
         }
-        Ok(HttpCompletionResponse::Batch(batch_responses)) => {
-            http_completion_batch_response_from_router_responses(batch_responses, &model)
-        }
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": { "message": error.to_string() } })),
-        )
-            .into_response(),
-    }
+    })
+    .await
 }
 
 pub(crate) enum HttpCompletionRequest {

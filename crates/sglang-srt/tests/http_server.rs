@@ -94,6 +94,24 @@ struct SlowHttpWorker {
     decode_started: Arc<AtomicBool>,
 }
 
+struct GatedHttpWorker {
+    started: Option<oneshot::Sender<()>>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+impl ModelWorker for GatedHttpWorker {
+    fn generate_batch(&mut self, batch: &ScheduleBatch) -> BatchGeneratedTokens {
+        if let Some(started) = self.started.take() {
+            started.send(()).expect("test should await execution");
+            self.resume
+                .recv_timeout(Duration::from_secs(10))
+                .expect("test should release execution after checking health");
+        }
+        BatchGeneratedTokens::from_batch(batch, vec![GeneratedToken::finished(vec![42])])
+            .expect("output shape should match batch")
+    }
+}
+
 impl ModelWorker for SlowHttpWorker {
     fn generate_batch(&mut self, batch: &ScheduleBatch) -> BatchGeneratedTokens {
         let token = match batch.forward_mode() {
@@ -801,6 +819,90 @@ async fn http_streams_before_decode_finishes_and_keeps_health_lock_free() {
         .await
         .expect("server task should join")
         .expect("server should stop cleanly");
+}
+
+#[tokio::test]
+async fn non_streaming_inference_keeps_health_and_metrics_responsive() {
+    for (path, body) in [
+        (
+            "/generate",
+            r#"{"text":"hello","sampling_params":{"max_new_tokens":1}}"#,
+        ),
+        (
+            "/v1/chat/completions",
+            r#"{"model":"health-probe","messages":[{"role":"user","content":"hello"}],"max_tokens":1}"#,
+        ),
+        (
+            "/v1/completions",
+            r#"{"model":"health-probe","prompt":"hello","max_tokens":1}"#,
+        ),
+        (
+            "/v1/responses",
+            r#"{"model":"health-probe","input":"hello","max_output_tokens":1}"#,
+        ),
+    ] {
+        let args = ServerArgs::parse_from([
+            "serve",
+            "--model-path",
+            "dummy",
+            "--served-model-name",
+            "health-probe",
+        ])
+        .expect("args should parse");
+        let (started_tx, started_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let runtime = RouterRuntime::new(Engine::new(
+            ByteTokenizer,
+            Scheduler::new(GatedHttpWorker {
+                started: Some(started_tx),
+                resume: resume_rx,
+            }),
+        ));
+        let service =
+            HttpRouterService::new(runtime, RouterGetModelInfoResponse::from_server_args(&args))
+                .with_server_info(HttpServerInfo {
+                    enable_metrics: true,
+                    ..Default::default()
+                });
+        let addr = unused_local_addr();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            serve_http_router_with_shutdown(addr, service, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+        });
+        let generation = tokio::spawn(request_raw_with_retry(addr, "POST", path, Some(body)));
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("inference should start")
+            .expect("worker should signal execution");
+
+        let probes = tokio::time::timeout(Duration::from_secs(5), async {
+            let health = get_json_with_retry(addr, "/health").await;
+            let deep_health = get_json_with_retry(addr, "/health_generate").await;
+            let metrics = request_raw_with_retry(addr, "GET", "/metrics", None).await;
+            (health, deep_health, metrics)
+        })
+        .await;
+        resume_tx.send(()).expect("worker should still be blocked");
+        let response = generation.await.expect("generation should join");
+        shutdown_tx.send(()).expect("server should be running");
+        server
+            .await
+            .expect("server should join")
+            .expect("server should stop cleanly");
+
+        let (health, deep_health, metrics) =
+            probes.expect("health and metrics must respond while inference is blocked");
+        assert_eq!(health["healthy"], true, "{path}: {health}");
+        assert_eq!(deep_health["healthy"], true, "{path}: {deep_health}");
+        assert!(
+            metrics.contains("sglang_requests_in_flight 1"),
+            "{path}: {metrics}"
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{path}: {response}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2752,7 +2854,7 @@ async fn http_server_poll_transfers_advances_async_pd_batches() {
         .expect("server should stop cleanly");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn mooncake_prefill_http_uses_bootstrap_kv_layout_for_transfer() {
     let mut notifications = PullSocket::new();
     let notify_endpoint = notifications
@@ -2825,17 +2927,25 @@ async fn mooncake_prefill_http_uses_bootstrap_kv_layout_for_transfer() {
     )
     .await;
 
-    assert_eq!(generated["request_id"], "http-pd-mooncake-prefill");
+    assert_eq!(
+        generated["request_id"], "http-pd-mooncake-prefill",
+        "prefill request failed: {generated}"
+    );
     assert_eq!(generated["usage"]["completion_tokens"], 2);
-    let aux = notifications
-        .recv()
-        .await
-        .expect("first token must be sent");
+    let (aux, status) = tokio::time::timeout(Duration::from_secs(5), async {
+        let aux = notifications
+            .recv()
+            .await
+            .expect("first token must be sent");
+        let status = notifications
+            .recv()
+            .await
+            .expect("terminal status must be sent");
+        (aux, status)
+    })
+    .await
+    .expect("completion notifications should arrive");
     assert_eq!(aux.into_vec()[0].as_ref(), b"AUX_DATA");
-    let status = notifications
-        .recv()
-        .await
-        .expect("terminal status must be sent");
     assert_eq!(status.into_vec()[1].as_ref(), b"4");
 
     {
