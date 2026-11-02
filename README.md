@@ -297,6 +297,57 @@ the NexusKV descriptor exposed by the active ModelRunner KV pool.
 
 ## Development
 
+### Single-Rank P/D Validation
+
+The current Mooncake P/D baseline requires `tp_size=1`, `dp_size=1`, and one
+node. Multi-rank P/D fails before model loading or memory registration; this
+does not disable centralized CUDA tensor parallelism. P/D currently disables
+radix reuse on both workers and transfers the full prompt, so independently
+cached prefixes cannot produce mismatched transfer spans.
+
+Prefill sends the sampled first token and terminal status using community
+SGLang's Mooncake control frames, only after every native KV task has drained.
+Decode waits for both, then runs decode on the received KV without a local
+prefill. SIGINT/SIGTERM stop serving, drain/cancel transfers, free native batch
+IDs, and unregister memory before releasing the active pool. Bootstrap ABORT
+handling stays available during drain. Stop decode workers before prefill
+workers when draining a deployment. Unconfirmed remote writes keep pages
+reserved; destruction that cannot prove safe drain or unregister is fatal,
+not permission to reuse that memory.
+
+Run the Mac numerical oracle and lifecycle tests:
+
+```bash
+cargo test -p sglang-srt --lib nonzero_qwen_pd
+cargo test -p sglang-srt --lib pd_shutdown_tests
+cargo test -p sglang-srt --features test-support \
+  --test mooncake_lifecycle --test pd_bootstrap_server
+```
+
+The oracle runs a complete two-layer, nonzero-weight Qwen3 Transformer for
+four output tokens, compares every logit against centralized execution, and
+detects deliberately corrupted KV. Its host KV copy is test-only, not a
+production transfer backend. Real ZMQ control sockets are exercised locally;
+native CUDA memory registration and network writes still require CUDA hosts.
+
+Run the linked network acceptance on a CUDA host with native Mooncake built:
+
+```bash
+MOONCAKE_BUILD_DIR=/path/to/Mooncake/build SGLANG_CUDA_TEST_DEVICE=1 \
+  cargo test -p sglang-router --features mooncake-link --test proxy \
+  real_srt_pd::router_pd_chat_completes_with_real_cuda_qwen_mooncake_workers \
+  -- --ignored --nocapture --test-threads=1
+```
+
+This test compares four generated tokens and finish reasons with centralized
+CUDA inference using nonzero Transformer weights. It is part of the optional
+Mooncake CUDA acceptance workflow. Local reference tests do not establish
+RDMA/NVLink correctness or GPU production readiness. NexusKV remains the
+memory descriptor contract here; this is not NexusKV store/offload or a
+NexusKV network executor integration.
+
+### CI And Checks
+
 GitHub Actions runs `Rust CI` for every pull request and push to `main` on a
 GitHub-hosted Ubuntu runner. It checks formatting, all workspace targets,
 Clippy with warnings denied, and the complete test-support suite. The

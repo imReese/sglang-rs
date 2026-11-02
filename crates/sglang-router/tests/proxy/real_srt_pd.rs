@@ -249,9 +249,39 @@ async fn router_pd_chat_completes_with_real_cuda_qwen_mooncake_workers() {
     wait_for_worker_health(prefill_addr, "prefill", &mut prefill_server).await;
     wait_for_worker_health(decode_addr, "decode", &mut decode_server).await;
 
+    let central_addr = unused_local_addr();
+    let device = cuda_test_device_ordinal().to_string();
+    let central_args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_dir.path().to_str().expect("model path"),
+        "--device",
+        "cuda",
+        "--base-gpu-id",
+        &device,
+        "--served-model-name",
+        "tiny",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &central_addr.port().to_string(),
+        "--engine-info-bootstrap-port",
+        "0",
+        "--num-reserved-decode-tokens",
+        "128",
+    ])
+    .expect("centralized args");
+    let (mut central_server, central_shutdown_tx) = spawn_worker(central_args);
+    wait_for_worker_health(central_addr, "centralized", &mut central_server).await;
+    let reference = request_raw(central_addr, "POST", "/v1/chat/completions", Some(r#"{"model":"tiny","messages":[{"role":"user","content":"hi"}],"max_tokens":4,"stream":false}"#)).await.expect("centralized inference");
+    assert!(reference.starts_with("HTTP/1.1 200"), "{reference}");
+    let reference: serde_json::Value =
+        serde_json::from_str(reference.split_once("\r\n\r\n").expect("HTTP body").1)
+            .expect("centralized JSON");
+
     let app = build_router(build_ctx(prefill_addr, decode_addr).await);
     let response = app
-        .oneshot(chat_request("tiny", "hi", 1))
+        .oneshot(chat_request("tiny", "hi", 4))
         .await
         .expect("router should respond");
     let status = response.status();
@@ -270,7 +300,16 @@ async fn router_pd_chat_completes_with_real_cuda_qwen_mooncake_workers() {
     let body: serde_json::Value =
         serde_json::from_slice(&body).expect("response should be OpenAI chat JSON");
     assert_eq!(body["model"], "tiny");
-    assert!(body["choices"][0]["message"]["content"].is_string());
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        reference["choices"][0]["message"]["content"]
+    );
+    assert_eq!(body["usage"]["completion_tokens"], 4);
+    assert_eq!(reference["usage"]["completion_tokens"], 4);
+    assert_eq!(
+        body["choices"][0]["finish_reason"],
+        reference["choices"][0]["finish_reason"]
+    );
 
     prefill_shutdown_tx
         .send(())
@@ -286,6 +325,13 @@ async fn router_pd_chat_completes_with_real_cuda_qwen_mooncake_workers() {
         .await
         .expect("decode server task should join")
         .expect("decode server should stop cleanly");
+    central_shutdown_tx
+        .send(())
+        .expect("centralized server still running");
+    central_server
+        .await
+        .expect("central server joins")
+        .expect("central server stops");
 }
 
 #[cfg(feature = "mooncake-link")]
@@ -372,7 +418,9 @@ async fn spawn_prefill_worker(
         "--kv-cache-dtype",
         "bfloat16",
         "--num-reserved-decode-tokens",
-        "8",
+        "128",
+        "--engine-info-bootstrap-port",
+        "0",
     ])
     .expect("prefill args should parse");
     spawn_worker(args)
@@ -408,7 +456,9 @@ async fn spawn_decode_worker(
         "--kv-cache-dtype",
         "bfloat16",
         "--num-reserved-decode-tokens",
-        "8",
+        "128",
+        "--engine-info-bootstrap-port",
+        "0",
     ])
     .expect("decode args should parse");
     spawn_worker(args)
@@ -508,7 +558,7 @@ fn write_qwen3_dense_fixture(model_dir: &Path) {
         (
             "model.layers.0.self_attn.q_proj.weight",
             vec![2, 2],
-            vec![0.0; 4],
+            vec![0.4, 0.2, -0.3, 0.5],
         ),
         (
             "model.layers.0.self_attn.q_norm.weight",
@@ -518,7 +568,7 @@ fn write_qwen3_dense_fixture(model_dir: &Path) {
         (
             "model.layers.0.self_attn.k_proj.weight",
             vec![2, 2],
-            vec![0.0; 4],
+            vec![0.3, -0.2, 0.1, 0.6],
         ),
         (
             "model.layers.0.self_attn.k_norm.weight",
@@ -528,12 +578,12 @@ fn write_qwen3_dense_fixture(model_dir: &Path) {
         (
             "model.layers.0.self_attn.v_proj.weight",
             vec![2, 2],
-            vec![0.0; 4],
+            vec![0.2, 0.4, -0.5, 0.3],
         ),
         (
             "model.layers.0.self_attn.o_proj.weight",
             vec![2, 2],
-            vec![0.0; 4],
+            vec![0.5, -0.1, 0.2, 0.4],
         ),
         (
             "model.layers.0.input_layernorm.weight",
@@ -548,17 +598,17 @@ fn write_qwen3_dense_fixture(model_dir: &Path) {
         (
             "model.layers.0.mlp.gate_proj.weight",
             vec![2, 2],
-            vec![0.0; 4],
+            vec![0.2, -0.3, 0.4, 0.1],
         ),
         (
             "model.layers.0.mlp.up_proj.weight",
             vec![2, 2],
-            vec![0.0; 4],
+            vec![0.1, 0.5, -0.2, 0.3],
         ),
         (
             "model.layers.0.mlp.down_proj.weight",
             vec![2, 2],
-            vec![0.0; 4],
+            vec![0.3, 0.2, -0.1, 0.4],
         ),
     ];
     let mut cursor = 0_usize;

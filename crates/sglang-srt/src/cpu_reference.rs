@@ -25,6 +25,10 @@ use crate::models::{
 use crate::runtime_kv_cache::{ActiveKvCache, RuntimeKvCache};
 use crate::transfer::{KvCacheTransferError, TransferableKvCacheMemory};
 
+#[cfg(test)]
+#[path = "cpu_reference_pd_tests.rs"]
+mod pd_tests;
+
 #[derive(Debug)]
 pub(crate) struct CpuReferenceDenseDecoder {
     plan: DenseDecoderExecutionPlan,

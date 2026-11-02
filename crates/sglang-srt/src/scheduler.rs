@@ -392,15 +392,21 @@ impl<W> Scheduler<W> {
         W: WorkerExecutor,
     {
         if let Some(request) = remove_request_from_queue(&mut self.waiting_queue, request_id) {
+            if self.worker.finish_request(&request).is_err() {
+                self.waiting_queue.push_front(request);
+                return false;
+            }
             self.release_request_cache_pages(&request);
-            self.worker.complete_request(&request);
             return true;
         }
 
         if let Some(request) = remove_request_from_queue(&mut self.decode_queue, request_id) {
+            if self.worker.finish_request(&request).is_err() {
+                self.decode_queue.push_front(request);
+                return false;
+            }
             self.release_pending_prefix_cache_insert(request_id);
             self.release_request_cache_pages(&request);
-            self.worker.complete_request(&request);
             return true;
         }
 
@@ -411,22 +417,20 @@ impl<W> Scheduler<W> {
     where
         W: WorkerExecutor,
     {
-        let mut aborted = 0;
-        while let Some(request) = self.waiting_queue.pop_front() {
-            self.release_request_cache_pages(&request);
-            self.worker.complete_request(&request);
-            aborted += 1;
-        }
-        while let Some(request) = self.decode_queue.pop_front() {
-            self.release_pending_prefix_cache_insert(request.request_id());
-            self.release_request_cache_pages(&request);
-            self.worker.complete_request(&request);
-            aborted += 1;
-        }
+        let ids = self
+            .waiting_queue
+            .iter()
+            .chain(self.decode_queue.iter())
+            .map(|request| request.request_id().clone())
+            .collect::<Vec<_>>();
+        let mut aborted = ids.iter().filter(|id| self.abort_request(id)).count();
         for request in std::mem::take(&mut self.pending_prefix_cache_inserts) {
-            self.release_unpublished_cache_pages(&request);
-            self.worker.complete_request(&request);
-            aborted += 1;
+            if self.worker.finish_request(&request).is_err() {
+                self.pending_prefix_cache_inserts.push(request);
+            } else {
+                self.release_unpublished_cache_pages(&request);
+                aborted += 1;
+            }
         }
         aborted
     }
@@ -706,6 +710,15 @@ where
 {
     pub fn shutdown(&mut self) -> Result<usize, WorkerExecutionError> {
         let aborted_requests = self.abort_all_requests();
+        if !self.waiting_queue.is_empty()
+            || !self.decode_queue.is_empty()
+            || !self.pending_prefix_cache_inserts.is_empty()
+        {
+            return Err(WorkerExecutionError::Runtime(
+                "cannot release KV memory: request transfer cancellation has not drained"
+                    .to_string(),
+            ));
+        }
         self.worker.shutdown()?;
         Ok(aborted_requests)
     }
@@ -810,18 +823,25 @@ where
         let tokens = generated.into_tokens();
 
         if requests.len() != tokens.len() {
+            let request_count = requests.len();
+            self.decode_queue.extend(requests);
             return Err(SchedulerError::Worker(WorkerExecutionError::Output(
                 crate::worker::WorkerOutputError::BatchSizeMismatch {
-                    request_count: requests.len(),
+                    request_count,
                     output_count: tokens.len(),
                 },
             )));
         }
 
         let mut outputs = Vec::with_capacity(requests.len());
+        let mut completion_error = None;
         for (mut request, generated_token) in requests.into_iter().zip(tokens) {
-            if forward_mode == ForwardMode::Prefill {
-                self.stage_prefill_cache_pages(&request)?;
+            if forward_mode == ForwardMode::Prefill
+                && let Err(error) = self.stage_prefill_cache_pages(&request)
+            {
+                self.decode_queue.push_back(request);
+                completion_error = Some(error);
+                continue;
             }
 
             request.append_output_ids(generated_token.token_ids());
@@ -829,8 +849,12 @@ where
 
             if finished {
                 request.set_stage(RequestStage::Finished);
+                if let Err(error) = self.worker.finish_request(&request) {
+                    self.decode_queue.push_back(request);
+                    completion_error = Some(error.into());
+                    continue;
+                }
                 self.release_request_cache_pages(&request);
-                self.worker.complete_request(&request);
             } else {
                 request.set_stage(RequestStage::DecodeWaiting);
                 self.decode_queue.push_back(request.clone());
@@ -839,7 +863,7 @@ where
             outputs.push(scheduled_output(request, generated_token, finished));
         }
 
-        Ok(outputs)
+        completion_error.map_or(Ok(outputs), Err)
     }
 
     fn dispatch_batch(
@@ -849,22 +873,30 @@ where
         let generated = match self.worker.execute_batch(&batch) {
             Ok(generated) => generated,
             Err(error) => {
-                self.release_failed_batch_cache_pages(&batch);
+                self.release_failed_batch_cache_pages(&batch)?;
                 return Err(error.into());
             }
         };
         self.complete_batch(batch, generated)
     }
 
-    fn release_failed_batch_cache_pages(&mut self, batch: &ScheduleBatch) {
-        if let Some(allocator) = self.cache_page_allocator.as_mut() {
-            for request in batch.requests() {
+    fn release_failed_batch_cache_pages(
+        &mut self,
+        batch: &ScheduleBatch,
+    ) -> Result<(), SchedulerError> {
+        let mut cleanup_error = None;
+        for request in batch.requests() {
+            if let Err(error) = self.worker.finish_request(request) {
+                self.decode_queue.push_back(request.clone());
+                cleanup_error = Some(error);
+                continue;
+            }
+            if let Some(allocator) = self.cache_page_allocator.as_mut() {
                 allocator.release(request.allocated_cache_pages());
             }
-        }
-        for request in batch.requests() {
             self.worker.fail_request(request);
         }
+        cleanup_error.map_or(Ok(()), |error| Err(error.into()))
     }
 
     fn stage_prefill_cache_pages(
@@ -950,6 +982,10 @@ where
     }
 
     fn release_failed_pending_prefix_cache(&mut self, request: ScheduledRequest) {
+        if self.worker.finish_request(&request).is_err() {
+            self.pending_prefix_cache_inserts.push(request);
+            return;
+        }
         self.release_unpublished_cache_pages(&request);
 
         let request = remove_request_from_queue(&mut self.decode_queue, request.request_id())

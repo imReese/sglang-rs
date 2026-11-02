@@ -14,6 +14,7 @@ use std::{
 
 use serde_json::Value;
 use tokio::sync::oneshot;
+use zeromq::{PullSocket, Socket, SocketRecv};
 
 use sglang_srt::cache::{CachePageAllocator, RadixCache};
 use sglang_srt::cli::ServerArgs;
@@ -2753,6 +2754,17 @@ async fn http_server_poll_transfers_advances_async_pd_batches() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mooncake_prefill_http_uses_bootstrap_kv_layout_for_transfer() {
+    let mut notifications = PullSocket::new();
+    let notify_endpoint = notifications
+        .bind("tcp://127.0.0.1:0")
+        .await
+        .expect("bind real completion receiver");
+    let notify_port = notify_endpoint
+        .to_string()
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .to_owned();
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
@@ -2783,8 +2795,11 @@ async fn mooncake_prefill_http_uses_bootstrap_kv_layout_for_transfer() {
         state
             .ingest_mooncake_bootstrap_frame(&kv_args_frame("session-a", &[0x9000], 128))
             .expect("KVArgs frame should parse");
+        let mut metadata = transfer_metadata_frame(34, "session-a", &[4, 5]);
+        metadata[1] = b"127.0.0.1".to_vec();
+        metadata[2] = notify_port.into_bytes();
         state
-            .ingest_mooncake_bootstrap_frame(&transfer_metadata_frame(34, "session-a", &[4, 5]))
+            .ingest_mooncake_bootstrap_frame(&metadata)
             .expect("transfer metadata frame should parse");
     }
     let transfer_executor = registered_recording_mooncake_executor(0x2000, 128, 0xdead_0000, 7);
@@ -2812,6 +2827,16 @@ async fn mooncake_prefill_http_uses_bootstrap_kv_layout_for_transfer() {
 
     assert_eq!(generated["request_id"], "http-pd-mooncake-prefill");
     assert_eq!(generated["usage"]["completion_tokens"], 2);
+    let aux = notifications
+        .recv()
+        .await
+        .expect("first token must be sent");
+    assert_eq!(aux.into_vec()[0].as_ref(), b"AUX_DATA");
+    let status = notifications
+        .recv()
+        .await
+        .expect("terminal status must be sent");
+    assert_eq!(status.into_vec()[1].as_ref(), b"4");
 
     {
         let runtime = inspected_service

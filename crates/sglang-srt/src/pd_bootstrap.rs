@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use zeromq::{PullSocket, PushSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
+use crate::mooncake_control::{MooncakeDecodeReceiver, completion_frames, send_frames};
 use crate::transfer::{
     DecodeBootstrapMetadataPublishSummary, DecodeBootstrapPublisher, KvCacheTransferError,
     KvCacheTransferPlan, KvCacheTransferSpan, KvPoll, KvTransferBackend, KvTransferPoll,
@@ -51,6 +52,7 @@ pub struct MooncakeBootstrapKvCacheTransferExecutor<E> {
     inner: E,
     metadata_wait_timeout: Duration,
     metadata_poll_interval: Duration,
+    pending_tokens: BTreeMap<BootstrapRoom, u32>,
 }
 
 impl<E> MooncakeBootstrapKvCacheTransferExecutor<E> {
@@ -63,6 +65,7 @@ impl<E> MooncakeBootstrapKvCacheTransferExecutor<E> {
             inner,
             metadata_wait_timeout: Self::DEFAULT_METADATA_WAIT_TIMEOUT,
             metadata_poll_interval: Self::DEFAULT_METADATA_POLL_INTERVAL,
+            pending_tokens: BTreeMap::new(),
         }
     }
 
@@ -133,23 +136,154 @@ where
     ) -> Result<(), KvCacheTransferError> {
         self.register_span_dp_rank(span);
         let remote_layouts = self.remote_kv_layouts_for_room(span.bootstrap_room())?;
+        {
+            let mut state = self
+                .bootstrap_service
+                .state
+                .lock()
+                .map_err(|e| KvCacheTransferError::Runtime(e.to_string()))?;
+            if state.aborted_rooms.contains(&span.bootstrap_room()) {
+                return Err(KvCacheTransferError::Runtime(
+                    "decode aborted this transfer room before submission".into(),
+                ));
+            }
+            state.active_rooms.insert(span.bootstrap_room());
+        }
         for (session_id, layout) in remote_layouts {
             self.inner
                 .insert_remote_kv_session_layout(span.bootstrap_room(), session_id, layout);
         }
-        self.inner.submit(span)
+        let result = self.inner.submit(span);
+        if let Some(token) = span.first_token() {
+            self.pending_tokens.insert(span.bootstrap_room(), token);
+        }
+        if let Err(error) = &result {
+            self.inner.cancel(span.bootstrap_room())?;
+            self.notify_room(span.bootstrap_room(), Some(&error.to_string()))?;
+        }
+        result
     }
 
     fn poll(&mut self) -> Result<KvTransferPoll, KvCacheTransferError> {
-        self.inner.poll()
+        let aborted = {
+            let state = self
+                .bootstrap_service
+                .state
+                .lock()
+                .map_err(|e| KvCacheTransferError::Runtime(e.to_string()))?;
+            state
+                .active_rooms
+                .intersection(&state.aborted_rooms)
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        let mut canceled = Vec::new();
+        for room in aborted {
+            self.inner.cancel(room)?;
+            self.notify_room(room, Some("decode aborted the transfer"))?;
+            canceled.push(crate::transfer::KvTransferCompletionEvent::canceled(
+                room,
+                String::new(),
+            ));
+        }
+        let poll = self.inner.poll()?;
+        for event in poll.events() {
+            let error = match event.status() {
+                crate::transfer::KvTransferEventStatus::Completed => None,
+                crate::transfer::KvTransferEventStatus::Failed(message) => Some(message.as_str()),
+                crate::transfer::KvTransferEventStatus::Canceled => {
+                    Some("prefill transfer canceled")
+                }
+            };
+            self.notify_room(event.bootstrap_room(), error)?;
+        }
+        let mut events = poll.events().to_vec();
+        events.extend(canceled);
+        Ok(KvTransferPoll::new(events, poll.pending_transfers()))
     }
 
     fn cancel(&mut self, bootstrap_room: BootstrapRoom) -> Result<(), KvCacheTransferError> {
-        self.inner.cancel(bootstrap_room)
+        self.inner.cancel(bootstrap_room)?;
+        self.notify_room(bootstrap_room, Some("prefill request canceled"))
     }
 
     fn shutdown(&mut self) -> Result<(), KvCacheTransferError> {
+        for room in self.pending_tokens.keys().copied().collect::<Vec<_>>() {
+            self.cancel(room)?;
+        }
         self.inner.shutdown()
+    }
+}
+
+impl<S, R> MooncakeBootstrapKvCacheTransferExecutor<MooncakeKvCacheTransferExecutor<S, R>>
+where
+    S: MooncakeTransferStatusReader + MooncakeBatchReleaser,
+{
+    fn notify_room(
+        &mut self,
+        room: BootstrapRoom,
+        error: Option<&str>,
+    ) -> Result<(), KvCacheTransferError> {
+        let (targets, abort_targets) = {
+            let state = self
+                .bootstrap_service
+                .state
+                .lock()
+                .map_err(|e| KvCacheTransferError::Runtime(e.to_string()))?;
+            let targets = state
+                .transfer_rooms
+                .get(&room)
+                .map(|state| {
+                    state
+                        .transfers
+                        .values()
+                        .map(|transfer| {
+                            (
+                                transfer.endpoint.clone(),
+                                transfer.dst_port,
+                                transfer.dst_aux_index.unwrap_or(0),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            (
+                targets,
+                state.abort_targets.get(&room).cloned().unwrap_or_default(),
+            )
+        };
+        let token = self.pending_tokens.get(&room).copied();
+        for (host, port, aux) in targets {
+            if token.is_none() {
+                continue;
+            }
+            let frames =
+                completion_frames(room, if error.is_none() { token } else { None }, error, aux)
+                    .map_err(KvCacheTransferError::Runtime)?;
+            send_frames(format!("tcp://{host}:{port}"), frames)
+                .map_err(KvCacheTransferError::Runtime)?;
+        }
+        for endpoint in abort_targets {
+            send_frames(
+                endpoint,
+                vec![vec![
+                    b"ABORT_ACK".to_vec(),
+                    room.to_string().into_bytes(),
+                    b"0".to_vec(),
+                ]],
+            )
+            .map_err(KvCacheTransferError::Runtime)?;
+        }
+        let mut state = self
+            .bootstrap_service
+            .state
+            .lock()
+            .map_err(|e| KvCacheTransferError::Runtime(e.to_string()))?;
+        state.active_rooms.remove(&room);
+        state.abort_targets.remove(&room);
+        state.transfer_rooms.remove(&room);
+        self.pending_tokens.remove(&room);
+        Ok(())
     }
 }
 
@@ -168,6 +302,9 @@ pub struct PrefillBootstrapState {
     decode_kv_args_table: BTreeMap<String, MooncakeKvArgsRegisterInfo>,
     decode_kv_args_registration_count: usize,
     transfer_rooms: BTreeMap<BootstrapRoom, MooncakeTransferRoom>,
+    active_rooms: BTreeSet<BootstrapRoom>,
+    aborted_rooms: BTreeSet<BootstrapRoom>,
+    abort_targets: BTreeMap<BootstrapRoom, Vec<String>>,
 }
 
 type PrefillPpRankTable = BTreeMap<usize, PrefillRankInfo>;
@@ -211,7 +348,11 @@ impl PrefillBootstrapState {
                 }
                 room_state.transfers.insert(session, transfer);
                 if room_state.transfers.len() == room_state.required_dst_info_num {
-                    room_state.status = KvPoll::WaitingForInput;
+                    room_state.status = if self.aborted_rooms.contains(&room) {
+                        KvPoll::Failed
+                    } else {
+                        KvPoll::WaitingForInput
+                    };
                 }
                 Ok(())
             }
@@ -748,7 +889,7 @@ impl MooncakeDecodeTransferMetadata {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct MooncakeDecodeBootstrapPublisher {
     endpoint: String,
     dst_port: u16,
@@ -759,6 +900,8 @@ pub struct MooncakeDecodeBootstrapPublisher {
     dst_aux_index: Option<i32>,
     required_dst_info_num: usize,
     registered_kv_args_endpoints: BTreeSet<String>,
+    receiver: Option<MooncakeDecodeReceiver>,
+    receive_targets: BTreeMap<BootstrapRoom, String>,
 }
 
 impl MooncakeDecodeBootstrapPublisher {
@@ -777,6 +920,8 @@ impl MooncakeDecodeBootstrapPublisher {
             dst_aux_index: Some(0),
             required_dst_info_num: 1,
             registered_kv_args_endpoints: BTreeSet::new(),
+            receiver: None,
+            receive_targets: BTreeMap::new(),
         }
     }
 
@@ -786,6 +931,13 @@ impl MooncakeDecodeBootstrapPublisher {
     ) -> Self {
         self.kv_cache_layout = Some(kv_cache_layout);
         self
+    }
+
+    pub fn with_receiver(mut self) -> Result<Self, String> {
+        let receiver = MooncakeDecodeReceiver::start(&self.endpoint)?;
+        self.dst_port = receiver.port();
+        self.receiver = Some(receiver);
+        Ok(self)
     }
 
     pub fn with_target_ranks(mut self, target_tp_rank: i32, target_pp_rank: i32) -> Self {
@@ -828,7 +980,7 @@ impl MooncakeDecodeBootstrapPublisher {
             dst_aux_index: self.dst_aux_index,
             dst_state_indices: Vec::new(),
             required_dst_info_num: self.required_dst_info_num,
-            decode_prefix_len: Some(span.token_offset() + span.token_count()),
+            decode_prefix_len: Some(span.token_offset()),
             is_dummy: false,
         })
     }
@@ -892,6 +1044,11 @@ impl DecodeBootstrapPublisher for MooncakeDecodeBootstrapPublisher {
                 self.kv_args_registration()
             };
             let mark_kv_args_registered = kv_args_registration.is_some();
+            if let Some(receiver) = &self.receiver {
+                receiver.register(span.bootstrap_room())?;
+            }
+            self.receive_targets
+                .insert(span.bootstrap_room(), bootstrap_addr.clone());
             publish_mooncake_decode_metadata_blocking(
                 bootstrap_addr,
                 prefill_dp_rank,
@@ -909,6 +1066,76 @@ impl DecodeBootstrapPublisher for MooncakeDecodeBootstrapPublisher {
 
         Ok(DecodeBootstrapMetadataPublishSummary { published_spans })
     }
+
+    fn receive_prefill_token(&mut self, room: BootstrapRoom) -> Result<u32, String> {
+        let receiver = self
+            .receiver
+            .as_ref()
+            .ok_or("Mooncake decode receiver was not started")?;
+        let token = receiver.receive(room)?;
+        receiver.remove(room);
+        self.receive_targets.remove(&room);
+        Ok(token)
+    }
+
+    fn cancel_receive(&mut self, room: BootstrapRoom) -> Result<(), String> {
+        let Some(bootstrap_addr) = self.receive_targets.get(&room).cloned() else {
+            return Ok(());
+        };
+        let receiver = self
+            .receiver
+            .as_ref()
+            .ok_or("Mooncake decode receiver was not started")?;
+        if receiver.is_drained(room) {
+            receiver.remove(room);
+            self.receive_targets.remove(&room);
+            return Ok(());
+        }
+        let target = query_mooncake_control_target(bootstrap_addr)?;
+        send_frames(
+            target,
+            vec![vec![
+                b"ABORT".to_vec(),
+                room.to_string().into_bytes(),
+                self.endpoint.as_bytes().to_vec(),
+                self.dst_port.to_string().into_bytes(),
+            ]],
+        )?;
+        receiver.wait_drained(room)?;
+        receiver.remove(room);
+        self.receive_targets.remove(&room);
+        Ok(())
+    }
+}
+
+impl Drop for MooncakeDecodeBootstrapPublisher {
+    fn drop(&mut self) {
+        for room in self.receive_targets.keys().copied().collect::<Vec<_>>() {
+            if self.receiver.is_some()
+                && let Err(error) = self.cancel_receive(room)
+            {
+                eprintln!(
+                    "fatal: cannot confirm remote KV writes stopped before receiver destruction: {error}"
+                );
+                std::process::abort();
+            }
+        }
+    }
+}
+
+fn query_mooncake_control_target(bootstrap_addr: String) -> Result<String, String> {
+    std::thread::spawn(move || {
+        let response = http_get(
+            &bootstrap_addr,
+            "/route?prefill_dp_rank=0&prefill_cp_rank=0&target_tp_rank=0&target_pp_rank=0",
+        )
+        .map_err(|e| e.to_string())?;
+        let body = http_success_body(response).map_err(|e| e.to_string())?;
+        let rank: PrefillRankInfo = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+        Ok(rank.zmq_endpoint())
+    })
+    .join()
+    .map_err(|_| "Mooncake route lookup panicked".to_string())?
 }
 
 #[derive(Debug)]
@@ -1009,6 +1236,24 @@ where
                     .into_iter()
                     .map(|frame| frame.to_vec())
                     .collect::<Vec<_>>();
+                if frames.first().is_some_and(|field| field == b"ABORT") {
+                    let room = parse_bootstrap_room(&frames, 1, "room")?;
+                    let host = ascii_field(&frames, 2, "decode host")?;
+                    let port = parse_u16(&frames, 3, "decode port")?;
+                    let endpoint = format!("tcp://{host}:{port}");
+                    let quiescent = {
+                        let mut state = service.state.lock().expect("bootstrap state lock");
+                        state.aborted_rooms.insert(room);
+                        if state.active_rooms.contains(&room) {
+                            state.abort_targets.entry(room).or_default().push(endpoint.clone());
+                            false
+                        } else { true }
+                    };
+                    if quiescent {
+                        send_mooncake_bootstrap_frame(&endpoint, vec![b"ABORT_ACK".to_vec(), room.to_string().into_bytes(), b"0".to_vec()]).await.map_err(|e| PrefillBootstrapServeError::Zmq(e.to_string()))?;
+                    }
+                    continue;
+                }
                 service
                     .state
                     .lock()

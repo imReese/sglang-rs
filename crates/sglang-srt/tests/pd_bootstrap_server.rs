@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use tokio::sync::oneshot;
-use zeromq::{PushSocket, Socket, SocketSend, ZmqMessage};
+use zeromq::{PullSocket, PushSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
 use sglang_srt::cache::{CachePageAllocator, RadixCache};
 use sglang_srt::engine_info_bootstrap::{
@@ -189,6 +189,21 @@ async fn prefill_bootstrap_tracks_room_dp_rank_queries() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prefill_transfer_executor_registers_dp_rank_for_bootstrap_queries() {
     let addr = unused_local_addr();
+    let notify_addr = unused_local_addr();
+    let mut notify_socket = PullSocket::new();
+    notify_socket
+        .bind(&format!("tcp://{notify_addr}"))
+        .await
+        .expect("bind completion receiver");
+    let notification = tokio::spawn(async move {
+        let aux = notify_socket
+            .recv()
+            .await
+            .expect("first-token auxiliary data");
+        assert_eq!(aux.into_vec()[0].as_ref(), b"AUX_DATA");
+        let status = notify_socket.recv().await.expect("KV completion status");
+        assert_eq!(status.into_vec()[1].as_ref(), b"4");
+    });
     let service = PrefillBootstrapService::default();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
@@ -206,7 +221,7 @@ async fn prefill_transfer_executor_registers_dp_rank_for_bootstrap_queries() {
             .ingest_mooncake_bootstrap_frame(&[
                 b"None".to_vec(),
                 b"127.0.0.1".to_vec(),
-                b"41010".to_vec(),
+                notify_addr.port().to_string().into_bytes(),
                 b"decode-rank-session".to_vec(),
                 pack_u64s(&[0x9000]),
                 pack_u64s(&[]),
@@ -220,7 +235,7 @@ async fn prefill_transfer_executor_registers_dp_rank_for_bootstrap_queries() {
             .ingest_mooncake_bootstrap_frame(&[
                 b"99".to_vec(),
                 b"127.0.0.1".to_vec(),
-                b"41010".to_vec(),
+                notify_addr.port().to_string().into_bytes(),
                 b"decode-rank-session".to_vec(),
                 pack_i32s(&[0, 1, 2]),
                 b"0".to_vec(),
@@ -261,7 +276,8 @@ async fn prefill_transfer_executor_registers_dp_rank_for_bootstrap_queries() {
         BootstrapMetadataWorker,
         DecodeBootstrapRegistry::default(),
         transfer_executor,
-    );
+    )
+    .with_prefill_only();
     let mut scheduler =
         Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(4));
     scheduler.enqueue(
@@ -285,6 +301,7 @@ async fn prefill_transfer_executor_registers_dp_rank_for_bootstrap_queries() {
     let dp_ranks =
         post_json_value_with_retry(addr, "/query_dp_ranks", r#"{"bootstrap_rooms":[99]}"#).await;
     assert_eq!(dp_ranks["99"], 5);
+    notification.await.expect("completion receiver joins");
 
     shutdown_tx
         .send(())
@@ -525,6 +542,67 @@ async fn mooncake_bootstrap_zmq_listener_ingests_multipart_transfer_metadata() {
         .await
         .expect("server task should join")
         .expect("server should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mooncake_abort_acknowledges_drain_and_rejects_late_metadata() {
+    let addr = unused_local_addr();
+    let mut receiver = PullSocket::new();
+    let endpoint = receiver
+        .bind("tcp://127.0.0.1:0")
+        .await
+        .expect("bind ACK receiver");
+    let port = endpoint.to_string().rsplit(':').next().unwrap().to_owned();
+    let service = PrefillBootstrapService::default();
+    let observed = service.clone();
+    let (stop, stopped) = oneshot::channel();
+    let server = tokio::spawn(serve_mooncake_bootstrap_zmq_with_shutdown(
+        format!("tcp://{addr}"),
+        service,
+        async move {
+            let _ = stopped.await;
+        },
+    ));
+    send_zmq_multipart_with_retry(
+        addr,
+        vec![
+            b"ABORT".to_vec(),
+            b"83".to_vec(),
+            b"127.0.0.1".to_vec(),
+            port.clone().into_bytes(),
+        ],
+    )
+    .await;
+    let ack = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+        .await
+        .expect("quiescent room must acknowledge promptly")
+        .expect("ACK")
+        .into_vec();
+    assert_eq!(ack.len(), 3);
+    assert_eq!(ack[0].as_ref(), b"ABORT_ACK");
+    assert_eq!(ack[1].as_ref(), b"83");
+    assert_eq!(ack[2].as_ref(), b"0");
+    send_zmq_multipart_with_retry(
+        addr,
+        vec![
+            b"83".to_vec(),
+            b"127.0.0.1".to_vec(),
+            port.into_bytes(),
+            b"late-session".to_vec(),
+            pack_i32s(&[0, 1]),
+            b"0".to_vec(),
+            pack_i32_lists(&[]),
+            b"1".to_vec(),
+            b"0".to_vec(),
+        ],
+    )
+    .await;
+    wait_until(|| {
+        observed.state().lock().expect("state").transfer_status(83) == Some(KvPoll::Failed)
+    })
+    .await;
+    stop.send(()).expect("server alive");
+    server.await.expect("server joins").expect("server stops");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -872,7 +950,7 @@ async fn decode_worker_publishes_bootstrap_metadata_to_prefill_zmq_route() {
         assert_eq!(transfer.endpoint, "127.0.0.1");
         assert_eq!(transfer.dst_port, 41007);
         assert_eq!(transfer.dst_kv_indices, vec![0, 1, 2]);
-        assert_eq!(transfer.decode_prefix_len, Some(3));
+        assert_eq!(transfer.decode_prefix_len, Some(0));
     }
 
     shutdown_tx

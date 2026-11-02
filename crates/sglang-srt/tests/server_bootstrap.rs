@@ -2977,6 +2977,67 @@ fn unused_local_addr() -> std::net::SocketAddr {
         .expect("ephemeral listener should have local addr")
 }
 
+#[tokio::test]
+async fn pd_launch_rejects_unimplemented_cache_modes_without_silent_fallback() {
+    for flag in [
+        "--disaggregation-decode-enable-radix-cache",
+        "--disaggregation-decode-enable-offload-kvcache",
+    ] {
+        let args = ServerArgs::parse_from([
+            "serve",
+            "--model-path",
+            "/nonexistent/pd-test-model",
+            "--disaggregation-mode",
+            "decode",
+            flag,
+        ])
+        .expect("arguments");
+        let error = sglang_srt::server::launch_http_server_with_shutdown(args, async {})
+            .await
+            .expect_err("unsupported cache mode");
+        assert!(
+            error
+                .to_string()
+                .contains("P/D prefix reuse and decode KV offload are not implemented"),
+            "{error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pd_multi_rank_launch_fails_before_loading_model_or_registering_memory() {
+    for (flag, value) in [("--tp-size", "2"), ("--dp-size", "2"), ("--nnodes", "2")] {
+        let args = ServerArgs::parse_from([
+            "serve",
+            "--model-path",
+            "/nonexistent/pd-test-model",
+            "--disaggregation-mode",
+            "decode",
+            flag,
+            value,
+        ])
+        .expect("arguments");
+        let error = sglang_srt::server::launch_http_server_with_shutdown(args.clone(), async {})
+            .await
+            .expect_err("unsupported topology");
+        assert!(
+            error
+                .to_string()
+                .contains("P/D completion and cancellation currently require one rank"),
+            "{error}"
+        );
+        let error = sglang_srt::server::launch_grpc_server_with_shutdown(args, async {})
+            .await
+            .expect_err("unsupported topology");
+        assert!(
+            error
+                .to_string()
+                .contains("P/D completion and cancellation currently require one rank"),
+            "{error}"
+        );
+    }
+}
+
 fn temp_model_dir(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("sglang-rs-{name}-{}", std::process::id()))
 }

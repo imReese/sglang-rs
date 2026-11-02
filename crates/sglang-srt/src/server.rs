@@ -366,7 +366,7 @@ pub type BootstrapPdGrpcRouterService<E, P = crate::transfer::NoopDecodeBootstra
 
 enum ProductionDecodeBootstrapPublisher {
     Noop(crate::transfer::NoopDecodeBootstrapPublisher),
-    Mooncake(MooncakeDecodeBootstrapPublisher),
+    Mooncake(Box<MooncakeDecodeBootstrapPublisher>),
 }
 
 impl DecodeBootstrapPublisher for ProductionDecodeBootstrapPublisher {
@@ -377,6 +377,20 @@ impl DecodeBootstrapPublisher for ProductionDecodeBootstrapPublisher {
         match self {
             Self::Noop(publisher) => publisher.publish_decode_bootstrap_metadata(plan),
             Self::Mooncake(publisher) => publisher.publish_decode_bootstrap_metadata(plan),
+        }
+    }
+
+    fn receive_prefill_token(&mut self, room: crate::types::BootstrapRoom) -> Result<u32, String> {
+        match self {
+            Self::Mooncake(publisher) => publisher.receive_prefill_token(room),
+            Self::Noop(_) => Err("prefill role does not receive remote KV".into()),
+        }
+    }
+
+    fn cancel_receive(&mut self, room: crate::types::BootstrapRoom) -> Result<(), String> {
+        match self {
+            Self::Mooncake(publisher) => publisher.cancel_receive(room),
+            Self::Noop(_) => Err("prefill role does not own a decode receive".into()),
         }
     }
 }
@@ -392,6 +406,7 @@ pub type BootstrapFakePdGrpcRouterService =
 #[derive(Debug)]
 pub enum ServerLaunchError {
     AddressResolve(std::io::Error),
+    ShutdownSignal(std::io::Error),
     NoSocketAddress {
         host: String,
         port: u16,
@@ -535,6 +550,12 @@ impl fmt::Display for ServerLaunchError {
         match self {
             Self::AddressResolve(error) => {
                 write!(formatter, "failed to resolve listen address: {error}")
+            }
+            Self::ShutdownSignal(error) => {
+                write!(
+                    formatter,
+                    "failed to install graceful shutdown signal handler: {error}"
+                )
             }
             Self::NoSocketAddress { host, port } => {
                 write!(formatter, "listen address {host}:{port} did not resolve")
@@ -1168,11 +1189,14 @@ where
         .with_kv_page_size(args.page_size);
     if decode_side_bootstrap_only {
         worker = worker.with_decode_side_bootstrap_only();
+    } else if args.disaggregation_mode == "prefill" {
+        worker = worker.with_prefill_only();
     }
-    let scheduler = Scheduler::with_cache_resources(
+    let scheduler = Scheduler::with_cache_resources_and_policy(
         worker,
         RadixCache::default(),
         cache_page_allocator_from_server_args(args)?,
+        PrefixCachePolicy::Disabled,
     )
     .with_max_running_requests(args.max_running_requests);
     let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
@@ -1194,7 +1218,7 @@ fn launch_mooncake_decode_bootstrap_publisher(
     args: &ServerArgs,
     kv_cache_layout: MooncakeKvCacheLayout,
     mooncake_session_id: impl Into<String>,
-) -> MooncakeDecodeBootstrapPublisher {
+) -> Result<MooncakeDecodeBootstrapPublisher, ServerLaunchError> {
     let endpoint = prefill_mooncake_route_rank_ip(args);
     let dst_port = args
         .disaggregation_zmq_ports
@@ -1202,6 +1226,8 @@ fn launch_mooncake_decode_bootstrap_publisher(
         .unwrap_or(args.port);
     MooncakeDecodeBootstrapPublisher::new(endpoint, dst_port, mooncake_session_id)
         .with_kv_cache_layout(kv_cache_layout)
+        .with_receiver()
+        .map_err(ServerLaunchError::KvCacheTransfer)
 }
 
 pub fn build_bootstrap_mooncake_prefill_http_router_service<S, R>(
@@ -1295,13 +1321,13 @@ fn try_build_launch_pd_runtime_bundle(
             false,
         ),
         DisaggregationMode::Decode => (
-            ProductionDecodeBootstrapPublisher::Mooncake(
+            ProductionDecodeBootstrapPublisher::Mooncake(Box::new(
                 launch_mooncake_decode_bootstrap_publisher(
                     args,
                     transfer_backend.layout,
                     transfer_backend.local_endpoint,
-                ),
-            ),
+                )?,
+            )),
             true,
         ),
         DisaggregationMode::Null => {
@@ -1441,11 +1467,14 @@ where
         .with_kv_page_size(args.page_size);
     if decode_side_bootstrap_only {
         worker = worker.with_decode_side_bootstrap_only();
+    } else if args.disaggregation_mode == "prefill" {
+        worker = worker.with_prefill_only();
     }
-    let scheduler = Scheduler::with_cache_resources(
+    let scheduler = Scheduler::with_cache_resources_and_policy(
         worker,
         RadixCache::default(),
         cache_page_allocator_from_server_args(args)?,
+        PrefixCachePolicy::Disabled,
     )
     .with_max_running_requests(args.max_running_requests);
     let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
@@ -1496,6 +1525,21 @@ fn validate_launch_transfer_backend(pd_config: &PdConfig) -> Result<(), ServerLa
     if pd_config.mode == DisaggregationMode::Null {
         return Ok(());
     }
+    if pd_config.tp_size != 1
+        || pd_config.dp_size != 1
+        || pd_config.nnodes != 1
+        || pd_config.node_rank != 0
+    {
+        return Err(ServerLaunchError::KvCacheTransfer(format!(
+            "P/D completion and cancellation currently require one rank (tp_size=1, dp_size=1, nnodes=1, node_rank=0); got tp_size={}, dp_size={}, nnodes={}, node_rank={}",
+            pd_config.tp_size, pd_config.dp_size, pd_config.nnodes, pd_config.node_rank
+        )));
+    }
+    if pd_config.decode_enable_radix_cache || pd_config.decode_enable_offload_kvcache {
+        return Err(ServerLaunchError::KvCacheTransfer(
+            "P/D prefix reuse and decode KV offload are not implemented; disable --disaggregation-decode-enable-radix-cache and --disaggregation-decode-enable-offload-kvcache".into(),
+        ));
+    }
 
     match pd_config.transfer_backend {
         TransferBackend::Mooncake if cfg!(feature = "mooncake-link") => Ok(()),
@@ -1526,7 +1570,7 @@ fn try_build_launch_http_router_service(
 }
 
 pub async fn launch_grpc_server(args: ServerArgs) -> Result<(), ServerLaunchError> {
-    launch_grpc_server_with_shutdown(args, std::future::pending::<()>()).await
+    launch_grpc_server_with_shutdown(args, process_shutdown_signal()?).await
 }
 
 pub async fn launch_grpc_server_with_shutdown<F>(
@@ -1588,7 +1632,32 @@ where
 }
 
 pub async fn launch_http_server(args: ServerArgs) -> Result<(), ServerLaunchError> {
-    launch_http_server_with_shutdown(args, std::future::pending::<()>()).await
+    launch_http_server_with_shutdown(args, process_shutdown_signal()?).await
+}
+
+fn process_shutdown_signal() -> Result<impl Future<Output = ()> + Send, ServerLaunchError> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut interrupt =
+            signal(SignalKind::interrupt()).map_err(ServerLaunchError::ShutdownSignal)?;
+        let mut terminate =
+            signal(SignalKind::terminate()).map_err(ServerLaunchError::ShutdownSignal)?;
+        Ok(async move {
+            tokio::select! {
+                _ = interrupt.recv() => {},
+                _ = terminate.recv() => {},
+            }
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let mut interrupt =
+            tokio::signal::windows::ctrl_c().map_err(ServerLaunchError::ShutdownSignal)?;
+        Ok(async move {
+            interrupt.recv().await;
+        })
+    }
 }
 
 pub async fn launch_http_server_with_shutdown<F>(
@@ -1731,13 +1800,14 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (bootstrap_shutdown_tx, bootstrap_shutdown_rx) = tokio::sync::watch::channel(false);
     let mut http_task = tokio::spawn(serve_http_router_with_shutdown(
         http_addr,
         http_service,
         watch_shutdown(shutdown_rx.clone()),
     ));
     let mut bootstrap_tasks = tokio::task::JoinSet::new();
-    let prefill_shutdown_rx = shutdown_rx.clone();
+    let prefill_shutdown_rx = bootstrap_shutdown_rx.clone();
     let prefill_bootstrap_service = bootstrap.prefill_service.clone();
     bootstrap_tasks.spawn(async move {
         serve_prefill_bootstrap_with_shutdown(
@@ -1748,7 +1818,7 @@ where
         .await
         .map_err(ServerLaunchError::from)
     });
-    let engine_info_shutdown_rx = shutdown_rx.clone();
+    let engine_info_shutdown_rx = bootstrap_shutdown_rx.clone();
     bootstrap_tasks.spawn(async move {
         serve_engine_info_bootstrap_with_shutdown(
             bootstrap.engine_info_addr,
@@ -1763,7 +1833,7 @@ where
             serve_mooncake_bootstrap_zmq_endpoints_with_shutdown(
                 bootstrap.zmq_endpoints,
                 bootstrap.prefill_service,
-                watch_shutdown(shutdown_rx),
+                watch_shutdown(bootstrap_shutdown_rx),
             )
             .await
             .map_err(ServerLaunchError::from)
@@ -1773,18 +1843,23 @@ where
     tokio::select! {
         _ = shutdown => {
             let _ = shutdown_tx.send(true);
-            join_http_task(http_task).await?;
+            // Keep bootstrap/ABORT handling alive until request DMA is drained.
+            let http_result = join_http_task(http_task).await;
+            let _ = bootstrap_shutdown_tx.send(true);
             join_launch_tasks(bootstrap_tasks).await?;
+            http_result?;
             Ok(())
         }
         result = &mut http_task => {
             let _ = shutdown_tx.send(true);
+            let _ = bootstrap_shutdown_tx.send(true);
             join_launch_tasks(bootstrap_tasks).await?;
             result.map_err(|error| ServerLaunchError::ServerTaskJoin(error.to_string()))??;
             Ok(())
         }
         result = bootstrap_tasks.join_next() => {
             let _ = shutdown_tx.send(true);
+            let _ = bootstrap_shutdown_tx.send(true);
             join_http_task(http_task).await?;
             match result {
                 Some(Ok(Ok(()))) => {
@@ -1868,6 +1943,7 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (bootstrap_shutdown_tx, bootstrap_shutdown_rx) = tokio::sync::watch::channel(false);
     let sidecar_service = grpc_service.clone();
     let mut grpc_task = tokio::spawn(serve_grpc_router_with_shutdown(
         grpc_addr,
@@ -1885,26 +1961,29 @@ where
     bootstrap_tasks.spawn(serve_prefill_bootstrap_with_shutdown(
         bootstrap.prefill_addr,
         bootstrap.prefill_service.clone(),
-        watch_shutdown(shutdown_rx.clone()),
+        watch_shutdown(bootstrap_shutdown_rx.clone()),
     ));
     if !bootstrap.zmq_endpoints.is_empty() {
         bootstrap_tasks.spawn(serve_mooncake_bootstrap_zmq_endpoints_with_shutdown(
             bootstrap.zmq_endpoints,
             bootstrap.prefill_service,
-            watch_shutdown(shutdown_rx),
+            watch_shutdown(bootstrap_shutdown_rx),
         ));
     }
 
     tokio::select! {
         _ = shutdown => {
             let _ = shutdown_tx.send(true);
-            join_grpc_task(grpc_task).await?;
+            let grpc_result = join_grpc_task(grpc_task).await;
+            let _ = bootstrap_shutdown_tx.send(true);
             join_http_task(sidecar_task).await?;
             join_bootstrap_tasks(bootstrap_tasks).await?;
+            grpc_result?;
             Ok(())
         }
         result = &mut grpc_task => {
             let _ = shutdown_tx.send(true);
+            let _ = bootstrap_shutdown_tx.send(true);
             join_http_task(sidecar_task).await?;
             join_bootstrap_tasks(bootstrap_tasks).await?;
             result.map_err(|error| ServerLaunchError::ServerTaskJoin(error.to_string()))??;
@@ -1912,13 +1991,16 @@ where
         }
         result = &mut sidecar_task => {
             let _ = shutdown_tx.send(true);
-            join_grpc_task(grpc_task).await?;
+            let grpc_result = join_grpc_task(grpc_task).await;
+            let _ = bootstrap_shutdown_tx.send(true);
             join_bootstrap_tasks(bootstrap_tasks).await?;
+            grpc_result?;
             result.map_err(|error| ServerLaunchError::ServerTaskJoin(error.to_string()))??;
             Ok(())
         }
         result = bootstrap_tasks.join_next() => {
             let _ = shutdown_tx.send(true);
+            let _ = bootstrap_shutdown_tx.send(true);
             join_grpc_task(grpc_task).await?;
             join_http_task(sidecar_task).await?;
             match result {
@@ -1991,3 +2073,7 @@ async fn watch_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "server_pd_shutdown_tests.rs"]
+mod pd_shutdown_tests;

@@ -70,6 +70,10 @@ impl BatchGeneratedTokens {
     pub(crate) fn into_tokens(self) -> Vec<GeneratedToken> {
         self.tokens
     }
+
+    pub fn tokens(&self) -> &[GeneratedToken] {
+        &self.tokens
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -149,6 +153,11 @@ pub trait FallibleModelWorker {
 
     fn complete_request(&mut self, _request: &ScheduledRequest) {}
 
+    fn finish_request(&mut self, request: &ScheduledRequest) -> Result<(), WorkerExecutionError> {
+        self.complete_request(request);
+        Ok(())
+    }
+
     fn fail_request(&mut self, request: &ScheduledRequest) {
         self.complete_request(request);
     }
@@ -181,6 +190,8 @@ pub trait WorkerExecutor {
     fn poll_transfers(&mut self) -> Result<KvTransferPollSummary, KvCacheTransferError>;
 
     fn complete_request(&mut self, request: &ScheduledRequest);
+
+    fn finish_request(&mut self, request: &ScheduledRequest) -> Result<(), WorkerExecutionError>;
 
     fn fail_request(&mut self, request: &ScheduledRequest);
 
@@ -228,6 +239,10 @@ where
 
     fn complete_request(&mut self, request: &ScheduledRequest) {
         FallibleModelWorker::complete_request(self, request)
+    }
+
+    fn finish_request(&mut self, request: &ScheduledRequest) -> Result<(), WorkerExecutionError> {
+        FallibleModelWorker::finish_request(self, request)
     }
 
     fn fail_request(&mut self, request: &ScheduledRequest) {

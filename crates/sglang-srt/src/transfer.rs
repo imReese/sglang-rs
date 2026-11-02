@@ -22,8 +22,8 @@ use crate::model_executor::ModelWorkerBatch;
 use crate::scheduler::{ForwardMode, ScheduleBatch, ScheduledRequest};
 use crate::types::{BootstrapRoom, DisaggregatedParams, RequestId};
 use crate::worker::{
-    BatchGeneratedTokens, DecodeRequestState, FallibleModelWorker, WorkerExecutionError,
-    WorkerWeightUpdateRequest,
+    BatchGeneratedTokens, DecodeRequestState, FallibleModelWorker, GeneratedToken,
+    WorkerExecutionError, WorkerWeightUpdateRequest,
 };
 
 #[cfg(feature = "mooncake-link")]
@@ -502,9 +502,13 @@ pub struct KvCacheTransferSpan {
     cache_pages: Vec<CachePageId>,
     page_size: usize,
     page_indices: Vec<KvCachePageIndex>,
+    first_token: Option<u32>,
 }
 
 impl KvCacheTransferSpan {
+    pub fn first_token(&self) -> Option<u32> {
+        self.first_token
+    }
     pub fn request_id(&self) -> &RequestId {
         &self.request_id
     }
@@ -650,6 +654,7 @@ impl KvCacheTransferPlan {
                 cache_pages,
                 page_size,
                 page_indices,
+                first_token: None,
             });
         }
 
@@ -665,6 +670,32 @@ impl KvCacheTransferPlan {
 
     pub fn spans(&self) -> &[KvCacheTransferSpan] {
         &self.spans
+    }
+
+    fn with_prefill_output(
+        mut self,
+        batch: &ScheduleBatch,
+        output: &BatchGeneratedTokens,
+    ) -> Result<Self, WorkerExecutionError> {
+        for span in &mut self.spans {
+            let index = batch
+                .requests()
+                .iter()
+                .position(|request| request.request_id() == span.request_id())
+                .ok_or_else(|| {
+                    WorkerExecutionError::Runtime(
+                        "transfer span has no matching prefill request".to_string(),
+                    )
+                })?;
+            let token_ids = output.tokens()[index].token_ids();
+            if token_ids.len() != 1 {
+                return Err(WorkerExecutionError::Runtime(
+                    "single-rank PD requires exactly one prefill output token".to_string(),
+                ));
+            }
+            span.first_token = Some(token_ids[0]);
+        }
+        Ok(self)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -834,6 +865,17 @@ pub trait DecodeBootstrapPublisher {
         &mut self,
         plan: &KvCacheTransferPlan,
     ) -> Result<DecodeBootstrapMetadataPublishSummary, String>;
+
+    fn receive_prefill_token(&mut self, _room: BootstrapRoom) -> Result<u32, String> {
+        Err("decode bootstrap publisher has no receive/completion implementation".to_string())
+    }
+
+    fn cancel_receive(&mut self, _room: BootstrapRoom) -> Result<(), String> {
+        Err(
+            "decode bootstrap publisher has no safe receive cancellation implementation"
+                .to_string(),
+        )
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1213,7 +1255,7 @@ where
     let mut summary = KvCacheTransferSummary::default();
 
     for span in plan.spans() {
-        if span.is_noop() {
+        if span.is_noop() && span.first_token().is_none() {
             registry.update_status(span.bootstrap_room(), KvPoll::Success)?;
             summary.noop_spans += 1;
             continue;
@@ -1277,12 +1319,13 @@ pub fn is_decode_request_kv_ready(
 pub struct KvTransferModelWorker<W, E, P = NoopDecodeBootstrapPublisher> {
     // Registration leases belong to the transfer executor, so it must drop before
     // the model releases the backing KV allocations.
+    decode_bootstrap_publisher: P,
     transfer_executor: E,
     worker: W,
     registry: DecodeBootstrapRegistry,
-    decode_bootstrap_publisher: P,
     kv_page_size: usize,
     submit_prefill_transfers: bool,
+    prefill_only: bool,
     last_transfer_summary: Option<KvCacheTransferSummary>,
 }
 
@@ -1295,6 +1338,7 @@ impl<W, E> KvTransferModelWorker<W, E> {
             decode_bootstrap_publisher: NoopDecodeBootstrapPublisher,
             kv_page_size: 1,
             submit_prefill_transfers: true,
+            prefill_only: false,
             last_transfer_summary: None,
         }
     }
@@ -1344,12 +1388,18 @@ impl<W, E, P> KvTransferModelWorker<W, E, P> {
             decode_bootstrap_publisher,
             kv_page_size: self.kv_page_size,
             submit_prefill_transfers: self.submit_prefill_transfers,
+            prefill_only: self.prefill_only,
             last_transfer_summary: self.last_transfer_summary,
         }
     }
 
     pub fn with_decode_side_bootstrap_only(mut self) -> Self {
         self.submit_prefill_transfers = false;
+        self
+    }
+
+    pub fn with_prefill_only(mut self) -> Self {
+        self.prefill_only = true;
         self
     }
 
@@ -1416,6 +1466,43 @@ where
             None
         };
 
+        if !self.submit_prefill_transfers
+            && let Some(plan) = transfer_plan.as_ref()
+        {
+            self.register_prefill_bootstrap_sessions(batch)
+                .map_err(|error| WorkerExecutionError::Runtime(error.to_string()))?;
+            let mut tokens = Vec::with_capacity(batch.batch_size());
+            for request in batch.requests() {
+                let room = request
+                    .disaggregated_params()
+                    .ok_or_else(|| {
+                        WorkerExecutionError::Runtime(
+                            "decode PD request requires bootstrap metadata".to_string(),
+                        )
+                    })?
+                    .bootstrap_room;
+                let token = self
+                    .decode_bootstrap_publisher
+                    .receive_prefill_token(room)
+                    .map_err(WorkerExecutionError::Runtime)?;
+                self.registry
+                    .update_status(room, KvPoll::Success)
+                    .map_err(|error| WorkerExecutionError::Runtime(error.to_string()))?;
+                let stop = !request.sampling().ignore_eos
+                    && request.sampling().stop_token_ids.contains(&token);
+                tokens.push(if stop {
+                    GeneratedToken::finished(vec![token])
+                } else {
+                    GeneratedToken::unfinished(vec![token])
+                });
+            }
+            self.last_transfer_summary = Some(KvCacheTransferSummary {
+                noop_spans: plan.spans().iter().filter(|span| span.is_noop()).count(),
+                ..KvCacheTransferSummary::default()
+            });
+            return BatchGeneratedTokens::from_batch(batch, tokens).map_err(Into::into);
+        }
+
         let output = self.worker.try_generate_batch(batch)?;
 
         if let Some(transfer_plan) = transfer_plan {
@@ -1425,17 +1512,7 @@ where
                         "KV transfer bootstrap registration failed: {error}"
                     ))
                 })?;
-            if !self.submit_prefill_transfers {
-                let transfer_summary = self
-                    .mark_prefill_bootstrap_sessions_ready_without_submit(&transfer_plan)
-                    .map_err(|error| {
-                        WorkerExecutionError::Runtime(format!(
-                            "KV transfer bootstrap registration failed: {error}"
-                        ))
-                    })?;
-                self.last_transfer_summary = Some(transfer_summary);
-                return Ok(output);
-            }
+            let transfer_plan = transfer_plan.with_prefill_output(batch, &output)?;
             let transfer_summary = execute_kv_cache_transfer_plan(
                 &mut self.registry,
                 &mut self.transfer_executor,
@@ -1445,6 +1522,38 @@ where
                 WorkerExecutionError::Runtime(format!("KV transfer execution failed: {error}"))
             })?;
             self.last_transfer_summary = Some(transfer_summary);
+            if self.prefill_only {
+                while batch.requests().iter().any(|request| {
+                    request.disaggregated_params().is_some_and(|params| {
+                        self.registry
+                            .get(params.bootstrap_room)
+                            .is_some_and(|session| session.status() != KvPoll::Success)
+                    })
+                }) {
+                    self.poll_transfers()
+                        .map_err(|error| WorkerExecutionError::Runtime(error.to_string()))?;
+                    for request in batch.requests() {
+                        if matches!(
+                            self.decode_request_state(request)?,
+                            DecodeRequestState::Failed(_)
+                        ) {
+                            return Err(WorkerExecutionError::Runtime(
+                                "prefill KV transfer failed".to_string(),
+                            ));
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                return BatchGeneratedTokens::from_batch(
+                    batch,
+                    output
+                        .tokens()
+                        .iter()
+                        .map(|token| GeneratedToken::finished(token.token_ids().to_vec()))
+                        .collect(),
+                )
+                .map_err(Into::into);
+            }
         }
 
         Ok(output)
@@ -1479,30 +1588,31 @@ where
     }
 
     fn complete_request(&mut self, request: &ScheduledRequest) {
-        if let Some(disaggregated_params) = request.disaggregated_params() {
-            self.registry.remove(disaggregated_params.bootstrap_room);
-            let _ = self
-                .transfer_executor
-                .cancel(disaggregated_params.bootstrap_room);
+        if let Err(error) = self.finish_request(request) {
+            eprintln!("PD request cleanup deferred: {error}");
         }
+    }
 
-        self.worker.complete_request(request)
+    fn finish_request(&mut self, request: &ScheduledRequest) -> Result<(), WorkerExecutionError> {
+        if let Some(params) = request.disaggregated_params() {
+            if !self.submit_prefill_transfers {
+                self.decode_bootstrap_publisher
+                    .cancel_receive(params.bootstrap_room)
+                    .map_err(WorkerExecutionError::Runtime)?;
+            }
+            self.transfer_executor
+                .cancel(params.bootstrap_room)
+                .map_err(|error| WorkerExecutionError::Runtime(error.to_string()))?;
+            self.registry.remove(params.bootstrap_room);
+        }
+        self.worker.finish_request(request)
     }
 
     fn fail_request(&mut self, request: &ScheduledRequest) {
-        if let Some(disaggregated_params) = request.disaggregated_params() {
-            let transfer_failed = self
-                .registry
-                .get(disaggregated_params.bootstrap_room)
-                .is_some_and(|session| session.status() == KvPoll::Failed);
-            if !transfer_failed {
-                self.registry.remove(disaggregated_params.bootstrap_room);
-                let _ = self
-                    .transfer_executor
-                    .cancel(disaggregated_params.bootstrap_room);
-            }
+        if let Err(error) = self.finish_request(request) {
+            eprintln!("PD failure cleanup deferred; KV memory remains reserved: {error}");
+            return;
         }
-
         self.worker.fail_request(request)
     }
 
@@ -1547,21 +1657,6 @@ impl<W, E, P> KvTransferModelWorker<W, E, P> {
         }
 
         Ok(())
-    }
-
-    fn mark_prefill_bootstrap_sessions_ready_without_submit(
-        &mut self,
-        transfer_plan: &KvCacheTransferPlan,
-    ) -> Result<KvCacheTransferSummary, DecodeBootstrapRegistryError> {
-        let mut summary = KvCacheTransferSummary::default();
-        for span in transfer_plan.spans() {
-            self.registry
-                .update_status(span.bootstrap_room(), KvPoll::Success)?;
-            if span.is_noop() {
-                summary.noop_spans += 1;
-            }
-        }
-        Ok(summary)
     }
 }
 
@@ -1812,7 +1907,10 @@ where
 {
     fn drop(&mut self) {
         if let Err(error) = self.unregister() {
-            eprintln!("failed to unregister Mooncake KV cache memory: {error}");
+            eprintln!(
+                "fatal: cannot release Mooncake KV memory with an active registration: {error}"
+            );
+            std::process::abort();
         }
     }
 }
@@ -2372,6 +2470,8 @@ where
     R: MooncakeTransferStatusReader,
 {
     let mut completed_tasks = 0;
+    let mut failure = None;
+    let mut pending = false;
 
     for task_id in 0..batch.task_count() {
         let status = reader
@@ -2381,28 +2481,39 @@ where
             MooncakeTransferStatusCode::Completed => {
                 completed_tasks += 1;
             }
-            MooncakeTransferStatusCode::Waiting | MooncakeTransferStatusCode::Pending => {}
+            MooncakeTransferStatusCode::Waiting | MooncakeTransferStatusCode::Pending => {
+                pending = true
+            }
             MooncakeTransferStatusCode::Invalid
             | MooncakeTransferStatusCode::Canceled
             | MooncakeTransferStatusCode::Timeout
             | MooncakeTransferStatusCode::Failed => {
-                return Ok(MooncakePolledBatchState::Failed(format!(
-                    "Mooncake transfer batch {} task {task_id} failed with status {}",
-                    batch.batch_id(),
-                    status.status
-                )));
+                failure.get_or_insert_with(|| {
+                    format!(
+                        "Mooncake transfer batch {} task {task_id} failed with status {}",
+                        batch.batch_id(),
+                        status.status
+                    )
+                });
             }
         }
     }
 
-    if completed_tasks == batch.task_count() {
+    if pending {
+        Ok(MooncakePolledBatchState::Pending)
+    } else if let Some(message) = failure {
+        Ok(MooncakePolledBatchState::Failed(message))
+    } else if completed_tasks == batch.task_count() {
         Ok(MooncakePolledBatchState::Completed)
     } else {
         Ok(MooncakePolledBatchState::Pending)
     }
 }
 
-pub struct MooncakeKvCacheTransferExecutor<S, R = FixedMooncakeTransferTargetResolver> {
+pub struct MooncakeKvCacheTransferExecutor<
+    S: MooncakeTransferStatusReader + MooncakeBatchReleaser,
+    R = FixedMooncakeTransferTargetResolver,
+> {
     local_memory_registration: Option<Box<dyn MooncakeMemoryRegistrationLease>>,
     memory_registrar: Option<Box<dyn MooncakeMemoryRegistrar>>,
     submitter: S,
@@ -2411,9 +2522,10 @@ pub struct MooncakeKvCacheTransferExecutor<S, R = FixedMooncakeTransferTargetRes
     remote_kv_layouts_by_room: BTreeMap<BootstrapRoom, BTreeMap<String, MooncakeRemoteKvLayout>>,
     submitted_batches: Vec<MooncakeBatchId>,
     submitted_transfers: Vec<MooncakeSubmittedBatch>,
+    completion_events: Vec<KvTransferCompletionEvent>,
 }
 
-impl<S> MooncakeKvCacheTransferExecutor<S> {
+impl<S: MooncakeTransferStatusReader + MooncakeBatchReleaser> MooncakeKvCacheTransferExecutor<S> {
     pub fn new(
         submitter: S,
         layout: MooncakeKvCacheLayout,
@@ -2441,7 +2553,9 @@ impl<S> MooncakeKvCacheTransferExecutor<S> {
     }
 }
 
-impl<S, R> MooncakeKvCacheTransferExecutor<S, R> {
+impl<S: MooncakeTransferStatusReader + MooncakeBatchReleaser, R>
+    MooncakeKvCacheTransferExecutor<S, R>
+{
     pub fn with_target_resolver(
         submitter: S,
         layout: MooncakeKvCacheLayout,
@@ -2456,6 +2570,7 @@ impl<S, R> MooncakeKvCacheTransferExecutor<S, R> {
             remote_kv_layouts_by_room: BTreeMap::new(),
             submitted_batches: Vec::new(),
             submitted_transfers: Vec::new(),
+            completion_events: Vec::new(),
         }
     }
 
@@ -2482,6 +2597,7 @@ impl<S, R> MooncakeKvCacheTransferExecutor<S, R> {
             remote_kv_layouts_by_room,
             submitted_batches: Vec::new(),
             submitted_transfers: Vec::new(),
+            completion_events: Vec::new(),
         }
     }
 
@@ -2508,6 +2624,7 @@ impl<S, R> MooncakeKvCacheTransferExecutor<S, R> {
             remote_kv_layouts_by_room,
             submitted_batches: Vec::new(),
             submitted_transfers: Vec::new(),
+            completion_events: Vec::new(),
         }
     }
 
@@ -2607,70 +2724,68 @@ where
         &mut self,
         bootstrap_room: BootstrapRoom,
     ) -> Result<(), KvCacheTransferError> {
-        let submitted_transfers = self.submitted_transfers.clone();
-        let mut pending_transfers = Vec::new();
-
-        for transfer in submitted_transfers {
-            if transfer.bootstrap_room() == bootstrap_room {
-                self.submitter
-                    .free_batch(transfer.batch_id())
-                    .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
-            } else {
-                pending_transfers.push(transfer);
-            }
-        }
-
-        self.submitted_transfers = pending_transfers;
-        self.submitted_batches = self
+        while let Some(index) = self
             .submitted_transfers
             .iter()
-            .map(MooncakeSubmittedBatch::batch_id)
-            .collect();
-
+            .position(|transfer| transfer.bootstrap_room() == bootstrap_room)
+        {
+            let transfer = &self.submitted_transfers[index];
+            while matches!(
+                poll_mooncake_submitted_batch(&mut self.submitter, transfer)?,
+                MooncakePolledBatchState::Pending
+            ) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            self.submitter
+                .free_batch(transfer.batch_id())
+                .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
+            self.submitted_transfers.remove(index);
+            self.submitted_batches.remove(index);
+        }
+        self.completion_events
+            .retain(|event| event.bootstrap_room != bootstrap_room);
+        self.remote_kv_layouts_by_room.remove(&bootstrap_room);
         Ok(())
     }
 
     pub fn poll_submitted_transfers(&mut self) -> Result<KvTransferPoll, KvCacheTransferError> {
-        let submitted_transfers = self.submitted_transfers.clone();
-        let mut poll = KvTransferPoll::default();
-        let mut pending_transfers = Vec::new();
-
-        for transfer in submitted_transfers {
-            match poll_mooncake_submitted_batch(&mut self.submitter, &transfer)? {
+        let mut index = 0;
+        while index < self.submitted_transfers.len() {
+            let transfer = &self.submitted_transfers[index];
+            match poll_mooncake_submitted_batch(&mut self.submitter, transfer)? {
                 MooncakePolledBatchState::Completed => {
                     self.submitter
                         .free_batch(transfer.batch_id())
                         .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
-                    poll.events.push(KvTransferCompletionEvent::completed(
-                        transfer.bootstrap_room(),
-                        transfer.descriptor_checksum().to_string(),
-                    ));
+                    self.completion_events
+                        .push(KvTransferCompletionEvent::completed(
+                            transfer.bootstrap_room(),
+                            transfer.descriptor_checksum().to_string(),
+                        ));
                 }
                 MooncakePolledBatchState::Pending => {
-                    pending_transfers.push(transfer);
-                    poll.pending_transfers += 1;
+                    index += 1;
+                    continue;
                 }
                 MooncakePolledBatchState::Failed(message) => {
                     self.submitter
                         .free_batch(transfer.batch_id())
                         .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
-                    poll.events.push(KvTransferCompletionEvent::failed(
-                        transfer.bootstrap_room(),
-                        transfer.descriptor_checksum().to_string(),
-                        message,
-                    ));
+                    self.completion_events
+                        .push(KvTransferCompletionEvent::failed(
+                            transfer.bootstrap_room(),
+                            transfer.descriptor_checksum().to_string(),
+                            message,
+                        ));
                 }
             }
+            self.submitted_transfers.remove(index);
+            self.submitted_batches.remove(index);
         }
-
-        self.submitted_transfers = pending_transfers;
-        self.submitted_batches = self
-            .submitted_transfers
-            .iter()
-            .map(MooncakeSubmittedBatch::batch_id)
-            .collect();
-
-        Ok(poll)
+        Ok(KvTransferPoll::new(
+            std::mem::take(&mut self.completion_events),
+            self.submitted_transfers.len(),
+        ))
     }
 }
 
@@ -2737,6 +2852,11 @@ where
                 .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?
         };
         if requests.is_empty() {
+            self.completion_events
+                .push(KvTransferCompletionEvent::completed(
+                    span.bootstrap_room(),
+                    span.descriptor_checksum(),
+                ));
             return Ok(());
         }
         let task_count = requests.len();
@@ -2770,12 +2890,28 @@ where
         for room in rooms {
             self.cancel_submitted_transfers_for_room(room)?;
         }
-        if let Some(mut registration) = self.local_memory_registration.take() {
+        if let Some(registration) = self.local_memory_registration.as_mut() {
             registration
                 .unregister()
                 .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
         }
+        self.local_memory_registration = None;
         Ok(())
+    }
+}
+
+impl<S: MooncakeTransferStatusReader + MooncakeBatchReleaser, R> Drop
+    for MooncakeKvCacheTransferExecutor<S, R>
+{
+    fn drop(&mut self) {
+        while let Some(transfer) = self.submitted_transfers.first() {
+            let room = transfer.bootstrap_room();
+            if let Err(error) = self.cancel_submitted_transfers_for_room(room) {
+                // Releasing registered memory without proving DMA quiescence is unsafe.
+                eprintln!("fatal: cannot drain Mooncake KV memory before destruction: {error}");
+                std::process::abort();
+            }
+        }
     }
 }
 #[cfg(feature = "mooncake-link")]
@@ -2893,7 +3029,29 @@ impl LinkedMooncakeTransferEngine {
         let code =
             unsafe { submitTransfer(self.handle, batch_id, requests.as_mut_ptr(), requests.len()) };
         if code != 0 {
-            let _ = unsafe { freeBatchID(self.handle, batch_id) };
+            // Submission can fail after some tasks were queued. The caller may
+            // release source memory as soon as this error returns.
+            loop {
+                let mut pending = false;
+                for task in 0..requests.len() {
+                    let status = match self.transfer_status(batch_id, task) {
+                        Ok(status) => status,
+                        Err(error) => {
+                            eprintln!(
+                                "fatal: cannot establish Mooncake quiescence after partial submission: {error}"
+                            );
+                            std::process::abort();
+                        }
+                    };
+                    pending |= status.status == MooncakeTransferStatusCode::Waiting as c_int
+                        || status.status == MooncakeTransferStatusCode::Pending as c_int;
+                }
+                if !pending {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            self.free_batch(batch_id)?;
             return Err(MooncakeError::SubmitTransferFailed(code));
         }
         Ok(batch_id)

@@ -28,6 +28,7 @@ pub mod model_registry;
 mod model_runtime;
 pub mod models;
 mod moe;
+mod mooncake_control;
 mod openai_classify;
 mod openai_embedding;
 mod openai_id;
