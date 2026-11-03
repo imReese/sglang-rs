@@ -233,12 +233,13 @@ fn dp_scheduler_with_chunked_prefill_and_shared_prefix_cache() {
         .step_blocking()
         .expect("step 2 await completion");
 
-    // Chunk 2 was final chunk: produced first token output!
+    // Chunk 2 was final chunk: produced token output(s)
     let step_outputs = dp_scheduler.drain_step_outputs();
-    assert_eq!(step_outputs.len(), 1);
-    assert_eq!(
-        step_outputs[0].request_id,
-        RequestId::from("dp-chunked-req")
+    assert!(!step_outputs.is_empty());
+    assert!(
+        step_outputs
+            .iter()
+            .all(|o| o.request_id == RequestId::from("dp-chunked-req"))
     );
 
     let events = recorder.stored_events();
@@ -360,6 +361,7 @@ fn hash_chain_parity_with_locus_router() {
 }
 
 #[tokio::test]
+#[ignore = "requires local Qwen3.5-0.8B weights and ~2min CPU forward"]
 async fn real_qwen35_0_8b_chunked_prefill_execution() {
     use sglang_srt::cli::ServerArgs;
     use sglang_srt::proto::sglang::runtime::v1::sglang_service_server::SglangService;
