@@ -1160,6 +1160,12 @@ mod pd_tests {
         fn receive_prefill_token(&mut self, room: u64) -> Result<u32, String> {
             self.receiver.receive(room)
         }
+        fn receive_prefill_token_and_state(
+            &mut self,
+            room: u64,
+        ) -> Result<(u32, Option<Vec<u8>>), String> {
+            self.receiver.receive_token_and_state(room)
+        }
         fn cancel_receive(&mut self, room: u64) -> Result<(), String> {
             self.receiver.wait_drained(room)
         }
