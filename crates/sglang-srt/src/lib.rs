@@ -32,6 +32,7 @@ pub mod models;
 mod moe;
 pub mod moe_a2a;
 mod mooncake_control;
+pub mod multi_worker_engine;
 pub mod multi_worker_scheduler;
 mod openai_classify;
 mod openai_embedding;
