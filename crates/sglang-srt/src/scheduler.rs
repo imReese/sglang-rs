@@ -622,15 +622,6 @@ impl<W> Scheduler<W> {
         Ok(remaining)
     }
 
-    #[allow(dead_code)]
-    fn prepare_prefill_request(
-        &mut self,
-        request: &mut ScheduledRequest,
-    ) -> Result<(), SchedulerError> {
-        let max_chunk_tokens = self.chunked_prefill_size.unwrap_or(usize::MAX);
-        self.prepare_prefill_request_chunk(request, max_chunk_tokens)
-    }
-
     fn prepare_prefill_request_chunk(
         &mut self,
         request: &mut ScheduledRequest,
