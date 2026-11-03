@@ -434,7 +434,21 @@ fn build_tcp_transfer_backend(
     }
 
     let layout = memory.mooncake_prefill_layout(0);
-    let port = pd_config.mooncake_rpc_port.unwrap_or(0);
+    let ranks_per_node = pd_config
+        .tp_size
+        .checked_div(pd_config.nnodes.max(1))
+        .unwrap_or(1);
+    let rank_offset = u16::try_from(pd_config.node_rank * ranks_per_node).unwrap_or(0);
+    let port = pd_config
+        .mooncake_rpc_port
+        .map(|p| {
+            if p == 0 {
+                0
+            } else {
+                p.saturating_add(rank_offset)
+            }
+        })
+        .unwrap_or(0);
     let hostname = hostname.into();
     let engine =
         SharedTcpTransferEngine::new(hostname, port).map_err(KvCacheTransferError::Runtime)?;

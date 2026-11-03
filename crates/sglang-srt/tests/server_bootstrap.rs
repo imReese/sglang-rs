@@ -3005,35 +3005,73 @@ async fn pd_launch_rejects_unimplemented_cache_modes_without_silent_fallback() {
 }
 
 #[tokio::test]
-async fn pd_multi_rank_launch_fails_before_loading_model_or_registering_memory() {
-    for (flag, value) in [("--tp-size", "2"), ("--dp-size", "2"), ("--nnodes", "2")] {
-        let args = ServerArgs::parse_from([
+async fn pd_invalid_topology_launch_fails_before_loading_model_or_registering_memory() {
+    let test_cases = [
+        (
+            vec!["--node-rank", "2", "--nnodes", "2"],
+            "P/D node_rank 2 must be less than nnodes 2",
+        ),
+        (
+            vec!["--nnodes", "2"],
+            "P/D tensor parallel size (tp_size=1) must be divisible by node count (nnodes=2)",
+        ),
+        (
+            vec!["--tp-size", "0"],
+            "P/D disaggregation requires tp_size >= 1 and dp_size >= 1",
+        ),
+    ];
+
+    for (flags, expected_substring) in test_cases {
+        let mut cli_args = vec![
             "serve",
             "--model-path",
             "/nonexistent/pd-test-model",
             "--disaggregation-mode",
             "decode",
-            flag,
-            value,
-        ])
-        .expect("arguments");
+        ];
+        cli_args.extend(flags);
+        let args = ServerArgs::parse_from(cli_args).expect("arguments");
         let error = sglang_srt::server::launch_http_server_with_shutdown(args.clone(), async {})
             .await
             .expect_err("unsupported topology");
         assert!(
-            error
-                .to_string()
-                .contains("P/D completion and cancellation currently require one rank"),
-            "{error}"
+            error.to_string().contains(expected_substring),
+            "expected '{expected_substring}', got: {error}"
         );
         let error = sglang_srt::server::launch_grpc_server_with_shutdown(args, async {})
             .await
             .expect_err("unsupported topology");
         assert!(
-            error
-                .to_string()
-                .contains("P/D completion and cancellation currently require one rank"),
-            "{error}"
+            error.to_string().contains(expected_substring),
+            "expected '{expected_substring}', got: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pd_valid_multi_rank_passes_transfer_backend_validation() {
+    for flags in [
+        vec!["--tp-size", "2"],
+        vec!["--dp-size", "2"],
+        vec!["--tp-size", "4", "--nnodes", "2", "--node-rank", "1"],
+    ] {
+        let mut cli_args = vec![
+            "serve",
+            "--model-path",
+            "/nonexistent/pd-test-model",
+            "--disaggregation-mode",
+            "decode",
+        ];
+        cli_args.extend(flags);
+        let args = ServerArgs::parse_from(cli_args).expect("arguments");
+        let error = sglang_srt::server::launch_http_server_with_shutdown(args.clone(), async {})
+            .await
+            .expect_err("should pass transfer validation then fail on missing model");
+        // Verify it failed at model resolution, not transfer backend validation
+        assert!(
+            !error.to_string().contains("P/D disaggregation")
+                && !error.to_string().contains("P/D node_rank"),
+            "should pass topology validation; got: {error}"
         );
     }
 }

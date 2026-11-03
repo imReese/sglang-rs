@@ -1664,3 +1664,223 @@ async fn tcp_transfer_engine_transfers_kv_cache_across_prefill_and_decode() {
     shutdown_tx.send(()).expect("shutdown server");
     server.await.expect("server joins").expect("clean stop");
 }
+
+#[tokio::test]
+async fn prefill_bootstrap_route_registers_and_queries_multi_rank_dp_and_tp() {
+    let service = PrefillBootstrapService::default();
+    let addr = unused_local_addr();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server_service = service.clone();
+    let server = tokio::spawn(async move {
+        serve_prefill_bootstrap_with_shutdown(addr, server_service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let dp_size = 2;
+    let tp_size = 2;
+    let base_port = 20000u16;
+
+    for dp_rank in 0..dp_size {
+        for tp_rank in 0..tp_size {
+            let port = base_port + (dp_rank * tp_size + tp_rank) as u16;
+            let body = format!(
+                r#"{{"attn_tp_size":{},"attn_tp_rank":{},"attn_cp_size":1,"attn_cp_rank":0,"attn_dp_size":{},"attn_dp_rank":{},"pp_size":1,"pp_rank":0,"system_dp_size":{},"system_dp_rank":{},"rank_ip":"127.0.0.1","rank_port":{},"page_size":64,"kv_cache_dtype":"auto","load_balance_method":"follow_bootstrap_room"}}"#,
+                tp_size, tp_rank, dp_size, dp_rank, dp_size, dp_rank, port
+            );
+            put_json_with_retry(addr, "/route", Box::leak(body.into_boxed_str())).await;
+        }
+    }
+
+    let info = get_json_with_retry(
+        addr,
+        "/route?prefill_dp_rank=-1&prefill_cp_rank=-1&target_tp_rank=-1&target_pp_rank=-1",
+    )
+    .await;
+    assert_eq!(info["attn_tp_size"], 2);
+    assert_eq!(info["dp_size"], 2);
+
+    for dp_rank in 0..dp_size {
+        for tp_rank in 0..tp_size {
+            let expected_port = base_port + (dp_rank * tp_size + tp_rank) as u16;
+            let path = format!(
+                "/route?prefill_dp_rank={}&prefill_cp_rank=0&target_tp_rank={}&target_pp_rank=0",
+                dp_rank, tp_rank
+            );
+            let route = get_json_with_retry(addr, Box::leak(path.into_boxed_str())).await;
+            assert_eq!(route["rank_ip"], "127.0.0.1");
+            assert_eq!(route["rank_port"], expected_port);
+        }
+    }
+
+    shutdown_tx.send(()).expect("shutdown");
+    server.await.expect("join").expect("clean stop");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tcp_transfer_engine_transfers_kv_cache_across_multi_rank_tp() {
+    use sglang_srt::tcp_transfer::SharedTcpTransferEngine;
+    use sglang_srt::transfer::MooncakeSessionTargetResolver;
+
+    let service = PrefillBootstrapService::default();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let addr = unused_local_addr();
+    let server_service = service.clone();
+    let server = tokio::spawn(async move {
+        serve_prefill_bootstrap_with_shutdown(addr, server_service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    // Rank 0: pattern 0x11, room 101
+    // Rank 1: pattern 0x22, room 102
+    let patterns = [0x11_u8, 0x22_u8];
+    let rooms: [u64; 2] = [101, 102];
+
+    for tp_rank in 0..2 {
+        let pattern = patterns[tp_rank];
+        let room = rooms[tp_rank];
+
+        let mut decode_engine =
+            SharedTcpTransferEngine::new("127.0.0.1", 0).expect("decode engine");
+        let decode_endpoint = decode_engine.local_endpoint().expect("decode endpoint");
+        let mut decode_kv_cache = vec![0u8; 128 * 4];
+        let decode_base_addr = decode_kv_cache.as_mut_ptr() as usize;
+
+        decode_engine
+            .register_memory_batch(
+                &mut [MooncakeBufferEntry {
+                    addr: decode_kv_cache.as_mut_ptr() as *mut c_void,
+                    length: decode_kv_cache.len(),
+                }],
+                "cpu",
+            )
+            .expect("register decode memory");
+
+        let notify_addr = unused_local_addr();
+        let mut notify_socket = PullSocket::new();
+        notify_socket
+            .bind(format!("tcp://{}", notify_addr).as_str())
+            .await
+            .expect("bind notify socket");
+
+        let notification = tokio::spawn(async move {
+            let aux = notify_socket
+                .recv()
+                .await
+                .expect("first-token auxiliary data");
+            assert_eq!(aux.into_vec()[0].as_ref(), b"AUX_DATA");
+            let status = notify_socket.recv().await.expect("KV completion status");
+            assert_eq!(status.into_vec()[1].as_ref(), b"4");
+        });
+
+        {
+            let mut state = service.state().lock().expect("state lock");
+            state
+                .ingest_mooncake_bootstrap_frame(&[
+                    b"None".to_vec(),
+                    b"127.0.0.1".to_vec(),
+                    notify_addr.port().to_string().into_bytes(),
+                    decode_endpoint.as_bytes().to_vec(),
+                    pack_u64s(&[decode_base_addr as u64]),
+                    pack_u64s(&[]),
+                    pack_u64_lists(&[]),
+                    b"0".to_vec(),
+                    b"1".to_vec(),
+                    b"128".to_vec(),
+                ])
+                .expect("decode KV args should parse");
+            state
+                .ingest_mooncake_bootstrap_frame(&[
+                    room.to_string().into_bytes(),
+                    b"127.0.0.1".to_vec(),
+                    notify_addr.port().to_string().into_bytes(),
+                    decode_endpoint.as_bytes().to_vec(),
+                    pack_i32s(&[0, 1]),
+                    b"0".to_vec(),
+                    pack_i32_lists(&[]),
+                    b"1".to_vec(),
+                    b"2".to_vec(),
+                ])
+                .expect("decode transfer metadata should parse");
+        }
+
+        let mut prefill_kv_cache = vec![pattern; 128 * 4];
+        let prefill_base_addr = prefill_kv_cache.as_mut_ptr() as usize;
+
+        let prefill_engine = SharedTcpTransferEngine::new("127.0.0.1", 0).expect("prefill engine");
+        let layout = MooncakeKvCacheLayout {
+            source_base_addr: prefill_base_addr,
+            page_size_bytes: 128,
+            target_base_offset: 0,
+        };
+        let target_resolver =
+            MooncakeSessionTargetResolver::new(prefill_engine.clone(), Vec::new());
+        let mut inner = MooncakeKvCacheTransferExecutor::with_target_resolver(
+            prefill_engine.clone(),
+            layout,
+            target_resolver,
+        )
+        .with_memory_registrar(prefill_engine);
+
+        inner
+            .register(
+                TransferableKvCacheMemory::new(
+                    vec![TransferableKvCacheRegion {
+                        base_addr: prefill_base_addr,
+                        byte_len: 128 * 4,
+                        page_size_bytes: 128,
+                    }],
+                    128,
+                    KvCacheMemoryLocation::Cpu { numa_node: 0 },
+                )
+                .expect("valid transferable memory"),
+            )
+            .expect("register prefill memory");
+
+        let transfer_executor =
+            MooncakeBootstrapKvCacheTransferExecutor::new(service.clone(), inner)
+                .with_metadata_wait_timeout(Duration::from_millis(100));
+
+        let worker = KvTransferModelWorker::new(
+            BootstrapMetadataWorker,
+            DecodeBootstrapRegistry::default(),
+            transfer_executor,
+        )
+        .with_prefill_only();
+
+        let mut scheduler = Scheduler::with_cache_resources(
+            worker,
+            RadixCache::default(),
+            CachePageAllocator::new(4),
+        );
+        scheduler.enqueue(
+            ScheduledRequest::new(
+                RequestId::from(format!("tcp-multi-rank-tp-{tp_rank}").as_str()),
+                vec![1, 2],
+                SamplingParams::new(1),
+            )
+            .with_disaggregated_params(Some(DisaggregatedParams {
+                bootstrap_host: addr.ip().to_string(),
+                bootstrap_port: addr.port(),
+                bootstrap_room: room,
+            }))
+            .with_data_parallel_rank(0),
+        );
+
+        scheduler
+            .dispatch_prefill_batch(1)
+            .expect("prefill multi-rank TP transfer should succeed over TCP");
+
+        notification.await.expect("completion receiver joins");
+
+        // Verify that decode_kv_cache received the exact rank-specific pattern
+        assert_eq!(&decode_kv_cache[0..256], &vec![pattern; 256][..]);
+        assert_eq!(&decode_kv_cache[256..512], &[0u8; 256]);
+    }
+
+    shutdown_tx.send(()).expect("shutdown server");
+    server.await.expect("server joins").expect("clean stop");
+}

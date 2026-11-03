@@ -331,7 +331,21 @@ pub struct MooncakeTransferEngineConfig {
 impl MooncakeTransferEngineConfig {
     pub fn from_pd_config(hostname: impl Into<String>, gpu_id: usize, config: &PdConfig) -> Self {
         let hostname = hostname.into();
-        let rpc_port = config.mooncake_rpc_port.unwrap_or(0);
+        let ranks_per_node = config
+            .tp_size
+            .checked_div(config.nnodes.max(1))
+            .unwrap_or(1);
+        let rank_offset = u16::try_from(config.node_rank * ranks_per_node).unwrap_or(0);
+        let rpc_port = config
+            .mooncake_rpc_port
+            .map(|p| {
+                if p == 0 {
+                    0
+                } else {
+                    p.saturating_add(rank_offset)
+                }
+            })
+            .unwrap_or(0);
         let session_id = format!("{hostname}:{rpc_port}");
         Self {
             hostname,

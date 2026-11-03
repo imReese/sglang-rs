@@ -1268,12 +1268,26 @@ fn launch_mooncake_decode_bootstrap_publisher(
     mooncake_session_id: impl Into<String>,
 ) -> Result<MooncakeDecodeBootstrapPublisher, ServerLaunchError> {
     let endpoint = prefill_mooncake_route_rank_ip(args);
+    let ranks_per_node = args.tp_size.checked_div(args.nnodes.max(1)).unwrap_or(1);
+    let target_tp_rank = i32::try_from(args.node_rank * ranks_per_node).unwrap_or(0);
     let dst_port = args
         .disaggregation_zmq_ports
-        .map(|ports| ports.start)
+        .map(|ports| {
+            let offset = target_tp_rank as u16;
+            if ports
+                .start
+                .checked_add(offset)
+                .is_some_and(|p| p <= ports.end)
+            {
+                ports.start + offset
+            } else {
+                ports.start
+            }
+        })
         .unwrap_or(args.port);
     MooncakeDecodeBootstrapPublisher::new(endpoint, dst_port, mooncake_session_id)
         .with_kv_cache_layout(kv_cache_layout)
+        .with_target_ranks(target_tp_rank, 0)
         .with_receiver()
         .map_err(ServerLaunchError::KvCacheTransfer)
 }
@@ -1573,14 +1587,26 @@ fn validate_launch_transfer_backend(pd_config: &PdConfig) -> Result<(), ServerLa
     if pd_config.mode == DisaggregationMode::Null {
         return Ok(());
     }
-    if pd_config.tp_size != 1
-        || pd_config.dp_size != 1
-        || pd_config.nnodes != 1
-        || pd_config.node_rank != 0
-    {
+    if pd_config.nnodes == 0 {
+        return Err(ServerLaunchError::KvCacheTransfer(
+            "P/D disaggregation requires nnodes >= 1".into(),
+        ));
+    }
+    if pd_config.node_rank >= pd_config.nnodes {
         return Err(ServerLaunchError::KvCacheTransfer(format!(
-            "P/D completion and cancellation currently require one rank (tp_size=1, dp_size=1, nnodes=1, node_rank=0); got tp_size={}, dp_size={}, nnodes={}, node_rank={}",
-            pd_config.tp_size, pd_config.dp_size, pd_config.nnodes, pd_config.node_rank
+            "P/D node_rank {} must be less than nnodes {}",
+            pd_config.node_rank, pd_config.nnodes
+        )));
+    }
+    if pd_config.tp_size == 0 || pd_config.dp_size == 0 {
+        return Err(ServerLaunchError::KvCacheTransfer(
+            "P/D disaggregation requires tp_size >= 1 and dp_size >= 1".into(),
+        ));
+    }
+    if !pd_config.tp_size.is_multiple_of(pd_config.nnodes) {
+        return Err(ServerLaunchError::KvCacheTransfer(format!(
+            "P/D tensor parallel size (tp_size={}) must be divisible by node count (nnodes={})",
+            pd_config.tp_size, pd_config.nnodes
         )));
     }
     if pd_config.decode_enable_radix_cache || pd_config.decode_enable_offload_kvcache {
