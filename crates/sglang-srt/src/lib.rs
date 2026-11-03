@@ -16,6 +16,7 @@ pub(crate) use cuda::moe as cuda_moe;
 pub use cuda::recurrent_state as cuda_recurrent_state;
 pub(crate) use cuda::tensor_parallel as cuda_tensor_parallel;
 pub(crate) use cuda::transformer as cuda_transformer;
+pub mod device_storage;
 pub mod distributed;
 pub use distributed::dp_coordinator;
 pub use distributed::dp_scheduler;

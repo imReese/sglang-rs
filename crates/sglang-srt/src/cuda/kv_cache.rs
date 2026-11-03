@@ -1,8 +1,7 @@
 use std::fmt;
 
 use nexus_transfer::{
-    KvCacheMemoryLocation, KvCacheMemoryProvider, TransferableKvCacheMemory,
-    TransferableKvCacheMemoryError, TransferableKvCacheRegion,
+    KvCacheMemoryProvider, TransferableKvCacheMemory, TransferableKvCacheMemoryError,
 };
 use sglang_kernel::cuda::{CudaContext, CudaDeviceAllocation, CudaError};
 use sglang_kernel::cuda_kv_kernels::{
@@ -10,6 +9,9 @@ use sglang_kernel::cuda_kv_kernels::{
     CudaKvPairGather, CudaKvPairScatter,
 };
 
+use crate::device_storage::{
+    DeviceSlotMap, DeviceTensorLocation, PagedDeviceStorage, PagedStorageError,
+};
 use crate::kv_cache::{
     KvCachePool, KvCachePoolError, KvCacheRuntimeLayout, KvCacheStorage, PagedKvCacheLayout,
     PagedKvCacheLayoutError,
@@ -101,45 +103,67 @@ impl From<TransferableKvCacheMemoryError> for CudaKvStorageError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CudaKvCacheTensorLocation {
-    pub device_ptr: u64,
-    pub byte_offset: usize,
-    pub byte_len: usize,
+impl From<PagedStorageError<CudaError>> for CudaKvStorageError {
+    fn from(value: PagedStorageError<CudaError>) -> Self {
+        match value {
+            PagedStorageError::Layout(error) => Self::Layout(error),
+            PagedStorageError::Pool(error) => Self::Pool(error),
+            PagedStorageError::StorageSizeMismatch { expected, actual } => {
+                Self::StorageSizeMismatch { expected, actual }
+            }
+            PagedStorageError::SlotMapCapacityMismatch {
+                map_slot_count,
+                layout_slot_count,
+            } => Self::SlotMapCapacityMismatch {
+                map_slot_count,
+                layout_slot_count,
+            },
+            PagedStorageError::PageBufferSizeMismatch { expected, actual } => {
+                Self::PageBufferSizeMismatch { expected, actual }
+            }
+            PagedStorageError::SizeOverflow => Self::SizeOverflow,
+            PagedStorageError::Device(error) => Self::Cuda(error),
+            PagedStorageError::Descriptor(error) => Self::Descriptor(error),
+        }
+    }
 }
 
+pub type CudaKvCacheTensorLocation = DeviceTensorLocation;
+
 pub struct CudaKvCacheSlotMap {
-    allocation: CudaDeviceAllocation,
-    slots: Vec<usize>,
-    slot_count: usize,
+    inner: DeviceSlotMap<CudaDeviceAllocation>,
 }
 
 impl fmt::Debug for CudaKvCacheSlotMap {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("CudaKvCacheSlotMap")
-            .field("device_ordinal", &self.allocation.device_ordinal())
-            .field("slots", &self.slots)
-            .field("slot_count", &self.slot_count)
+            .field("device_ordinal", &self.inner.allocation().device_ordinal())
+            .field("slots", &self.inner.slots())
+            .field("slot_count", &self.inner.slot_count())
             .finish()
     }
 }
 
 impl CudaKvCacheSlotMap {
     pub fn slots(&self) -> &[usize] {
-        &self.slots
+        self.inner.slots()
     }
 
     pub fn len(&self) -> usize {
-        self.slots.len()
+        self.inner.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.slots.is_empty()
+        self.inner.is_empty()
     }
 
     pub fn allocation(&self) -> &CudaDeviceAllocation {
-        &self.allocation
+        self.inner.allocation()
+    }
+
+    pub fn slot_count(&self) -> usize {
+        self.inner.slot_count()
     }
 }
 
@@ -169,8 +193,7 @@ pub struct CudaKvSlotGatherLaunch<'a> {
 
 pub struct CudaKvStorage {
     context: CudaContext,
-    allocation: CudaDeviceAllocation,
-    page_size_bytes: usize,
+    storage: PagedDeviceStorage<CudaDeviceAllocation>,
 }
 
 impl CudaKvStorage {
@@ -181,19 +204,29 @@ impl CudaKvStorage {
     ) -> Result<Self, CudaKvStorageError> {
         let mut allocation = context.allocate(byte_len)?;
         allocation.fill(0)?;
+        let memory_location = nexus_transfer::KvCacheMemoryLocation::Cuda {
+            device_id: allocation.device_ordinal(),
+        };
         Ok(Self {
             context: context.clone(),
-            allocation,
-            page_size_bytes,
+            storage: PagedDeviceStorage::new(allocation, page_size_bytes, memory_location),
         })
     }
 
+    pub fn inner(&self) -> &PagedDeviceStorage<CudaDeviceAllocation> {
+        &self.storage
+    }
+
+    pub fn inner_mut(&mut self) -> &mut PagedDeviceStorage<CudaDeviceAllocation> {
+        &mut self.storage
+    }
+
     pub fn allocation(&self) -> &CudaDeviceAllocation {
-        &self.allocation
+        self.storage.allocation()
     }
 
     pub fn allocation_mut(&mut self) -> &mut CudaDeviceAllocation {
-        &mut self.allocation
+        self.storage.allocation_mut()
     }
 
     pub fn upload_slot_map(
@@ -201,24 +234,10 @@ impl CudaKvStorage {
         layout: PagedKvCacheLayout,
         slots: &[usize],
     ) -> Result<CudaKvCacheSlotMap, CudaKvStorageError> {
-        self.validate_layout(layout)?;
-        layout.validate_slot_indices(slots)?;
-        let byte_len = slots
-            .len()
-            .checked_mul(size_of::<u64>())
-            .ok_or(CudaKvStorageError::SizeOverflow)?;
-        let mut bytes = Vec::with_capacity(byte_len);
-        for slot in slots {
-            let slot = u64::try_from(*slot).map_err(|_| CudaKvStorageError::SizeOverflow)?;
-            bytes.extend_from_slice(&slot.to_ne_bytes());
-        }
-        let mut allocation = self.context.allocate(byte_len)?;
-        allocation.copy_from_host(0, &bytes)?;
-        Ok(CudaKvCacheSlotMap {
-            allocation,
-            slots: slots.to_vec(),
-            slot_count: layout.slot_count(),
-        })
+        let inner = self
+            .storage
+            .upload_slot_map(layout, slots, |byte_len| self.context.allocate(byte_len))?;
+        Ok(CudaKvCacheSlotMap { inner })
     }
 
     pub fn write_page(
@@ -227,16 +246,9 @@ impl CudaKvStorage {
         page_index: usize,
         bytes: &[u8],
     ) -> Result<(), CudaKvStorageError> {
-        self.validate_layout(layout)?;
-        if bytes.len() != layout.runtime().page_size_bytes {
-            return Err(CudaKvStorageError::PageBufferSizeMismatch {
-                expected: layout.runtime().page_size_bytes,
-                actual: bytes.len(),
-            });
-        }
-        let range = layout.page_byte_range(page_index)?;
-        self.allocation.copy_from_host(range.start, bytes)?;
-        Ok(())
+        self.storage
+            .write_page(layout, page_index, bytes)
+            .map_err(Into::into)
     }
 
     pub fn read_page(
@@ -245,16 +257,9 @@ impl CudaKvStorage {
         page_index: usize,
         bytes: &mut [u8],
     ) -> Result<(), CudaKvStorageError> {
-        self.validate_layout(layout)?;
-        if bytes.len() != layout.runtime().page_size_bytes {
-            return Err(CudaKvStorageError::PageBufferSizeMismatch {
-                expected: layout.runtime().page_size_bytes,
-                actual: bytes.len(),
-            });
-        }
-        let range = layout.page_byte_range(page_index)?;
-        self.allocation.copy_to_host(range.start, bytes)?;
-        Ok(())
+        self.storage
+            .read_page(layout, page_index, bytes)
+            .map_err(Into::into)
     }
 
     pub fn write_tensor_slot_from_device(
@@ -266,11 +271,16 @@ impl CudaKvStorage {
         source: &CudaDeviceAllocation,
         source_offset: usize,
     ) -> Result<(), CudaKvStorageError> {
-        self.validate_layout(layout)?;
-        let range = layout.tensor_slot_byte_range(layer_index, tensor_index, slot_index)?;
-        self.allocation
-            .copy_from_device(range.start, source, source_offset, range.len())?;
-        Ok(())
+        self.storage
+            .write_tensor_slot_from_device(
+                layout,
+                layer_index,
+                tensor_index,
+                slot_index,
+                source,
+                source_offset,
+            )
+            .map_err(Into::into)
     }
 
     pub fn read_tensor_slot_to_device(
@@ -282,15 +292,45 @@ impl CudaKvStorage {
         destination: &mut CudaDeviceAllocation,
         destination_offset: usize,
     ) -> Result<(), CudaKvStorageError> {
-        self.validate_layout(layout)?;
-        let range = layout.tensor_slot_byte_range(layer_index, tensor_index, slot_index)?;
-        destination.copy_from_device(
-            destination_offset,
-            &self.allocation,
-            range.start,
-            range.len(),
-        )?;
-        Ok(())
+        self.storage
+            .read_tensor_slot_to_device(
+                layout,
+                layer_index,
+                tensor_index,
+                slot_index,
+                destination,
+                destination_offset,
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn tensor_location(
+        &self,
+        layout: PagedKvCacheLayout,
+        page_index: usize,
+        layer_index: usize,
+        tensor_index: usize,
+        token_index: usize,
+    ) -> Result<CudaKvCacheTensorLocation, CudaKvStorageError> {
+        self.storage
+            .tensor_location(layout, page_index, layer_index, tensor_index, token_index)
+            .map_err(Into::into)
+    }
+
+    pub fn slot_location(
+        &self,
+        layout: PagedKvCacheLayout,
+        layer_index: usize,
+        tensor_index: usize,
+        slot_index: usize,
+    ) -> Result<CudaKvCacheTensorLocation, CudaKvStorageError> {
+        self.storage
+            .slot_location(layout, layer_index, tensor_index, slot_index)
+            .map_err(Into::into)
+    }
+
+    pub fn validate_layout(&self, layout: PagedKvCacheLayout) -> Result<(), CudaKvStorageError> {
+        self.storage.validate_layout(layout).map_err(Into::into)
     }
 
     pub fn write_kv_slots_from_device(
@@ -309,7 +349,7 @@ impl CudaKvStorage {
             values_offset,
             value_row_stride_bytes,
         } = launch;
-        self.validate_slot_map(layout, slot_map)?;
+        self.storage.validate_slot_map(layout, &slot_map.inner)?;
         let plan = kv_pair_copy_plan(
             layout,
             layer_index,
@@ -324,9 +364,9 @@ impl CudaKvStorage {
                 keys_offset,
                 values,
                 values_offset,
-                slot_indices: &slot_map.allocation,
+                slot_indices: slot_map.allocation(),
                 slot_indices_offset: 0,
-                pool: &mut self.allocation,
+                pool: self.storage.allocation_mut(),
                 pool_offset: 0,
             },
         )?;
@@ -349,7 +389,7 @@ impl CudaKvStorage {
             values_offset,
             value_row_stride_bytes,
         } = launch;
-        self.validate_slot_map(layout, slot_map)?;
+        self.storage.validate_slot_map(layout, &slot_map.inner)?;
         let plan = kv_pair_copy_plan(
             layout,
             layer_index,
@@ -360,9 +400,9 @@ impl CudaKvStorage {
         kernels.gather(
             plan,
             CudaKvPairGather {
-                pool: &self.allocation,
+                pool: self.storage.allocation(),
                 pool_offset: 0,
-                slot_indices: &slot_map.allocation,
+                slot_indices: slot_map.allocation(),
                 slot_indices_offset: 0,
                 keys,
                 keys_offset,
@@ -372,83 +412,15 @@ impl CudaKvStorage {
         )?;
         Ok(())
     }
-
-    pub fn tensor_location(
-        &self,
-        layout: PagedKvCacheLayout,
-        page_index: usize,
-        layer_index: usize,
-        tensor_index: usize,
-        token_index: usize,
-    ) -> Result<CudaKvCacheTensorLocation, CudaKvStorageError> {
-        self.validate_layout(layout)?;
-        let range =
-            layout.tensor_token_byte_range(page_index, layer_index, tensor_index, token_index)?;
-        let device_ptr = self.allocation.device_ptr_at(range.start, range.len())?;
-        Ok(CudaKvCacheTensorLocation {
-            device_ptr,
-            byte_offset: range.start,
-            byte_len: range.len(),
-        })
-    }
-
-    pub fn slot_location(
-        &self,
-        layout: PagedKvCacheLayout,
-        layer_index: usize,
-        tensor_index: usize,
-        slot_index: usize,
-    ) -> Result<CudaKvCacheTensorLocation, CudaKvStorageError> {
-        self.validate_layout(layout)?;
-        let range = layout.tensor_slot_byte_range(layer_index, tensor_index, slot_index)?;
-        let device_ptr = self.allocation.device_ptr_at(range.start, range.len())?;
-        Ok(CudaKvCacheTensorLocation {
-            device_ptr,
-            byte_offset: range.start,
-            byte_len: range.len(),
-        })
-    }
-
-    pub fn validate_layout(&self, layout: PagedKvCacheLayout) -> Result<(), CudaKvStorageError> {
-        let actual = self.allocation.byte_len();
-        let expected = layout.total_byte_len();
-        if actual != expected {
-            return Err(CudaKvStorageError::StorageSizeMismatch { expected, actual });
-        }
-        if self.page_size_bytes != layout.runtime().page_size_bytes {
-            return Err(CudaKvStorageError::PageBufferSizeMismatch {
-                expected: layout.runtime().page_size_bytes,
-                actual: self.page_size_bytes,
-            });
-        }
-        Ok(())
-    }
-
-    fn validate_slot_map(
-        &self,
-        layout: PagedKvCacheLayout,
-        slot_map: &CudaKvCacheSlotMap,
-    ) -> Result<(), CudaKvStorageError> {
-        self.validate_layout(layout)?;
-        if slot_map.slot_count != layout.slot_count() {
-            return Err(CudaKvStorageError::SlotMapCapacityMismatch {
-                map_slot_count: slot_map.slot_count,
-                layout_slot_count: layout.slot_count(),
-            });
-        }
-        layout.validate_slot_indices(&slot_map.slots)?;
-        Ok(())
-    }
 }
 
 impl KvCacheStorage for CudaKvStorage {
     fn byte_len(&self) -> usize {
-        self.allocation.byte_len()
+        self.storage.byte_len()
     }
 
     fn clear(&mut self) -> Result<(), Self::Error> {
-        self.allocation.fill(0)?;
-        Ok(())
+        self.storage.clear().map_err(Into::into)
     }
 }
 
@@ -456,22 +428,9 @@ impl KvCacheMemoryProvider for CudaKvStorage {
     type Error = CudaKvStorageError;
 
     fn transferable_kv_cache_memory(&self) -> Result<TransferableKvCacheMemory, Self::Error> {
-        let device_ptr = self
-            .allocation
-            .device_ptr_at(0, self.allocation.byte_len())?;
-        let base_addr =
-            usize::try_from(device_ptr).map_err(|_| CudaKvStorageError::SizeOverflow)?;
-        Ok(TransferableKvCacheMemory::new(
-            vec![TransferableKvCacheRegion {
-                base_addr,
-                byte_len: self.allocation.byte_len(),
-                page_size_bytes: self.page_size_bytes,
-            }],
-            self.page_size_bytes,
-            KvCacheMemoryLocation::Cuda {
-                device_id: self.allocation.device_ordinal(),
-            },
-        )?)
+        self.storage
+            .transferable_kv_cache_memory()
+            .map_err(Into::into)
     }
 }
 

@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use nexus_transfer::{KvCacheMemoryProvider, TransferableKvCacheMemory};
 use sglang_kernel::cpu::{
     GatedDeltaRuleShape, KeyGatedDeltaRuleShape, causal_depthwise_conv1d_step,
     gated_delta_rule_step, key_gated_delta_rule_step, rms_norm,
@@ -19,7 +18,7 @@ use crate::cpu_reference::{
 };
 use crate::model_artifacts::LocalModelArtifacts;
 use crate::model_executor::{ModelForwardError, ModelForwardOutput, ModelWorkerBatch};
-use crate::model_runtime::{BackendExecutionResources, BackendModelExecutor};
+use crate::model_runtime::{ActiveRecurrentState, BackendModelExecutor, ModelExecutionResources};
 use crate::models::{
     DecoderNormalization, GatedDeltaNetWeightNames, HybridDecoderExecutionPlan,
     HybridDecoderLayerKind, HybridDecoderLayerWeightNames, HybridFeedForward,
@@ -29,81 +28,19 @@ use crate::models::{
     MultiLatentQueryWeightNames, RecurrentStateLayout, RoutedExpertWeightFormat,
 };
 use crate::moe::MoeRouter;
-use crate::runtime_kv_cache::{RuntimeKvCache, RuntimeKvCacheMetadata};
-use crate::transfer::KvCacheTransferError;
 use crate::types::RequestId;
 
-#[derive(Debug)]
-pub(crate) struct CpuHybridExecutionResources {
-    active_kv_cache: RuntimeKvCache<CpuReferenceKvCache>,
-    recurrent_state: Option<CpuHybridStatePool>,
-}
-
-impl CpuHybridExecutionResources {
-    pub(crate) fn new(
-        active_kv_cache: CpuReferenceKvCache,
-        recurrent_state_layout: Option<RecurrentStateLayout>,
-    ) -> Result<Self, CpuReferenceDenseDecoderError> {
-        Ok(Self {
-            active_kv_cache: RuntimeKvCache::new(active_kv_cache),
-            recurrent_state: recurrent_state_layout
-                .map(CpuHybridStatePool::new)
-                .transpose()?,
-        })
-    }
-
-    fn parts_mut(&mut self) -> (&mut CpuReferenceKvCache, Option<&mut CpuHybridStatePool>) {
-        (
-            self.active_kv_cache.allocation_mut(),
-            self.recurrent_state.as_mut(),
-        )
-    }
-
-    fn has_recurrent_state(&self) -> bool {
-        self.recurrent_state.is_some()
-    }
-}
-
-impl KvCacheMemoryProvider for CpuHybridExecutionResources {
-    type Error = KvCacheTransferError;
-
-    fn transferable_kv_cache_memory(&self) -> Result<TransferableKvCacheMemory, Self::Error> {
-        self.active_kv_cache.transferable_kv_cache_memory()
-    }
-}
-
-impl RuntimeKvCacheMetadata for CpuHybridExecutionResources {
-    fn active_kv_cache_layout(&self) -> Option<crate::kv_cache::PagedKvCacheLayout> {
-        self.active_kv_cache.active_kv_cache_layout()
-    }
-}
-
-impl BackendExecutionResources for CpuHybridExecutionResources {
-    fn runtime_backend(&self) -> crate::backend::RuntimeBackend {
-        crate::backend::RuntimeBackend::Cpu
-    }
-
-    fn complete_request(&mut self, request_id: &RequestId) {
-        if let Some(recurrent_state) = self.recurrent_state.as_mut() {
-            recurrent_state.complete_request(request_id);
-        }
-    }
-
-    fn recurrent_state_layout(&self) -> Option<RecurrentStateLayout> {
-        self.recurrent_state
-            .as_ref()
-            .map(CpuHybridStatePool::layout)
-    }
-}
+pub(crate) type CpuHybridExecutionResources =
+    ModelExecutionResources<CpuReferenceKvCache, CpuHybridStatePool>;
 
 #[derive(Debug)]
-struct CpuHybridStatePool {
+pub(crate) struct CpuHybridStatePool {
     layout: RecurrentStateLayout,
     requests: HashMap<String, HybridRequestState>,
 }
 
 impl CpuHybridStatePool {
-    fn new(layout: RecurrentStateLayout) -> Result<Self, CpuReferenceDenseDecoderError> {
+    pub(crate) fn new(layout: RecurrentStateLayout) -> Result<Self, CpuReferenceDenseDecoderError> {
         if layout.layer_count == 0
             || layout.conv_elements_per_layer().is_none()
             || layout.temporal_elements_per_layer().is_none()
@@ -144,6 +81,16 @@ impl CpuHybridStatePool {
 
     fn complete_request(&mut self, request_id: &RequestId) {
         self.requests.remove(request_id.as_str());
+    }
+}
+
+impl ActiveRecurrentState for CpuHybridStatePool {
+    fn layout(&self) -> Option<RecurrentStateLayout> {
+        Some(self.layout())
+    }
+
+    fn complete_request(&mut self, request_id: &RequestId) {
+        self.complete_request(request_id);
     }
 }
 
@@ -228,7 +175,7 @@ impl CpuReferenceHybridDecoder {
             )));
         }
 
-        let (kv_cache, state_pool) = resources.parts_mut();
+        let (kv_cache, state_pool) = resources.execution_memory_mut();
         let mut request_state = state_pool
             .map(|state_pool| state_pool.request_state_mut(request_id, position))
             .transpose()?;

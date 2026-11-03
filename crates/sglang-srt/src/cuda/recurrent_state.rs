@@ -162,6 +162,16 @@ impl CudaRecurrentStateStorage {
     }
 }
 
+impl crate::model_runtime::ActiveRecurrentState for CudaRecurrentStateStorage {
+    fn layout(&self) -> Option<RecurrentStateLayout> {
+        Some(self.layout())
+    }
+
+    fn complete_request(&mut self, request_id: &RequestId) {
+        self.release_request(request_id);
+    }
+}
+
 pub struct CudaRecurrentLayerState<'a> {
     pub conv_state: &'a mut CudaDeviceAllocation,
     pub conv_state_offset: usize,

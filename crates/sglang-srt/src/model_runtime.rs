@@ -24,6 +24,105 @@ pub(crate) trait BackendExecutionResources:
     }
 }
 
+pub(crate) trait ActiveRecurrentState: fmt::Debug + Send {
+    fn layout(&self) -> Option<crate::models::RecurrentStateLayout>;
+    fn complete_request(&mut self, request_id: &RequestId);
+}
+
+impl ActiveRecurrentState for () {
+    fn layout(&self) -> Option<crate::models::RecurrentStateLayout> {
+        None
+    }
+
+    fn complete_request(&mut self, _request_id: &RequestId) {}
+}
+
+pub(crate) struct ModelExecutionResources<K, R = ()> {
+    active_kv_cache: RuntimeKvCache<K>,
+    recurrent_state: Option<R>,
+}
+
+impl<K, R> fmt::Debug for ModelExecutionResources<K, R>
+where
+    K: ActiveKvCache,
+    R: fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ModelExecutionResources")
+            .field("active_kv_cache", &self.active_kv_cache)
+            .field("recurrent_state", &self.recurrent_state)
+            .finish()
+    }
+}
+
+impl<K, R> ModelExecutionResources<K, R>
+where
+    K: ActiveKvCache,
+{
+    pub(crate) fn new(active_kv_cache: K, recurrent_state: Option<R>) -> Self {
+        Self {
+            active_kv_cache: RuntimeKvCache::new(active_kv_cache),
+            recurrent_state,
+        }
+    }
+
+    pub(crate) fn active_kv_cache_mut(&mut self) -> &mut K {
+        self.active_kv_cache.allocation_mut()
+    }
+
+    pub(crate) fn has_recurrent_state(&self) -> bool {
+        self.recurrent_state.is_some()
+    }
+
+    pub(crate) fn execution_memory_mut(&mut self) -> (&mut K, Option<&mut R>) {
+        (
+            self.active_kv_cache.allocation_mut(),
+            self.recurrent_state.as_mut(),
+        )
+    }
+}
+
+impl<K, R> KvCacheMemoryProvider for ModelExecutionResources<K, R>
+where
+    K: ActiveKvCache,
+{
+    type Error = KvCacheTransferError;
+
+    fn transferable_kv_cache_memory(&self) -> Result<TransferableKvCacheMemory, Self::Error> {
+        self.active_kv_cache.transferable_kv_cache_memory()
+    }
+}
+
+impl<K, R> RuntimeKvCacheMetadata for ModelExecutionResources<K, R>
+where
+    K: ActiveKvCache,
+{
+    fn active_kv_cache_layout(&self) -> Option<crate::kv_cache::PagedKvCacheLayout> {
+        self.active_kv_cache.active_kv_cache_layout()
+    }
+}
+
+impl<K, R> BackendExecutionResources for ModelExecutionResources<K, R>
+where
+    K: ActiveKvCache,
+    R: ActiveRecurrentState,
+{
+    fn runtime_backend(&self) -> RuntimeBackend {
+        self.active_kv_cache.backend()
+    }
+
+    fn complete_request(&mut self, request_id: &RequestId) {
+        if let Some(recurrent_state) = self.recurrent_state.as_mut() {
+            recurrent_state.complete_request(request_id);
+        }
+    }
+
+    fn recurrent_state_layout(&self) -> Option<crate::models::RecurrentStateLayout> {
+        self.recurrent_state.as_ref().and_then(|r| r.layout())
+    }
+}
+
 impl<K> BackendExecutionResources for RuntimeKvCache<K>
 where
     K: ActiveKvCache,

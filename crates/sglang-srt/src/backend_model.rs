@@ -217,9 +217,12 @@ fn create_cpu_model_runtime(
         ModelExecutionArchitecture::Transformer { .. } if definition.hybrid_decoder().is_some() => {
             let executor = CpuReferenceHybridDecoder::load(definition, artifacts)
                 .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?;
-            let recurrent_state_layout = definition.recurrent_state_layout();
-            let resources = CpuHybridExecutionResources::new(kv_cache, recurrent_state_layout)
+            let recurrent_state = definition
+                .recurrent_state_layout()
+                .map(crate::cpu_hybrid::CpuHybridStatePool::new)
+                .transpose()
                 .map_err(|error| ModelRuntimeLoadError::Load(error.to_string()))?;
+            let resources = CpuHybridExecutionResources::new(kv_cache, recurrent_state);
             Ok(Box::new(BackendExecutionBundle::new(executor, resources)))
         }
         ModelExecutionArchitecture::Transformer { .. } if definition.dense_decoder().is_some() => {
