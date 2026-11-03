@@ -101,8 +101,16 @@ impl<T> DpCoordinator<T> {
         self.scheduler.running_batch_count()
     }
 
+    pub fn available_cache_pages(&self) -> usize {
+        self.scheduler.available_cache_pages()
+    }
+
     pub fn abort_request(&mut self, request_id: &RequestId) -> bool {
         self.scheduler.abort_request(request_id)
+    }
+
+    pub fn abort_all_requests(&mut self) -> usize {
+        self.scheduler.abort_all_requests()
     }
 
     pub fn flush_cache(&mut self) {
@@ -218,6 +226,88 @@ where
                 )));
             }
         }
+    }
+
+    /// Synchronously runs a token-level generation request until completion.
+    pub fn generate_tokens(
+        &mut self,
+        request: TokenGenerateRequest,
+    ) -> Result<TokenGenerateOutput, DpCoordinatorError> {
+        let mut output_ids = Vec::new();
+        let mut cached_tokens = 0;
+        let mut finished = false;
+        let req_id = request.request_id.clone();
+
+        self.generate_token_stream_with_sink(request, |out| {
+            output_ids.extend_from_slice(&out.output_ids);
+            cached_tokens = out.cached_tokens;
+            finished = out.finished;
+            true
+        })?;
+
+        Ok(TokenGenerateOutput {
+            request_id: req_id,
+            output_ids,
+            cached_tokens,
+            finished,
+        })
+    }
+
+    /// Runs a token-level generation request and streams incremental tokens to a callback sink.
+    pub fn generate_token_stream_with_sink<F>(
+        &mut self,
+        request: TokenGenerateRequest,
+        mut sink: F,
+    ) -> Result<(), DpCoordinatorError>
+    where
+        F: FnMut(TokenGenerateOutput) -> bool,
+    {
+        let target_id = request.request_id.clone();
+        self.enqueue_token_request(request);
+
+        loop {
+            self.scheduler.step()?;
+            let step_outputs = self.scheduler.drain_step_outputs();
+            for item in step_outputs {
+                if item.request_id == target_id {
+                    let is_finished = item.finished;
+                    let cont = sink(TokenGenerateOutput {
+                        request_id: item.request_id,
+                        output_ids: item.token_ids,
+                        cached_tokens: item.cached_tokens,
+                        finished: item.finished,
+                    });
+                    if !cont {
+                        self.scheduler.abort_request(&target_id);
+                        return Ok(());
+                    }
+                    if is_finished {
+                        return Ok(());
+                    }
+                }
+            }
+            if !self.scheduler.is_idle() {
+                self.scheduler.step_blocking()?;
+            } else {
+                return Err(DpCoordinatorError::InvalidState(format!(
+                    "request {} disappeared before generating completion",
+                    target_id.as_str()
+                )));
+            }
+        }
+    }
+
+    /// Runs a token-level generation request and collects all incremental token outputs into a vector.
+    pub fn generate_token_stream(
+        &mut self,
+        request: TokenGenerateRequest,
+    ) -> Result<Vec<TokenGenerateOutput>, DpCoordinatorError> {
+        let mut outputs = Vec::new();
+        self.generate_token_stream_with_sink(request, |out| {
+            outputs.push(out);
+            true
+        })?;
+        Ok(outputs)
     }
 }
 

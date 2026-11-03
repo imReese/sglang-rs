@@ -22,6 +22,7 @@ pub struct DpScheduler {
     worker_pool: DpWorkerPool,
     running_batches: BTreeMap<u64, (usize, ScheduleBatch)>,
     finished_outputs: Vec<ScheduledOutput>,
+    step_outputs: Vec<ScheduledOutput>,
     max_batch_size: usize,
     page_size: usize,
 }
@@ -54,6 +55,7 @@ impl DpScheduler {
             worker_pool,
             running_batches: BTreeMap::new(),
             finished_outputs: Vec::new(),
+            step_outputs: Vec::new(),
             max_batch_size,
             page_size,
         })
@@ -102,7 +104,11 @@ impl DpScheduler {
                 aborted = true;
                 let rank_idx = r.data_parallel_rank() as usize;
                 if rank_idx < self.allocators.len() {
-                    self.allocators[rank_idx].release(r.allocated_cache_pages());
+                    let owned_slots = r
+                        .sequence_cache_pages()
+                        .get(r.input_ids().len()..)
+                        .unwrap_or_default();
+                    self.allocators[rank_idx].release(owned_slots);
                 }
                 false
             } else {
@@ -204,6 +210,46 @@ impl DpScheduler {
         std::mem::take(&mut self.finished_outputs)
     }
 
+    /// Drains incremental step token outputs generated across all workers during recent steps.
+    pub fn drain_step_outputs(&mut self) -> Vec<ScheduledOutput> {
+        std::mem::take(&mut self.step_outputs)
+    }
+
+    /// Returns the sum of available cache pages across all DP worker allocators.
+    pub fn available_cache_pages(&self) -> usize {
+        self.allocators.iter().map(|a| a.available_pages()).sum()
+    }
+
+    /// Aborts all queued and running requests across all worker ranks.
+    pub fn abort_all_requests(&mut self) -> usize {
+        let count = self.waiting_queue.len() + self.decode_queue.len();
+        for req in self.waiting_queue.drain(..) {
+            if let Some(allocator) = req
+                .data_parallel_rank()
+                .try_into()
+                .ok()
+                .and_then(|r: usize| self.allocators.get_mut(r))
+            {
+                allocator.release(req.allocated_cache_pages());
+            }
+        }
+        for req in self.decode_queue.drain(..) {
+            if let Some(allocator) = req
+                .data_parallel_rank()
+                .try_into()
+                .ok()
+                .and_then(|r: usize| self.allocators.get_mut(r))
+            {
+                let owned_slots = req
+                    .sequence_cache_pages()
+                    .get(req.input_ids().len()..)
+                    .unwrap_or_default();
+                allocator.release(owned_slots);
+            }
+        }
+        count
+    }
+
     fn handle_batch_completion(
         &mut self,
         rank: usize,
@@ -227,11 +273,23 @@ impl DpScheduler {
             }
 
             request.append_output_ids(token.token_ids());
+            let is_finished = token.is_finished() || request.reached_max_new_tokens();
 
-            if token.is_finished() || request.reached_max_new_tokens() {
+            self.step_outputs.push(ScheduledOutput {
+                request_id: request.request_id().clone(),
+                token_ids: token.token_ids().to_vec(),
+                cached_tokens: request.cached_token_count(),
+                finished: is_finished,
+            });
+
+            if is_finished {
                 // Request finished: free allocated pages on this rank
                 if let Some(allocator) = self.allocators.get_mut(rank) {
-                    allocator.release(request.allocated_cache_pages());
+                    let owned_slots = request
+                        .sequence_cache_pages()
+                        .get(request.input_ids().len()..)
+                        .unwrap_or_default();
+                    allocator.release(owned_slots);
                 }
                 self.finished_outputs.push(ScheduledOutput {
                     request_id: request.request_id().clone(),
@@ -254,12 +312,29 @@ impl DpScheduler {
         &mut self,
         rank: usize,
     ) -> Result<Option<ScheduleBatch>, DpSchedulerError> {
+        let allocator = self
+            .allocators
+            .get_mut(rank)
+            .ok_or(DpSchedulerError::InvalidRank(rank))?;
+
         // 1. Prioritize decode requests pinned to this rank
         let mut decode_requests = Vec::new();
         let mut i = 0;
         while i < self.decode_queue.len() && decode_requests.len() < self.max_batch_size {
             if self.decode_queue[i].data_parallel_rank() == rank as i32 {
                 if let Some(mut req) = self.decode_queue.remove(i) {
+                    let allocated =
+                        match allocator.allocate_for_sequence(req.sequence_cache_pages(), 1) {
+                            Ok(pages) => pages,
+                            Err(CacheAllocationError::OutOfSlots { .. }) => {
+                                self.decode_queue.insert(i, req);
+                                break;
+                            }
+                            Err(err) => return Err(DpSchedulerError::CacheAllocation(err)),
+                        };
+                    req.set_forward_cache_pages(allocated.clone());
+                    req.set_allocated_cache_pages(allocated.clone());
+                    req.append_sequence_cache_pages(&allocated);
                     req.set_stage(RequestStage::DecodeForward);
                     decode_requests.push(req);
                 }

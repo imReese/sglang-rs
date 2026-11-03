@@ -4338,6 +4338,7 @@ dependencies = [
  "tonic-prost",
  "tonic-prost-build",
  "tonic-reflection",
+ "tower",
  "zeromq",
 ]
 

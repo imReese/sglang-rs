@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cache::{KvBlockPrefixIndex, KvCacheWorkerId, KvCacheWorkerSnapshot};
 use crate::cli::ServerArgs;
+use crate::dp_coordinator::DpCoordinator;
 use crate::engine::{Engine, RuntimeError};
 use crate::model_artifacts::{HfModelConfig, LocalModelArtifacts, RoutedExpertCheckpointCoverage};
 use crate::model_registry::ModelRegistry;
@@ -749,8 +750,13 @@ fn usize_to_model_info_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
+pub enum RuntimeEngine<T, W> {
+    Single(Engine<T, W>),
+    Dp(DpCoordinator<T>),
+}
+
 pub struct RouterRuntime<T, W> {
-    engine: Engine<T, W>,
+    engine: RuntimeEngine<T, W>,
     validation_config: RouterValidationConfig,
     default_stop_token_ids: Vec<u32>,
     generation_paused: bool,
@@ -766,8 +772,17 @@ impl<T, W> RouterRuntime<T, W> {
         validation_config: RouterValidationConfig,
     ) -> Self {
         Self {
-            engine,
+            engine: RuntimeEngine::Single(engine),
             validation_config,
+            default_stop_token_ids: Vec::new(),
+            generation_paused: false,
+        }
+    }
+
+    pub fn from_dp_coordinator(coordinator: DpCoordinator<T>) -> Self {
+        Self {
+            engine: RuntimeEngine::Dp(coordinator),
+            validation_config: RouterValidationConfig::default(),
             default_stop_token_ids: Vec::new(),
             generation_paused: false,
         }
@@ -781,15 +796,45 @@ impl<T, W> RouterRuntime<T, W> {
     }
 
     pub fn engine(&self) -> &Engine<T, W> {
+        match &self.engine {
+            RuntimeEngine::Single(engine) => engine,
+            RuntimeEngine::Dp(_) => panic!("RouterRuntime is operating in DpCoordinator mode"),
+        }
+    }
+
+    pub fn try_engine(&self) -> Option<&Engine<T, W>> {
+        match &self.engine {
+            RuntimeEngine::Single(engine) => Some(engine),
+            RuntimeEngine::Dp(_) => None,
+        }
+    }
+
+    pub fn dp_coordinator(&self) -> Option<&DpCoordinator<T>> {
+        match &self.engine {
+            RuntimeEngine::Dp(coordinator) => Some(coordinator),
+            RuntimeEngine::Single(_) => None,
+        }
+    }
+
+    pub fn runtime_engine(&self) -> &RuntimeEngine<T, W> {
         &self.engine
     }
 
     pub fn load(&self) -> RouterLoadResponse {
-        let scheduler = self.engine.scheduler();
-        RouterLoadResponse {
-            waiting_queue_depth: scheduler.waiting_queue_depth(),
-            decode_queue_depth: scheduler.decode_queue_depth(),
-            available_cache_pages: scheduler.available_cache_pages(),
+        match &self.engine {
+            RuntimeEngine::Single(engine) => {
+                let scheduler = engine.scheduler();
+                RouterLoadResponse {
+                    waiting_queue_depth: scheduler.waiting_queue_depth(),
+                    decode_queue_depth: scheduler.decode_queue_depth(),
+                    available_cache_pages: scheduler.available_cache_pages(),
+                }
+            }
+            RuntimeEngine::Dp(coordinator) => RouterLoadResponse {
+                waiting_queue_depth: coordinator.waiting_queue_depth(),
+                decode_queue_depth: coordinator.decode_queue_depth(),
+                available_cache_pages: Some(coordinator.available_cache_pages()),
+            },
         }
     }
 
@@ -820,7 +865,13 @@ impl<T, W> RouterRuntime<T, W> {
             return Err(RouterProtocolError::MissingRequestId);
         }
 
-        if self.engine.abort_request(&RequestId::from(request_id)) {
+        let req_id = RequestId::from(request_id);
+        let aborted = match &mut self.engine {
+            RuntimeEngine::Single(engine) => engine.abort_request(&req_id),
+            RuntimeEngine::Dp(coordinator) => coordinator.abort_request(&req_id),
+        };
+
+        if aborted {
             return Ok(RouterControlResponse {
                 success: true,
                 message: "request aborted".to_string(),
@@ -837,7 +888,10 @@ impl<T, W> RouterRuntime<T, W> {
     where
         W: WorkerExecutor,
     {
-        let aborted = self.engine.abort_all_requests();
+        let aborted = match &mut self.engine {
+            RuntimeEngine::Single(engine) => engine.abort_all_requests(),
+            RuntimeEngine::Dp(coordinator) => coordinator.abort_all_requests(),
+        };
         RouterControlResponse {
             success: true,
             message: format!("aborted {aborted} request(s)"),
@@ -874,25 +928,50 @@ where
     W: WorkerExecutor,
 {
     pub fn shutdown(&mut self) -> Result<usize, RouterRuntimeError> {
-        Ok(self.engine.shutdown()?)
+        match &mut self.engine {
+            RuntimeEngine::Single(engine) => Ok(engine.shutdown()?),
+            RuntimeEngine::Dp(coordinator) => {
+                coordinator.shutdown().map_err(|e| {
+                    RouterRuntimeError::Runtime(RuntimeError::InvalidState(e.to_string()))
+                })?;
+                Ok(0)
+            }
+        }
     }
 
     pub fn poll_transfers(&mut self) -> Result<RouterTransferPollResponse, RouterRuntimeError> {
-        let summary = self.engine.poll_transfers()?;
-        Ok(RouterTransferPollResponse {
-            completed_batches: summary.completed_batches(),
-            pending_batches: summary.pending_batches(),
-            completed_descriptor_checksums: summary.completed_descriptor_checksums().to_vec(),
-            pending_descriptor_checksums: summary.pending_descriptor_checksums().to_vec(),
-        })
+        match &mut self.engine {
+            RuntimeEngine::Single(engine) => {
+                let summary = engine.poll_transfers()?;
+                Ok(RouterTransferPollResponse {
+                    completed_batches: summary.completed_batches(),
+                    pending_batches: summary.pending_batches(),
+                    completed_descriptor_checksums: summary
+                        .completed_descriptor_checksums()
+                        .to_vec(),
+                    pending_descriptor_checksums: summary.pending_descriptor_checksums().to_vec(),
+                })
+            }
+            RuntimeEngine::Dp(_) => Ok(RouterTransferPollResponse {
+                completed_batches: 0,
+                pending_batches: 0,
+                completed_descriptor_checksums: Vec::new(),
+                pending_descriptor_checksums: Vec::new(),
+            }),
+        }
     }
 
     pub fn update_weights_from_disk(
         &mut self,
         request: WorkerWeightUpdateRequest,
     ) -> Result<(), RouterRuntimeError> {
-        self.engine.update_weights_from_disk(&request)?;
-        Ok(())
+        match &mut self.engine {
+            RuntimeEngine::Single(engine) => {
+                engine.update_weights_from_disk(&request)?;
+                Ok(())
+            }
+            RuntimeEngine::Dp(_) => Ok(()),
+        }
     }
 }
 
@@ -900,23 +979,37 @@ impl<T, W> RouterRuntime<T, W>
 where
     T: Tokenizer,
 {
-    pub fn tokenize(&self, text: &str) -> RouterTokenizeResponse {
-        RouterTokenizeResponse {
-            token_ids: self.engine.tokenize(text),
+    pub fn tokenizer(&self) -> &T {
+        match &self.engine {
+            RuntimeEngine::Single(engine) => engine.tokenizer(),
+            RuntimeEngine::Dp(coordinator) => coordinator.tokenizer(),
         }
+    }
+
+    pub fn tokenize(&self, text: &str) -> RouterTokenizeResponse {
+        let token_ids = match &self.engine {
+            RuntimeEngine::Single(engine) => engine.tokenize(text),
+            RuntimeEngine::Dp(coordinator) => coordinator.tokenize(text),
+        };
+        RouterTokenizeResponse { token_ids }
     }
 
     pub fn detokenize(
         &self,
         token_ids: &[u32],
     ) -> Result<RouterDetokenizeResponse, TokenizerError> {
-        Ok(RouterDetokenizeResponse {
-            text: self.engine.detokenize(token_ids)?,
-        })
+        let text = match &self.engine {
+            RuntimeEngine::Single(engine) => engine.detokenize(token_ids)?,
+            RuntimeEngine::Dp(coordinator) => coordinator.detokenize(token_ids)?,
+        };
+        Ok(RouterDetokenizeResponse { text })
     }
 
     pub fn apply_chat_template(&self, input: &ChatTemplateInput) -> Result<String, TokenizerError> {
-        self.engine.apply_chat_template(input)
+        match &self.engine {
+            RuntimeEngine::Single(engine) => engine.apply_chat_template(input),
+            RuntimeEngine::Dp(coordinator) => coordinator.apply_chat_template(input),
+        }
     }
 }
 
@@ -932,9 +1025,15 @@ where
         let validated_request = request.try_into_validated_token_request(self.validation_config)?;
         self.ensure_generation_ready()?;
         let prompt_tokens = validated_request.prompt_tokens as i32;
-        let output = self
-            .engine
-            .generate_tokens(self.apply_default_stop_token_ids(validated_request.request))?;
+        let token_req = self.apply_default_stop_token_ids(validated_request.request);
+        let output = match &mut self.engine {
+            RuntimeEngine::Single(engine) => engine.generate_tokens(token_req)?,
+            RuntimeEngine::Dp(coordinator) => {
+                coordinator.generate_tokens(token_req).map_err(|e| {
+                    RouterRuntimeError::Runtime(RuntimeError::InvalidState(e.to_string()))
+                })?
+            }
+        };
 
         Ok(RouterGenerateResponse::from_token_generate_output(
             output,
@@ -950,9 +1049,15 @@ where
         self.ensure_generation_ready()?;
         let prompt_tokens = validated_request.prompt_tokens as i32;
         let stream = validated_request.stream;
-        let outputs = self
-            .engine
-            .generate_token_stream(self.apply_default_stop_token_ids(validated_request.request))?;
+        let token_req = self.apply_default_stop_token_ids(validated_request.request);
+        let outputs = match &mut self.engine {
+            RuntimeEngine::Single(engine) => engine.generate_token_stream(token_req)?,
+            RuntimeEngine::Dp(coordinator) => {
+                coordinator.generate_token_stream(token_req).map_err(|e| {
+                    RouterRuntimeError::Runtime(RuntimeError::InvalidState(e.to_string()))
+                })?
+            }
+        };
         Ok(token_outputs_to_generate_responses(
             outputs,
             prompt_tokens,
@@ -974,10 +1079,23 @@ where
             validated_request.prompt_tokens as i32,
             validated_request.stream,
         );
-        self.engine.generate_token_stream_with_sink(
-            self.apply_default_stop_token_ids(validated_request.request),
-            |output| state.responses(output).into_iter().all(&mut sink),
-        )?;
+        let token_req = self.apply_default_stop_token_ids(validated_request.request);
+        match &mut self.engine {
+            RuntimeEngine::Single(engine) => {
+                engine.generate_token_stream_with_sink(token_req, |output| {
+                    state.responses(output).into_iter().all(&mut sink)
+                })?;
+            }
+            RuntimeEngine::Dp(coordinator) => {
+                coordinator
+                    .generate_token_stream_with_sink(token_req, |output| {
+                        state.responses(output).into_iter().all(&mut sink)
+                    })
+                    .map_err(|e| {
+                        RouterRuntimeError::Runtime(RuntimeError::InvalidState(e.to_string()))
+                    })?;
+            }
+        }
         Ok(())
     }
 
@@ -997,7 +1115,19 @@ where
         }
 
         self.ensure_generation_ready()?;
-        let batch_outputs = self.engine.generate_token_batch_stream(token_requests)?;
+        let batch_outputs = match &mut self.engine {
+            RuntimeEngine::Single(engine) => engine.generate_token_batch_stream(token_requests)?,
+            RuntimeEngine::Dp(coordinator) => {
+                let mut batch_outputs = Vec::with_capacity(token_requests.len());
+                for req in token_requests {
+                    let outputs = coordinator.generate_token_stream(req).map_err(|e| {
+                        RouterRuntimeError::Runtime(RuntimeError::InvalidState(e.to_string()))
+                    })?;
+                    batch_outputs.push(outputs);
+                }
+                batch_outputs
+            }
+        };
         Ok(batch_outputs
             .into_iter()
             .zip(prompt_tokens)
@@ -1016,7 +1146,7 @@ where
             return Err(RouterProtocolError::EmptyTextInput.into());
         }
 
-        let input_ids = self.engine.tokenize(&request.text);
+        let input_ids = self.tokenize(&request.text).token_ids;
         let mut responses = self.generate_stream(RouterGenerateRequest {
             request_id: request.request_id,
             tokenized: Some(RouterTokenizedInput {
@@ -1049,8 +1179,8 @@ where
             return Err(RouterProtocolError::EmptyTextInput.into());
         }
 
-        let input_ids = self.engine.tokenize(&request.text);
-        let tokenizer = self.engine.tokenizer().clone();
+        let input_ids = self.tokenize(&request.text).token_ids;
+        let tokenizer = self.tokenizer().clone();
         let mut decoder = tokenizer.incremental_decoder();
         let mut decode_error = None;
         self.generate_stream_with_sink(
@@ -1092,7 +1222,7 @@ where
                 return Err(RouterProtocolError::EmptyTextInput.into());
             }
 
-            let input_ids = self.engine.tokenize(&request.text);
+            let input_ids = self.tokenize(&request.text).token_ids;
             tokenized_requests.push(RouterGenerateRequest {
                 request_id: request.request_id,
                 tokenized: Some(RouterTokenizedInput {
@@ -1124,15 +1254,15 @@ where
         match &mut response.body {
             RouterGenerateResponseBody::Chunk(chunk) => {
                 chunk.text = self
-                    .engine
                     .detokenize(&chunk.token_ids)
-                    .map_err(RuntimeError::from)?;
+                    .map_err(RuntimeError::from)?
+                    .text;
             }
             RouterGenerateResponseBody::Complete(complete) => {
                 complete.text = self
-                    .engine
                     .detokenize(&complete.output_ids)
-                    .map_err(RuntimeError::from)?;
+                    .map_err(RuntimeError::from)?
+                    .text;
             }
             RouterGenerateResponseBody::Error(_) => {}
         }
@@ -1141,7 +1271,14 @@ where
     }
 
     pub fn flush_cache(&mut self) -> RouterFlushCacheResponse {
-        if self.engine.flush_cache() {
+        let success = match &mut self.engine {
+            RuntimeEngine::Single(engine) => engine.flush_cache(),
+            RuntimeEngine::Dp(coordinator) => {
+                coordinator.flush_cache();
+                true
+            }
+        };
+        if success {
             RouterFlushCacheResponse {
                 success: true,
                 message: "cache flushed".to_string(),
@@ -1169,10 +1306,17 @@ where
         self.ensure_generation_ready()?;
         let prompt_tokens = validated_request.prompt_tokens as i32;
         let stream = validated_request.stream;
-        let outputs = self.engine.generate_token_stream_with_transfer_polling(
-            self.apply_default_stop_token_ids(validated_request.request),
-            max_transfer_polls,
-        )?;
+        let token_req = self.apply_default_stop_token_ids(validated_request.request);
+        let outputs = match &mut self.engine {
+            RuntimeEngine::Single(engine) => {
+                engine.generate_token_stream_with_transfer_polling(token_req, max_transfer_polls)?
+            }
+            RuntimeEngine::Dp(coordinator) => {
+                coordinator.generate_token_stream(token_req).map_err(|e| {
+                    RouterRuntimeError::Runtime(RuntimeError::InvalidState(e.to_string()))
+                })?
+            }
+        };
         Ok(token_outputs_to_generate_responses(
             outputs,
             prompt_tokens,
@@ -1195,12 +1339,25 @@ where
             validated_request.prompt_tokens as i32,
             validated_request.stream,
         );
-        self.engine
-            .generate_token_stream_with_transfer_polling_sink(
-                self.apply_default_stop_token_ids(validated_request.request),
-                max_transfer_polls,
-                |output| state.responses(output).into_iter().all(&mut sink),
-            )?;
+        let token_req = self.apply_default_stop_token_ids(validated_request.request);
+        match &mut self.engine {
+            RuntimeEngine::Single(engine) => {
+                engine.generate_token_stream_with_transfer_polling_sink(
+                    token_req,
+                    max_transfer_polls,
+                    |output| state.responses(output).into_iter().all(&mut sink),
+                )?;
+            }
+            RuntimeEngine::Dp(coordinator) => {
+                coordinator
+                    .generate_token_stream_with_sink(token_req, |output| {
+                        state.responses(output).into_iter().all(&mut sink)
+                    })
+                    .map_err(|e| {
+                        RouterRuntimeError::Runtime(RuntimeError::InvalidState(e.to_string()))
+                    })?;
+            }
+        }
         Ok(())
     }
 
@@ -1221,12 +1378,23 @@ where
         }
 
         self.ensure_generation_ready()?;
-        let batch_outputs = self
-            .engine
-            .generate_token_batch_stream_with_transfer_polling(
-                token_requests,
-                max_transfer_polls,
-            )?;
+        let batch_outputs = match &mut self.engine {
+            RuntimeEngine::Single(engine) => engine
+                .generate_token_batch_stream_with_transfer_polling(
+                    token_requests,
+                    max_transfer_polls,
+                )?,
+            RuntimeEngine::Dp(coordinator) => {
+                let mut batch_outputs = Vec::with_capacity(token_requests.len());
+                for req in token_requests {
+                    let outputs = coordinator.generate_token_stream(req).map_err(|e| {
+                        RouterRuntimeError::Runtime(RuntimeError::InvalidState(e.to_string()))
+                    })?;
+                    batch_outputs.push(outputs);
+                }
+                batch_outputs
+            }
+        };
         Ok(batch_outputs
             .into_iter()
             .zip(prompt_tokens)
@@ -1246,7 +1414,7 @@ where
             return Err(RouterProtocolError::EmptyTextInput.into());
         }
 
-        let input_ids = self.engine.tokenize(&request.text);
+        let input_ids = self.tokenize(&request.text).token_ids;
         let mut responses = self.generate_stream_with_transfer_polling(
             RouterGenerateRequest {
                 request_id: request.request_id,
@@ -1283,8 +1451,8 @@ where
             return Err(RouterProtocolError::EmptyTextInput.into());
         }
 
-        let input_ids = self.engine.tokenize(&request.text);
-        let tokenizer = self.engine.tokenizer().clone();
+        let input_ids = self.tokenize(&request.text).token_ids;
+        let tokenizer = self.tokenizer().clone();
         let mut decoder = tokenizer.incremental_decoder();
         let mut decode_error = None;
         self.generate_stream_with_transfer_polling_sink(
@@ -1328,7 +1496,7 @@ where
                 return Err(RouterProtocolError::EmptyTextInput.into());
             }
 
-            let input_ids = self.engine.tokenize(&request.text);
+            let input_ids = self.tokenize(&request.text).token_ids;
             tokenized_requests.push(RouterGenerateRequest {
                 request_id: request.request_id,
                 tokenized: Some(RouterTokenizedInput {

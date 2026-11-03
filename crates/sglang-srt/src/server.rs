@@ -7,6 +7,9 @@ use std::path::Path;
 use crate::backend::{RuntimeBackend, validate_runtime_backend};
 use crate::cache::{CachePageAllocator, RadixCache};
 use crate::cli::ServerArgs;
+use crate::dp_coordinator::{DpCoordinator, DpCoordinatorError};
+use crate::dp_scheduler::DpScheduler;
+use crate::dp_worker_pool::DpWorkerPool;
 use crate::engine::Engine;
 use crate::engine_info_bootstrap::{
     EngineInfoBootstrapServeError, EngineInfoBootstrapService,
@@ -25,6 +28,7 @@ use crate::model_artifacts::{HfModelConfig, LocalModelArtifacts, ModelArtifactEr
 use crate::model_executor::ModelRunner;
 pub use crate::model_registry::BootstrapForwardModel;
 use crate::model_registry::{ModelRegistry, ModelRegistryError};
+use crate::parallel_topology::{Parallel4DConfig, Parallel4DTopology};
 use crate::pd_bootstrap::{
     MooncakeBootstrapKvCacheTransferExecutor, MooncakeDecodeBootstrapPublisher,
     PrefillBootstrapServeError, PrefillBootstrapService, PrefillRouteRegistration,
@@ -449,6 +453,7 @@ pub enum ServerLaunchError {
         expected: usize,
         actual: usize,
     },
+    DpCoordinator(String),
 }
 
 impl PartialEq for ServerLaunchError {
@@ -540,6 +545,7 @@ impl PartialEq for ServerLaunchError {
                     actual: right_actual,
                 },
             ) => left_expected == right_expected && left_actual == right_actual,
+            (Self::DpCoordinator(left), Self::DpCoordinator(right)) => left == right,
             _ => false,
         }
     }
@@ -617,6 +623,9 @@ impl fmt::Display for ServerLaunchError {
                 formatter,
                 "prefill Mooncake ZMQ route port count mismatch: expected {expected}, got {actual}"
             ),
+            Self::DpCoordinator(error) => {
+                write!(formatter, "DP coordinator launch error: {error}")
+            }
         }
     }
 }
@@ -708,6 +717,12 @@ impl From<ModelRegistryError> for ServerLaunchError {
 impl From<TokenizerError> for ServerLaunchError {
     fn from(value: TokenizerError) -> Self {
         Self::Tokenizer(value)
+    }
+}
+
+impl From<DpCoordinatorError> for ServerLaunchError {
+    fn from(value: DpCoordinatorError) -> Self {
+        Self::DpCoordinator(value.to_string())
     }
 }
 
@@ -975,12 +990,62 @@ pub fn build_bootstrap_grpc_router_service(args: &ServerArgs) -> BootstrapGrpcRo
     try_build_bootstrap_grpc_router_service(args).expect("bootstrap tokenizer should load")
 }
 
+pub fn try_build_bootstrap_dp_coordinator(
+    args: &ServerArgs,
+) -> Result<DpCoordinator<RuntimeTokenizer>, ServerLaunchError> {
+    let dp_size = args.dp_size;
+    let tp_size = args.tp_size.max(1);
+    let pp_size = 1;
+    let config = Parallel4DConfig::new(pp_size, dp_size, tp_size, dp_size, tp_size)
+        .map_err(|e| ServerLaunchError::DpCoordinator(format!("invalid 4D topology: {e}")))?;
+    let topology = Parallel4DTopology::new(config).map_err(|e| {
+        ServerLaunchError::DpCoordinator(format!("failed to initialize 4D topology: {e}"))
+    })?;
+
+    let mut allocators = Vec::with_capacity(dp_size);
+    for _ in 0..dp_size {
+        allocators.push(cache_page_allocator_from_server_args(args)?);
+    }
+
+    let worker_args = args.clone();
+    let worker_pool = DpWorkerPool::launch(dp_size, move |_rank| {
+        let model = bootstrap_forward_model_from_server_args(&worker_args)?;
+        let model_runner = bootstrap_model_runner(model)?;
+        Ok::<_, ServerLaunchError>(model_runner)
+    })
+    .map_err(|e| {
+        ServerLaunchError::DpCoordinator(format!("failed to launch DP worker pool: {e}"))
+    })?;
+
+    let max_batch_size = args.max_running_requests.unwrap_or(32);
+    let scheduler = DpScheduler::new(worker_pool, allocators, max_batch_size, args.page_size)
+        .map_err(|e| {
+            ServerLaunchError::DpCoordinator(format!("failed to initialize DP scheduler: {e}"))
+        })?;
+
+    let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
+        &args.model_path,
+        args.tokenizer_path.as_deref(),
+    )?;
+
+    Ok(DpCoordinator::new(tokenizer, scheduler, topology))
+}
+
 pub fn try_build_bootstrap_grpc_router_service(
     args: &ServerArgs,
 ) -> Result<BootstrapGrpcRouterService, ServerLaunchError> {
     validate_local_model_artifacts_if_present(args)?;
-    let model = bootstrap_forward_model_from_server_args(args)?;
-    try_build_bootstrap_grpc_router_service_from_model(args, model)
+    if args.dp_size > 1 {
+        let coordinator = try_build_bootstrap_dp_coordinator(args)?;
+        let server_info_attributes = server_info_attributes_from_args(args);
+        let runtime = RouterRuntime::from_dp_coordinator(coordinator)
+            .with_default_stop_token_ids(model_config_eos_token_ids(&args.model_path));
+        Ok(GrpcRouterService::with_server_args(runtime, args)
+            .with_server_info_attributes(server_info_attributes))
+    } else {
+        let model = bootstrap_forward_model_from_server_args(args)?;
+        try_build_bootstrap_grpc_router_service_from_model(args, model)
+    }
 }
 
 fn try_build_bootstrap_grpc_router_service_from_model(
@@ -1016,8 +1081,19 @@ pub fn try_build_bootstrap_http_router_service(
     args: &ServerArgs,
 ) -> Result<BootstrapHttpRouterService, ServerLaunchError> {
     validate_local_model_artifacts_if_present(args)?;
-    let model = bootstrap_forward_model_from_server_args(args)?;
-    try_build_bootstrap_http_router_service_from_model(args, model)
+    if args.dp_size > 1 {
+        let coordinator = try_build_bootstrap_dp_coordinator(args)?;
+        let server_info = http_server_info_from_args(args);
+        let runtime = RouterRuntime::from_dp_coordinator(coordinator)
+            .with_default_stop_token_ids(model_config_eos_token_ids(&args.model_path));
+        Ok(
+            HttpRouterService::new(runtime, RouterGetModelInfoResponse::from_server_args(args))
+                .with_server_info(server_info),
+        )
+    } else {
+        let model = bootstrap_forward_model_from_server_args(args)?;
+        try_build_bootstrap_http_router_service_from_model(args, model)
+    }
 }
 
 fn try_build_bootstrap_http_router_service_from_model(

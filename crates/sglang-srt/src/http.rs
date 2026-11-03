@@ -191,7 +191,7 @@ where
     T: Tokenizer + Send + 'static,
     W: WorkerExecutor + Send + 'static,
 {
-    fn into_router(self) -> Router {
+    pub fn into_router(self) -> Router {
         let enable_metrics = self.server_info.enable_metrics;
         let router = Router::new()
             .route("/health", get(health))
