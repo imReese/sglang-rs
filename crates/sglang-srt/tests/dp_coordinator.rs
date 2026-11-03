@@ -45,7 +45,7 @@ impl FallibleModelWorker for CountingWorker {
 }
 
 #[test]
-fn test_4_worker_dp_coordinator_continuous_batching() {
+fn dp_coordinator_executes_continuous_batching_across_workers() {
     let dp_size = 4;
     let config = Parallel4DConfig::new(1, dp_size, 1, dp_size, 1).unwrap();
     let topology = Parallel4DTopology::new(config).unwrap();

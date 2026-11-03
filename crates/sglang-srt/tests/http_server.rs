@@ -12,8 +12,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode};
 use serde_json::Value;
 use tokio::sync::oneshot;
+use tower::ServiceExt;
 use zeromq::{PullSocket, Socket, SocketRecv};
 
 use sglang_srt::cache::{CachePageAllocator, RadixCache};
@@ -31,7 +34,8 @@ use sglang_srt::server::test_support::{
     build_reference_pd_http_router_service, build_reference_prefill_http_router_service,
 };
 use sglang_srt::server::{
-    ServerLaunchError, launch_http_server_with_shutdown, register_prefill_mooncake_routes_from_args,
+    ServerLaunchError, launch_http_server_with_shutdown,
+    register_prefill_mooncake_routes_from_args, try_build_bootstrap_http_router_service,
 };
 use sglang_srt::tokenizer::ByteTokenizer;
 use sglang_srt::transfer::{
@@ -47,6 +51,10 @@ use sglang_srt::worker::{
     BatchGeneratedTokens, FallibleModelWorker, GeneratedToken, ModelWorker, WorkerExecutionError,
     WorkerWeightUpdateRequest,
 };
+
+mod support {
+    pub mod qwen3_nonzero;
+}
 
 #[derive(Default)]
 struct HttpTwoStepWorker;
@@ -3200,6 +3208,197 @@ async fn prefill_http_launch_registers_mooncake_zmq_routes() {
         .await
         .expect("server task should join")
         .expect("servers should stop cleanly");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_server_data_parallel_inference() {
+    let model_dir = temp_model_dir("http-data-parallel-inference");
+    support::qwen3_nonzero::write_model(&model_dir);
+
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_dir.to_str().expect("temp model path"),
+        "--served-model-name",
+        "qwen3-dp",
+        "--device",
+        "cpu",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--dp-size",
+        "2",
+        "--page-size",
+        "4",
+        "--max-running-requests",
+        "8",
+    ])
+    .expect("args parse");
+
+    let service = try_build_bootstrap_http_router_service(&args)
+        .expect("bootstrap http router service should initialize with DP size 2");
+
+    let router = service.into_router();
+
+    // 1. Health check
+    let res = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .expect("request build"),
+        )
+        .await
+        .expect("oneshot call");
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // 2. Server info exposes data parallel rank configuration
+    let res = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/get_server_info")
+                .body(Body::empty())
+                .expect("request build"),
+        )
+        .await
+        .expect("oneshot call");
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = to_bytes(res.into_body(), usize::MAX)
+        .await
+        .expect("body read");
+    let server_info: Value = serde_json::from_slice(&bytes).expect("json parse");
+    assert_eq!(server_info["dp_size"], 2);
+
+    // 3. Worker loads report available cache pages across DP workers
+    let res = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/get_loads")
+                .body(Body::empty())
+                .expect("request build"),
+        )
+        .await
+        .expect("oneshot call");
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = to_bytes(res.into_body(), usize::MAX)
+        .await
+        .expect("body read");
+    let load_info: Value = serde_json::from_slice(&bytes).expect("json parse");
+    assert_eq!(load_info["loads"][0]["waiting_queue_depth"], 0);
+    assert_eq!(load_info["loads"][0]["decode_queue_depth"], 0);
+    assert!(
+        load_info["loads"][0]["available_cache_pages"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+
+    // 4. Data parallel generate inference
+    let generate_payload = serde_json::json!({
+        "text": "hello",
+        "sampling_params": {
+            "max_new_tokens": 2,
+            "temperature": 0.7
+        }
+    });
+    let res = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&generate_payload).unwrap()))
+                .expect("request build"),
+        )
+        .await
+        .expect("oneshot call");
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = to_bytes(res.into_body(), usize::MAX)
+        .await
+        .expect("body read");
+    let gen_res: Value = serde_json::from_slice(&bytes).expect("json parse");
+    assert!(gen_res.get("text").is_some());
+    assert!(gen_res["usage"]["prompt_tokens"].as_i64().unwrap() > 0);
+    assert_eq!(gen_res["usage"]["completion_tokens"], 2);
+
+    // 5. Data parallel streaming generation
+    let stream_payload = serde_json::json!({
+        "text": "hello",
+        "stream": true,
+        "sampling_params": {
+            "max_new_tokens": 2,
+            "temperature": 0.7
+        }
+    });
+    let res = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&stream_payload).unwrap()))
+                .expect("request build"),
+        )
+        .await
+        .expect("oneshot call");
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = to_bytes(res.into_body(), usize::MAX)
+        .await
+        .expect("body read");
+    let stream_text = String::from_utf8_lossy(&bytes);
+    assert!(stream_text.contains("data: "));
+
+    // 6. Data parallel OpenAI completions inference
+    let completions_payload = serde_json::json!({
+        "model": "qwen3-dp",
+        "prompt": "hello",
+        "max_tokens": 2,
+        "temperature": 0.7
+    });
+    let res = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&completions_payload).unwrap(),
+                ))
+                .expect("request build"),
+        )
+        .await
+        .expect("oneshot call");
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = to_bytes(res.into_body(), usize::MAX)
+        .await
+        .expect("body read");
+    let comp_res: Value = serde_json::from_slice(&bytes).expect("json parse");
+    assert_eq!(comp_res["object"], "text_completion");
+    assert_eq!(comp_res["model"], "qwen3-dp");
+    assert_eq!(comp_res["choices"][0]["index"], 0);
+
+    // 7. Flush cache across DP workers
+    let res = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/flush_cache")
+                .body(Body::empty())
+                .expect("request build"),
+        )
+        .await
+        .expect("oneshot call");
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let _ = fs::remove_dir_all(model_dir);
 }
 
 fn kv_args_frame(session_id: &str, dst_kv_ptrs: &[u64], dst_kv_item_len: usize) -> Vec<Vec<u8>> {
