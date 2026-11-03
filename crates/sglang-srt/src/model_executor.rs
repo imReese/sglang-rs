@@ -312,6 +312,16 @@ impl ModelForwardOutput {
         &self.logits
     }
 
+    pub fn truncate_to_batch_size(&self, batch_size: usize) -> Result<Self, ModelForwardError> {
+        if batch_size > self.logits.len() {
+            return Err(ModelForwardError::BatchSizeMismatch {
+                request_count: batch_size,
+                output_count: self.logits.len(),
+            });
+        }
+        Self::new(self.logits[..batch_size].to_vec())
+    }
+
     fn into_logits(self) -> Vec<Vec<f32>> {
         self.logits
     }
