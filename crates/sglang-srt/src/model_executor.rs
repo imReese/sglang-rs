@@ -152,26 +152,54 @@ impl ModelWorkerBatch {
         match forward_mode {
             ForwardMode::Prefill => self.push_prefill_request(request),
             ForwardMode::Decode => self.push_decode_request(request),
+            ForwardMode::Mixed => match request.stage() {
+                crate::scheduler::RequestStage::PrefillForward => {
+                    self.push_prefill_request(request)
+                }
+                crate::scheduler::RequestStage::DecodeForward => self.push_decode_request(request),
+                _ => {
+                    if request.output_ids().is_empty() {
+                        self.push_prefill_request(request);
+                    } else {
+                        self.push_decode_request(request);
+                    }
+                }
+            },
         }
     }
 
     fn push_prefill_request(&mut self, request: &ScheduledRequest) {
-        let prefix_len = request.prefix_cache_pages().len();
-        let uncached_input_ids = request.uncached_input_ids();
+        let chunk_len = if request.current_chunk_len() > 0 {
+            request.current_chunk_len()
+        } else {
+            request.uncached_input_ids().len()
+        };
+        let start_pos = request
+            .prompt_tokens_processed()
+            .max(request.prefix_cache_pages().len());
+        let end_pos = (start_pos + chunk_len).min(request.input_ids().len());
+        let effective_chunk_len = end_pos.saturating_sub(start_pos);
+
         self.sequence_offsets.push(self.sequence_token_ids.len());
         self.sequence_token_ids
-            .extend_from_slice(request.input_ids());
-        self.sequence_token_counts.push(request.input_ids().len());
-        self.sequence_cache_pages
-            .extend_from_slice(request.sequence_cache_pages());
+            .extend_from_slice(&request.input_ids()[..end_pos]);
+        self.sequence_token_counts.push(end_pos);
+        if request.sequence_cache_pages().is_empty() {
+            self.sequence_cache_pages
+                .extend_from_slice(request.sequence_cache_pages());
+        } else {
+            let end_slice = end_pos.min(request.sequence_cache_pages().len());
+            self.sequence_cache_pages
+                .extend_from_slice(&request.sequence_cache_pages()[..end_slice]);
+        }
 
-        self.input_ids.extend_from_slice(uncached_input_ids);
-        self.input_token_counts.push(uncached_input_ids.len());
+        self.input_ids
+            .extend_from_slice(&request.input_ids()[start_pos..end_pos]);
+        self.input_token_counts.push(effective_chunk_len);
         self.out_cache_pages
             .extend_from_slice(request.forward_cache_pages());
-        self.positions
-            .extend(prefix_len..prefix_len + uncached_input_ids.len());
-        self.sequence_lengths.push(request.input_ids().len());
+        self.positions.extend(start_pos..end_pos);
+        self.sequence_lengths.push(end_pos);
     }
 
     fn push_decode_request(&mut self, request: &ScheduledRequest) {

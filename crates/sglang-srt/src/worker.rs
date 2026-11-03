@@ -308,6 +308,7 @@ where
         match batch.forward_mode() {
             ForwardMode::Prefill => self.prefill.try_generate_batch(batch),
             ForwardMode::Decode => self.decode.try_generate_batch(batch),
+            ForwardMode::Mixed => self.prefill.try_generate_batch(batch),
         }
     }
 

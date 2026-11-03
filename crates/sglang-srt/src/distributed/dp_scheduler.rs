@@ -3,12 +3,14 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
+use std::sync::Arc;
 
 use crate::cache::{CacheAllocationError, CachePageAllocator, RadixCache};
 use crate::dp_worker_pool::{DpWorkerEvent, DpWorkerPool, DpWorkerPoolError};
 use crate::scheduler::{
     ForwardMode, RequestStage, ScheduleBatch, ScheduledOutput, ScheduledRequest,
 };
+use crate::transfer::{BlockStoredEvent, KvStateEventPublisher};
 use crate::types::RequestId;
 use crate::worker::WorkerExecutionError;
 
@@ -25,6 +27,8 @@ pub struct DpScheduler {
     step_outputs: Vec<ScheduledOutput>,
     max_batch_size: usize,
     page_size: usize,
+    chunked_prefill_size: Option<usize>,
+    event_publisher: Option<Arc<dyn KvStateEventPublisher>>,
 }
 
 impl DpScheduler {
@@ -58,7 +62,27 @@ impl DpScheduler {
             step_outputs: Vec::new(),
             max_batch_size,
             page_size,
+            chunked_prefill_size: None,
+            event_publisher: None,
         })
+    }
+
+    pub fn with_chunked_prefill_size(mut self, chunk_size: Option<usize>) -> Self {
+        self.chunked_prefill_size = chunk_size;
+        self
+    }
+
+    pub fn with_event_publisher(mut self, publisher: Arc<dyn KvStateEventPublisher>) -> Self {
+        self.event_publisher = Some(publisher);
+        self
+    }
+
+    pub fn chunked_prefill_size(&self) -> Option<usize> {
+        self.chunked_prefill_size
+    }
+
+    pub fn event_publisher(&self) -> Option<&Arc<dyn KvStateEventPublisher>> {
+        self.event_publisher.as_ref()
     }
 
     pub fn dp_size(&self) -> usize {
@@ -256,19 +280,51 @@ impl DpScheduler {
         batch: ScheduleBatch,
         generated: crate::worker::BatchGeneratedTokens,
     ) -> Result<(), DpSchedulerError> {
-        let is_prefill = batch.forward_mode() == ForwardMode::Prefill;
+        let forward_mode = batch.forward_mode();
 
         for (mut request, token) in batch
             .into_requests()
             .into_iter()
             .zip(generated.into_tokens())
         {
-            if is_prefill {
-                // Insert completed prompt into the global shared prefix cache!
-                if !request.skips_radix_cache_insert() {
-                    let _ = self
-                        .prefix_cache
-                        .insert(request.input_ids(), request.sequence_cache_pages());
+            let is_prefill_forward = request.stage() == RequestStage::PrefillForward
+                || (forward_mode == ForwardMode::Prefill && request.output_ids().is_empty());
+
+            if is_prefill_forward {
+                let chunk_len = if request.current_chunk_len() > 0 {
+                    request.current_chunk_len()
+                } else {
+                    request.uncached_input_ids().len()
+                };
+                let prev_processed = request.prompt_tokens_processed();
+                request.advance_prompt_tokens(chunk_len);
+                let new_processed = request.prompt_tokens_processed();
+
+                if !request.skips_radix_cache_insert() && new_processed > 0 {
+                    let end = new_processed.min(request.sequence_cache_pages().len());
+                    let _ = self.prefix_cache.insert(
+                        &request.input_ids()[..end],
+                        &request.sequence_cache_pages()[..end],
+                    );
+                }
+
+                if let Some(publisher) = &self.event_publisher {
+                    let event = BlockStoredEvent::from_chunk(
+                        request.request_id().clone(),
+                        request.input_ids(),
+                        prev_processed..new_processed,
+                        self.page_size,
+                        request.data_parallel_rank(),
+                    );
+                    publisher.publish_block_stored(&event);
+                }
+
+                if !request.is_prefill_complete() {
+                    // Intermediate prefill chunk completed: put back to waiting queue
+                    request.clear_forward_chunk_tracking();
+                    request.set_stage(RequestStage::PrefillWaiting);
+                    self.waiting_queue.push_front(request);
+                    continue;
                 }
             }
 
@@ -287,7 +343,7 @@ impl DpScheduler {
                 if let Some(allocator) = self.allocators.get_mut(rank) {
                     let owned_slots = request
                         .sequence_cache_pages()
-                        .get(request.input_ids().len()..)
+                        .get(request.cached_token_count()..)
                         .unwrap_or_default();
                     allocator.release(owned_slots);
                 }
@@ -299,6 +355,7 @@ impl DpScheduler {
                 });
             } else {
                 // Request continues: move to decode queue pinned to this rank
+                request.clear_forward_chunk_tracking();
                 request.set_stage(RequestStage::DecodeWaiting);
                 request.set_data_parallel_rank(rank as i32);
                 self.decode_queue.push_back(request);
@@ -318,9 +375,9 @@ impl DpScheduler {
             .ok_or(DpSchedulerError::InvalidRank(rank))?;
 
         // 1. Prioritize decode requests pinned to this rank
-        let mut decode_requests = Vec::new();
+        let mut batch_requests = Vec::new();
         let mut i = 0;
-        while i < self.decode_queue.len() && decode_requests.len() < self.max_batch_size {
+        while i < self.decode_queue.len() && batch_requests.len() < self.max_batch_size {
             if self.decode_queue[i].data_parallel_rank() == rank as i32 {
                 if let Some(mut req) = self.decode_queue.remove(i) {
                     let allocated =
@@ -336,73 +393,79 @@ impl DpScheduler {
                     req.set_allocated_cache_pages(allocated.clone());
                     req.append_sequence_cache_pages(&allocated);
                     req.set_stage(RequestStage::DecodeForward);
-                    decode_requests.push(req);
+                    batch_requests.push(req);
                 }
             } else {
                 i += 1;
             }
         }
 
-        if !decode_requests.is_empty() {
-            return Ok(Some(ScheduleBatch::decode(decode_requests)));
-        }
-
-        // 2. Otherwise form prefill batch from global waiting queue
-        if self.waiting_queue.is_empty() {
-            return Ok(None);
-        }
-
-        let allocator = self
-            .allocators
-            .get_mut(rank)
-            .ok_or(DpSchedulerError::InvalidRank(rank))?;
-
-        let mut prefill_requests = Vec::new();
-
-        while prefill_requests.len() < self.max_batch_size {
+        // 2. Piggyback prefill chunk(s) if capacity remains in batch
+        let chunk_budget = self.chunked_prefill_size.unwrap_or(usize::MAX);
+        while batch_requests.len() < self.max_batch_size && !self.waiting_queue.is_empty() {
             let Some(mut req) = self.waiting_queue.pop_front() else {
                 break;
             };
 
-            // Match against the unified shared RadixCache
-            let prefix_match = self
-                .prefix_cache
-                .match_prefix_page_aligned(req.input_ids(), self.page_size);
+            // If start of request, match prefix against shared RadixCache
+            if req.prompt_tokens_processed() == 0 {
+                let prefix_match = self
+                    .prefix_cache
+                    .match_prefix_page_aligned(req.input_ids(), self.page_size);
+                let cached_token_count = prefix_match.matched_token_count;
+                req.set_cache_hit_token_count(cached_token_count);
+                req.set_prompt_tokens_processed(cached_token_count);
+                req.set_sequence_cache_pages(prefix_match.cache_pages.clone());
+                req.apply_prefix_match(prefix_match);
+            }
 
-            let cached_token_count = prefix_match.matched_token_count;
-            let uncached_count = prefix_match.remaining_input_ids.len();
+            let remaining = req.remaining_prompt_tokens();
+            let chunk_len = remaining.min(chunk_budget);
+            if chunk_len == 0 {
+                self.waiting_queue.push_front(req);
+                break;
+            }
 
-            let allocated = match allocator.allocate(uncached_count) {
-                Ok(pages) => pages,
-                Err(CacheAllocationError::OutOfSlots { .. }) => {
-                    // Not enough cache pages on this rank: put back and stop batch
-                    self.waiting_queue.push_front(req);
-                    break;
-                }
-                Err(err) => return Err(DpSchedulerError::CacheAllocation(err)),
-            };
-
-            let mut seq_pages =
-                Vec::with_capacity(prefix_match.cache_pages.len() + allocated.len());
-            seq_pages.extend_from_slice(&prefix_match.cache_pages);
-            seq_pages.extend_from_slice(&allocated);
+            let allocated =
+                match allocator.allocate_for_sequence(req.sequence_cache_pages(), chunk_len) {
+                    Ok(pages) => pages,
+                    Err(CacheAllocationError::OutOfSlots { .. }) => {
+                        self.waiting_queue.push_front(req);
+                        break;
+                    }
+                    Err(err) => return Err(DpSchedulerError::CacheAllocation(err)),
+                };
 
             req.set_forward_cache_pages(allocated.clone());
-            req.set_allocated_cache_pages(allocated);
-            req.set_sequence_cache_pages(seq_pages);
-            req.set_cache_hit_token_count(cached_token_count);
-            req.apply_prefix_match(prefix_match);
+            req.set_allocated_cache_pages(allocated.clone());
+            req.append_sequence_cache_pages(&allocated);
+            req.set_current_chunk_len(chunk_len);
             req.set_stage(RequestStage::PrefillForward);
             req.set_data_parallel_rank(rank as i32);
 
-            prefill_requests.push(req);
+            batch_requests.push(req);
         }
 
-        if prefill_requests.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(ScheduleBatch::prefill(prefill_requests)))
+        if batch_requests.is_empty() {
+            return Ok(None);
         }
+
+        let has_prefill = batch_requests
+            .iter()
+            .any(|r| r.stage() == RequestStage::PrefillForward);
+        let has_decode = batch_requests
+            .iter()
+            .any(|r| r.stage() == RequestStage::DecodeForward);
+
+        let batch = if has_prefill && has_decode {
+            ScheduleBatch::mixed(batch_requests)
+        } else if has_prefill {
+            ScheduleBatch::prefill(batch_requests)
+        } else {
+            ScheduleBatch::decode(batch_requests)
+        };
+
+        Ok(Some(batch))
     }
 }
 

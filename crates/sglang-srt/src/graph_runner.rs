@@ -175,6 +175,43 @@ impl ModelInputDescriptor {
                         slot_mapping.push(0);
                     }
                 }
+                ForwardMode::Mixed => {
+                    if req.stage() == crate::scheduler::RequestStage::DecodeForward
+                        || !req.output_ids().is_empty()
+                    {
+                        let last_token = req
+                            .output_ids()
+                            .last()
+                            .copied()
+                            .or_else(|| req.input_ids().last().copied())
+                            .unwrap_or(0);
+
+                        let seq_len = req.input_ids().len() + req.output_ids().len();
+                        context_lens.push(seq_len);
+                        input_ids.push(last_token);
+                        positions.push(seq_len.saturating_sub(1));
+
+                        if let Some(slot) = req.forward_cache_pages().first() {
+                            slot_mapping.push(slot.as_usize());
+                        } else {
+                            slot_mapping.push(0);
+                        }
+                    } else {
+                        let uncached = req.uncached_input_ids();
+                        let prefix_len = req.forward_prefix_token_count();
+                        let total_seq_len = req.input_ids().len();
+                        context_lens.push(total_seq_len);
+
+                        for (offset, &token_id) in uncached.iter().enumerate() {
+                            input_ids.push(token_id);
+                            positions.push(prefix_len + offset);
+                        }
+
+                        for slot in req.forward_cache_pages() {
+                            slot_mapping.push(slot.as_usize());
+                        }
+                    }
+                }
             }
 
             // Extract unique physical block page indices
@@ -343,6 +380,7 @@ where
             let batch = match descriptor.forward_mode() {
                 ForwardMode::Prefill => ScheduleBatch::prefill(reqs),
                 ForwardMode::Decode => ScheduleBatch::decode(reqs),
+                ForwardMode::Mixed => ScheduleBatch::mixed(reqs),
             };
             crate::model_executor::ModelWorkerBatch::from_schedule_batch(&batch)
         };

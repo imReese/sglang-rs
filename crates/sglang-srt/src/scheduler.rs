@@ -1,10 +1,13 @@
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::cache::{
     CacheAllocationError, CachePageAllocator, CachePageId, PrefixMatch, RadixCache,
 };
-use crate::transfer::{KvCacheTransferError, KvTransferPollSummary};
+use crate::transfer::{
+    BlockStoredEvent, KvCacheTransferError, KvStateEventPublisher, KvTransferPollSummary,
+};
 use crate::types::{DisaggregatedParams, FAKE_BOOTSTRAP_HOST, RequestId, SamplingParams};
 use crate::worker::{DecodeRequestState, GeneratedToken, WorkerExecutionError, WorkerExecutor};
 
@@ -21,6 +24,7 @@ pub enum RequestStage {
 pub enum ForwardMode {
     Prefill,
     Decode,
+    Mixed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,6 +47,8 @@ pub struct ScheduledRequest {
     data_parallel_rank: i32,
     prefix_match: PrefixMatch,
     stage: RequestStage,
+    prompt_tokens_processed: usize,
+    current_chunk_len: usize,
 }
 
 impl ScheduledRequest {
@@ -65,6 +71,8 @@ impl ScheduledRequest {
                 remaining_input_ids,
             },
             stage: RequestStage::PrefillWaiting,
+            prompt_tokens_processed: 0,
+            current_chunk_len: 0,
         }
     }
 
@@ -179,6 +187,43 @@ impl ScheduledRequest {
         self.sequence_cache_pages.extend_from_slice(cache_pages);
     }
 
+    pub fn prompt_tokens_processed(&self) -> usize {
+        self.prompt_tokens_processed
+    }
+
+    pub fn current_chunk_len(&self) -> usize {
+        self.current_chunk_len
+    }
+
+    pub fn is_prefill_complete(&self) -> bool {
+        self.prompt_tokens_processed >= self.input_ids.len()
+    }
+
+    pub fn remaining_prompt_tokens(&self) -> usize {
+        self.input_ids
+            .len()
+            .saturating_sub(self.prompt_tokens_processed)
+    }
+
+    pub(crate) fn set_prompt_tokens_processed(&mut self, count: usize) {
+        self.prompt_tokens_processed = count;
+    }
+
+    pub(crate) fn set_current_chunk_len(&mut self, len: usize) {
+        self.current_chunk_len = len;
+    }
+
+    pub(crate) fn advance_prompt_tokens(&mut self, count: usize) {
+        self.prompt_tokens_processed =
+            (self.prompt_tokens_processed + count).min(self.input_ids.len());
+    }
+
+    pub(crate) fn clear_forward_chunk_tracking(&mut self) {
+        self.allocated_cache_pages.clear();
+        self.forward_cache_pages.clear();
+        self.current_chunk_len = 0;
+    }
+
     pub(crate) fn clear_forward_cache_allocation(&mut self) {
         let allocated_page_count = self.allocated_cache_pages.len();
         if allocated_page_count > 0 {
@@ -190,6 +235,7 @@ impl ScheduledRequest {
         }
         self.allocated_cache_pages.clear();
         self.forward_cache_pages.clear();
+        self.current_chunk_len = 0;
     }
 
     pub(crate) fn append_output_ids(&mut self, output_ids: &[u32]) {
@@ -263,6 +309,8 @@ pub struct Scheduler<W> {
     pending_prefix_cache_inserts: Vec<ScheduledRequest>,
     cache_page_allocator: Option<CachePageAllocator>,
     max_running_requests: Option<usize>,
+    chunked_prefill_size: Option<usize>,
+    event_publisher: Option<Arc<dyn KvStateEventPublisher>>,
     worker: W,
 }
 
@@ -273,16 +321,23 @@ pub struct ScheduleBatch {
 }
 
 impl ScheduleBatch {
-    pub(crate) fn prefill(requests: Vec<ScheduledRequest>) -> Self {
+    pub fn prefill(requests: Vec<ScheduledRequest>) -> Self {
         Self {
             forward_mode: ForwardMode::Prefill,
             requests,
         }
     }
 
-    pub(crate) fn decode(requests: Vec<ScheduledRequest>) -> Self {
+    pub fn decode(requests: Vec<ScheduledRequest>) -> Self {
         Self {
             forward_mode: ForwardMode::Decode,
+            requests,
+        }
+    }
+
+    pub fn mixed(requests: Vec<ScheduledRequest>) -> Self {
+        Self {
+            forward_mode: ForwardMode::Mixed,
             requests,
         }
     }
@@ -325,6 +380,8 @@ impl<W> Scheduler<W> {
             pending_prefix_cache_inserts: Vec::new(),
             cache_page_allocator: None,
             max_running_requests: None,
+            chunked_prefill_size: None,
+            event_publisher: None,
             worker,
         }
     }
@@ -342,6 +399,8 @@ impl<W> Scheduler<W> {
             pending_prefix_cache_inserts: Vec::new(),
             cache_page_allocator: Some(cache_page_allocator),
             max_running_requests: None,
+            chunked_prefill_size: None,
+            event_publisher: None,
             worker,
         }
     }
@@ -360,8 +419,28 @@ impl<W> Scheduler<W> {
             pending_prefix_cache_inserts: Vec::new(),
             cache_page_allocator: Some(cache_page_allocator),
             max_running_requests: None,
+            chunked_prefill_size: None,
+            event_publisher: None,
             worker,
         }
+    }
+
+    pub fn with_chunked_prefill_size(mut self, chunk_size: Option<usize>) -> Self {
+        self.chunked_prefill_size = chunk_size;
+        self
+    }
+
+    pub fn chunked_prefill_size(&self) -> Option<usize> {
+        self.chunked_prefill_size
+    }
+
+    pub fn with_event_publisher(mut self, publisher: Arc<dyn KvStateEventPublisher>) -> Self {
+        self.event_publisher = Some(publisher);
+        self
+    }
+
+    pub fn event_publisher(&self) -> Option<&Arc<dyn KvStateEventPublisher>> {
+        self.event_publisher.as_ref()
     }
 
     pub fn with_max_running_requests(mut self, max_running_requests: Option<usize>) -> Self {
@@ -371,6 +450,10 @@ impl<W> Scheduler<W> {
 
     pub fn max_running_requests(&self) -> Option<usize> {
         self.max_running_requests
+    }
+
+    pub fn prefix_cache(&self) -> &RadixCache {
+        &self.prefix_cache
     }
 
     pub fn enqueue(&mut self, request: ScheduledRequest) {
@@ -480,20 +563,27 @@ impl<W> Scheduler<W> {
         let max_batch_size = max_batch_size.min(self.remaining_running_request_capacity()?);
         let mut requests = Vec::with_capacity(max_batch_size.min(self.waiting_queue.len()));
         let mut uncached_token_count = 0;
+        let chunk_budget = self.chunked_prefill_size.unwrap_or(usize::MAX);
 
         while requests.len() < max_batch_size {
             let Some(mut request) = self.waiting_queue.pop_front() else {
                 break;
             };
-            if let Err(error) = self.prepare_prefill_request(&mut request) {
+
+            if let Err(error) = self.prepare_prefill_request_chunk(&mut request, chunk_budget) {
                 self.restore_failed_prefill_attempt(requests, request);
                 return Err(error);
             }
-            let request_uncached_tokens = request.uncached_input_ids().len();
+            let request_uncached_tokens = request.current_chunk_len();
 
             if !requests.is_empty()
                 && uncached_token_count + request_uncached_tokens > max_uncached_tokens
             {
+                if let Some(allocator) = self.cache_page_allocator.as_mut() {
+                    allocator.release(request.allocated_cache_pages());
+                }
+                request.clear_forward_cache_allocation();
+                request.set_stage(RequestStage::PrefillWaiting);
                 self.waiting_queue.push_front(request);
                 break;
             }
@@ -507,7 +597,7 @@ impl<W> Scheduler<W> {
                 .waiting_queue
                 .pop_front()
                 .ok_or(SchedulerError::EmptyQueue)?;
-            if let Err(error) = self.prepare_prefill_request(&mut request) {
+            if let Err(error) = self.prepare_prefill_request_chunk(&mut request, chunk_budget) {
                 self.waiting_queue.push_front(request);
                 return Err(error);
             }
@@ -532,69 +622,86 @@ impl<W> Scheduler<W> {
         Ok(remaining)
     }
 
+    #[allow(dead_code)]
     fn prepare_prefill_request(
         &mut self,
         request: &mut ScheduledRequest,
+    ) -> Result<(), SchedulerError> {
+        let max_chunk_tokens = self.chunked_prefill_size.unwrap_or(usize::MAX);
+        self.prepare_prefill_request_chunk(request, max_chunk_tokens)
+    }
+
+    fn prepare_prefill_request_chunk(
+        &mut self,
+        request: &mut ScheduledRequest,
+        max_chunk_tokens: usize,
     ) -> Result<(), SchedulerError> {
         let page_size = self
             .cache_page_allocator
             .as_ref()
             .map(CachePageAllocator::page_size)
             .unwrap_or(1);
-        let mut prefix_match = match self.prefix_cache_policy {
-            PrefixCachePolicy::Enabled => self
-                .prefix_cache
-                .match_prefix_page_aligned(request.input_ids(), page_size),
-            PrefixCachePolicy::Disabled => PrefixMatch {
-                matched_token_count: 0,
-                cache_pages: Vec::new(),
-                remaining_input_ids: request.input_ids().to_vec(),
-            },
-        };
-        let cache_hit_token_count = prefix_match.matched_token_count;
-        let replay_cache_page = if request.disaggregated_params().is_none()
-            && !request.input_ids().is_empty()
-            && prefix_match.remaining_input_ids.is_empty()
-        {
-            prefix_match.matched_token_count -= 1;
-            prefix_match
-                .remaining_input_ids
-                .push(*request.input_ids().last().expect("input is not empty"));
-            Some(
+
+        if request.prompt_tokens_processed() == 0 {
+            let mut prefix_match = match self.prefix_cache_policy {
+                PrefixCachePolicy::Enabled => self
+                    .prefix_cache
+                    .match_prefix_page_aligned(request.input_ids(), page_size),
+                PrefixCachePolicy::Disabled => PrefixMatch {
+                    matched_token_count: 0,
+                    cache_pages: Vec::new(),
+                    remaining_input_ids: request.input_ids().to_vec(),
+                },
+            };
+            let cache_hit_token_count = prefix_match.matched_token_count;
+            let replay_cache_page = if request.disaggregated_params().is_none()
+                && !request.input_ids().is_empty()
+                && prefix_match.remaining_input_ids.is_empty()
+            {
+                prefix_match.matched_token_count -= 1;
                 prefix_match
-                    .cache_pages
-                    .pop()
-                    .expect("fully matched prefix must have a cache page"),
-            )
-        } else {
-            None
-        };
-        let uncached_token_count = if replay_cache_page.is_some() {
-            0
-        } else {
-            prefix_match.remaining_input_ids.len()
-        };
+                    .remaining_input_ids
+                    .push(*request.input_ids().last().expect("input is not empty"));
+                Some(
+                    prefix_match
+                        .cache_pages
+                        .pop()
+                        .expect("fully matched prefix must have a cache page"),
+                )
+            } else {
+                None
+            };
+
+            let mut sequence_cache_pages = prefix_match.cache_pages.clone();
+            if let Some(replay_cache_page) = replay_cache_page {
+                sequence_cache_pages.push(replay_cache_page);
+                request.set_forward_cache_pages(vec![replay_cache_page]);
+            }
+            request.set_cache_hit_token_count(cache_hit_token_count);
+            request.set_prompt_tokens_processed(prefix_match.matched_token_count);
+            request.apply_prefix_match(prefix_match);
+            request.set_sequence_cache_pages(sequence_cache_pages);
+
+            if replay_cache_page.is_some() {
+                request.set_current_chunk_len(1);
+                request.set_stage(RequestStage::PrefillForward);
+                return Ok(());
+            }
+        }
+
+        let remaining = request.remaining_prompt_tokens();
+        let chunk_len = remaining.min(max_chunk_tokens);
         let allocated_cache_pages = match self.cache_page_allocator.as_mut() {
-            Some(allocator) => allocator.allocate(uncached_token_count)?,
+            Some(allocator) => {
+                allocator.allocate_for_sequence(request.sequence_cache_pages(), chunk_len)?
+            }
             None => Vec::new(),
         };
-        let mut sequence_cache_pages = Vec::with_capacity(
-            prefix_match.cache_pages.len()
-                + usize::from(replay_cache_page.is_some())
-                + allocated_cache_pages.len(),
-        );
-        sequence_cache_pages.extend_from_slice(&prefix_match.cache_pages);
-        if let Some(replay_cache_page) = replay_cache_page {
-            sequence_cache_pages.push(replay_cache_page);
-            request.set_forward_cache_pages(vec![replay_cache_page]);
-        } else {
-            request.set_forward_cache_pages(allocated_cache_pages.clone());
-        }
-        sequence_cache_pages.extend_from_slice(&allocated_cache_pages);
-        request.set_cache_hit_token_count(cache_hit_token_count);
-        request.apply_prefix_match(prefix_match);
-        request.set_allocated_cache_pages(allocated_cache_pages);
-        request.set_sequence_cache_pages(sequence_cache_pages);
+
+        request.set_forward_cache_pages(allocated_cache_pages.clone());
+        request.set_allocated_cache_pages(allocated_cache_pages.clone());
+        request.append_sequence_cache_pages(&allocated_cache_pages);
+        request.set_current_chunk_len(chunk_len);
         request.set_stage(RequestStage::PrefillForward);
         Ok(())
     }
@@ -602,19 +709,20 @@ impl<W> Scheduler<W> {
     fn restore_failed_prefill_attempt(
         &mut self,
         prepared_requests: Vec<ScheduledRequest>,
-        failed_request: ScheduledRequest,
+        mut failed_request: ScheduledRequest,
     ) {
         if let Some(allocator) = self.cache_page_allocator.as_mut() {
+            allocator.release(failed_request.allocated_cache_pages());
             for request in prepared_requests.iter() {
                 allocator.release(request.allocated_cache_pages());
             }
         }
 
+        failed_request.clear_forward_cache_allocation();
+        failed_request.set_stage(RequestStage::PrefillWaiting);
         self.waiting_queue.push_front(failed_request);
         for mut request in prepared_requests.into_iter().rev() {
-            request.set_allocated_cache_pages(Vec::new());
-            request.set_forward_cache_pages(Vec::new());
-            request.set_sequence_cache_pages(Vec::new());
+            request.clear_forward_cache_allocation();
             request.set_stage(RequestStage::PrefillWaiting);
             self.waiting_queue.push_front(request);
         }
@@ -812,6 +920,128 @@ where
         Ok(ScheduleBatch::decode(requests))
     }
 
+    pub fn next_mixed_batch(
+        &mut self,
+        max_batch_size: usize,
+        token_budget: usize,
+    ) -> Result<ScheduleBatch, SchedulerError> {
+        if (self.decode_queue.is_empty() && self.waiting_queue.is_empty()) || max_batch_size == 0 {
+            return Err(SchedulerError::EmptyQueue);
+        }
+
+        let mut requests = Vec::new();
+        let mut tokens_used = 0;
+
+        // 1. Prioritize runnable decode requests (1 token each)
+        while requests.len() < max_batch_size
+            && tokens_used < token_budget
+            && !self.decode_queue.is_empty()
+        {
+            let Some(next_request) = self.decode_queue.front() else {
+                break;
+            };
+
+            match self.worker.decode_request_state(next_request)? {
+                DecodeRequestState::Ready => {}
+                DecodeRequestState::Pending => break,
+                DecodeRequestState::Failed(message) => {
+                    return Err(SchedulerError::Worker(WorkerExecutionError::Runtime(
+                        message,
+                    )));
+                }
+            }
+
+            let mut request = self
+                .decode_queue
+                .pop_front()
+                .ok_or(SchedulerError::EmptyQueue)?;
+            if let Err(error) = self.prepare_decode_request(&mut request) {
+                self.restore_failed_decode_attempt(requests, request);
+                return Err(error);
+            }
+            request.set_stage(RequestStage::DecodeForward);
+            requests.push(request);
+            tokens_used += 1;
+        }
+
+        // 2. Piggyback prefill chunk(s) if capacity and token budget remain
+        let chunk_budget = self.chunked_prefill_size.unwrap_or(usize::MAX);
+        while requests.len() < max_batch_size
+            && tokens_used < token_budget
+            && !self.waiting_queue.is_empty()
+        {
+            let remaining_tokens = token_budget.saturating_sub(tokens_used);
+            let effective_chunk_size = chunk_budget.min(remaining_tokens);
+            if effective_chunk_size == 0 {
+                break;
+            }
+
+            let Some(mut request) = self.waiting_queue.pop_front() else {
+                break;
+            };
+
+            if let Err(error) =
+                self.prepare_prefill_request_chunk(&mut request, effective_chunk_size)
+            {
+                if matches!(
+                    error,
+                    SchedulerError::CacheAllocation(CacheAllocationError::OutOfSlots { .. })
+                ) {
+                    self.waiting_queue.push_front(request);
+                    break;
+                }
+                self.restore_failed_prefill_attempt(requests, request);
+                return Err(error);
+            }
+
+            let chunk_len = request.current_chunk_len();
+            if chunk_len == 0 {
+                requests.push(request);
+                break;
+            }
+            tokens_used += chunk_len;
+            requests.push(request);
+        }
+
+        if requests.is_empty() {
+            return Err(SchedulerError::EmptyQueue);
+        }
+
+        let has_prefill = requests
+            .iter()
+            .any(|r| r.stage() == RequestStage::PrefillForward);
+        let has_decode = requests
+            .iter()
+            .any(|r| r.stage() == RequestStage::DecodeForward);
+
+        let batch = if has_prefill && has_decode {
+            ScheduleBatch::mixed(requests)
+        } else if has_prefill {
+            ScheduleBatch::prefill(requests)
+        } else {
+            ScheduleBatch::decode(requests)
+        };
+
+        Ok(batch)
+    }
+
+    pub fn dispatch_mixed_batch(
+        &mut self,
+        max_batch_size: usize,
+        token_budget: usize,
+    ) -> Result<Vec<ScheduledOutput>, SchedulerError> {
+        let batch = self.next_mixed_batch(max_batch_size, token_budget)?;
+        self.dispatch_batch(batch)
+    }
+
+    pub fn step(
+        &mut self,
+        max_batch_size: usize,
+        token_budget: usize,
+    ) -> Result<Vec<ScheduledOutput>, SchedulerError> {
+        self.dispatch_mixed_batch(max_batch_size, token_budget)
+    }
+
     /// Retire a completed execution on the CPU side.
     ///
     /// This is intentionally separate from model execution so an asynchronous
@@ -840,12 +1070,33 @@ where
         let mut outputs = Vec::with_capacity(requests.len());
         let mut completion_error = None;
         for (mut request, generated_token) in requests.into_iter().zip(tokens) {
-            if forward_mode == ForwardMode::Prefill
-                && let Err(error) = self.stage_prefill_cache_pages(&request)
-            {
-                self.decode_queue.push_back(request);
-                completion_error = Some(error);
-                continue;
+            let is_prefill_forward = request.stage() == RequestStage::PrefillForward
+                || (forward_mode == ForwardMode::Prefill && request.output_ids().is_empty());
+
+            if is_prefill_forward {
+                let chunk_len = if request.current_chunk_len() > 0 {
+                    request.current_chunk_len()
+                } else {
+                    request.uncached_input_ids().len()
+                };
+                let prev_processed = request.prompt_tokens_processed();
+                request.advance_prompt_tokens(chunk_len);
+                let new_processed = request.prompt_tokens_processed();
+
+                let chunk_range = prev_processed..new_processed;
+                if let Err(error) = self.stage_prefill_chunk_cache_pages(&request, chunk_range) {
+                    self.decode_queue.push_back(request);
+                    completion_error = Some(error);
+                    continue;
+                }
+
+                if !request.is_prefill_complete() {
+                    // Intermediate prefill chunk completed
+                    request.clear_forward_chunk_tracking();
+                    request.set_stage(RequestStage::PrefillWaiting);
+                    self.waiting_queue.push_front(request);
+                    continue;
+                }
             }
 
             request.append_output_ids(generated_token.token_ids());
@@ -860,6 +1111,7 @@ where
                 }
                 self.release_request_cache_pages(&request);
             } else {
+                request.clear_forward_chunk_tracking();
                 request.set_stage(RequestStage::DecodeWaiting);
                 self.decode_queue.push_back(request.clone());
             }
@@ -903,12 +1155,12 @@ where
         cleanup_error.map_or(Ok(()), |error| Err(error.into()))
     }
 
-    fn stage_prefill_cache_pages(
+    fn stage_prefill_chunk_cache_pages(
         &mut self,
         request: &ScheduledRequest,
+        chunk_range: std::ops::Range<usize>,
     ) -> Result<(), SchedulerError> {
         if self.prefix_cache_policy == PrefixCachePolicy::Disabled
-            || request.allocated_cache_pages().is_empty()
             || request.skips_radix_cache_insert()
         {
             return Ok(());
@@ -916,7 +1168,9 @@ where
 
         if request.disaggregated_params().is_some() {
             match self.worker.decode_request_state(request)? {
-                DecodeRequestState::Ready => self.publish_prefill_cache_pages(request),
+                DecodeRequestState::Ready => {
+                    self.publish_prefill_chunk_cache_pages(request, chunk_range)
+                }
                 DecodeRequestState::Pending => {
                     self.pending_prefix_cache_inserts.push(request.clone())
                 }
@@ -929,29 +1183,49 @@ where
             return Ok(());
         }
 
-        self.publish_prefill_cache_pages(request);
+        self.publish_prefill_chunk_cache_pages(request, chunk_range);
         Ok(())
     }
 
-    fn publish_prefill_cache_pages(&mut self, request: &ScheduledRequest) {
-        let input_ids = request.input_ids();
-        let prefix_pages = request.prefix_cache_pages();
-        let allocated_pages = request.allocated_cache_pages();
-        let mut cache_pages = Vec::with_capacity(prefix_pages.len() + allocated_pages.len());
-        cache_pages.extend_from_slice(prefix_pages);
-        cache_pages.extend_from_slice(allocated_pages);
+    fn publish_prefill_chunk_cache_pages(
+        &mut self,
+        request: &ScheduledRequest,
+        chunk_range: std::ops::Range<usize>,
+    ) {
+        let end = chunk_range.end.min(request.sequence_cache_pages().len());
+        if end > 0 {
+            let input_ids = &request.input_ids()[..end];
+            let cache_pages = &request.sequence_cache_pages()[..end];
+            let _ = self.prefix_cache.insert(input_ids, cache_pages);
+        }
 
-        // The scheduler produced the page list from the same request tokens, so
-        // length mismatch would indicate an internal invariant violation.
-        self.prefix_cache
-            .insert(input_ids, &cache_pages)
-            .expect("prefill cache pages must match request input length");
+        if let Some(publisher) = &self.event_publisher {
+            let page_size = self
+                .cache_page_allocator
+                .as_ref()
+                .map(CachePageAllocator::page_size)
+                .unwrap_or(1);
+            let event = BlockStoredEvent::from_chunk(
+                request.request_id().clone(),
+                request.input_ids(),
+                chunk_range,
+                page_size,
+                request.data_parallel_rank(),
+            );
+            publisher.publish_block_stored(&event);
+        }
     }
 
     pub fn dispatch_next(&mut self) -> Result<ScheduledOutput, SchedulerError> {
-        self.dispatch_prefill_batch(1)?
-            .pop()
-            .ok_or(SchedulerError::EmptyQueue)
+        loop {
+            let mut outputs = self.dispatch_prefill_batch(1)?;
+            if let Some(output) = outputs.pop() {
+                return Ok(output);
+            }
+            if self.waiting_queue.is_empty() && self.decode_queue.is_empty() {
+                return Err(SchedulerError::EmptyQueue);
+            }
+        }
     }
 
     pub fn poll_transfers(&mut self) -> Result<KvTransferPollSummary, KvCacheTransferError> {
@@ -976,7 +1250,10 @@ where
                 .decode_request_state(&request)
                 .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?
             {
-                DecodeRequestState::Ready => self.publish_prefill_cache_pages(&request),
+                DecodeRequestState::Ready => {
+                    let end = request.prompt_tokens_processed();
+                    self.publish_prefill_chunk_cache_pages(&request, 0..end);
+                }
                 DecodeRequestState::Pending => self.pending_prefix_cache_inserts.push(request),
                 DecodeRequestState::Failed(_) => self.release_failed_pending_prefix_cache(request),
             }

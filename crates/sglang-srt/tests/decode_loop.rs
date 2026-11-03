@@ -26,6 +26,13 @@ impl ModelWorker for TwoStepWorker {
                     assert_eq!(request.output_ids(), &[101]);
                     GeneratedToken::finished(vec![102])
                 }
+                ForwardMode::Mixed => {
+                    if request.stage() == RequestStage::DecodeForward {
+                        GeneratedToken::finished(vec![102])
+                    } else {
+                        GeneratedToken::unfinished(vec![101])
+                    }
+                }
             })
             .collect();
 

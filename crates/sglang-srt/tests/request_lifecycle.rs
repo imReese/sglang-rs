@@ -31,7 +31,7 @@ impl ModelWorker for TwoStepTextWorker {
         self.seen_modes.push(batch.forward_mode());
         let token = match batch.forward_mode() {
             ForwardMode::Prefill => GeneratedToken::unfinished(vec![b'o' as u32]),
-            ForwardMode::Decode => GeneratedToken::finished(vec![b'k' as u32]),
+            ForwardMode::Decode | ForwardMode::Mixed => GeneratedToken::finished(vec![b'k' as u32]),
         };
 
         BatchGeneratedTokens::from_batch(batch, vec![token])

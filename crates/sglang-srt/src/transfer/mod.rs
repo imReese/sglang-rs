@@ -2,7 +2,13 @@ pub mod backend_factory;
 pub mod engine_info;
 pub mod mooncake_control;
 pub mod pd_bootstrap;
+pub mod state_events;
 pub mod tcp;
+
+pub use state_events::{
+    BlockRemovedEvent, BlockStoredEvent, BroadcastKvStateEventPublisher, KvStateEventPublisher,
+    NoopKvStateEventPublisher, RecordingKvStateEventPublisher, ReusableBoundary,
+};
 
 use std::collections::BTreeMap;
 #[cfg(feature = "mooncake-link")]
@@ -1038,6 +1044,7 @@ where
         match batch.forward_mode() {
             ForwardMode::Prefill => self.try_generate_prefill_batch(batch),
             ForwardMode::Decode => self.decode.try_generate_batch(batch),
+            ForwardMode::Mixed => self.try_generate_prefill_batch(batch),
         }
     }
 

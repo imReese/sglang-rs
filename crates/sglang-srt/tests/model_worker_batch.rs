@@ -588,7 +588,9 @@ impl ForwardModel for TwoStepForwardModel {
         self.seen_forward_modes.push(batch.forward_mode());
         match batch.forward_mode() {
             ForwardMode::Prefill => ModelForwardOutput::new(vec![vec![0.0, 4.0, 0.1]]),
-            ForwardMode::Decode => ModelForwardOutput::new(vec![vec![0.0, 0.1, 4.0]]),
+            ForwardMode::Decode | ForwardMode::Mixed => {
+                ModelForwardOutput::new(vec![vec![0.0, 0.1, 4.0]])
+            }
         }
     }
 }

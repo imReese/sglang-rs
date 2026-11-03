@@ -53,7 +53,8 @@ impl ModelWorker for TwoStepRouterWorker {
         self.seen_modes.push(batch.forward_mode());
         let token = match batch.forward_mode() {
             sglang_srt::scheduler::ForwardMode::Prefill => GeneratedToken::unfinished(vec![42]),
-            sglang_srt::scheduler::ForwardMode::Decode => GeneratedToken::finished(vec![43]),
+            sglang_srt::scheduler::ForwardMode::Decode
+            | sglang_srt::scheduler::ForwardMode::Mixed => GeneratedToken::finished(vec![43]),
         };
 
         BatchGeneratedTokens::from_batch(batch, vec![token])
