@@ -253,7 +253,7 @@ impl BootstrapForwardModel {
                     tensor_parallel_node_rank: args.node_rank,
                     device_placement,
                     kv_cache: Some(KvCacheAllocationConfig {
-                        slot_capacity: args.num_reserved_decode_tokens,
+                        slot_capacity: crate::cli::resolve_max_total_tokens(args),
                         page_size: args.page_size,
                     }),
                     recurrent_state_slot_capacity: args.max_running_requests.unwrap_or(256),

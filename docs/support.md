@@ -78,10 +78,10 @@ Active KV storage -> NexusKV descriptor -> transfer backend
 ## KV Capacity
 
 `--page-size` is the number of token slots per physical KV page.
-`--num-reserved-decode-tokens` is the total slot capacity and must be nonzero
-and divisible by the page size. Invalid geometry fails before serving begins.
-Prefix reuse operates on complete physical pages and is disabled for recurrent
-models until prefix-state restoration is available.
+`--max-total-tokens` is the total token slot capacity of the KV cache. When omitted,
+it defaults based on `--max-running-requests` or 4096 tokens. Invalid geometry fails
+before serving begins. Prefix reuse operates on complete physical pages and is disabled
+for recurrent models until prefix-state restoration is available.
 
 For network transfer restrictions and shutdown behavior, see
 [P/D disaggregation](disaggregation.md). For test commands and acceptance

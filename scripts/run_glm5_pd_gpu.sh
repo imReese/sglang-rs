@@ -38,7 +38,7 @@ PAGE_SIZE="${PAGE_SIZE:-64}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-auto}"
 DEVICE="${DEVICE:-cuda}"
 TRANSFER_BACKEND="${TRANSFER_BACKEND:-mooncake}"
-NUM_RESERVED_DECODE_TOKENS="${NUM_RESERVED_DECODE_TOKENS:-512}"
+MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-${NUM_RESERVED_DECODE_TOKENS:-512}}"
 
 PREFILL_HOST="${PREFILL_HOST:-127.0.0.1}"
 PREFILL_ADVERTISE_HOST="${PREFILL_ADVERTISE_HOST:-$PREFILL_HOST}"
@@ -138,7 +138,7 @@ common_worker_args=(
     --device "$DEVICE"
     --page-size "$PAGE_SIZE"
     --kv-cache-dtype "$KV_CACHE_DTYPE"
-    --num-reserved-decode-tokens "$NUM_RESERVED_DECODE_TOKENS"
+    --max-total-tokens "$MAX_TOTAL_TOKENS"
     --grpc-mode
 )
 append_optional_srt_args common_worker_args

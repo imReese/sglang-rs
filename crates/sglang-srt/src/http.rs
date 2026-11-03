@@ -10,13 +10,13 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::engine_info_bootstrap::EngineInfoBootstrapService;
+use crate::engine_info_bootstrap::{EngineInfoBootstrapService, TransferEngineInfoRegistration};
 use crate::openai_classify::{classify_response_json, parse_classify_request};
 use crate::openai_embedding::{embeddings_response_json, parse_embedding_request};
 use crate::openai_id::openai_response_id;
@@ -208,6 +208,14 @@ where
             .route(
                 "/get_remote_instance_transfer_engine_info",
                 get(remote_instance_transfer_engine_info::<T, W>),
+            )
+            .route(
+                "/get_transfer_engine_info",
+                get(remote_instance_transfer_engine_info::<T, W>),
+            )
+            .route(
+                "/register_transfer_engine_info",
+                put(register_transfer_engine_info::<T, W>),
             )
             .route("/v1/loads", get(loads::<T, W>))
             .route("/get_loads", get(loads::<T, W>))
@@ -544,6 +552,43 @@ where
         })),
     )
         .into_response()
+}
+
+async fn register_transfer_engine_info<T, W>(
+    State(service): State<HttpRouterService<T, W>>,
+    Json(registration): Json<TransferEngineInfoRegistration>,
+) -> Response
+where
+    T: Send + 'static,
+    W: Send + 'static,
+{
+    if registration.transfer_engine_info.session_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {"message": "session_id cannot be empty"}
+            })),
+        )
+            .into_response();
+    }
+
+    let Some(engine_info_bootstrap) = service.engine_info_bootstrap else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": {"message": "transfer engine bootstrap service is not initialized"}
+            })),
+        )
+            .into_response();
+    };
+
+    engine_info_bootstrap
+        .state()
+        .lock()
+        .expect("engine info state should lock")
+        .register_transfer_engine_info(registration);
+
+    StatusCode::OK.into_response()
 }
 
 fn failed_transfer_engine_info_response(rank: i32) -> Response {

@@ -88,7 +88,6 @@ where
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn router_rerank_reaches_real_rust_srt_http_worker() {
     let addr = unused_local_addr();
-    let engine_info_addr = unused_local_addr();
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
@@ -99,8 +98,6 @@ async fn router_rerank_reaches_real_rust_srt_http_worker() {
         &addr.ip().to_string(),
         "--port",
         &addr.port().to_string(),
-        "--engine-info-bootstrap-port",
-        &engine_info_addr.port().to_string(),
     ])
     .expect("HTTP SRT args should parse");
 
@@ -160,7 +157,6 @@ async fn router_rerank_reaches_real_rust_srt_http_worker() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn router_responses_streaming_reaches_real_rust_srt_http_worker() {
     let addr = unused_local_addr();
-    let engine_info_addr = unused_local_addr();
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
@@ -171,8 +167,6 @@ async fn router_responses_streaming_reaches_real_rust_srt_http_worker() {
         &addr.ip().to_string(),
         "--port",
         &addr.port().to_string(),
-        "--engine-info-bootstrap-port",
-        &engine_info_addr.port().to_string(),
     ])
     .expect("HTTP SRT args should parse");
 
@@ -254,7 +248,6 @@ async fn router_responses_streaming_reaches_real_rust_srt_http_worker() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn router_score_reaches_real_rust_srt_http_worker() {
     let addr = unused_local_addr();
-    let engine_info_addr = unused_local_addr();
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
@@ -265,8 +258,6 @@ async fn router_score_reaches_real_rust_srt_http_worker() {
         &addr.ip().to_string(),
         "--port",
         &addr.port().to_string(),
-        "--engine-info-bootstrap-port",
-        &engine_info_addr.port().to_string(),
     ])
     .expect("HTTP SRT args should parse");
 
@@ -324,7 +315,6 @@ async fn router_score_reaches_real_rust_srt_http_worker() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn router_embeddings_reaches_real_rust_srt_http_worker() {
     let addr = unused_local_addr();
-    let engine_info_addr = unused_local_addr();
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
@@ -335,8 +325,6 @@ async fn router_embeddings_reaches_real_rust_srt_http_worker() {
         &addr.ip().to_string(),
         "--port",
         &addr.port().to_string(),
-        "--engine-info-bootstrap-port",
-        &engine_info_addr.port().to_string(),
     ])
     .expect("HTTP SRT args should parse");
 
@@ -389,7 +377,6 @@ async fn router_embeddings_reaches_real_rust_srt_http_worker() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn router_classify_reaches_real_rust_srt_http_worker() {
     let addr = unused_local_addr();
-    let engine_info_addr = unused_local_addr();
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
@@ -400,8 +387,6 @@ async fn router_classify_reaches_real_rust_srt_http_worker() {
         &addr.ip().to_string(),
         "--port",
         &addr.port().to_string(),
-        "--engine-info-bootstrap-port",
-        &engine_info_addr.port().to_string(),
     ])
     .expect("HTTP SRT args should parse");
 
@@ -527,7 +512,6 @@ async fn router_remote_instance_transfer_engine_info_reaches_real_rust_srt_http_
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn router_poll_transfers_reaches_real_rust_srt_http_worker() {
     let addr = unused_local_addr();
-    let engine_info_addr = unused_local_addr();
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
@@ -538,8 +522,6 @@ async fn router_poll_transfers_reaches_real_rust_srt_http_worker() {
         &addr.ip().to_string(),
         "--port",
         &addr.port().to_string(),
-        "--engine-info-bootstrap-port",
-        &engine_info_addr.port().to_string(),
     ])
     .expect("HTTP SRT args should parse");
 

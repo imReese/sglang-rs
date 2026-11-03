@@ -61,7 +61,7 @@ async fn cuda_qwen3_uses_the_shared_dense_decoder_and_runtime_kv_pool() {
         "0",
         "--page-size",
         "4",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "32",
     ])
     .expect("server args should parse");
@@ -131,7 +131,7 @@ async fn cuda_qwen3_runs_two_rank_tensor_parallel_inference() {
         "2",
         "--page-size",
         "4",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "32",
     ])
     .expect("server args should parse");
@@ -194,7 +194,7 @@ async fn cuda_kimi_linear_uses_shared_kda_mla_moe_and_runtime_kv_pool() {
         "0",
         "--page-size",
         "4",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "32",
     ])
     .expect("server args should parse");
@@ -287,7 +287,7 @@ async fn assert_cuda_deepseek_v3_family_generation(
         "0",
         "--page-size",
         "4",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "32",
     ])
     .expect("server args should parse");

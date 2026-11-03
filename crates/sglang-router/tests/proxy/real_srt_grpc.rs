@@ -266,7 +266,7 @@ async fn router_chat_completions_reaches_real_rust_srt_grpc_worker() {
         "--port",
         &addr.port().to_string(),
         "--grpc-mode",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("gRPC SRT args should parse");
@@ -331,7 +331,7 @@ async fn router_streaming_chat_completions_reaches_real_rust_srt_grpc_worker() {
         "--port",
         &addr.port().to_string(),
         "--grpc-mode",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("gRPC SRT args should parse");
@@ -411,7 +411,7 @@ async fn router_update_weights_from_disk_reaches_real_rust_srt_grpc_worker() {
         "--port",
         &addr.port().to_string(),
         "--grpc-mode",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("gRPC SRT args should parse");
@@ -478,7 +478,7 @@ async fn router_update_weight_version_reaches_real_rust_srt_grpc_worker() {
         "--port",
         &addr.port().to_string(),
         "--grpc-mode",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("gRPC SRT args should parse");
@@ -555,7 +555,7 @@ async fn router_get_weights_by_name_reaches_real_rust_srt_grpc_worker() {
         "--port",
         &addr.port().to_string(),
         "--grpc-mode",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("gRPC SRT args should parse");
@@ -634,7 +634,7 @@ async fn router_flush_cache_reaches_real_rust_srt_grpc_worker() {
         "--port",
         &addr.port().to_string(),
         "--grpc-mode",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("gRPC SRT args should parse");
@@ -691,7 +691,7 @@ async fn router_start_and_stop_profile_reach_real_rust_srt_grpc_worker() {
         "--port",
         &addr.port().to_string(),
         "--grpc-mode",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("gRPC SRT args should parse");
@@ -789,7 +789,7 @@ async fn router_pause_and_continue_generation_reach_real_rust_srt_grpc_worker() 
         "--port",
         &addr.port().to_string(),
         "--grpc-mode",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("gRPC SRT args should parse");
@@ -892,7 +892,7 @@ async fn router_abort_request_reaches_real_rust_srt_grpc_worker() {
         "--port",
         &addr.port().to_string(),
         "--grpc-mode",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("gRPC SRT args should parse");
@@ -949,7 +949,7 @@ async fn router_abort_all_reaches_real_rust_srt_grpc_worker() {
         "--port",
         &addr.port().to_string(),
         "--grpc-mode",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("gRPC SRT args should parse");
@@ -1008,7 +1008,7 @@ async fn router_completions_reaches_real_rust_srt_grpc_worker() {
         "--port",
         &addr.port().to_string(),
         "--grpc-mode",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("gRPC SRT args should parse");
@@ -1074,7 +1074,7 @@ async fn router_streaming_completions_reaches_real_rust_srt_grpc_worker() {
         "--port",
         &addr.port().to_string(),
         "--grpc-mode",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("gRPC SRT args should parse");
@@ -1154,7 +1154,7 @@ async fn router_responses_reaches_real_rust_srt_grpc_worker() {
         "--port",
         &addr.port().to_string(),
         "--grpc-mode",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("gRPC SRT args should parse");
@@ -1223,7 +1223,7 @@ async fn router_streaming_responses_reaches_real_rust_srt_grpc_worker() {
         "--port",
         &addr.port().to_string(),
         "--grpc-mode",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("gRPC SRT args should parse");
@@ -1314,7 +1314,7 @@ async fn router_v1_loads_reaches_real_rust_srt_grpc_worker() {
         "--port",
         &addr.port().to_string(),
         "--grpc-mode",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("gRPC SRT args should parse");
@@ -1373,7 +1373,7 @@ async fn router_poll_transfers_reaches_real_rust_srt_grpc_worker() {
         "--port",
         &addr.port().to_string(),
         "--grpc-mode",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("gRPC SRT args should parse");
@@ -1437,7 +1437,7 @@ async fn router_generate_reaches_real_rust_srt_grpc_worker() {
         "--port",
         &addr.port().to_string(),
         "--grpc-mode",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("gRPC SRT args should parse");
@@ -1505,7 +1505,7 @@ async fn router_rerank_reaches_real_rust_srt_grpc_worker() {
         "--port",
         &addr.port().to_string(),
         "--grpc-mode",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("gRPC SRT args should parse");
@@ -1577,7 +1577,7 @@ async fn router_score_reaches_real_rust_srt_grpc_worker() {
         "--port",
         &addr.port().to_string(),
         "--grpc-mode",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("gRPC SRT args should parse");
@@ -1647,7 +1647,7 @@ async fn router_embeddings_reaches_real_rust_srt_grpc_worker() {
         "--port",
         &addr.port().to_string(),
         "--grpc-mode",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("gRPC SRT args should parse");
@@ -1712,7 +1712,7 @@ async fn router_classify_reaches_real_rust_srt_grpc_worker() {
         "--port",
         &addr.port().to_string(),
         "--grpc-mode",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("gRPC SRT args should parse");
@@ -1776,7 +1776,7 @@ async fn router_streaming_generate_reaches_real_rust_srt_grpc_worker() {
         "--port",
         &addr.port().to_string(),
         "--grpc-mode",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("gRPC SRT args should parse");
@@ -1861,7 +1861,7 @@ async fn router_generate_accepts_tokenized_input_ids_for_real_rust_srt_grpc_work
         "--port",
         &addr.port().to_string(),
         "--grpc-mode",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("gRPC SRT args should parse");
@@ -1942,7 +1942,7 @@ async fn real_rust_srt_grpc_mooncake_workers_reject_unlinked_transfer_backend() 
         &bootstrap_addr.port().to_string(),
         "--disaggregation-zmq-ports",
         &prefill_zmq_addr.port().to_string(),
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("prefill args should parse");
@@ -1961,7 +1961,7 @@ async fn real_rust_srt_grpc_mooncake_workers_reject_unlinked_transfer_backend() 
         "decode",
         "--disaggregation-transfer-backend",
         "mooncake",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("decode args should parse");

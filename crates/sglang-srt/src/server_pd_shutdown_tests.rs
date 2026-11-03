@@ -105,8 +105,6 @@ async fn http_and_grpc_keep_abort_control_alive_until_runtime_shutdown_finishes(
                     PrefillHttpBootstrapServices {
                         prefill_addr: bootstrap_addr,
                         prefill_service: bootstrap,
-                        engine_info_addr: address(),
-                        engine_info_service: EngineInfoBootstrapService::default(),
                         zmq_endpoints: endpoints,
                     },
                     shutdown,

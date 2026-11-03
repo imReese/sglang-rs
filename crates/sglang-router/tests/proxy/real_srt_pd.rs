@@ -168,7 +168,7 @@ async fn real_rust_srt_mooncake_workers_reject_unlinked_transfer_backend() {
         &bootstrap_addr.port().to_string(),
         "--disaggregation-zmq-ports",
         &prefill_zmq_addr.port().to_string(),
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("prefill args should parse");
@@ -186,7 +186,7 @@ async fn real_rust_srt_mooncake_workers_reject_unlinked_transfer_backend() {
         "decode",
         "--disaggregation-transfer-backend",
         "mooncake_tcp",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("decode args should parse");
@@ -265,9 +265,7 @@ async fn router_pd_chat_completes_with_real_cuda_qwen_mooncake_workers() {
         "127.0.0.1",
         "--port",
         &central_addr.port().to_string(),
-        "--engine-info-bootstrap-port",
-        "0",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "128",
     ])
     .expect("centralized args");
@@ -417,10 +415,8 @@ async fn spawn_prefill_worker(
         &prefill_zmq_addr.port().to_string(),
         "--kv-cache-dtype",
         "bfloat16",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "128",
-        "--engine-info-bootstrap-port",
-        "0",
     ])
     .expect("prefill args should parse");
     spawn_worker(args)
@@ -455,10 +451,8 @@ async fn spawn_decode_worker(
         "mooncake_tcp",
         "--kv-cache-dtype",
         "bfloat16",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "128",
-        "--engine-info-bootstrap-port",
-        "0",
     ])
     .expect("decode args should parse");
     spawn_worker(args)

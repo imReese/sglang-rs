@@ -208,7 +208,7 @@ fn bootstrap_pd_service_rejects_unaligned_kv_slot_capacity_before_serving() {
         "dummy",
         "--page-size",
         "4",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "10",
     ])
     .expect("args should parse");
@@ -722,7 +722,7 @@ fn qwen3_5_pd_startup_rejects_kv_only_transfer_before_serving() {
         model_dir.to_str().expect("temp model dir should be utf-8"),
         "--device",
         "cpu",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "16",
     ])
     .expect("args should parse");
@@ -760,7 +760,7 @@ async fn assert_centralized_generation_with_kv_layers(
         "--device",
         "cpu",
         "--grpc-mode",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "16",
     ])
     .expect("args should parse");
@@ -1153,7 +1153,7 @@ async fn bootstrap_pd_grpc_router_service_polls_transfer_before_decode() {
         "decode",
         "--disaggregation-decode-polling-interval",
         "1",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("args should parse");
@@ -1251,7 +1251,7 @@ async fn bootstrap_fake_pd_grpc_router_service_uses_decode_transfer_path() {
         "fake",
         "--disaggregation-decode-polling-interval",
         "1",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("args should parse");

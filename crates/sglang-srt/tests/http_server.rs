@@ -2330,7 +2330,7 @@ async fn http_prefill_server_reports_router_server_info_with_kv_events() {
         &bootstrap_addr.port().to_string(),
         "--disaggregation-zmq-ports",
         &format!("{}-{}", zmq_ports[0], zmq_ports[1]),
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "64",
     ])
     .expect("args should parse");
@@ -2389,7 +2389,7 @@ async fn http_prefill_server_accepts_disaggregated_generate_requests() {
         "prefill",
         "--disaggregation-transfer-backend",
         "fake",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("args should parse");
@@ -2452,7 +2452,7 @@ async fn http_prefill_server_accepts_batched_disaggregated_token_generate_reques
         "prefill",
         "--disaggregation-transfer-backend",
         "fake",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("args should parse");
@@ -2521,7 +2521,7 @@ async fn http_prefill_server_accepts_batched_disaggregated_text_generate_request
         "prefill",
         "--disaggregation-transfer-backend",
         "fake",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("args should parse");
@@ -2590,7 +2590,7 @@ async fn http_prefill_server_accepts_batched_disaggregated_openai_completions() 
         "prefill",
         "--disaggregation-transfer-backend",
         "fake",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("args should parse");
@@ -2665,7 +2665,7 @@ async fn http_prefill_server_accepts_batched_disaggregated_chat_completions() {
         "prefill",
         "--disaggregation-transfer-backend",
         "fake",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("args should parse");
@@ -2742,7 +2742,7 @@ async fn http_pd_server_polls_async_transfer_before_decode() {
         "prefill",
         "--disaggregation-decode-polling-interval",
         "1",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("args should parse");
@@ -2797,7 +2797,7 @@ async fn http_server_poll_transfers_advances_async_pd_batches() {
         "prefill",
         "--disaggregation-decode-polling-interval",
         "0",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("args should parse");
@@ -2883,7 +2883,7 @@ async fn mooncake_prefill_http_uses_bootstrap_kv_layout_for_transfer() {
         "mooncake",
         "--disaggregation-decode-polling-interval",
         "1",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("args should parse");
@@ -3005,7 +3005,6 @@ async fn prefill_http_launch_rejects_unstartable_dummy_mooncake_runtime() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn http_launch_starts_engine_info_bootstrap_and_serves_remote_info() {
     let http_addr = unused_local_addr();
-    let engine_info_addr = unused_local_addr();
     let model_dir = temp_model_dir("http-launch-engine-info");
     write_minimal_generic_model_artifacts(&model_dir);
     let args = ServerArgs::parse_from([
@@ -3020,8 +3019,6 @@ async fn http_launch_starts_engine_info_bootstrap_and_serves_remote_info() {
         "127.0.0.1",
         "--port",
         &http_addr.port().to_string(),
-        "--engine-info-bootstrap-port",
-        &engine_info_addr.port().to_string(),
     ])
     .expect("args should parse");
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -3031,7 +3028,7 @@ async fn http_launch_starts_engine_info_bootstrap_and_serves_remote_info() {
     }));
 
     let registration = request_raw_with_retry(
-        engine_info_addr,
+        http_addr,
         "PUT",
         "/register_transfer_engine_info",
         Some(
@@ -3083,7 +3080,7 @@ async fn prefill_http_launch_routes_reject_unstartable_dummy_mooncake_runtime() 
         "mooncake",
         "--disaggregation-bootstrap-port",
         &bootstrap_addr.port().to_string(),
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("args should parse");
@@ -3113,7 +3110,7 @@ async fn decode_http_launch_rejects_unstartable_dummy_mooncake_runtime() {
         "mooncake",
         "--kv-cache-dtype",
         "bfloat16",
-        "--num-reserved-decode-tokens",
+        "--max-total-tokens",
         "8",
     ])
     .expect("args should parse");

@@ -46,13 +46,11 @@ pub struct ServerArgs {
     pub disaggregation_mode: String,
     pub disaggregation_transfer_backend: String,
     pub disaggregation_bootstrap_port: u16,
-    pub engine_info_bootstrap_port: u16,
     pub disaggregation_mooncake_rpc_port: Option<u16>,
     pub disaggregation_ib_device: Option<String>,
     pub disaggregation_zmq_ports: Option<ZmqPortRange>,
     pub disaggregation_decode_enable_radix_cache: bool,
     pub disaggregation_decode_enable_offload_kvcache: bool,
-    pub num_reserved_decode_tokens: usize,
     pub disaggregation_decode_polling_interval: usize,
     pub deepep_config: Option<serde_json::Value>,
     pub deepep_mode: Option<String>,
@@ -87,6 +85,11 @@ impl ServerArgs {
         let mut parser = ArgParser::new(args);
         parser.parse()
     }
+}
+
+pub fn resolve_max_total_tokens(args: &ServerArgs) -> usize {
+    args.max_total_tokens
+        .unwrap_or_else(|| args.max_running_requests.unwrap_or(1) * 4096)
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -328,12 +331,6 @@ impl ArgParser {
                         .parse::<u16>()
                         .map_err(|_| CliParseError::InvalidPort(value))?;
                 }
-                "--engine-info-bootstrap-port" => {
-                    let value = self.take_value("--engine-info-bootstrap-port")?;
-                    self.parsed.engine_info_bootstrap_port = value
-                        .parse::<u16>()
-                        .map_err(|_| CliParseError::InvalidPort(value))?;
-                }
                 "--disaggregation-mooncake-rpc-port" => {
                     let value = self.take_value("--disaggregation-mooncake-rpc-port")?;
                     self.parsed.disaggregation_mooncake_rpc_port = Some(
@@ -356,12 +353,6 @@ impl ArgParser {
                 }
                 "--disaggregation-decode-enable-offload-kvcache" => {
                     self.parsed.disaggregation_decode_enable_offload_kvcache = true;
-                }
-                "--num-reserved-decode-tokens" => {
-                    self.parsed.num_reserved_decode_tokens = parse_usize(
-                        "--num-reserved-decode-tokens",
-                        self.take_value("--num-reserved-decode-tokens")?,
-                    )?;
                 }
                 "--disaggregation-decode-polling-interval" => {
                     self.parsed.disaggregation_decode_polling_interval = parse_usize(
@@ -506,7 +497,6 @@ impl ArgParser {
             disaggregation_mode: self.parsed.disaggregation_mode.clone(),
             disaggregation_transfer_backend: self.parsed.disaggregation_transfer_backend.clone(),
             disaggregation_bootstrap_port: self.parsed.disaggregation_bootstrap_port,
-            engine_info_bootstrap_port: self.parsed.engine_info_bootstrap_port,
             disaggregation_mooncake_rpc_port: self.parsed.disaggregation_mooncake_rpc_port,
             disaggregation_ib_device: self.parsed.disaggregation_ib_device.clone(),
             disaggregation_zmq_ports: self.parsed.disaggregation_zmq_ports,
@@ -516,7 +506,6 @@ impl ArgParser {
             disaggregation_decode_enable_offload_kvcache: self
                 .parsed
                 .disaggregation_decode_enable_offload_kvcache,
-            num_reserved_decode_tokens: self.parsed.num_reserved_decode_tokens,
             disaggregation_decode_polling_interval: self
                 .parsed
                 .disaggregation_decode_polling_interval,
@@ -616,13 +605,11 @@ struct PartialServerArgs {
     disaggregation_mode: String,
     disaggregation_transfer_backend: String,
     disaggregation_bootstrap_port: u16,
-    engine_info_bootstrap_port: u16,
     disaggregation_mooncake_rpc_port: Option<u16>,
     disaggregation_ib_device: Option<String>,
     disaggregation_zmq_ports: Option<ZmqPortRange>,
     disaggregation_decode_enable_radix_cache: bool,
     disaggregation_decode_enable_offload_kvcache: bool,
-    num_reserved_decode_tokens: usize,
     disaggregation_decode_polling_interval: usize,
     deepep_config: Option<serde_json::Value>,
     deepep_mode: Option<String>,
@@ -683,13 +670,11 @@ impl Default for PartialServerArgs {
             disaggregation_mode: "null".to_string(),
             disaggregation_transfer_backend: "mooncake".to_string(),
             disaggregation_bootstrap_port: 8998,
-            engine_info_bootstrap_port: 6789,
             disaggregation_mooncake_rpc_port: None,
             disaggregation_ib_device: None,
             disaggregation_zmq_ports: None,
             disaggregation_decode_enable_radix_cache: false,
             disaggregation_decode_enable_offload_kvcache: false,
-            num_reserved_decode_tokens: 512,
             disaggregation_decode_polling_interval: 1,
             deepep_config: None,
             deepep_mode: None,

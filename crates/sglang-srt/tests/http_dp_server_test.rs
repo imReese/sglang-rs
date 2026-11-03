@@ -254,8 +254,18 @@ async fn test_multi_dp_http_server_real_tcp() {
         .await
     });
 
-    // Make real HTTP GET request over TCP socket
-    let mut stream = TcpStream::connect(addr).expect("TCP connect to server");
+    // Make real HTTP GET request over TCP socket with retry until server is listening
+    let mut stream = {
+        let mut connected = None;
+        for _ in 0..100 {
+            if let Ok(stream) = TcpStream::connect(addr) {
+                connected = Some(stream);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        connected.expect("TCP connect to server within timeout")
+    };
     use std::io::{Read, Write};
     stream
         .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")

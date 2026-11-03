@@ -11,10 +11,7 @@ use crate::dp_coordinator::{DpCoordinator, DpCoordinatorError};
 use crate::dp_scheduler::DpScheduler;
 use crate::dp_worker_pool::DpWorkerPool;
 use crate::engine::Engine;
-use crate::engine_info_bootstrap::{
-    EngineInfoBootstrapServeError, EngineInfoBootstrapService,
-    serve_engine_info_bootstrap_with_shutdown,
-};
+use crate::engine_info_bootstrap::EngineInfoBootstrapService;
 use crate::grpc::{
     GrpcRouterService, GrpcServeError, serve_grpc_router_with_shutdown,
     server_info_attributes_from_args,
@@ -428,7 +425,6 @@ pub enum ServerLaunchError {
     Tokenizer(TokenizerError),
     Grpc(GrpcServeError),
     Http(HttpServeError),
-    EngineInfoBootstrap(EngineInfoBootstrapServeError),
     PrefillBootstrap(PrefillBootstrapServeError),
     MooncakeTransfer(MooncakeError),
     TransferBackendFactory(String),
@@ -583,7 +579,6 @@ impl fmt::Display for ServerLaunchError {
             Self::Tokenizer(error) => write!(formatter, "tokenizer error: {error}"),
             Self::Grpc(error) => write!(formatter, "{error}"),
             Self::Http(error) => write!(formatter, "{error}"),
-            Self::EngineInfoBootstrap(error) => write!(formatter, "{error}"),
             Self::PrefillBootstrap(error) => write!(formatter, "{error}"),
             Self::MooncakeTransfer(error) => write!(formatter, "{error}"),
             Self::TransferBackendFactory(error) => {
@@ -641,12 +636,6 @@ impl From<GrpcServeError> for ServerLaunchError {
 impl From<HttpServeError> for ServerLaunchError {
     fn from(value: HttpServeError) -> Self {
         Self::Http(value)
-    }
-}
-
-impl From<EngineInfoBootstrapServeError> for ServerLaunchError {
-    fn from(value: EngineInfoBootstrapServeError) -> Self {
-        Self::EngineInfoBootstrap(value)
     }
 }
 
@@ -774,21 +763,6 @@ pub fn prefill_bootstrap_listen_addr(args: &ServerArgs) -> Result<SocketAddr, Se
         .ok_or_else(|| ServerLaunchError::NoSocketAddress {
             host: args.host.clone(),
             port: args.disaggregation_bootstrap_port,
-        })
-}
-
-pub fn engine_info_bootstrap_listen_addr(
-    args: &ServerArgs,
-) -> Result<SocketAddr, ServerLaunchError> {
-    let mut addresses = (args.host.as_str(), args.engine_info_bootstrap_port)
-        .to_socket_addrs()
-        .map_err(ServerLaunchError::AddressResolve)?;
-
-    addresses
-        .next()
-        .ok_or_else(|| ServerLaunchError::NoSocketAddress {
-            host: args.host.clone(),
-            port: args.engine_info_bootstrap_port,
         })
 }
 
@@ -1133,7 +1107,7 @@ pub fn build_bootstrap_prefill_http_router_service(
 fn cache_page_allocator_from_server_args(
     args: &ServerArgs,
 ) -> Result<CachePageAllocator, ServerLaunchError> {
-    CachePageAllocator::with_page_size(args.num_reserved_decode_tokens, args.page_size)
+    CachePageAllocator::with_page_size(crate::cli::resolve_max_total_tokens(args), args.page_size)
         .map_err(|error| ServerLaunchError::KvCacheTransfer(error.to_string()))
 }
 
@@ -1382,7 +1356,7 @@ fn try_build_launch_pd_runtime_bundle(
         &mut model_runner,
         pd_config,
         prefill_mooncake_route_rank_ip(args),
-        args.num_reserved_decode_tokens,
+        crate::cli::resolve_max_total_tokens(args),
         args.page_size,
     );
     if let Some(service) = prefill_bootstrap_service {
@@ -1751,20 +1725,12 @@ where
     let pd_config = PdConfig::from_server_args(&args)?;
     validate_launch_transfer_backend(&pd_config)?;
     let addr = http_listen_addr(&args)?;
-    let engine_info_addr = engine_info_bootstrap_listen_addr(&args)?;
     let engine_info_service = EngineInfoBootstrapService::default();
     match pd_config.mode {
         DisaggregationMode::Null => {
             let service = try_build_launch_http_router_service(&args)?
-                .with_engine_info_bootstrap_service(engine_info_service.clone());
-            serve_http_and_engine_info_bootstrap(
-                addr,
-                service,
-                engine_info_addr,
-                engine_info_service,
-                shutdown,
-            )
-            .await?;
+                .with_engine_info_bootstrap_service(engine_info_service);
+            serve_http_router_with_shutdown(addr, service, shutdown).await?;
         }
         DisaggregationMode::Prefill
             if pd_config.transfer_backend == TransferBackend::Mooncake
@@ -1780,15 +1746,13 @@ where
                 Some(bootstrap_service.clone()),
             )?;
             let service = try_build_launch_pd_http_router_service(&args, runtime_bundle)?
-                .with_engine_info_bootstrap_service(engine_info_service.clone());
+                .with_engine_info_bootstrap_service(engine_info_service);
             serve_prefill_http_and_bootstrap(
                 addr,
                 service,
                 PrefillHttpBootstrapServices {
                     prefill_addr: bootstrap_addr,
                     prefill_service: bootstrap_service,
-                    engine_info_addr,
-                    engine_info_service,
                     zmq_endpoints,
                 },
                 shutdown,
@@ -1801,15 +1765,8 @@ where
         {
             let runtime_bundle = try_build_launch_pd_runtime_bundle(&args, &pd_config, None)?;
             let service = try_build_launch_pd_http_router_service(&args, runtime_bundle)?
-                .with_engine_info_bootstrap_service(engine_info_service.clone());
-            serve_http_and_engine_info_bootstrap(
-                addr,
-                service,
-                engine_info_addr,
-                engine_info_service,
-                shutdown,
-            )
-            .await?;
+                .with_engine_info_bootstrap_service(engine_info_service);
+            serve_http_router_with_shutdown(addr, service, shutdown).await?;
         }
         _ => {
             return Err(ServerLaunchError::UnsupportedBootstrapPdRuntime {
@@ -1821,57 +1778,9 @@ where
     Ok(())
 }
 
-async fn serve_http_and_engine_info_bootstrap<T, W, F>(
-    http_addr: SocketAddr,
-    http_service: HttpRouterService<T, W>,
-    engine_info_addr: SocketAddr,
-    engine_info_service: EngineInfoBootstrapService,
-    shutdown: F,
-) -> Result<(), ServerLaunchError>
-where
-    T: Tokenizer + Send + 'static,
-    W: WorkerExecutor + Send + 'static,
-    F: Future<Output = ()> + Send + 'static,
-{
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let mut http_task = tokio::spawn(serve_http_router_with_shutdown(
-        http_addr,
-        http_service,
-        watch_shutdown(shutdown_rx.clone()),
-    ));
-    let mut bootstrap_task = tokio::spawn(serve_engine_info_bootstrap_with_shutdown(
-        engine_info_addr,
-        engine_info_service,
-        watch_shutdown(shutdown_rx.clone()),
-    ));
-
-    tokio::select! {
-        _ = shutdown => {
-            let _ = shutdown_tx.send(true);
-            join_http_task(http_task).await?;
-            join_engine_info_bootstrap_task(bootstrap_task).await?;
-            Ok(())
-        }
-        result = &mut http_task => {
-            let _ = shutdown_tx.send(true);
-            join_engine_info_bootstrap_task(bootstrap_task).await?;
-            result.map_err(|error| ServerLaunchError::ServerTaskJoin(error.to_string()))??;
-            Ok(())
-        }
-        result = &mut bootstrap_task => {
-            let _ = shutdown_tx.send(true);
-            join_http_task(http_task).await?;
-            result.map_err(|error| ServerLaunchError::ServerTaskJoin(error.to_string()))??;
-            Ok(())
-        }
-    }
-}
-
 struct PrefillHttpBootstrapServices {
     prefill_addr: SocketAddr,
     prefill_service: PrefillBootstrapService,
-    engine_info_addr: SocketAddr,
-    engine_info_service: EngineInfoBootstrapService,
     zmq_endpoints: Vec<String>,
 }
 
@@ -1901,16 +1810,6 @@ where
             bootstrap.prefill_addr,
             prefill_bootstrap_service,
             watch_shutdown(prefill_shutdown_rx),
-        )
-        .await
-        .map_err(ServerLaunchError::from)
-    });
-    let engine_info_shutdown_rx = bootstrap_shutdown_rx.clone();
-    bootstrap_tasks.spawn(async move {
-        serve_engine_info_bootstrap_with_shutdown(
-            bootstrap.engine_info_addr,
-            bootstrap.engine_info_service,
-            watch_shutdown(engine_info_shutdown_rx),
         )
         .await
         .map_err(ServerLaunchError::from)
@@ -2105,14 +2004,6 @@ where
 
 async fn join_http_task(
     task: tokio::task::JoinHandle<Result<(), HttpServeError>>,
-) -> Result<(), ServerLaunchError> {
-    task.await
-        .map_err(|error| ServerLaunchError::ServerTaskJoin(error.to_string()))??;
-    Ok(())
-}
-
-async fn join_engine_info_bootstrap_task(
-    task: tokio::task::JoinHandle<Result<(), EngineInfoBootstrapServeError>>,
 ) -> Result<(), ServerLaunchError> {
     task.await
         .map_err(|error| ServerLaunchError::ServerTaskJoin(error.to_string()))??;

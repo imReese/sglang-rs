@@ -49,8 +49,7 @@ hf download Qwen/Qwen3.5-0.8B \
   --served-model-name Qwen3.5-0.8B \
   --device cpu \
   --host 127.0.0.1 --port 30000 \
-  --engine-info-bootstrap-port 0 \
-  --num-reserved-decode-tokens 256 \
+  --max-total-tokens 4096 \
   --max-running-requests 1
 ```
 
