@@ -48,7 +48,7 @@ the full-model demo and is not a network transfer test.
 cargo test -p sglang-srt --locked --lib nonzero_qwen_pd
 cargo test -p sglang-srt --locked --lib pd_shutdown_tests
 cargo test -p sglang-srt --locked --features test-support \
-  --test mooncake_lifecycle --test pd_bootstrap_server
+  --test core mooncake_lifecycle --test server pd_bootstrap_server
 ```
 
 The numerical oracle runs a complete nonzero-weight Qwen3 Transformer for four
@@ -73,7 +73,7 @@ For a single-device allocation and kernel check:
 
 ```bash
 SGLANG_CUDA_TEST_DEVICE=0 cargo test -p sglang-srt --locked \
-  --test cuda_backend -- --ignored --nocapture --test-threads=1
+  --test core cuda_backend:: -- --ignored --nocapture --test-threads=1
 ```
 
 For linked P/D acceptance, using a nonzero CUDA ordinal:
