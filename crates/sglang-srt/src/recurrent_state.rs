@@ -140,6 +140,141 @@ impl fmt::Display for RecurrentStateSlotError {
 
 impl std::error::Error for RecurrentStateSlotError {}
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecurrentLayerStatePayload {
+    pub conv: Vec<f32>,
+    pub recurrent: Vec<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecurrentStatePayload {
+    pub next_position: usize,
+    pub layer_states: Vec<RecurrentLayerStatePayload>,
+}
+
+impl RecurrentStatePayload {
+    pub const MAGIC: u32 = 0x5347_4C52; // 'SGLR'
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&Self::MAGIC.to_le_bytes());
+        let pos_u64 = self.next_position as u64;
+        bytes.extend_from_slice(&pos_u64.to_le_bytes());
+        let layer_count_u32 = self.layer_states.len() as u32;
+        bytes.extend_from_slice(&layer_count_u32.to_le_bytes());
+        for layer in &self.layer_states {
+            let conv_len_u32 = layer.conv.len() as u32;
+            bytes.extend_from_slice(&conv_len_u32.to_le_bytes());
+            for value in &layer.conv {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            let rec_len_u32 = layer.recurrent.len() as u32;
+            bytes.extend_from_slice(&rec_len_u32.to_le_bytes());
+            for value in &layer.recurrent {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() < 16 {
+            return Err("recurrent state payload too short".to_string());
+        }
+        let magic = u32::from_le_bytes(
+            bytes[0..4]
+                .try_into()
+                .map_err(|_| "failed to read magic".to_string())?,
+        );
+        if magic != Self::MAGIC {
+            return Err(format!(
+                "invalid recurrent state magic: expected {:#X}, found {magic:#X}",
+                Self::MAGIC
+            ));
+        }
+        let next_position = u64::from_le_bytes(
+            bytes[4..12]
+                .try_into()
+                .map_err(|_| "failed to read next_position".to_string())?,
+        ) as usize;
+        let layer_count = u32::from_le_bytes(
+            bytes[12..16]
+                .try_into()
+                .map_err(|_| "failed to read layer_count".to_string())?,
+        ) as usize;
+
+        let mut offset = 16;
+        let mut layer_states = Vec::with_capacity(layer_count);
+        for _ in 0..layer_count {
+            if offset + 4 > bytes.len() {
+                return Err("unexpected EOF reading conv length".to_string());
+            }
+            let conv_len = u32::from_le_bytes(
+                bytes[offset..offset + 4]
+                    .try_into()
+                    .map_err(|_| "failed to read conv length".to_string())?,
+            ) as usize;
+            offset += 4;
+            let conv_bytes = conv_len
+                .checked_mul(4)
+                .ok_or_else(|| "conv byte length overflow".to_string())?;
+            if offset + conv_bytes > bytes.len() {
+                return Err("unexpected EOF reading conv data".to_string());
+            }
+            let mut conv = Vec::with_capacity(conv_len);
+            for i in 0..conv_len {
+                let elem_offset = offset + i * 4;
+                conv.push(f32::from_le_bytes(
+                    bytes[elem_offset..elem_offset + 4]
+                        .try_into()
+                        .map_err(|_| "failed to read conv float".to_string())?,
+                ));
+            }
+            offset += conv_bytes;
+
+            if offset + 4 > bytes.len() {
+                return Err("unexpected EOF reading recurrent length".to_string());
+            }
+            let rec_len = u32::from_le_bytes(
+                bytes[offset..offset + 4]
+                    .try_into()
+                    .map_err(|_| "failed to read recurrent length".to_string())?,
+            ) as usize;
+            offset += 4;
+            let rec_bytes = rec_len
+                .checked_mul(4)
+                .ok_or_else(|| "recurrent byte length overflow".to_string())?;
+            if offset + rec_bytes > bytes.len() {
+                return Err("unexpected EOF reading recurrent data".to_string());
+            }
+            let mut recurrent = Vec::with_capacity(rec_len);
+            for i in 0..rec_len {
+                let elem_offset = offset + i * 4;
+                recurrent.push(f32::from_le_bytes(
+                    bytes[elem_offset..elem_offset + 4]
+                        .try_into()
+                        .map_err(|_| "failed to read recurrent float".to_string())?,
+                ));
+            }
+            offset += rec_bytes;
+
+            layer_states.push(RecurrentLayerStatePayload { conv, recurrent });
+        }
+
+        if offset != bytes.len() {
+            return Err(format!(
+                "trailing bytes in recurrent state payload: read {offset}, total {}",
+                bytes.len()
+            ));
+        }
+
+        Ok(Self {
+            next_position,
+            layer_states,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +328,44 @@ mod tests {
             .assign_batch(&[RequestId::from("second")])
             .expect("failed batch must leave the only slot available");
         assert_eq!(assigned.slots(), &[0]);
+    }
+
+    #[test]
+    fn recurrent_state_payload_roundtrips_bytes_cleanly() {
+        let payload = RecurrentStatePayload {
+            next_position: 42,
+            layer_states: vec![
+                RecurrentLayerStatePayload {
+                    conv: vec![1.0, -2.5, 3.125],
+                    recurrent: vec![0.5, 0.25, -0.125, 4.0],
+                },
+                RecurrentLayerStatePayload {
+                    conv: vec![0.0, 1.5, -1.0],
+                    recurrent: vec![2.0, -3.0, 0.0, 1.0],
+                },
+            ],
+        };
+        let bytes = payload.to_bytes();
+        let decoded = RecurrentStatePayload::from_bytes(&bytes).expect("valid bytes decode");
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn recurrent_state_payload_rejects_corrupted_or_truncated_bytes() {
+        assert!(RecurrentStatePayload::from_bytes(&[]).is_err());
+        assert!(RecurrentStatePayload::from_bytes(&[0u8; 15]).is_err());
+        assert!(RecurrentStatePayload::from_bytes(&[0u8; 16]).is_err()); // wrong magic
+
+        let mut valid = RecurrentStatePayload {
+            next_position: 1,
+            layer_states: vec![RecurrentLayerStatePayload {
+                conv: vec![1.0],
+                recurrent: vec![2.0],
+            }],
+        }
+        .to_bytes();
+
+        valid.push(0); // trailing byte
+        assert!(RecurrentStatePayload::from_bytes(&valid).is_err());
     }
 }

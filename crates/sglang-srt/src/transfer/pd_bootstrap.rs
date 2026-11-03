@@ -53,6 +53,7 @@ pub struct MooncakeBootstrapKvCacheTransferExecutor<E> {
     metadata_wait_timeout: Duration,
     metadata_poll_interval: Duration,
     pending_tokens: BTreeMap<BootstrapRoom, u32>,
+    pending_states: BTreeMap<BootstrapRoom, Vec<u8>>,
 }
 
 impl<E> MooncakeBootstrapKvCacheTransferExecutor<E> {
@@ -66,6 +67,7 @@ impl<E> MooncakeBootstrapKvCacheTransferExecutor<E> {
             metadata_wait_timeout: Self::DEFAULT_METADATA_WAIT_TIMEOUT,
             metadata_poll_interval: Self::DEFAULT_METADATA_POLL_INTERVAL,
             pending_tokens: BTreeMap::new(),
+            pending_states: BTreeMap::new(),
         }
     }
 
@@ -156,6 +158,10 @@ where
         let result = self.inner.submit(span);
         if let Some(token) = span.first_token() {
             self.pending_tokens.insert(span.bootstrap_room(), token);
+        }
+        if let Some(state) = span.recurrent_state() {
+            self.pending_states
+                .insert(span.bootstrap_room(), state.to_vec());
         }
         if let Err(error) = &result {
             self.inner.cancel(span.bootstrap_room())?;
@@ -253,13 +259,19 @@ where
             )
         };
         let token = self.pending_tokens.get(&room).copied();
+        let recurrent_state = self.pending_states.get(&room).map(|v| v.as_slice());
         for (host, port, aux) in targets {
             if token.is_none() {
                 continue;
             }
-            let frames =
-                completion_frames(room, if error.is_none() { token } else { None }, error, aux)
-                    .map_err(KvCacheTransferError::Runtime)?;
+            let frames = completion_frames(
+                room,
+                if error.is_none() { token } else { None },
+                recurrent_state,
+                error,
+                aux,
+            )
+            .map_err(KvCacheTransferError::Runtime)?;
             send_frames(format!("tcp://{host}:{port}"), frames)
                 .map_err(KvCacheTransferError::Runtime)?;
         }
@@ -283,6 +295,7 @@ where
         state.abort_targets.remove(&room);
         state.transfer_rooms.remove(&room);
         self.pending_tokens.remove(&room);
+        self.pending_states.remove(&room);
         Ok(())
     }
 }
@@ -1068,14 +1081,22 @@ impl DecodeBootstrapPublisher for MooncakeDecodeBootstrapPublisher {
     }
 
     fn receive_prefill_token(&mut self, room: BootstrapRoom) -> Result<u32, String> {
+        self.receive_prefill_token_and_state(room)
+            .map(|(token, _)| token)
+    }
+
+    fn receive_prefill_token_and_state(
+        &mut self,
+        room: BootstrapRoom,
+    ) -> Result<(u32, Option<Vec<u8>>), String> {
         let receiver = self
             .receiver
             .as_ref()
             .ok_or("Mooncake decode receiver was not started")?;
-        let token = receiver.receive(room)?;
+        let (token, state) = receiver.receive_token_and_state(room)?;
         receiver.remove(room);
         self.receive_targets.remove(&room);
-        Ok(token)
+        Ok((token, state))
     }
 
     fn cancel_receive(&mut self, room: BootstrapRoom) -> Result<(), String> {

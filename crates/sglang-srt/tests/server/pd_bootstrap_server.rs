@@ -18,6 +18,7 @@ use sglang_srt::pd_bootstrap::{
     serve_mooncake_bootstrap_zmq_endpoints_with_shutdown,
     serve_mooncake_bootstrap_zmq_with_shutdown, serve_prefill_bootstrap_with_shutdown,
 };
+use sglang_srt::recurrent_state::{RecurrentLayerStatePayload, RecurrentStatePayload};
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::transfer::{
     DecodeBootstrapRegistry, FakeKvCacheTransferExecutor, KvCacheMemoryLocation, KvPoll,
@@ -29,7 +30,9 @@ use sglang_srt::transfer::{
     TransferableKvCacheRegion,
 };
 use sglang_srt::types::{BootstrapRoom, DisaggregatedParams, RequestId, SamplingParams};
-use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
+use sglang_srt::worker::{
+    BatchGeneratedTokens, FallibleModelWorker, GeneratedToken, ModelWorker, WorkerExecutionError,
+};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn engine_info_bootstrap_registers_and_serves_transfer_engine_info() {
@@ -1878,6 +1881,222 @@ async fn tcp_transfer_engine_transfers_kv_cache_across_multi_rank_tp() {
         assert_eq!(&decode_kv_cache[0..256], &vec![pattern; 256][..]);
         assert_eq!(&decode_kv_cache[256..512], &[0u8; 256]);
     }
+
+    shutdown_tx.send(()).expect("shutdown server");
+    server.await.expect("server joins").expect("clean stop");
+}
+
+struct HybridStateTransferPrefillWorker {
+    state_bytes: Vec<u8>,
+}
+
+impl FallibleModelWorker for HybridStateTransferPrefillWorker {
+    fn try_generate_batch(
+        &mut self,
+        batch: &ScheduleBatch,
+    ) -> Result<BatchGeneratedTokens, WorkerExecutionError> {
+        BatchGeneratedTokens::from_batch(
+            batch,
+            batch
+                .requests()
+                .iter()
+                .map(|_| GeneratedToken::unfinished(vec![42]))
+                .collect(),
+        )
+        .map_err(WorkerExecutionError::from)
+    }
+
+    fn export_recurrent_state(
+        &self,
+        _request_id: &RequestId,
+    ) -> Result<Option<Vec<u8>>, WorkerExecutionError> {
+        Ok(Some(self.state_bytes.clone()))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tcp_transfer_engine_transfers_hybrid_recurrent_state_to_decode() {
+    use sglang_srt::tcp_transfer::SharedTcpTransferEngine;
+    use sglang_srt::transfer::MooncakeSessionTargetResolver;
+
+    // 1. Set up Decode side
+    let mut decode_engine = SharedTcpTransferEngine::new("127.0.0.1", 0).expect("decode engine");
+    let decode_endpoint = decode_engine.local_endpoint().expect("decode endpoint");
+    let mut decode_kv_cache = vec![0u8; 128 * 4];
+    let decode_base_addr = decode_kv_cache.as_mut_ptr() as usize;
+
+    decode_engine
+        .register_memory_batch(
+            &mut [MooncakeBufferEntry {
+                addr: decode_kv_cache.as_mut_ptr() as *mut c_void,
+                length: decode_kv_cache.len(),
+            }],
+            "cpu",
+        )
+        .expect("register decode memory");
+
+    // 2. Set up ZMQ notify socket
+    let notify_addr = unused_local_addr();
+    let mut notify_socket = PullSocket::new();
+    notify_socket
+        .bind(format!("tcp://{}", notify_addr).as_str())
+        .await
+        .expect("bind notify socket");
+
+    let notification = tokio::spawn(async move {
+        let aux0 = notify_socket
+            .recv()
+            .await
+            .expect("first-token auxiliary data")
+            .into_vec();
+        assert_eq!(aux0[0].as_ref(), b"AUX_DATA");
+        assert_eq!(aux0[2].as_ref(), b"0");
+        let token = u32::from_ne_bytes(aux0[5][..4].try_into().unwrap());
+        assert_eq!(token, 42);
+
+        let aux1 = notify_socket
+            .recv()
+            .await
+            .expect("recurrent-state auxiliary data")
+            .into_vec();
+        assert_eq!(aux1[0].as_ref(), b"AUX_DATA");
+        assert_eq!(aux1[2].as_ref(), b"1");
+        let received_payload =
+            RecurrentStatePayload::from_bytes(&aux1[5]).expect("parse recurrent state");
+
+        let status = notify_socket.recv().await.expect("KV completion status");
+        assert_eq!(status.into_vec()[1].as_ref(), b"4");
+        received_payload
+    });
+
+    // 3. Set up Prefill bootstrap service
+    let service = PrefillBootstrapService::default();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let addr = unused_local_addr();
+    let server_service = service.clone();
+    let server = tokio::spawn(async move {
+        serve_prefill_bootstrap_with_shutdown(addr, server_service, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    {
+        let mut state = service.state().lock().expect("state lock");
+        state
+            .ingest_mooncake_bootstrap_frame(&[
+                b"None".to_vec(),
+                b"127.0.0.1".to_vec(),
+                notify_addr.port().to_string().into_bytes(),
+                decode_endpoint.as_bytes().to_vec(),
+                pack_u64s(&[decode_base_addr as u64]),
+                pack_u64s(&[]),
+                pack_u64_lists(&[]),
+                b"0".to_vec(),
+                b"1".to_vec(),
+                b"128".to_vec(),
+            ])
+            .expect("decode KV args should parse");
+        state
+            .ingest_mooncake_bootstrap_frame(&[
+                b"99".to_vec(),
+                b"127.0.0.1".to_vec(),
+                notify_addr.port().to_string().into_bytes(),
+                decode_endpoint.as_bytes().to_vec(),
+                pack_i32s(&[0, 1]),
+                b"0".to_vec(),
+                pack_i32_lists(&[]),
+                b"1".to_vec(),
+                b"2".to_vec(),
+            ])
+            .expect("decode transfer metadata should parse");
+    }
+
+    // 4. Set up Prefill side with test pattern and recurrent state payload
+    let mut prefill_kv_cache = vec![0x5A_u8; 128 * 4];
+    let prefill_base_addr = prefill_kv_cache.as_mut_ptr() as usize;
+
+    let prefill_engine = SharedTcpTransferEngine::new("127.0.0.1", 0).expect("prefill engine");
+    let layout = MooncakeKvCacheLayout {
+        source_base_addr: prefill_base_addr,
+        page_size_bytes: 128,
+        target_base_offset: 0,
+    };
+    let target_resolver = MooncakeSessionTargetResolver::new(prefill_engine.clone(), Vec::new());
+    let mut inner = MooncakeKvCacheTransferExecutor::with_target_resolver(
+        prefill_engine.clone(),
+        layout,
+        target_resolver,
+    )
+    .with_memory_registrar(prefill_engine);
+
+    inner
+        .register(
+            TransferableKvCacheMemory::new(
+                vec![TransferableKvCacheRegion {
+                    base_addr: prefill_base_addr,
+                    byte_len: 128 * 4,
+                    page_size_bytes: 128,
+                }],
+                128,
+                KvCacheMemoryLocation::Cpu { numa_node: 0 },
+            )
+            .expect("valid transferable memory"),
+        )
+        .expect("register prefill memory");
+
+    let transfer_executor = MooncakeBootstrapKvCacheTransferExecutor::new(service, inner)
+        .with_metadata_wait_timeout(Duration::from_millis(100));
+
+    let expected_payload = RecurrentStatePayload {
+        next_position: 8,
+        layer_states: vec![
+            RecurrentLayerStatePayload {
+                conv: vec![0.5, -1.25, 2.75],
+                recurrent: vec![10.0, 20.0, 30.0, 40.0],
+            },
+            RecurrentLayerStatePayload {
+                conv: vec![3.5, 2.5, 1.5],
+                recurrent: vec![-1.0, -2.0, -3.0, -4.0],
+            },
+        ],
+    };
+
+    let worker = KvTransferModelWorker::new(
+        HybridStateTransferPrefillWorker {
+            state_bytes: expected_payload.to_bytes(),
+        },
+        DecodeBootstrapRegistry::default(),
+        transfer_executor,
+    )
+    .with_prefill_only();
+
+    let mut scheduler =
+        Scheduler::with_cache_resources(worker, RadixCache::default(), CachePageAllocator::new(4));
+    scheduler.enqueue(
+        ScheduledRequest::new(
+            RequestId::from("tcp-pd-hybrid-recurrent-test"),
+            vec![1, 2],
+            SamplingParams::new(1),
+        )
+        .with_disaggregated_params(Some(DisaggregatedParams {
+            bootstrap_host: addr.ip().to_string(),
+            bootstrap_port: addr.port(),
+            bootstrap_room: 99,
+        }))
+        .with_data_parallel_rank(0),
+    );
+
+    scheduler
+        .dispatch_prefill_batch(1)
+        .expect("prefill transfer should succeed over TCP with recurrent state");
+
+    let received_payload = notification.await.expect("completion receiver joins");
+
+    // 5. Verify both KV cache pages and recurrent state were transferred accurately
+    assert_eq!(&decode_kv_cache[0..256], &[0x5A_u8; 256]);
+    assert_eq!(&decode_kv_cache[256..512], &[0u8; 256]);
+    assert_eq!(received_payload, expected_payload);
 
     shutdown_tx.send(()).expect("shutdown server");
     server.await.expect("server joins").expect("clean stop");

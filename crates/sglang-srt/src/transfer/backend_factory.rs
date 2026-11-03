@@ -266,17 +266,19 @@ impl fmt::Display for TransferBackendFactoryError {
                 "transfer backend role {requested:?} does not match configured PD role {configured:?}"
             ),
             Self::UnsupportedRole(role) => {
-                write!(formatter, "transfer backend cannot be built for PD role {role:?}")
+                write!(
+                    formatter,
+                    "transfer backend cannot be built for PD role {role:?}"
+                )
             }
             Self::UnsupportedBackend { role, backend } => write!(
                 formatter,
                 "transfer backend {backend:?} is not implemented for PD role {role:?}"
             ),
-            Self::MissingPrefillBootstrapService => formatter.write_str(
-                "prefill transfer backend requires a bootstrap metadata service",
-            ),
+            Self::MissingPrefillBootstrapService => formatter
+                .write_str("prefill transfer backend requires a bootstrap metadata service"),
             Self::UnsupportedCacheArchitecture => formatter.write_str(
-                "model cache architecture includes recurrent state; KV-only transfer is insufficient",
+                "model cache architecture does not declare a transferable KV cache or hybrid state",
             ),
             Self::MissingRuntimeCapabilities {
                 runtime_name,
@@ -314,11 +316,10 @@ fn build_mooncake_transfer_backend(
     slot_capacity: usize,
     page_size: usize,
 ) -> Result<MooncakeTransferBackendBundle, TransferBackendFactoryError> {
-    if !model_runner
-        .model()
-        .cache_architecture()
-        .supports_kv_only_transfer()
-    {
+    if matches!(
+        model_runner.model().cache_architecture(),
+        crate::models::ModelCacheArchitecture::None
+    ) {
         return Err(TransferBackendFactoryError::UnsupportedCacheArchitecture);
     }
 
@@ -398,11 +399,10 @@ fn build_tcp_transfer_backend(
     slot_capacity: usize,
     page_size: usize,
 ) -> Result<TcpTransferBackendBundle, TransferBackendFactoryError> {
-    if !model_runner
-        .model()
-        .cache_architecture()
-        .supports_kv_only_transfer()
-    {
+    if matches!(
+        model_runner.model().cache_architecture(),
+        crate::models::ModelCacheArchitecture::None
+    ) {
         return Err(TransferBackendFactoryError::UnsupportedCacheArchitecture);
     }
 

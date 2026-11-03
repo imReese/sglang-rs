@@ -295,6 +295,21 @@ pub trait ForwardModel {
             "forward model does not support update_weights_from_disk".to_string(),
         ))
     }
+
+    fn export_recurrent_state(
+        &self,
+        _request_id: &RequestId,
+    ) -> Result<Option<Vec<u8>>, ModelForwardError> {
+        Ok(None)
+    }
+
+    fn restore_recurrent_state(
+        &mut self,
+        _request_id: &RequestId,
+        _state: &[u8],
+    ) -> Result<(), ModelForwardError> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -820,6 +835,25 @@ where
     ) -> Result<(), WorkerExecutionError> {
         self.model
             .update_weights_from_disk(request)
+            .map_err(|error| WorkerExecutionError::Runtime(error.to_string()))
+    }
+
+    fn export_recurrent_state(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<Option<Vec<u8>>, WorkerExecutionError> {
+        self.model
+            .export_recurrent_state(request_id)
+            .map_err(|error| WorkerExecutionError::Runtime(error.to_string()))
+    }
+
+    fn restore_recurrent_state(
+        &mut self,
+        request_id: &RequestId,
+        state: &[u8],
+    ) -> Result<(), WorkerExecutionError> {
+        self.model
+            .restore_recurrent_state(request_id, state)
             .map_err(|error| WorkerExecutionError::Runtime(error.to_string()))
     }
 }

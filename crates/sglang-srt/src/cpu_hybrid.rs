@@ -28,6 +28,7 @@ use crate::models::{
     MultiLatentQueryWeightNames, RecurrentStateLayout, RoutedExpertWeightFormat,
 };
 use crate::moe::MoeRouter;
+use crate::recurrent_state::{RecurrentLayerStatePayload, RecurrentStatePayload};
 use crate::types::RequestId;
 
 pub(crate) type CpuHybridExecutionResources =
@@ -82,6 +83,75 @@ impl CpuHybridStatePool {
     fn complete_request(&mut self, request_id: &RequestId) {
         self.requests.remove(request_id.as_str());
     }
+
+    pub(crate) fn export_request_state(
+        &self,
+        request_id: &RequestId,
+    ) -> Option<RecurrentStatePayload> {
+        let state = self.requests.get(request_id.as_str())?;
+        Some(RecurrentStatePayload {
+            next_position: state.next_position,
+            layer_states: state
+                .recurrent_layers
+                .iter()
+                .map(|layer| RecurrentLayerStatePayload {
+                    conv: layer.conv.clone(),
+                    recurrent: layer.recurrent.clone(),
+                })
+                .collect(),
+        })
+    }
+
+    pub(crate) fn restore_request_state(
+        &mut self,
+        request_id: &RequestId,
+        payload: RecurrentStatePayload,
+    ) -> Result<(), String> {
+        if payload.layer_states.len() != self.layout.layer_count {
+            return Err(format!(
+                "recurrent state layer count {} does not match layout {}",
+                payload.layer_states.len(),
+                self.layout.layer_count
+            ));
+        }
+        let conv_elements = self
+            .layout
+            .conv_elements_per_layer()
+            .ok_or_else(|| "conv element count overflowed".to_string())?;
+        let temporal_elements = self
+            .layout
+            .temporal_elements_per_layer()
+            .ok_or_else(|| "temporal element count overflowed".to_string())?;
+        for (i, layer) in payload.layer_states.iter().enumerate() {
+            if layer.conv.len() != conv_elements {
+                return Err(format!(
+                    "layer {i} conv elements {} does not match expected {conv_elements}",
+                    layer.conv.len()
+                ));
+            }
+            if layer.recurrent.len() != temporal_elements {
+                return Err(format!(
+                    "layer {i} recurrent elements {} does not match expected {temporal_elements}",
+                    layer.recurrent.len()
+                ));
+            }
+        }
+        self.requests.insert(
+            request_id.as_str().to_string(),
+            HybridRequestState {
+                next_position: payload.next_position,
+                recurrent_layers: payload
+                    .layer_states
+                    .into_iter()
+                    .map(|layer| LinearAttentionLayerState {
+                        conv: layer.conv,
+                        recurrent: layer.recurrent,
+                    })
+                    .collect(),
+            },
+        );
+        Ok(())
+    }
 }
 
 impl ActiveRecurrentState for CpuHybridStatePool {
@@ -91,6 +161,19 @@ impl ActiveRecurrentState for CpuHybridStatePool {
 
     fn complete_request(&mut self, request_id: &RequestId) {
         self.complete_request(request_id);
+    }
+
+    fn export_request_state(&self, request_id: &RequestId) -> Result<Option<Vec<u8>>, String> {
+        Ok(self.export_request_state(request_id).map(|p| p.to_bytes()))
+    }
+
+    fn restore_request_state(
+        &mut self,
+        request_id: &RequestId,
+        state: &[u8],
+    ) -> Result<(), String> {
+        let payload = RecurrentStatePayload::from_bytes(state)?;
+        self.restore_request_state(request_id, payload)
     }
 }
 
@@ -146,7 +229,7 @@ impl CpuReferenceHybridDecoder {
     }
 
     pub(crate) fn runtime_capability(&self) -> RuntimeCapability {
-        RuntimeCapability::cpu_reference("cpu-reference-hybrid-decoder", false)
+        RuntimeCapability::cpu_reference("cpu-reference-hybrid-decoder", true)
     }
 
     pub(crate) fn execution_dtype(&self) -> RuntimeDtype {
@@ -1560,5 +1643,42 @@ mod tests {
             .expect("valid low-rank MLA query should project");
 
         assert_eq!(projected, vec![2.0, 3.0, -1.0]);
+    }
+
+    #[test]
+    fn hybrid_recurrent_state_exports_and_restores_across_pools_accurately() {
+        let mut prefill_pool = CpuHybridStatePool::new(state_layout()).expect("prefill pool");
+        let mut decode_pool = CpuHybridStatePool::new(state_layout()).expect("decode pool");
+        let request_id = RequestId::from("hybrid-transfer-test");
+
+        let prefill_state = prefill_pool
+            .request_state_mut(&request_id, 0)
+            .expect("prefill allocate");
+        prefill_state.next_position = 5;
+        prefill_state.recurrent_layers[0].conv[0] = 1.25;
+        prefill_state.recurrent_layers[0].recurrent[2] = 9.75;
+        prefill_state.recurrent_layers[1].conv[1] = -4.5;
+        prefill_state.recurrent_layers[1].recurrent[3] = 7.125;
+
+        let payload = prefill_pool
+            .export_request_state(&request_id)
+            .expect("export state");
+        let bytes = payload.to_bytes();
+        let deserialized =
+            crate::recurrent_state::RecurrentStatePayload::from_bytes(&bytes).expect("deserialize");
+        assert_eq!(deserialized, payload);
+
+        decode_pool
+            .restore_request_state(&request_id, deserialized)
+            .expect("restore state");
+
+        let restored = decode_pool
+            .request_state_mut(&request_id, 5)
+            .expect("access restored state at next_position");
+        assert_eq!(restored.next_position, 5);
+        assert_eq!(restored.recurrent_layers[0].conv[0], 1.25);
+        assert_eq!(restored.recurrent_layers[0].recurrent[2], 9.75);
+        assert_eq!(restored.recurrent_layers[1].conv[1], -4.5);
+        assert_eq!(restored.recurrent_layers[1].recurrent[3], 7.125);
     }
 }

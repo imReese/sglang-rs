@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fmt;
 
 use sglang_kernel::cpu::{
@@ -23,7 +22,10 @@ use crate::models::{
     ModelExecutionArchitecture,
 };
 use crate::runtime_kv_cache::{ActiveKvCache, RuntimeKvCache};
-use crate::transfer::{KvCacheTransferError, TransferableKvCacheMemory};
+use crate::transfer::{
+    KvCacheMemoryLocation, KvCacheTransferError, TransferableKvCacheMemory,
+    TransferableKvCacheRegion,
+};
 
 #[derive(Debug)]
 pub(crate) struct CpuReferenceDenseDecoder {
@@ -113,7 +115,7 @@ impl CpuReferenceDenseDecoder {
     }
 
     pub(crate) fn runtime_capability(&self) -> RuntimeCapability {
-        RuntimeCapability::cpu_reference("cpu-reference-dense-decoder", false)
+        RuntimeCapability::cpu_reference("cpu-reference-dense-decoder", true)
     }
 
     pub(crate) fn execution_dtype(&self) -> RuntimeDtype {
@@ -755,7 +757,7 @@ impl FloatMatrix {
 #[derive(Debug)]
 pub(crate) struct CpuReferenceKvCache {
     layout: PagedKvCacheLayout,
-    layers: Vec<HashMap<usize, KvSlot>>,
+    data: Vec<u8>,
     key_width: usize,
     value_width: usize,
 }
@@ -786,9 +788,10 @@ impl CpuReferenceKvCache {
                 "CPU reference KV tensor byte widths {key_bytes}/{value_bytes} are not f32 aligned"
             )));
         }
+        let total_byte_len = layout.total_byte_len();
         Ok(Self {
             layout,
-            layers: (0..runtime.num_layers).map(|_| HashMap::new()).collect(),
+            data: vec![0u8; total_byte_len],
             key_width: key_bytes / std::mem::size_of::<f32>(),
             value_width: value_bytes / std::mem::size_of::<f32>(),
         })
@@ -810,12 +813,21 @@ impl CpuReferenceKvCache {
                 self.value_width
             )));
         }
-        let layer = self.layers.get_mut(layer_index).ok_or_else(|| {
-            CpuReferenceDenseDecoderError::Execution(format!(
-                "KV cache layer {layer_index} is out of range"
-            ))
-        })?;
-        layer.insert(slot.as_usize(), KvSlot { key, value });
+        let key_range = self
+            .layout
+            .tensor_slot_byte_range(layer_index, 0, slot.as_usize())
+            .map_err(|e| CpuReferenceDenseDecoderError::Execution(e.to_string()))?;
+        let value_range = self
+            .layout
+            .tensor_slot_byte_range(layer_index, 1, slot.as_usize())
+            .map_err(|e| CpuReferenceDenseDecoderError::Execution(e.to_string()))?;
+
+        for (val, chunk) in key.iter().zip(self.data[key_range].chunks_exact_mut(4)) {
+            chunk.copy_from_slice(&val.to_ne_bytes());
+        }
+        for (val, chunk) in value.iter().zip(self.data[value_range].chunks_exact_mut(4)) {
+            chunk.copy_from_slice(&val.to_ne_bytes());
+        }
         Ok(())
     }
 
@@ -824,11 +836,6 @@ impl CpuReferenceKvCache {
         layer_index: usize,
         slots: &[CachePageId],
     ) -> Result<(Vec<f32>, Vec<f32>), CpuReferenceDenseDecoderError> {
-        let layer = self.layers.get(layer_index).ok_or_else(|| {
-            CpuReferenceDenseDecoderError::Execution(format!(
-                "KV cache layer {layer_index} is out of range"
-            ))
-        })?;
         let key_capacity = slots.len().checked_mul(self.key_width).ok_or_else(|| {
             CpuReferenceDenseDecoderError::Execution("KV gather size overflowed".to_string())
         })?;
@@ -838,14 +845,21 @@ impl CpuReferenceKvCache {
         let mut keys = Vec::with_capacity(key_capacity);
         let mut values = Vec::with_capacity(value_capacity);
         for slot in slots {
-            let entry = layer.get(&slot.as_usize()).ok_or_else(|| {
-                CpuReferenceDenseDecoderError::Execution(format!(
-                    "KV cache layer {layer_index} physical slot {} is not initialized",
-                    slot.as_usize()
-                ))
-            })?;
-            keys.extend_from_slice(&entry.key);
-            values.extend_from_slice(&entry.value);
+            let key_range = self
+                .layout
+                .tensor_slot_byte_range(layer_index, 0, slot.as_usize())
+                .map_err(|e| CpuReferenceDenseDecoderError::Execution(e.to_string()))?;
+            let value_range = self
+                .layout
+                .tensor_slot_byte_range(layer_index, 1, slot.as_usize())
+                .map_err(|e| CpuReferenceDenseDecoderError::Execution(e.to_string()))?;
+
+            for chunk in self.data[key_range].chunks_exact(4) {
+                keys.push(f32::from_ne_bytes(chunk.try_into().unwrap()));
+            }
+            for chunk in self.data[value_range].chunks_exact(4) {
+                values.push(f32::from_ne_bytes(chunk.try_into().unwrap()));
+            }
         }
         Ok((keys, values))
     }
@@ -861,17 +875,20 @@ impl ActiveKvCache for CpuReferenceKvCache {
     }
 
     fn transferable_memory(&self) -> Result<TransferableKvCacheMemory, KvCacheTransferError> {
-        Err(KvCacheTransferError::Runtime(
-            "CPU reference active KV memory is not a production transfer or offload tier"
-                .to_string(),
-        ))
+        let base_addr = self.data.as_ptr() as usize;
+        let page_size_bytes = self.layout.runtime().page_size_bytes;
+        let region = TransferableKvCacheRegion {
+            base_addr,
+            byte_len: self.data.len(),
+            page_size_bytes,
+        };
+        TransferableKvCacheMemory::new(
+            vec![region],
+            page_size_bytes,
+            KvCacheMemoryLocation::Cpu { numa_node: 0 },
+        )
+        .map_err(|e| KvCacheTransferError::Runtime(e.to_string()))
     }
-}
-
-#[derive(Debug)]
-struct KvSlot {
-    key: Vec<f32>,
-    value: Vec<f32>,
 }
 
 pub(crate) fn load_vector(
@@ -1067,9 +1084,7 @@ mod pd_tests {
 
     impl KvTransferBackend for ReferencePageCopy {
         fn register(&mut self, _: TransferableKvCacheMemory) -> Result<(), KvCacheTransferError> {
-            Err(KvCacheTransferError::Runtime(
-                "reference HashMap storage has no production memory descriptor".into(),
-            ))
+            Ok(())
         }
         fn submit(&mut self, span: &KvCacheTransferSpan) -> Result<(), KvCacheTransferError> {
             let (lock, ready) = &*self.rendezvous;
@@ -1098,8 +1113,9 @@ mod pd_tests {
                 }
             }
             drop(target_resources);
-            let frames = completion_frames(span.bootstrap_room(), span.first_token(), None, 0)
-                .expect("community control frames");
+            let frames =
+                completion_frames(span.bootstrap_room(), span.first_token(), None, None, 0)
+                    .expect("community control frames");
             send_frames(destination.endpoint.clone(), frames)
                 .map_err(KvCacheTransferError::Runtime)?;
             self.pending.push(KvTransferCompletionEvent::completed(

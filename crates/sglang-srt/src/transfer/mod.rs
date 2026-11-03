@@ -532,11 +532,21 @@ pub struct KvCacheTransferSpan {
     page_size: usize,
     page_indices: Vec<KvCachePageIndex>,
     first_token: Option<u32>,
+    recurrent_state: Option<Vec<u8>>,
 }
 
 impl KvCacheTransferSpan {
     pub fn first_token(&self) -> Option<u32> {
         self.first_token
+    }
+
+    pub fn recurrent_state(&self) -> Option<&[u8]> {
+        self.recurrent_state.as_deref()
+    }
+
+    pub fn with_recurrent_state(mut self, recurrent_state: Option<Vec<u8>>) -> Self {
+        self.recurrent_state = recurrent_state;
+        self
     }
     pub fn request_id(&self) -> &RequestId {
         &self.request_id
@@ -684,6 +694,7 @@ impl KvCacheTransferPlan {
                 page_size,
                 page_indices,
                 first_token: None,
+                recurrent_state: None,
             });
         }
 
@@ -699,6 +710,10 @@ impl KvCacheTransferPlan {
 
     pub fn spans(&self) -> &[KvCacheTransferSpan] {
         &self.spans
+    }
+
+    pub fn spans_mut(&mut self) -> &mut [KvCacheTransferSpan] {
+        &mut self.spans
     }
 
     fn with_prefill_output(
@@ -895,7 +910,15 @@ pub trait DecodeBootstrapPublisher {
         plan: &KvCacheTransferPlan,
     ) -> Result<DecodeBootstrapMetadataPublishSummary, String>;
 
-    fn receive_prefill_token(&mut self, _room: BootstrapRoom) -> Result<u32, String> {
+    fn receive_prefill_token(&mut self, room: BootstrapRoom) -> Result<u32, String> {
+        self.receive_prefill_token_and_state(room)
+            .map(|(token, _)| token)
+    }
+
+    fn receive_prefill_token_and_state(
+        &mut self,
+        _room: BootstrapRoom,
+    ) -> Result<(u32, Option<Vec<u8>>), String> {
         Err("decode bootstrap publisher has no receive/completion implementation".to_string())
     }
 
@@ -1071,6 +1094,21 @@ where
         self.prefill.update_weights_from_disk(request)?;
         self.decode.update_weights_from_disk(request)
     }
+
+    fn export_recurrent_state(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<Option<Vec<u8>>, WorkerExecutionError> {
+        self.decode.export_recurrent_state(request_id)
+    }
+
+    fn restore_recurrent_state(
+        &mut self,
+        request_id: &RequestId,
+        state: &[u8],
+    ) -> Result<(), WorkerExecutionError> {
+        self.decode.restore_recurrent_state(request_id, state)
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1093,6 +1131,10 @@ where
         let output = self.prefill.try_generate_batch(batch)?;
         let mut summary = KvCacheTransferSummary::default();
         for span in transfer_plan.spans() {
+            if let Some(state) = self.prefill.export_recurrent_state(span.request_id())? {
+                self.decode
+                    .restore_recurrent_state(span.request_id(), &state)?;
+            }
             if span.is_noop() {
                 summary.noop_spans += 1;
                 continue;
@@ -1511,10 +1553,14 @@ where
                         )
                     })?
                     .bootstrap_room;
-                let token = self
+                let (token, recurrent_state) = self
                     .decode_bootstrap_publisher
-                    .receive_prefill_token(room)
+                    .receive_prefill_token_and_state(room)
                     .map_err(WorkerExecutionError::Runtime)?;
+                if let Some(state_bytes) = recurrent_state {
+                    self.worker
+                        .restore_recurrent_state(request.request_id(), &state_bytes)?;
+                }
                 self.registry
                     .update_status(room, KvPoll::Success)
                     .map_err(|error| WorkerExecutionError::Runtime(error.to_string()))?;
@@ -1542,7 +1588,10 @@ where
                         "KV transfer bootstrap registration failed: {error}"
                     ))
                 })?;
-            let transfer_plan = transfer_plan.with_prefill_output(batch, &output)?;
+            let mut transfer_plan = transfer_plan.with_prefill_output(batch, &output)?;
+            for span in transfer_plan.spans_mut() {
+                span.recurrent_state = self.worker.export_recurrent_state(span.request_id())?;
+            }
             let transfer_summary = execute_kv_cache_transfer_plan(
                 &mut self.registry,
                 &mut self.transfer_executor,
@@ -1659,6 +1708,21 @@ where
         request: &WorkerWeightUpdateRequest,
     ) -> Result<(), WorkerExecutionError> {
         self.worker.update_weights_from_disk(request)
+    }
+
+    fn export_recurrent_state(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<Option<Vec<u8>>, WorkerExecutionError> {
+        self.worker.export_recurrent_state(request_id)
+    }
+
+    fn restore_recurrent_state(
+        &mut self,
+        request_id: &RequestId,
+        state: &[u8],
+    ) -> Result<(), WorkerExecutionError> {
+        self.worker.restore_recurrent_state(request_id, state)
     }
 }
 

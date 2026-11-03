@@ -306,6 +306,7 @@ fn model_prefix_cache_policy(model: &BootstrapForwardModel) -> PrefixCachePolicy
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn validate_kv_only_transfer_model(model: &BootstrapForwardModel) -> Result<(), ServerLaunchError> {
     if model.cache_architecture().supports_kv_only_transfer() {
         return Ok(());
@@ -389,6 +390,16 @@ impl DecodeBootstrapPublisher for ProductionDecodeBootstrapPublisher {
     fn receive_prefill_token(&mut self, room: crate::types::BootstrapRoom) -> Result<u32, String> {
         match self {
             Self::Mooncake(publisher) => publisher.receive_prefill_token(room),
+            Self::Noop(_) => Err("prefill role does not receive remote KV".into()),
+        }
+    }
+
+    fn receive_prefill_token_and_state(
+        &mut self,
+        room: crate::types::BootstrapRoom,
+    ) -> Result<(u32, Option<Vec<u8>>), String> {
+        match self {
+            Self::Mooncake(publisher) => publisher.receive_prefill_token_and_state(room),
             Self::Noop(_) => Err("prefill role does not receive remote KV".into()),
         }
     }
@@ -1217,7 +1228,6 @@ where
     E: KvTransferBackend,
     P: DecodeBootstrapPublisher,
 {
-    validate_kv_only_transfer_model(&model)?;
     try_build_bootstrap_pd_http_router_service_from_runner_with_decode_publisher(
         args,
         bootstrap_model_runner(model)?,
@@ -1510,7 +1520,6 @@ where
     E: KvTransferBackend,
     P: DecodeBootstrapPublisher,
 {
-    validate_kv_only_transfer_model(&model)?;
     try_build_bootstrap_pd_grpc_router_service_from_runner_with_decode_publisher(
         args,
         bootstrap_model_runner(model)?,

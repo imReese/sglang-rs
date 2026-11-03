@@ -2,6 +2,7 @@ use std::fmt;
 
 use crate::scheduler::{ForwardMode, ScheduleBatch, ScheduledOutput, ScheduledRequest};
 use crate::transfer::{KvCacheTransferError, KvTransferPollSummary};
+use crate::types::RequestId;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GeneratedToken {
@@ -174,6 +175,21 @@ pub trait FallibleModelWorker {
             "worker does not support update_weights_from_disk".to_string(),
         ))
     }
+
+    fn export_recurrent_state(
+        &self,
+        _request_id: &RequestId,
+    ) -> Result<Option<Vec<u8>>, WorkerExecutionError> {
+        Ok(None)
+    }
+
+    fn restore_recurrent_state(
+        &mut self,
+        _request_id: &RequestId,
+        _state: &[u8],
+    ) -> Result<(), WorkerExecutionError> {
+        Ok(())
+    }
 }
 
 pub trait WorkerExecutor {
@@ -200,6 +216,17 @@ pub trait WorkerExecutor {
     fn update_weights_from_disk(
         &mut self,
         request: &WorkerWeightUpdateRequest,
+    ) -> Result<(), WorkerExecutionError>;
+
+    fn export_recurrent_state(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<Option<Vec<u8>>, WorkerExecutionError>;
+
+    fn restore_recurrent_state(
+        &mut self,
+        request_id: &RequestId,
+        state: &[u8],
     ) -> Result<(), WorkerExecutionError>;
 }
 
@@ -258,6 +285,21 @@ where
         request: &WorkerWeightUpdateRequest,
     ) -> Result<(), WorkerExecutionError> {
         FallibleModelWorker::update_weights_from_disk(self, request)
+    }
+
+    fn export_recurrent_state(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<Option<Vec<u8>>, WorkerExecutionError> {
+        FallibleModelWorker::export_recurrent_state(self, request_id)
+    }
+
+    fn restore_recurrent_state(
+        &mut self,
+        request_id: &RequestId,
+        state: &[u8],
+    ) -> Result<(), WorkerExecutionError> {
+        FallibleModelWorker::restore_recurrent_state(self, request_id, state)
     }
 }
 

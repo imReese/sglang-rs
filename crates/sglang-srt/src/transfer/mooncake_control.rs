@@ -10,6 +10,7 @@ use crate::types::BootstrapRoom;
 #[derive(Default)]
 struct Room {
     token: Option<u32>,
+    recurrent_state: Option<Vec<u8>>,
     terminal: Option<Result<(), String>>,
     abort_ack: bool,
 }
@@ -129,9 +130,20 @@ impl MooncakeDecodeReceiver {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn receive(&self, room: BootstrapRoom) -> Result<u32, String> {
         self.wait(room, false)?
+            .0
             .ok_or_else(|| format!("room {room} completed without a first token"))
+    }
+
+    pub(crate) fn receive_token_and_state(
+        &self,
+        room: BootstrapRoom,
+    ) -> Result<(u32, Option<Vec<u8>>), String> {
+        let (token, state) = self.wait(room, false)?;
+        let token = token.ok_or_else(|| format!("room {room} completed without a first token"))?;
+        Ok((token, state))
     }
 
     pub(crate) fn wait_drained(&self, room: BootstrapRoom) -> Result<(), String> {
@@ -147,7 +159,11 @@ impl MooncakeDecodeReceiver {
         })
     }
 
-    fn wait(&self, room: BootstrapRoom, cancel: bool) -> Result<Option<u32>, String> {
+    fn wait(
+        &self,
+        room: BootstrapRoom,
+        cancel: bool,
+    ) -> Result<(Option<u32>, Option<Vec<u8>>), String> {
         let deadline = Instant::now() + Duration::from_secs(30);
         let (lock, changed) = &*self.inbox;
         let mut state = lock.lock().map_err(|e| e.to_string())?;
@@ -160,11 +176,13 @@ impl MooncakeDecodeReceiver {
                 .get(&room)
                 .ok_or_else(|| format!("unregistered decode room {room}"))?;
             if cancel && (received.abort_ack || received.terminal.is_some()) {
-                return Ok(received.token);
+                return Ok((received.token, received.recurrent_state.clone()));
             }
             match &received.terminal {
                 Some(Err(error)) => return Err(error.clone()),
-                Some(Ok(())) if received.token.is_some() => return Ok(received.token),
+                Some(Ok(())) if received.token.is_some() => {
+                    return Ok((received.token, received.recurrent_state.clone()));
+                }
                 _ => {}
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -243,6 +261,8 @@ fn ingest(state: &mut Inbox, frames: &[Vec<u8>]) -> Result<(), String> {
                     .map_err(|_| "invalid first token")?,
             );
             room.token = Some(u32::try_from(token).map_err(|_| "negative prefill token")?);
+        } else if buffer == 1 {
+            room.recurrent_state = Some(frames[5].clone());
         }
     } else {
         if frames.len() < 3 || ascii::<u32>(frames.get(2))? != 0 {
@@ -264,6 +284,7 @@ fn ingest(state: &mut Inbox, frames: &[Vec<u8>]) -> Result<(), String> {
 pub(crate) fn completion_frames(
     room: BootstrapRoom,
     token: Option<u32>,
+    recurrent_state: Option<&[u8]>,
     error: Option<&str>,
     aux_index: i32,
 ) -> Result<Vec<Vec<Vec<u8>>>, String> {
@@ -280,6 +301,18 @@ pub(crate) fn completion_frames(
             aux_index.to_string().into_bytes(),
             64_u32.to_be_bytes().to_vec(),
             data,
+        ]);
+    }
+    if let Some(state) = recurrent_state {
+        let length_u32 =
+            u32::try_from(state.len()).map_err(|_| "recurrent state length exceeds u32")?;
+        frames.push(vec![
+            b"AUX_DATA".to_vec(),
+            room.to_string().into_bytes(),
+            b"1".to_vec(),
+            aux_index.to_string().into_bytes(),
+            length_u32.to_be_bytes().to_vec(),
+            state.to_vec(),
         ]);
     }
     frames.push(vec![
@@ -334,7 +367,7 @@ mod tests {
         let receiver = MooncakeDecodeReceiver::start("127.0.0.1").expect("receiver");
         receiver.register(7).expect("room");
         let endpoint = format!("tcp://127.0.0.1:{}", receiver.port());
-        let mut frames = completion_frames(7, Some(3), None, 0).expect("frames");
+        let mut frames = completion_frames(7, Some(3), None, None, 0).expect("frames");
         let status = frames.pop().expect("status");
         send_frames(endpoint.clone(), vec![status]).expect("send completion before auxiliary data");
         let (output, result) = std::sync::mpsc::channel();
@@ -354,10 +387,25 @@ mod tests {
     }
 
     #[test]
+    fn decode_receives_token_and_recurrent_state_over_real_control_socket() {
+        let receiver = MooncakeDecodeReceiver::start("127.0.0.1").expect("receiver");
+        receiver.register(8).expect("room");
+        let endpoint = format!("tcp://127.0.0.1:{}", receiver.port());
+        let state_bytes = b"sample_recurrent_state_payload";
+        let frames = completion_frames(8, Some(42), Some(state_bytes), None, 0).expect("frames");
+        send_frames(endpoint, frames).expect("send completion frames");
+        let (token, state) = receiver
+            .receive_token_and_state(8)
+            .expect("receive token and state");
+        assert_eq!(token, 42);
+        assert_eq!(state.as_deref(), Some(&state_bytes[..]));
+    }
+
+    #[test]
     fn malformed_auxiliary_data_and_nonzero_rank_fail_explicitly() {
         let mut state = Inbox::default();
         state.rooms.insert(9, Room::default());
-        let mut frames = completion_frames(9, Some(2), None, 0).expect("frames");
+        let mut frames = completion_frames(9, Some(2), None, None, 0).expect("frames");
         frames[0][4] = 63_u32.to_be_bytes().to_vec();
         assert!(ingest(&mut state, &frames[0]).is_err());
         frames[1][2] = b"1".to_vec();

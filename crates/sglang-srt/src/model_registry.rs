@@ -339,6 +339,23 @@ impl ForwardModel for BootstrapForwardModel {
         *self = next;
         Ok(())
     }
+
+    fn export_recurrent_state(
+        &self,
+        request_id: &crate::types::RequestId,
+    ) -> Result<Option<Vec<u8>>, ModelForwardError> {
+        self.registered.runtime.export_recurrent_state(request_id)
+    }
+
+    fn restore_recurrent_state(
+        &mut self,
+        request_id: &crate::types::RequestId,
+        state: &[u8],
+    ) -> Result<(), ModelForwardError> {
+        self.registered
+            .runtime
+            .restore_recurrent_state(request_id, state)
+    }
 }
 
 impl KvCacheMemoryProvider for BootstrapForwardModel {

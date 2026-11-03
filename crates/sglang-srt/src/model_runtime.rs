@@ -22,11 +22,35 @@ pub(crate) trait BackendExecutionResources:
     fn recurrent_state_layout(&self) -> Option<crate::models::RecurrentStateLayout> {
         None
     }
+
+    fn export_recurrent_state(&self, _request_id: &RequestId) -> Result<Option<Vec<u8>>, String> {
+        Ok(None)
+    }
+
+    fn restore_recurrent_state(
+        &mut self,
+        _request_id: &RequestId,
+        _state: &[u8],
+    ) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 pub(crate) trait ActiveRecurrentState: fmt::Debug + Send {
     fn layout(&self) -> Option<crate::models::RecurrentStateLayout>;
     fn complete_request(&mut self, request_id: &RequestId);
+
+    fn export_request_state(&self, _request_id: &RequestId) -> Result<Option<Vec<u8>>, String> {
+        Ok(None)
+    }
+
+    fn restore_request_state(
+        &mut self,
+        _request_id: &RequestId,
+        _state: &[u8],
+    ) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 impl ActiveRecurrentState for () {
@@ -120,6 +144,26 @@ where
 
     fn recurrent_state_layout(&self) -> Option<crate::models::RecurrentStateLayout> {
         self.recurrent_state.as_ref().and_then(|r| r.layout())
+    }
+
+    fn export_recurrent_state(&self, request_id: &RequestId) -> Result<Option<Vec<u8>>, String> {
+        if let Some(recurrent_state) = self.recurrent_state.as_ref() {
+            recurrent_state.export_request_state(request_id)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn restore_recurrent_state(
+        &mut self,
+        request_id: &RequestId,
+        state: &[u8],
+    ) -> Result<(), String> {
+        if let Some(recurrent_state) = self.recurrent_state.as_mut() {
+            recurrent_state.restore_request_state(request_id, state)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -232,6 +276,25 @@ where
         request: &WorkerWeightUpdateRequest,
     ) -> Result<(), ModelForwardError> {
         self.executor.update_weights_from_disk(request)
+    }
+
+    fn export_recurrent_state(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<Option<Vec<u8>>, ModelForwardError> {
+        self.resources
+            .export_recurrent_state(request_id)
+            .map_err(ModelForwardError::Runtime)
+    }
+
+    fn restore_recurrent_state(
+        &mut self,
+        request_id: &RequestId,
+        state: &[u8],
+    ) -> Result<(), ModelForwardError> {
+        self.resources
+            .restore_recurrent_state(request_id, state)
+            .map_err(ModelForwardError::Runtime)
     }
 }
 
@@ -396,6 +459,21 @@ impl ForwardModel for LoadedModelRuntime {
         request: &WorkerWeightUpdateRequest,
     ) -> Result<(), ModelForwardError> {
         self.execution.update_weights_from_disk(request)
+    }
+
+    fn export_recurrent_state(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<Option<Vec<u8>>, ModelForwardError> {
+        self.execution.export_recurrent_state(request_id)
+    }
+
+    fn restore_recurrent_state(
+        &mut self,
+        request_id: &RequestId,
+        state: &[u8],
+    ) -> Result<(), ModelForwardError> {
+        self.execution.restore_recurrent_state(request_id, state)
     }
 }
 

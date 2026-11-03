@@ -159,7 +159,7 @@ impl InitializedRuntimeBackend for CpuReferenceBackend {
     }
 
     fn capabilities(&self) -> RuntimeCapability {
-        RuntimeCapability::cpu_reference("cpu-reference-backend", false)
+        RuntimeCapability::cpu_reference("cpu-reference-backend", true)
     }
 
     fn validate_model_runtime(
