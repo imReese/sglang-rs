@@ -3,7 +3,7 @@
 
 use std::fmt;
 
-use crate::multi_worker_scheduler::{MultiWorkerScheduler, MultiWorkerSchedulerError};
+use crate::dp_scheduler::{DpScheduler, DpSchedulerError};
 use crate::parallel_topology::Parallel4DTopology;
 use crate::scheduler::ScheduledRequest;
 use crate::tokenizer::{ChatTemplateInput, Tokenizer, TokenizerError};
@@ -12,16 +12,16 @@ use crate::types::{
 };
 use crate::worker::WorkerExecutionError;
 
-/// Error conditions arising during multi-worker engine orchestration.
+/// Error conditions arising during Data Parallel (DP) coordinator orchestration.
 #[derive(Debug)]
-pub enum MultiWorkerEngineError {
-    Scheduler(MultiWorkerSchedulerError),
+pub enum DpCoordinatorError {
+    Scheduler(DpSchedulerError),
     Tokenizer(TokenizerError),
     Worker(WorkerExecutionError),
     InvalidState(String),
 }
 
-impl fmt::Display for MultiWorkerEngineError {
+impl fmt::Display for DpCoordinatorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Scheduler(err) => write!(f, "scheduler error: {err}"),
@@ -32,40 +32,36 @@ impl fmt::Display for MultiWorkerEngineError {
     }
 }
 
-impl std::error::Error for MultiWorkerEngineError {}
+impl std::error::Error for DpCoordinatorError {}
 
-impl From<MultiWorkerSchedulerError> for MultiWorkerEngineError {
-    fn from(err: MultiWorkerSchedulerError) -> Self {
+impl From<DpSchedulerError> for DpCoordinatorError {
+    fn from(err: DpSchedulerError) -> Self {
         Self::Scheduler(err)
     }
 }
 
-impl From<TokenizerError> for MultiWorkerEngineError {
+impl From<TokenizerError> for DpCoordinatorError {
     fn from(err: TokenizerError) -> Self {
         Self::Tokenizer(err)
     }
 }
 
-impl From<WorkerExecutionError> for MultiWorkerEngineError {
+impl From<WorkerExecutionError> for DpCoordinatorError {
     fn from(err: WorkerExecutionError) -> Self {
         Self::Worker(err)
     }
 }
 
-/// Unified multi-worker engine coordinating tokenization, 4D distributed topology,
+/// Unified Data Parallel (DP) coordinator coordinating tokenization, 4D distributed topology,
 /// and a centralized multi-worker continuous batching scheduler.
-pub struct MultiWorkerEngine<T> {
+pub struct DpCoordinator<T> {
     tokenizer: T,
-    scheduler: MultiWorkerScheduler,
+    scheduler: DpScheduler,
     topology: Parallel4DTopology,
 }
 
-impl<T> MultiWorkerEngine<T> {
-    pub fn new(
-        tokenizer: T,
-        scheduler: MultiWorkerScheduler,
-        topology: Parallel4DTopology,
-    ) -> Self {
+impl<T> DpCoordinator<T> {
+    pub fn new(tokenizer: T, scheduler: DpScheduler, topology: Parallel4DTopology) -> Self {
         Self {
             tokenizer,
             scheduler,
@@ -77,11 +73,11 @@ impl<T> MultiWorkerEngine<T> {
         &self.topology
     }
 
-    pub fn scheduler(&self) -> &MultiWorkerScheduler {
+    pub fn scheduler(&self) -> &DpScheduler {
         &self.scheduler
     }
 
-    pub fn scheduler_mut(&mut self) -> &mut MultiWorkerScheduler {
+    pub fn scheduler_mut(&mut self) -> &mut DpScheduler {
         &mut self.scheduler
     }
 
@@ -113,13 +109,13 @@ impl<T> MultiWorkerEngine<T> {
         self.scheduler.flush_cache();
     }
 
-    pub fn shutdown(&mut self) -> Result<(), MultiWorkerEngineError> {
+    pub fn shutdown(&mut self) -> Result<(), DpCoordinatorError> {
         self.scheduler.shutdown()?;
         Ok(())
     }
 }
 
-impl<T> MultiWorkerEngine<T>
+impl<T> DpCoordinator<T>
 where
     T: Tokenizer,
 {
@@ -156,7 +152,7 @@ where
 
     /// Performs a non-blocking step on the scheduler, draining completed batches,
     /// scheduling ready work onto idle worker ranks, and returning newly finished text outputs.
-    pub fn step(&mut self) -> Result<Vec<GenerateOutput>, MultiWorkerEngineError> {
+    pub fn step(&mut self) -> Result<Vec<GenerateOutput>, DpCoordinatorError> {
         self.scheduler.step()?;
         let finished = self.scheduler.drain_finished_outputs();
         let mut outputs = Vec::with_capacity(finished.len());
@@ -174,7 +170,7 @@ where
     }
 
     /// Performs a non-blocking step and returns raw token outputs without string decoding.
-    pub fn step_tokens(&mut self) -> Result<Vec<TokenGenerateOutput>, MultiWorkerEngineError> {
+    pub fn step_tokens(&mut self) -> Result<Vec<TokenGenerateOutput>, DpCoordinatorError> {
         self.scheduler.step()?;
         let finished = self.scheduler.drain_finished_outputs();
         let mut outputs = Vec::with_capacity(finished.len());
@@ -195,7 +191,7 @@ where
     pub fn generate(
         &mut self,
         request: GenerateRequest,
-    ) -> Result<GenerateOutput, MultiWorkerEngineError> {
+    ) -> Result<GenerateOutput, DpCoordinatorError> {
         let target_id = request.request_id.clone();
         self.enqueue_request(request);
 
@@ -216,7 +212,7 @@ where
             if !self.scheduler.is_idle() {
                 self.scheduler.step_blocking()?;
             } else {
-                return Err(MultiWorkerEngineError::InvalidState(format!(
+                return Err(DpCoordinatorError::InvalidState(format!(
                     "request {} disappeared before generating completion",
                     target_id.as_str()
                 )));
@@ -263,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_worker_engine_end_to_end() {
+    fn test_dp_coordinator_end_to_end() {
         let dp_size = 2;
         let config = Parallel4DConfig::new(1, dp_size, 1, dp_size, 1).unwrap();
         let topology = Parallel4DTopology::new(config).unwrap();
@@ -277,9 +273,9 @@ mod tests {
             CachePageAllocator::with_page_size(64, 4).unwrap(),
         ];
 
-        let scheduler = MultiWorkerScheduler::new(pool, allocators, 16, 4).unwrap();
+        let scheduler = DpScheduler::new(pool, allocators, 16, 4).unwrap();
 
-        let mut engine = MultiWorkerEngine::new(ByteTokenizer, scheduler, topology);
+        let mut engine = DpCoordinator::new(ByteTokenizer, scheduler, topology);
 
         assert!(engine.is_idle());
 

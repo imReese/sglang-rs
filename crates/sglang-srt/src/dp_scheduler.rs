@@ -12,9 +12,9 @@ use crate::scheduler::{
 use crate::types::RequestId;
 use crate::worker::WorkerExecutionError;
 
-/// Centralized multi-worker scheduler managing unified request queues,
+/// Centralized Data Parallel (DP) scheduler managing unified request queues,
 /// a single global shared prefix cache, and concurrent worker execution ranks.
-pub struct MultiWorkerScheduler {
+pub struct DpScheduler {
     waiting_queue: VecDeque<ScheduledRequest>,
     decode_queue: VecDeque<ScheduledRequest>,
     prefix_cache: RadixCache,
@@ -26,24 +26,24 @@ pub struct MultiWorkerScheduler {
     page_size: usize,
 }
 
-impl MultiWorkerScheduler {
+impl DpScheduler {
     pub fn new(
         worker_pool: DpWorkerPool,
         allocators: Vec<CachePageAllocator>,
         max_batch_size: usize,
         page_size: usize,
-    ) -> Result<Self, MultiWorkerSchedulerError> {
+    ) -> Result<Self, DpSchedulerError> {
         if worker_pool.dp_size() != allocators.len() {
-            return Err(MultiWorkerSchedulerError::AllocatorCountMismatch {
+            return Err(DpSchedulerError::AllocatorCountMismatch {
                 dp_size: worker_pool.dp_size(),
                 allocators: allocators.len(),
             });
         }
         if max_batch_size == 0 {
-            return Err(MultiWorkerSchedulerError::ZeroBatchSize);
+            return Err(DpSchedulerError::ZeroBatchSize);
         }
         if page_size == 0 {
-            return Err(MultiWorkerSchedulerError::ZeroPageSize);
+            return Err(DpSchedulerError::ZeroPageSize);
         }
 
         Ok(Self {
@@ -120,7 +120,7 @@ impl MultiWorkerScheduler {
         }
     }
 
-    pub fn shutdown(&mut self) -> Result<(), MultiWorkerSchedulerError> {
+    pub fn shutdown(&mut self) -> Result<(), DpSchedulerError> {
         self.worker_pool.shutdown()?;
         Ok(())
     }
@@ -130,7 +130,7 @@ impl MultiWorkerScheduler {
     /// 1. Drains completed events from the worker pool.
     /// 2. Updates request output tokens and registers completed prefills into the SHARED prefix cache.
     /// 3. Forms and dispatches new batches to any currently idle worker ranks.
-    pub fn step(&mut self) -> Result<usize, MultiWorkerSchedulerError> {
+    pub fn step(&mut self) -> Result<usize, DpSchedulerError> {
         let events = self.worker_pool.poll_events();
         let event_count = events.len();
 
@@ -144,12 +144,12 @@ impl MultiWorkerScheduler {
                     let (_, batch) = self
                         .running_batches
                         .remove(&sequence)
-                        .ok_or(MultiWorkerSchedulerError::UnknownSequence { sequence, rank })?;
-                    let generated = result.map_err(MultiWorkerSchedulerError::Worker)?;
+                        .ok_or(DpSchedulerError::UnknownSequence { sequence, rank })?;
+                    let generated = result.map_err(DpSchedulerError::Worker)?;
                     self.handle_batch_completion(rank, batch, generated)?;
                 }
                 DpWorkerEvent::FatalError { rank, error } => {
-                    return Err(MultiWorkerSchedulerError::RankFatal { rank, error });
+                    return Err(DpSchedulerError::RankFatal { rank, error });
                 }
                 DpWorkerEvent::WeightsUpdated { .. } => {}
             }
@@ -167,7 +167,7 @@ impl MultiWorkerScheduler {
     }
 
     /// Blocks until at least one batch completion event arrives and processes it.
-    pub fn step_blocking(&mut self) -> Result<(), MultiWorkerSchedulerError> {
+    pub fn step_blocking(&mut self) -> Result<(), DpSchedulerError> {
         let event = self.worker_pool.wait_for_event()?;
         match event {
             DpWorkerEvent::BatchCompleted {
@@ -178,12 +178,12 @@ impl MultiWorkerScheduler {
                 let (_, batch) = self
                     .running_batches
                     .remove(&sequence)
-                    .ok_or(MultiWorkerSchedulerError::UnknownSequence { sequence, rank })?;
-                let generated = result.map_err(MultiWorkerSchedulerError::Worker)?;
+                    .ok_or(DpSchedulerError::UnknownSequence { sequence, rank })?;
+                let generated = result.map_err(DpSchedulerError::Worker)?;
                 self.handle_batch_completion(rank, batch, generated)?;
             }
             DpWorkerEvent::FatalError { rank, error } => {
-                return Err(MultiWorkerSchedulerError::RankFatal { rank, error });
+                return Err(DpSchedulerError::RankFatal { rank, error });
             }
             DpWorkerEvent::WeightsUpdated { .. } => {}
         }
@@ -209,7 +209,7 @@ impl MultiWorkerScheduler {
         rank: usize,
         batch: ScheduleBatch,
         generated: crate::worker::BatchGeneratedTokens,
-    ) -> Result<(), MultiWorkerSchedulerError> {
+    ) -> Result<(), DpSchedulerError> {
         let is_prefill = batch.forward_mode() == ForwardMode::Prefill;
 
         for (mut request, token) in batch
@@ -253,7 +253,7 @@ impl MultiWorkerScheduler {
     fn form_batch_for_rank(
         &mut self,
         rank: usize,
-    ) -> Result<Option<ScheduleBatch>, MultiWorkerSchedulerError> {
+    ) -> Result<Option<ScheduleBatch>, DpSchedulerError> {
         // 1. Prioritize decode requests pinned to this rank
         let mut decode_requests = Vec::new();
         let mut i = 0;
@@ -280,7 +280,7 @@ impl MultiWorkerScheduler {
         let allocator = self
             .allocators
             .get_mut(rank)
-            .ok_or(MultiWorkerSchedulerError::InvalidRank(rank))?;
+            .ok_or(DpSchedulerError::InvalidRank(rank))?;
 
         let mut prefill_requests = Vec::new();
 
@@ -304,7 +304,7 @@ impl MultiWorkerScheduler {
                     self.waiting_queue.push_front(req);
                     break;
                 }
-                Err(err) => return Err(MultiWorkerSchedulerError::CacheAllocation(err)),
+                Err(err) => return Err(DpSchedulerError::CacheAllocation(err)),
             };
 
             let mut seq_pages =
@@ -333,7 +333,7 @@ impl MultiWorkerScheduler {
 
 /// Errors occurring during multi-worker scheduler operations.
 #[derive(Debug)]
-pub enum MultiWorkerSchedulerError {
+pub enum DpSchedulerError {
     ZeroBatchSize,
     ZeroPageSize,
     AllocatorCountMismatch { dp_size: usize, allocators: usize },
@@ -345,7 +345,7 @@ pub enum MultiWorkerSchedulerError {
     CacheAllocation(CacheAllocationError),
 }
 
-impl fmt::Display for MultiWorkerSchedulerError {
+impl fmt::Display for DpSchedulerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ZeroBatchSize => f.write_str("max batch size must be positive"),
@@ -369,15 +369,15 @@ impl fmt::Display for MultiWorkerSchedulerError {
     }
 }
 
-impl std::error::Error for MultiWorkerSchedulerError {}
+impl std::error::Error for DpSchedulerError {}
 
-impl From<DpWorkerPoolError> for MultiWorkerSchedulerError {
+impl From<DpWorkerPoolError> for DpSchedulerError {
     fn from(e: DpWorkerPoolError) -> Self {
         Self::WorkerPool(e)
     }
 }
 
-impl From<CacheAllocationError> for MultiWorkerSchedulerError {
+impl From<CacheAllocationError> for DpSchedulerError {
     fn from(e: CacheAllocationError) -> Self {
         Self::CacheAllocation(e)
     }
@@ -417,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_worker_shared_prefix_cache_across_dp_ranks() {
+    fn test_dp_shared_prefix_cache_across_dp_ranks() {
         let pool = DpWorkerPool::launch(2, |rank| Ok::<_, String>(TestRankWorker { rank }))
             .expect("launch pool of 2 ranks");
 
@@ -427,8 +427,8 @@ mod tests {
             CachePageAllocator::with_page_size(64, 4).expect("allocator 1"),
         ];
 
-        let mut scheduler = MultiWorkerScheduler::new(pool, allocators, 4, 4)
-            .expect("create multi-worker scheduler");
+        let mut scheduler =
+            DpScheduler::new(pool, allocators, 4, 4).expect("create multi-worker scheduler");
 
         // Request 1: prompt has 8 tokens (2 pages of 4 tokens)
         let prompt1 = vec![1, 2, 3, 4, 5, 6, 7, 8];

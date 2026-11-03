@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use sglang_srt::cache::CachePageAllocator;
+use sglang_srt::dp_coordinator::DpCoordinator;
+use sglang_srt::dp_scheduler::DpScheduler;
 use sglang_srt::dp_worker_pool::DpWorkerPool;
-use sglang_srt::multi_worker_engine::MultiWorkerEngine;
-use sglang_srt::multi_worker_scheduler::MultiWorkerScheduler;
 use sglang_srt::parallel_topology::{Parallel4DConfig, Parallel4DTopology};
 use sglang_srt::scheduler::ScheduleBatch;
 use sglang_srt::tokenizer::ByteTokenizer;
@@ -45,7 +45,7 @@ impl FallibleModelWorker for CountingWorker {
 }
 
 #[test]
-fn test_4_worker_dp_continuous_batching_and_shared_prefix() {
+fn test_4_worker_dp_coordinator_continuous_batching() {
     let dp_size = 4;
     let config = Parallel4DConfig::new(1, dp_size, 1, dp_size, 1).unwrap();
     let topology = Parallel4DTopology::new(config).unwrap();
@@ -70,9 +70,9 @@ fn test_4_worker_dp_continuous_batching_and_shared_prefix() {
         .collect();
 
     let max_batch_size = 16;
-    let scheduler = MultiWorkerScheduler::new(pool, allocators, max_batch_size, page_size).unwrap();
+    let scheduler = DpScheduler::new(pool, allocators, max_batch_size, page_size).unwrap();
 
-    let mut engine = MultiWorkerEngine::new(ByteTokenizer, scheduler, topology);
+    let mut engine = DpCoordinator::new(ByteTokenizer, scheduler, topology);
 
     assert!(engine.is_idle());
 
