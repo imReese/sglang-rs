@@ -30,7 +30,7 @@ fn server_reuses_transfer_factory_without_constructing_mooncake_infrastructure()
 
 #[test]
 fn transfer_and_artifact_primitives_do_not_rederive_model_specific_layouts() {
-    let transfer = include_str!("../src/transfer.rs");
+    let transfer = include_str!("../src/transfer/mod.rs");
     let artifacts = include_str!("../src/model_artifacts.rs");
 
     assert!(!transfer.contains("HfModelConfig"));
@@ -60,7 +60,7 @@ fn transfer_and_artifact_primitives_do_not_rederive_model_specific_layouts() {
 
 #[test]
 fn production_launch_has_no_fake_transfer_backend() {
-    let transfer = include_str!("../src/transfer.rs");
+    let transfer = include_str!("../src/transfer/mod.rs");
     let server = include_str!("../src/server.rs");
 
     assert!(!transfer.contains("\"fake\" =>"));
@@ -100,16 +100,16 @@ fn model_adapters_do_not_select_runtime_backend_providers() {
 
 #[test]
 fn cuda_backend_components_do_not_branch_on_model_names() {
-    let dense = include_str!("../src/cuda_dense_decoder.rs");
-    let hybrid = include_str!("../src/cuda_hybrid_decoder.rs");
-    let mla = include_str!("../src/cuda_mla.rs");
-    let moe = include_str!("../src/cuda_moe.rs");
+    let dense = include_str!("../src/cuda/dense_decoder.rs");
+    let hybrid = include_str!("../src/cuda/hybrid_decoder.rs");
+    let mla = include_str!("../src/cuda/mla.rs");
+    let moe = include_str!("../src/cuda/moe.rs");
     for source in [
         include_str!("../src/backend_model.rs"),
-        include_str!("../src/cuda_execution_resources.rs"),
-        include_str!("../src/cuda_tensor_parallel.rs"),
-        include_str!("../src/cuda_transformer.rs"),
-        include_str!("../src/transformer_parallel.rs"),
+        include_str!("../src/cuda/execution_resources.rs"),
+        include_str!("../src/cuda/tensor_parallel.rs"),
+        include_str!("../src/cuda/transformer.rs"),
+        include_str!("../src/distributed/transformer_parallel.rs"),
         include_str!("../src/moe.rs"),
         hybrid,
         mla,

@@ -17,13 +17,13 @@ use serde_json::{Value, json};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::engine_info_bootstrap::{EngineInfoBootstrapService, TransferEngineInfoRegistration};
-use crate::openai_classify::{classify_response_json, parse_classify_request};
-use crate::openai_embedding::{embeddings_response_json, parse_embedding_request};
-use crate::openai_id::openai_response_id;
-use crate::openai_rerank::{
+use crate::openai::classify::{classify_response_json, parse_classify_request};
+use crate::openai::embedding::{embeddings_response_json, parse_embedding_request};
+use crate::openai::id::openai_response_id;
+use crate::openai::rerank::{
     parse_rerank_request, rerank_results_to_json, score_rerank_documents, truncate_rerank_results,
 };
-use crate::openai_score::{parse_score_request, score_response_json};
+use crate::openai::score::{parse_score_request, score_response_json};
 use crate::profile::{
     ProfileError, ProfileSession, ensure_profile_output_dir, profile_output_dir, write_profile_file,
 };

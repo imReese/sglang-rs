@@ -1,3 +1,9 @@
+pub mod backend_factory;
+pub mod engine_info;
+pub mod mooncake_control;
+pub mod pd_bootstrap;
+pub mod tcp;
+
 use std::collections::BTreeMap;
 #[cfg(feature = "mooncake-link")]
 use std::ffi::{CStr, CString};

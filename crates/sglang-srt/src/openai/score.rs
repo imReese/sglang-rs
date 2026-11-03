@@ -1,6 +1,6 @@
 use serde_json::{Value, json};
 
-use crate::openai_embedding::token_ids_to_embedding;
+use super::embedding::token_ids_to_embedding;
 use crate::router::RouterRuntime;
 use crate::tokenizer::Tokenizer;
 use crate::worker::WorkerExecutor;
