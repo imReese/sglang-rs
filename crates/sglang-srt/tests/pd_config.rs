@@ -113,9 +113,31 @@ fn mooncake_engine_config_consumes_runtime_device_ordinal() {
 fn transfer_capabilities_distinguish_production_and_planned_backends() {
     let mooncake = TransferBackendCapability::from_backend(TransferBackend::Mooncake);
     let nixl = TransferBackendCapability::from_backend(TransferBackend::Nixl);
+    let tcp = TransferBackendCapability::from_backend(TransferBackend::Tcp);
 
     assert_eq!(mooncake.class, TransferBackendClass::Production);
     assert!(mooncake.is_production());
     assert_eq!(nixl.class, TransferBackendClass::Planned);
     assert!(!nixl.is_production());
+    assert_eq!(tcp.class, TransferBackendClass::Production);
+    assert!(tcp.is_production());
+    assert!(tcp.linked_transport);
+}
+
+#[test]
+fn pd_config_supports_native_tcp_backend() {
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--disaggregation-mode",
+        "prefill",
+        "--disaggregation-transfer-backend",
+        "tcp",
+    ])
+    .expect("args should parse");
+    let config = PdConfig::from_server_args(&args).expect("PD config should parse");
+
+    assert_eq!(config.mode, DisaggregationMode::Prefill);
+    assert_eq!(config.transfer_backend, TransferBackend::Tcp);
 }

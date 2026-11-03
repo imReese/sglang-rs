@@ -1,13 +1,14 @@
 use std::fmt;
 
-#[cfg(feature = "mooncake-link")]
 use crate::backend::RuntimeRequirements;
 use crate::model_executor::ModelRunner;
 use crate::model_registry::BootstrapForwardModel;
 use crate::pd_bootstrap::{MooncakeBootstrapKvCacheTransferExecutor, PrefillBootstrapService};
+use crate::tcp_transfer::SharedTcpTransferEngine;
 use crate::transfer::{
-    DisaggregationMode, KvCacheTransferError, KvCacheTransferSpan, KvTransferBackend,
-    KvTransferPoll, MooncakeError, MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor,
+    DisaggregationMode, KvCacheMemoryProvider, KvCacheTransferError, KvCacheTransferSpan,
+    KvTransferBackend, KvTransferPoll, MooncakeError, MooncakeKvCacheLayout,
+    MooncakeKvCacheMemoryExt, MooncakeKvCacheTransferExecutor, MooncakeSessionTargetResolver,
     PdConfig, TransferBackend, TransferableKvCacheMemory,
 };
 use crate::types::BootstrapRoom;
@@ -15,10 +16,7 @@ use crate::types::BootstrapRoom;
 #[cfg(not(feature = "mooncake-link"))]
 use crate::transfer::UnlinkedMooncakeTransferEngine;
 #[cfg(feature = "mooncake-link")]
-use crate::transfer::{
-    KvCacheMemoryProvider, MooncakeKvCacheMemoryExt, MooncakeSessionTargetResolver,
-    MooncakeTransferEngineConfig, SharedLinkedMooncakeTransferEngine,
-};
+use crate::transfer::{MooncakeTransferEngineConfig, SharedLinkedMooncakeTransferEngine};
 
 #[cfg(feature = "mooncake-link")]
 pub(crate) type ProductionMooncakeTransferBackend = MooncakeKvCacheTransferExecutor<
@@ -30,44 +28,61 @@ pub(crate) type ProductionMooncakeTransferBackend = MooncakeKvCacheTransferExecu
 pub(crate) type ProductionMooncakeTransferBackend =
     MooncakeKvCacheTransferExecutor<UnlinkedMooncakeTransferEngine>;
 
+pub(crate) type ProductionTcpTransferBackend = MooncakeKvCacheTransferExecutor<
+    SharedTcpTransferEngine,
+    MooncakeSessionTargetResolver<SharedTcpTransferEngine>,
+>;
+
 pub(crate) enum ProductionTransferBackend {
-    Prefill(MooncakeBootstrapKvCacheTransferExecutor<ProductionMooncakeTransferBackend>),
-    Decode(ProductionMooncakeTransferBackend),
+    MooncakePrefill(MooncakeBootstrapKvCacheTransferExecutor<ProductionMooncakeTransferBackend>),
+    MooncakeDecode(ProductionMooncakeTransferBackend),
+    TcpPrefill(MooncakeBootstrapKvCacheTransferExecutor<ProductionTcpTransferBackend>),
+    TcpDecode(ProductionTcpTransferBackend),
 }
 
 impl KvTransferBackend for ProductionTransferBackend {
     fn register(&mut self, memory: TransferableKvCacheMemory) -> Result<(), KvCacheTransferError> {
         match self {
-            Self::Prefill(backend) => backend.register(memory),
-            Self::Decode(backend) => backend.register(memory),
+            Self::MooncakePrefill(backend) => backend.register(memory),
+            Self::MooncakeDecode(backend) => backend.register(memory),
+            Self::TcpPrefill(backend) => backend.register(memory),
+            Self::TcpDecode(backend) => backend.register(memory),
         }
     }
 
     fn submit(&mut self, span: &KvCacheTransferSpan) -> Result<(), KvCacheTransferError> {
         match self {
-            Self::Prefill(backend) => backend.submit(span),
-            Self::Decode(backend) => backend.submit(span),
+            Self::MooncakePrefill(backend) => backend.submit(span),
+            Self::MooncakeDecode(backend) => backend.submit(span),
+            Self::TcpPrefill(backend) => backend.submit(span),
+            Self::TcpDecode(backend) => backend.submit(span),
         }
     }
 
     fn poll(&mut self) -> Result<KvTransferPoll, KvCacheTransferError> {
         match self {
-            Self::Prefill(backend) => backend.poll(),
-            Self::Decode(backend) => backend.poll(),
+            Self::MooncakePrefill(backend) => backend.poll(),
+            Self::MooncakeDecode(backend) => backend.poll(),
+            Self::TcpPrefill(backend) => backend.poll(),
+            Self::TcpDecode(backend) => backend.poll(),
         }
     }
 
     fn cancel(&mut self, bootstrap_room: BootstrapRoom) -> Result<(), KvCacheTransferError> {
         match self {
-            Self::Prefill(backend) => backend.cancel(bootstrap_room),
-            Self::Decode(backend) => backend.cancel(bootstrap_room),
+            Self::MooncakePrefill(backend) => backend.cancel(bootstrap_room),
+            Self::MooncakeDecode(backend) => backend.cancel(bootstrap_room),
+            Self::TcpPrefill(backend) => backend.cancel(bootstrap_room),
+            Self::TcpDecode(backend) => backend.cancel(bootstrap_room),
         }
     }
 
     fn shutdown(&mut self) -> Result<(), KvCacheTransferError> {
         match self {
-            Self::Prefill(backend) => backend.shutdown(),
-            Self::Decode(backend) => backend.shutdown(),
+            Self::MooncakePrefill(backend) => backend.shutdown(),
+            Self::MooncakeDecode(backend) => backend.shutdown(),
+            Self::TcpPrefill(backend) => backend.shutdown(),
+            Self::TcpDecode(backend) => backend.shutdown(),
         }
     }
 }
@@ -139,12 +154,6 @@ impl TransferBackendFactory {
         if role == DisaggregationMode::Null {
             return Err(TransferBackendFactoryError::UnsupportedRole(role));
         }
-        if pd_config.transfer_backend != TransferBackend::Mooncake {
-            return Err(TransferBackendFactoryError::UnsupportedBackend {
-                role,
-                backend: pd_config.transfer_backend,
-            });
-        }
         let prefill_bootstrap_service = match role {
             DisaggregationMode::Prefill => Some(
                 prefill_bootstrap_service
@@ -154,26 +163,68 @@ impl TransferBackendFactory {
             DisaggregationMode::Null => unreachable!("null role is rejected before backend build"),
         };
 
-        let bundle = build_mooncake_transfer_backend(
-            model_runner,
-            pd_config,
-            hostname,
-            slot_capacity,
-            page_size,
-        )?;
-        let backend = match (role, prefill_bootstrap_service) {
-            (DisaggregationMode::Prefill, Some(service)) => ProductionTransferBackend::Prefill(
-                MooncakeBootstrapKvCacheTransferExecutor::new(service, bundle.backend),
-            ),
-            (DisaggregationMode::Decode, None) => ProductionTransferBackend::Decode(bundle.backend),
-            _ => unreachable!("transfer role prerequisites are validated before backend build"),
-        };
+        match pd_config.transfer_backend {
+            TransferBackend::Mooncake => {
+                let bundle = build_mooncake_transfer_backend(
+                    model_runner,
+                    pd_config,
+                    hostname,
+                    slot_capacity,
+                    page_size,
+                )?;
+                let backend = match (role, prefill_bootstrap_service) {
+                    (DisaggregationMode::Prefill, Some(service)) => {
+                        ProductionTransferBackend::MooncakePrefill(
+                            MooncakeBootstrapKvCacheTransferExecutor::new(service, bundle.backend),
+                        )
+                    }
+                    (DisaggregationMode::Decode, None) => {
+                        ProductionTransferBackend::MooncakeDecode(bundle.backend)
+                    }
+                    _ => unreachable!(
+                        "transfer role prerequisites are validated before backend build"
+                    ),
+                };
 
-        Ok(ProductionTransferBackendBundle {
-            backend,
-            layout: bundle.layout,
-            local_endpoint: bundle.local_endpoint,
-        })
+                Ok(ProductionTransferBackendBundle {
+                    backend,
+                    layout: bundle.layout,
+                    local_endpoint: bundle.local_endpoint,
+                })
+            }
+            TransferBackend::Tcp => {
+                let bundle = build_tcp_transfer_backend(
+                    model_runner,
+                    pd_config,
+                    hostname,
+                    slot_capacity,
+                    page_size,
+                )?;
+                let backend = match (role, prefill_bootstrap_service) {
+                    (DisaggregationMode::Prefill, Some(service)) => {
+                        ProductionTransferBackend::TcpPrefill(
+                            MooncakeBootstrapKvCacheTransferExecutor::new(service, bundle.backend),
+                        )
+                    }
+                    (DisaggregationMode::Decode, None) => {
+                        ProductionTransferBackend::TcpDecode(bundle.backend)
+                    }
+                    _ => unreachable!(
+                        "transfer role prerequisites are validated before backend build"
+                    ),
+                };
+
+                Ok(ProductionTransferBackendBundle {
+                    backend,
+                    layout: bundle.layout,
+                    local_endpoint: bundle.local_endpoint,
+                })
+            }
+            other => Err(TransferBackendFactoryError::UnsupportedBackend {
+                role,
+                backend: other,
+            }),
+        }
     }
 }
 
@@ -195,9 +246,7 @@ pub(crate) enum TransferBackendFactoryError {
         backend: TransferBackend,
     },
     MissingPrefillBootstrapService,
-    #[cfg(feature = "mooncake-link")]
     UnsupportedCacheArchitecture,
-    #[cfg(feature = "mooncake-link")]
     MissingRuntimeCapabilities {
         runtime_name: String,
         missing: Vec<String>,
@@ -226,11 +275,9 @@ impl fmt::Display for TransferBackendFactoryError {
             Self::MissingPrefillBootstrapService => formatter.write_str(
                 "prefill transfer backend requires a bootstrap metadata service",
             ),
-            #[cfg(feature = "mooncake-link")]
             Self::UnsupportedCacheArchitecture => formatter.write_str(
-                "model cache architecture includes recurrent state; Mooncake KV-only transfer is insufficient",
+                "model cache architecture includes recurrent state; KV-only transfer is insufficient",
             ),
-            #[cfg(feature = "mooncake-link")]
             Self::MissingRuntimeCapabilities {
                 runtime_name,
                 missing,
@@ -336,4 +383,74 @@ fn build_mooncake_transfer_backend(
     _page_size: usize,
 ) -> Result<MooncakeTransferBackendBundle, TransferBackendFactoryError> {
     Err(MooncakeError::UnavailableWithoutLink.into())
+}
+
+struct TcpTransferBackendBundle {
+    backend: ProductionTcpTransferBackend,
+    layout: MooncakeKvCacheLayout,
+    local_endpoint: String,
+}
+
+fn build_tcp_transfer_backend(
+    model_runner: &mut ModelRunner<BootstrapForwardModel>,
+    pd_config: &PdConfig,
+    hostname: impl Into<String>,
+    slot_capacity: usize,
+    page_size: usize,
+) -> Result<TcpTransferBackendBundle, TransferBackendFactoryError> {
+    if !model_runner
+        .model()
+        .cache_architecture()
+        .supports_kv_only_transfer()
+    {
+        return Err(TransferBackendFactoryError::UnsupportedCacheArchitecture);
+    }
+
+    model_runner
+        .model()
+        .runtime_capability()
+        .validate_requirements(&RuntimeRequirements {
+            requires_kv_cache_registration: true,
+            requires_mooncake: false,
+            ..RuntimeRequirements::default()
+        })
+        .map_err(
+            |mismatch| TransferBackendFactoryError::MissingRuntimeCapabilities {
+                runtime_name: mismatch.runtime_name.to_string(),
+                missing: mismatch.missing,
+            },
+        )?;
+
+    model_runner.reserve_transferable_kv_cache_slots(slot_capacity, page_size)?;
+    let memory = model_runner
+        .transferable_kv_cache_memory()
+        .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
+    if memory.regions().len() != 1 {
+        return Err(KvCacheTransferError::Runtime(format!(
+            "TCP backend requires one contiguous NexusKV region, descriptor has {}",
+            memory.regions().len()
+        ))
+        .into());
+    }
+
+    let layout = memory.mooncake_prefill_layout(0);
+    let port = pd_config.mooncake_rpc_port.unwrap_or(0);
+    let hostname = hostname.into();
+    let engine =
+        SharedTcpTransferEngine::new(hostname, port).map_err(KvCacheTransferError::Runtime)?;
+    let local_endpoint = engine.local_endpoint()?;
+    let target_resolver = MooncakeSessionTargetResolver::new(engine.clone(), Vec::new());
+    let mut backend = MooncakeKvCacheTransferExecutor::with_target_resolver(
+        engine.clone(),
+        layout,
+        target_resolver,
+    )
+    .with_memory_registrar(engine);
+    backend.register(memory)?;
+
+    Ok(TcpTransferBackendBundle {
+        backend,
+        layout,
+        local_endpoint,
+    })
 }

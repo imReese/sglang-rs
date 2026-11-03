@@ -514,6 +514,11 @@ impl TransferBackendCapability {
                 class: TransferBackendClass::Production,
                 linked_transport: cfg!(feature = "mooncake-link"),
             },
+            TransferBackend::Tcp => Self {
+                backend,
+                class: TransferBackendClass::Production,
+                linked_transport: true,
+            },
             TransferBackend::Nixl | TransferBackend::Ascend | TransferBackend::Mori => Self {
                 backend,
                 class: TransferBackendClass::Planned,

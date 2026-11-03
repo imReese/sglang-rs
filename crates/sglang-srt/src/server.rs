@@ -663,7 +663,6 @@ impl From<TransferBackendFactoryError> for ServerLaunchError {
                 | TransferBackendFactoryError::MissingPrefillBootstrapService) => {
                     Self::TransferBackendFactory(error.to_string())
                 }
-            #[cfg(feature = "mooncake-link")]
             TransferBackendFactoryError::UnsupportedCacheArchitecture => {
                 Self::MissingRuntimeCapabilities {
                     runtime_name: "model-cache-architecture".to_string(),
@@ -673,7 +672,6 @@ impl From<TransferBackendFactoryError> for ServerLaunchError {
                     ],
                 }
             }
-            #[cfg(feature = "mooncake-link")]
             TransferBackendFactoryError::MissingRuntimeCapabilities {
                 runtime_name,
                 missing,
@@ -1544,6 +1542,7 @@ fn validate_launch_transfer_backend(pd_config: &PdConfig) -> Result<(), ServerLa
     match pd_config.transfer_backend {
         TransferBackend::Mooncake if cfg!(feature = "mooncake-link") => Ok(()),
         TransferBackend::Mooncake => Err(MooncakeError::UnavailableWithoutLink.into()),
+        TransferBackend::Tcp => Ok(()),
         backend @ (TransferBackend::Nixl | TransferBackend::Ascend | TransferBackend::Mori) => {
             Err(ServerLaunchError::UnsupportedBootstrapPdRuntime {
                 mode: pd_config.mode,
@@ -1590,7 +1589,10 @@ where
             serve_grpc_and_sidecar(addr, service, sidecar_addr, args.enable_metrics, shutdown)
                 .await?;
         }
-        DisaggregationMode::Prefill if pd_config.transfer_backend == TransferBackend::Mooncake => {
+        DisaggregationMode::Prefill
+            if pd_config.transfer_backend == TransferBackend::Mooncake
+                || pd_config.transfer_backend == TransferBackend::Tcp =>
+        {
             let bootstrap_addr = prefill_bootstrap_listen_addr(&args)?;
             let zmq_endpoints = prefill_mooncake_zmq_endpoints(&args);
             let bootstrap_service = PrefillBootstrapService::default();
@@ -1615,7 +1617,10 @@ where
             )
             .await?;
         }
-        DisaggregationMode::Decode if pd_config.transfer_backend == TransferBackend::Mooncake => {
+        DisaggregationMode::Decode
+            if pd_config.transfer_backend == TransferBackend::Mooncake
+                || pd_config.transfer_backend == TransferBackend::Tcp =>
+        {
             let runtime_bundle = try_build_launch_pd_runtime_bundle(&args, &pd_config, None)?;
             let service = try_build_launch_pd_grpc_router_service(&args, runtime_bundle)?;
             serve_grpc_and_sidecar(addr, service, sidecar_addr, args.enable_metrics, shutdown)
@@ -1685,7 +1690,10 @@ where
             )
             .await?;
         }
-        DisaggregationMode::Prefill if pd_config.transfer_backend == TransferBackend::Mooncake => {
+        DisaggregationMode::Prefill
+            if pd_config.transfer_backend == TransferBackend::Mooncake
+                || pd_config.transfer_backend == TransferBackend::Tcp =>
+        {
             let bootstrap_addr = prefill_bootstrap_listen_addr(&args)?;
             let zmq_endpoints = prefill_mooncake_zmq_endpoints(&args);
             let bootstrap_service = PrefillBootstrapService::default();
@@ -1711,7 +1719,10 @@ where
             )
             .await?;
         }
-        DisaggregationMode::Decode if pd_config.transfer_backend == TransferBackend::Mooncake => {
+        DisaggregationMode::Decode
+            if pd_config.transfer_backend == TransferBackend::Mooncake
+                || pd_config.transfer_backend == TransferBackend::Tcp =>
+        {
             let runtime_bundle = try_build_launch_pd_runtime_bundle(&args, &pd_config, None)?;
             let service = try_build_launch_pd_http_router_service(&args, runtime_bundle)?
                 .with_engine_info_bootstrap_service(engine_info_service.clone());

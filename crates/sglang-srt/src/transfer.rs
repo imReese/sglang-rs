@@ -55,6 +55,7 @@ impl DisaggregationMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransferBackend {
     Mooncake,
+    Tcp,
     Nixl,
     Ascend,
     Mori,
@@ -69,6 +70,10 @@ impl TransferBackend {
             }),
             "mooncake_tcp" => Ok(ParsedTransferBackend {
                 backend: Self::Mooncake,
+                force_tcp_transport: true,
+            }),
+            "tcp" => Ok(ParsedTransferBackend {
+                backend: Self::Tcp,
                 force_tcp_transport: true,
             }),
             "nixl" => Ok(ParsedTransferBackend {

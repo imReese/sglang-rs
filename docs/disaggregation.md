@@ -21,8 +21,21 @@ enabling `mooncake-link`, including through `--all-features`, does not work
 without them.
 
 Workers use the community-style `--disaggregation-mode prefill|decode` and
-`--disaggregation-transfer-backend mooncake|mooncake_tcp` flags. Bootstrap
+`--disaggregation-transfer-backend tcp|mooncake|mooncake_tcp` flags. Bootstrap
 metadata carries the room and destination KV layout between workers.
+
+## Native TCP Transfer Backend (`tcp`)
+
+The native TCP transfer backend (`--disaggregation-transfer-backend tcp`) provides
+a pure-Rust, cross-platform data plane that does not require Mooncake C++ libraries,
+RDMA devices, or CUDA. It runs seamlessly on macOS (CPU/Metal) as well as Linux,
+streaming KV cache chunks directly over standard TCP sockets into registered memory
+buffers.
+
+When using `tcp`, ephemeral ports can be bound automatically (e.g. `127.0.0.1:0`)
+or specified explicitly via `--disaggregation-mooncake-rpc-port <PORT>`. The bound
+address is published automatically via the P/D ZeroMQ bootstrap protocol to peer
+workers.
 
 ## Current Limits
 
