@@ -1,22 +1,19 @@
 pub mod backend_factory;
 pub mod engine_info;
-pub mod mooncake_control;
 pub mod pd_bootstrap;
+pub mod pd_control;
 pub mod state_events;
 pub mod tcp;
 
 pub use state_events::{
-    BlockRemovedEvent, BlockStoredEvent, BroadcastKvStateEventPublisher, KvStateEventPublisher,
-    NoopKvStateEventPublisher, RecordingKvStateEventPublisher, ReusableBoundary,
+    BlockRemovedEvent, BlockStoredEvent, BroadcastKvStateEventPublisher,
+    CompositeKvStateEventPublisher, KvStateEventPublisher, NoopKvStateEventPublisher,
+    RecordingKvStateEventPublisher, ReusableBoundary, ZmqKvStateEventPublisher,
 };
 
 use std::collections::BTreeMap;
-#[cfg(feature = "mooncake-link")]
-use std::ffi::{CStr, CString};
-use std::ffi::{NulError, c_char, c_int, c_void};
+use std::ffi::{c_int, c_void};
 use std::fmt;
-#[cfg(feature = "mooncake-link")]
-use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 
@@ -38,14 +35,6 @@ use crate::worker::{
     WorkerExecutionError, WorkerWeightUpdateRequest,
 };
 
-#[cfg(feature = "mooncake-link")]
-#[link(name = "transfer_engine", kind = "static")]
-unsafe extern "C" {}
-
-#[cfg(feature = "mooncake-link")]
-#[link(name = "mooncake_common", kind = "static")]
-unsafe extern "C" {}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DisaggregationMode {
     Null,
@@ -66,7 +55,6 @@ impl DisaggregationMode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransferBackend {
-    Mooncake,
     Tcp,
     Nixl,
     Ascend,
@@ -76,14 +64,6 @@ pub enum TransferBackend {
 impl TransferBackend {
     fn parse(value: &str) -> Result<ParsedTransferBackend, PdConfigError> {
         match value {
-            "mooncake" => Ok(ParsedTransferBackend {
-                backend: Self::Mooncake,
-                force_tcp_transport: false,
-            }),
-            "mooncake_tcp" => Ok(ParsedTransferBackend {
-                backend: Self::Mooncake,
-                force_tcp_transport: true,
-            }),
             "tcp" => Ok(ParsedTransferBackend {
                 backend: Self::Tcp,
                 force_tcp_transport: true,
@@ -117,7 +97,7 @@ pub struct PdConfig {
     pub transfer_backend: TransferBackend,
     pub force_tcp_transport: bool,
     pub bootstrap_port: u16,
-    pub mooncake_rpc_port: Option<u16>,
+    pub transfer_rpc_port: Option<u16>,
     pub ib_device: Option<String>,
     pub decode_enable_radix_cache: bool,
     pub decode_enable_offload_kvcache: bool,
@@ -160,6 +140,7 @@ pub struct PdConfig {
     pub allow_auto_truncate: bool,
     pub collect_tokens_histogram: bool,
     pub enable_cache_report: bool,
+    pub kv_events_port: Option<u16>,
     pub enable_metrics: bool,
     pub disable_radix_cache: bool,
     pub tool_call_parser: Option<String>,
@@ -177,7 +158,7 @@ impl PdConfig {
             transfer_backend: backend.backend,
             force_tcp_transport: backend.force_tcp_transport,
             bootstrap_port: args.disaggregation_bootstrap_port,
-            mooncake_rpc_port: args.disaggregation_mooncake_rpc_port,
+            transfer_rpc_port: args.disaggregation_transfer_rpc_port,
             ib_device: if backend.force_tcp_transport {
                 None
             } else {
@@ -224,6 +205,7 @@ impl PdConfig {
             allow_auto_truncate: args.allow_auto_truncate,
             collect_tokens_histogram: args.collect_tokens_histogram,
             enable_cache_report: args.enable_cache_report,
+            kv_events_port: args.kv_events_port,
             enable_metrics: args.enable_metrics,
             disable_radix_cache: args.disable_radix_cache,
             tool_call_parser: args.tool_call_parser.clone(),
@@ -259,78 +241,51 @@ impl fmt::Display for PdConfigError {
 
 impl std::error::Error for PdConfigError {}
 
-#[derive(Debug, Eq, PartialEq)]
-pub enum MooncakeError {
-    InteriorNul,
-    UnavailableWithoutLink,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KvTransportError {
+    Internal(String),
+    ConnectionFailed(String),
     UnsupportedMemoryLocation(KvCacheMemoryLocation),
-    EngineCreateFailed,
-    LocalEndpointQueryFailed(i32),
-    LocalEndpointUtf8,
-    TransportInstallFailed(String),
-    RegisterMemoryFailed(i32),
-    UnregisterMemoryFailed(i32),
+    RegisterMemoryFailed(String),
+    UnregisterMemoryFailed(String),
     OpenSegmentFailed(String),
-    SubmitTransferFailed(i32),
-    StatusQueryFailed(i32),
-    FreeBatchFailed(i32),
+    SubmitTransferFailed(String),
+    StatusQueryFailed(String),
+    FreeBatchFailed(String),
 }
 
-impl From<NulError> for MooncakeError {
-    fn from(_: NulError) -> Self {
-        Self::InteriorNul
-    }
-}
-
-impl fmt::Display for MooncakeError {
+impl fmt::Display for KvTransportError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InteriorNul => formatter.write_str("mooncake string contains interior nul byte"),
-            Self::UnavailableWithoutLink => formatter.write_str(
-                "mooncake transfer engine requires building sglang-srt with the mooncake-link feature",
-            ),
-            Self::UnsupportedMemoryLocation(location) => write!(
-                formatter,
-                "mooncake transfer engine does not support KV memory location {location:?}"
-            ),
-            Self::EngineCreateFailed => {
-                formatter.write_str("mooncake transfer engine create failed")
+            Self::Internal(msg) => write!(formatter, "KV transport internal error: {msg}"),
+            Self::ConnectionFailed(msg) => {
+                write!(formatter, "KV transport connection failed: {msg}")
             }
-            Self::LocalEndpointQueryFailed(code) => {
-                write!(formatter, "mooncake local endpoint query failed: {code}")
+            Self::UnsupportedMemoryLocation(loc) => {
+                write!(formatter, "unsupported KV memory location: {loc:?}")
             }
-            Self::LocalEndpointUtf8 => {
-                formatter.write_str("mooncake local endpoint is not valid UTF-8")
+            Self::RegisterMemoryFailed(msg) => {
+                write!(formatter, "KV memory register failed: {msg}")
             }
-            Self::TransportInstallFailed(protocol) => {
-                write!(formatter, "mooncake transport install failed: {protocol}")
+            Self::UnregisterMemoryFailed(msg) => {
+                write!(formatter, "KV memory unregister failed: {msg}")
             }
-            Self::RegisterMemoryFailed(code) => {
-                write!(formatter, "mooncake memory register failed: {code}")
+            Self::OpenSegmentFailed(msg) => write!(formatter, "KV open segment failed: {msg}"),
+            Self::SubmitTransferFailed(msg) => {
+                write!(formatter, "KV transfer submit failed: {msg}")
             }
-            Self::UnregisterMemoryFailed(code) => {
-                write!(formatter, "mooncake memory unregister failed: {code}")
-            }
-            Self::OpenSegmentFailed(segment) => {
-                write!(formatter, "mooncake open segment failed: {segment}")
-            }
-            Self::SubmitTransferFailed(code) => {
-                write!(formatter, "mooncake transfer submit failed: {code}")
-            }
-            Self::StatusQueryFailed(code) => {
-                write!(formatter, "mooncake status query failed: {code}")
-            }
-            Self::FreeBatchFailed(code) => write!(formatter, "mooncake free batch failed: {code}"),
+            Self::StatusQueryFailed(msg) => write!(formatter, "KV status query failed: {msg}"),
+            Self::FreeBatchFailed(msg) => write!(formatter, "KV free batch failed: {msg}"),
         }
     }
 }
 
-impl std::error::Error for MooncakeError {}
+impl std::error::Error for KvTransportError {}
 
-pub const MOONCAKE_P2P_HANDSHAKE_METADATA: &str = "P2PHANDSHAKE";
+pub const PD_P2P_HANDSHAKE_METADATA: &str = "P2PHANDSHAKE";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MooncakeTransferEngineConfig {
+pub struct PdTransferEngineConfig {
     pub hostname: String,
     pub gpu_id: usize,
     pub rpc_port: u16,
@@ -340,7 +295,7 @@ pub struct MooncakeTransferEngineConfig {
     pub device_name: String,
 }
 
-impl MooncakeTransferEngineConfig {
+impl PdTransferEngineConfig {
     pub fn from_pd_config(hostname: impl Into<String>, gpu_id: usize, config: &PdConfig) -> Self {
         let hostname = hostname.into();
         let ranks_per_node = config
@@ -349,7 +304,7 @@ impl MooncakeTransferEngineConfig {
             .unwrap_or(1);
         let rank_offset = u16::try_from(config.node_rank * ranks_per_node).unwrap_or(0);
         let rpc_port = config
-            .mooncake_rpc_port
+            .transfer_rpc_port
             .map(|p| {
                 if p == 0 {
                     0
@@ -364,7 +319,7 @@ impl MooncakeTransferEngineConfig {
             gpu_id,
             rpc_port,
             session_id,
-            metadata_server: MOONCAKE_P2P_HANDSHAKE_METADATA.to_string(),
+            metadata_server: PD_P2P_HANDSHAKE_METADATA.to_string(),
             protocol: if config.force_tcp_transport {
                 "tcp".to_string()
             } else {
@@ -1756,14 +1711,14 @@ impl<W, E, P> KvTransferModelWorker<W, E, P> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(i32)]
-pub enum MooncakeOpcode {
+pub enum KvOpcode {
     Read = 0,
     Write = 1,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(i32)]
-pub enum MooncakeTransferStatusCode {
+pub enum KvTransferStatusCode {
     Waiting = 0,
     Pending = 1,
     Invalid = 2,
@@ -1773,7 +1728,7 @@ pub enum MooncakeTransferStatusCode {
     Failed = 6,
 }
 
-impl TryFrom<c_int> for MooncakeTransferStatusCode {
+impl TryFrom<c_int> for KvTransferStatusCode {
     type Error = KvCacheTransferError;
 
     fn try_from(value: c_int) -> Result<Self, Self::Error> {
@@ -1786,7 +1741,7 @@ impl TryFrom<c_int> for MooncakeTransferStatusCode {
             5 => Ok(Self::Timeout),
             6 => Ok(Self::Failed),
             other => Err(KvCacheTransferError::Runtime(format!(
-                "unknown Mooncake transfer status: {other}"
+                "unknown KV transfer status: {other}"
             ))),
         }
     }
@@ -1794,14 +1749,14 @@ impl TryFrom<c_int> for MooncakeTransferStatusCode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
-pub struct MooncakeTransferStatus {
+pub struct KvTransferStatus {
     pub status: c_int,
     pub transferred_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
-pub struct MooncakeTransferRequest {
+pub struct KvTransferRequest {
     pub opcode: c_int,
     pub source: *mut c_void,
     pub target_id: i32,
@@ -1809,47 +1764,54 @@ pub struct MooncakeTransferRequest {
     pub length: u64,
 }
 
-// The pointer is an opaque registered device/host address passed to Mooncake; moving
+// The pointer is an opaque registered device/host address passed to the transport engine; moving
 // the request between Rust threads does not grant dereference access in Rust.
-unsafe impl Send for MooncakeTransferRequest {}
+unsafe impl Send for KvTransferRequest {}
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
-pub struct MooncakeBufferEntry {
+pub struct KvBufferEntry {
     pub addr: *mut c_void,
     pub length: usize,
 }
 
-pub type MooncakeTransferEngineHandle = *mut c_void;
-pub type MooncakeTransportHandle = *mut c_void;
-pub type MooncakeSegmentId = i32;
-pub type MooncakeBatchId = u64;
+pub type KvTransferEngineHandle = *mut c_void;
+pub type KvTransportHandle = *mut c_void;
+pub type KvSegmentId = i32;
+pub type KvBatchId = u64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MooncakeKvCacheLayout {
+pub struct KvTransferLayout {
     pub source_base_addr: usize,
     pub page_size_bytes: usize,
     pub target_base_offset: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MooncakeTransferTarget {
+pub struct KvTransferTarget {
     pub target_id: i32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MooncakeRemoteKvLayout {
+pub struct KvRemoteLayout {
     pub dst_kv_ptrs: Vec<u64>,
     pub dst_kv_indices: Vec<i32>,
     pub dst_kv_item_len: usize,
 }
 
-pub trait MooncakeMemoryLocationExt {
-    fn mooncake_memory_location_label(self) -> Result<String, MooncakeError>;
+pub trait KvMemoryLocationExt {
+    fn kv_memory_location_label(self) -> Result<String, KvTransportError>;
+
+    fn mooncake_memory_location_label(self) -> Result<String, KvTransportError>
+    where
+        Self: Sized,
+    {
+        self.kv_memory_location_label()
+    }
 }
 
-impl MooncakeMemoryLocationExt for KvCacheMemoryLocation {
-    fn mooncake_memory_location_label(self) -> Result<String, MooncakeError> {
+impl KvMemoryLocationExt for KvCacheMemoryLocation {
+    fn kv_memory_location_label(self) -> Result<String, KvTransportError> {
         let label = match self {
             Self::Cpu { numa_node } => format!("cpu:{numa_node}"),
             Self::Cuda { device_id } => format!("cuda:{device_id}"),
@@ -1857,30 +1819,38 @@ impl MooncakeMemoryLocationExt for KvCacheMemoryLocation {
             Self::Musa { device_id } => format!("musa:{device_id}"),
             Self::Npu { device_id } => format!("npu:{device_id}"),
             location @ (Self::Metal { .. } | Self::Xpu { .. } | Self::Hpu { .. }) => {
-                return Err(MooncakeError::UnsupportedMemoryLocation(location));
+                return Err(KvTransportError::UnsupportedMemoryLocation(location));
             }
         };
         Ok(label)
     }
 }
 
-pub trait MooncakeKvCacheMemoryExt {
-    fn mooncake_prefill_layout(&self, target_base_offset: u64) -> MooncakeKvCacheLayout;
+pub trait KvCacheMemoryExt {
+    fn kv_prefill_layout(&self, target_base_offset: u64) -> KvTransferLayout;
 
-    fn mooncake_decode_remote_layout(&self, dst_kv_indices: &[i32]) -> MooncakeRemoteKvLayout;
+    fn kv_decode_remote_layout(&self, dst_kv_indices: &[i32]) -> KvRemoteLayout;
+
+    fn mooncake_prefill_layout(&self, target_base_offset: u64) -> KvTransferLayout {
+        self.kv_prefill_layout(target_base_offset)
+    }
+
+    fn mooncake_decode_remote_layout(&self, dst_kv_indices: &[i32]) -> KvRemoteLayout {
+        self.kv_decode_remote_layout(dst_kv_indices)
+    }
 }
 
-impl MooncakeKvCacheMemoryExt for TransferableKvCacheMemory {
-    fn mooncake_prefill_layout(&self, target_base_offset: u64) -> MooncakeKvCacheLayout {
-        MooncakeKvCacheLayout {
+impl KvCacheMemoryExt for TransferableKvCacheMemory {
+    fn kv_prefill_layout(&self, target_base_offset: u64) -> KvTransferLayout {
+        KvTransferLayout {
             source_base_addr: self.regions()[0].base_addr,
             page_size_bytes: self.page_size_bytes(),
             target_base_offset,
         }
     }
 
-    fn mooncake_decode_remote_layout(&self, dst_kv_indices: &[i32]) -> MooncakeRemoteKvLayout {
-        MooncakeRemoteKvLayout {
+    fn kv_decode_remote_layout(&self, dst_kv_indices: &[i32]) -> KvRemoteLayout {
+        KvRemoteLayout {
             dst_kv_ptrs: self
                 .regions()
                 .iter()
@@ -1892,38 +1862,44 @@ impl MooncakeKvCacheMemoryExt for TransferableKvCacheMemory {
     }
 }
 
-pub trait MooncakeMemoryRegistrar: Send + 'static {
+pub trait KvMemoryRegistrar: Send + 'static {
     fn register_memory_batch(
         &mut self,
-        buffers: &mut [MooncakeBufferEntry],
+        buffers: &mut [KvBufferEntry],
         location: &str,
-    ) -> Result<(), MooncakeError>;
+    ) -> Result<(), KvTransportError>;
 
-    fn unregister_memory_batch(&mut self, addrs: &mut [*mut c_void]) -> Result<(), MooncakeError>;
+    fn unregister_memory_batch(
+        &mut self,
+        addrs: &mut [*mut c_void],
+    ) -> Result<(), KvTransportError>;
 }
 
-impl MooncakeMemoryRegistrar for Box<dyn MooncakeMemoryRegistrar> {
+impl KvMemoryRegistrar for Box<dyn KvMemoryRegistrar> {
     fn register_memory_batch(
         &mut self,
-        buffers: &mut [MooncakeBufferEntry],
+        buffers: &mut [KvBufferEntry],
         location: &str,
-    ) -> Result<(), MooncakeError> {
+    ) -> Result<(), KvTransportError> {
         self.as_mut().register_memory_batch(buffers, location)
     }
 
-    fn unregister_memory_batch(&mut self, addrs: &mut [*mut c_void]) -> Result<(), MooncakeError> {
+    fn unregister_memory_batch(
+        &mut self,
+        addrs: &mut [*mut c_void],
+    ) -> Result<(), KvTransportError> {
         self.as_mut().unregister_memory_batch(addrs)
     }
 }
 
-pub trait MooncakeMemoryRegistrationLease: Send {
+pub trait KvMemoryRegistrationLease: Send {
     fn memory(&self) -> &TransferableKvCacheMemory;
-    fn unregister(&mut self) -> Result<(), MooncakeError>;
+    fn unregister(&mut self) -> Result<(), KvTransportError>;
 }
 
-pub struct RegisteredMooncakeKvCacheMemory<R>
+pub struct RegisteredKvCacheMemory<R>
 where
-    R: MooncakeMemoryRegistrar,
+    R: KvMemoryRegistrar,
 {
     registrar: R,
     memory: TransferableKvCacheMemory,
@@ -1931,23 +1907,23 @@ where
     active: bool,
 }
 
-impl<R> RegisteredMooncakeKvCacheMemory<R>
+impl<R> RegisteredKvCacheMemory<R>
 where
-    R: MooncakeMemoryRegistrar,
+    R: KvMemoryRegistrar,
 {
     pub fn register(
         mut registrar: R,
         memory: TransferableKvCacheMemory,
-    ) -> Result<Self, MooncakeError> {
+    ) -> Result<Self, KvTransportError> {
         let mut buffers = memory
             .regions()
             .iter()
-            .map(|region| MooncakeBufferEntry {
+            .map(|region| KvBufferEntry {
                 addr: region.base_addr as *mut c_void,
                 length: region.byte_len,
             })
             .collect::<Vec<_>>();
-        let location = memory.location().mooncake_memory_location_label()?;
+        let location = memory.location().kv_memory_location_label()?;
         registrar.register_memory_batch(&mut buffers, &location)?;
 
         Ok(Self {
@@ -1966,7 +1942,7 @@ where
         &self.memory
     }
 
-    pub fn unregister(&mut self) -> Result<(), MooncakeError> {
+    pub fn unregister(&mut self) -> Result<(), KvTransportError> {
         if !self.active {
             return Ok(());
         }
@@ -1982,80 +1958,78 @@ where
     }
 }
 
-impl<R> MooncakeMemoryRegistrationLease for RegisteredMooncakeKvCacheMemory<R>
+impl<R> KvMemoryRegistrationLease for RegisteredKvCacheMemory<R>
 where
-    R: MooncakeMemoryRegistrar,
+    R: KvMemoryRegistrar,
 {
     fn memory(&self) -> &TransferableKvCacheMemory {
         self.memory()
     }
 
-    fn unregister(&mut self) -> Result<(), MooncakeError> {
+    fn unregister(&mut self) -> Result<(), KvTransportError> {
         self.unregister()
     }
 }
 
-impl<R> Drop for RegisteredMooncakeKvCacheMemory<R>
+impl<R> Drop for RegisteredKvCacheMemory<R>
 where
-    R: MooncakeMemoryRegistrar,
+    R: KvMemoryRegistrar,
 {
     fn drop(&mut self) {
         if let Err(error) = self.unregister() {
-            eprintln!(
-                "fatal: cannot release Mooncake KV memory with an active registration: {error}"
-            );
+            eprintln!("fatal: cannot release KV memory with an active registration: {error}");
             std::process::abort();
         }
     }
 }
 
-pub trait MooncakeSegmentOpener {
-    fn open_segment(&mut self, segment: &str) -> Result<i32, MooncakeError>;
+pub trait KvSegmentOpener {
+    fn open_segment(&mut self, segment: &str) -> Result<i32, KvTransportError>;
 }
 
-pub trait MooncakeTransferTargetResolver {
+pub trait KvTransferTargetResolver {
     fn resolve_target(
         &mut self,
         span: &KvCacheTransferSpan,
-    ) -> Result<MooncakeTransferTarget, KvCacheTransferError>;
+    ) -> Result<KvTransferTarget, KvCacheTransferError>;
 
     fn resolve_session_target(
         &mut self,
         span: &KvCacheTransferSpan,
         _session_id: &str,
-    ) -> Result<MooncakeTransferTarget, KvCacheTransferError> {
+    ) -> Result<KvTransferTarget, KvCacheTransferError> {
         self.resolve_target(span)
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FixedMooncakeTransferTargetResolver {
-    target: MooncakeTransferTarget,
+pub struct FixedKvTransferTargetResolver {
+    target: KvTransferTarget,
 }
 
-impl FixedMooncakeTransferTargetResolver {
-    pub fn new(target: MooncakeTransferTarget) -> Self {
+impl FixedKvTransferTargetResolver {
+    pub fn new(target: KvTransferTarget) -> Self {
         Self { target }
     }
 }
 
-impl MooncakeTransferTargetResolver for FixedMooncakeTransferTargetResolver {
+impl KvTransferTargetResolver for FixedKvTransferTargetResolver {
     fn resolve_target(
         &mut self,
         _span: &KvCacheTransferSpan,
-    ) -> Result<MooncakeTransferTarget, KvCacheTransferError> {
+    ) -> Result<KvTransferTarget, KvCacheTransferError> {
         Ok(self.target)
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct MooncakeSessionTargetResolver<O> {
+pub struct SessionKvTargetResolver<O> {
     opener: O,
     sessions_by_room: BTreeMap<BootstrapRoom, String>,
-    targets_by_session: BTreeMap<String, MooncakeTransferTarget>,
+    targets_by_session: BTreeMap<String, KvTransferTarget>,
 }
 
-impl<O> MooncakeSessionTargetResolver<O> {
+impl<O> SessionKvTargetResolver<O> {
     pub fn new(opener: O, sessions_by_room: Vec<(BootstrapRoom, String)>) -> Self {
         Self {
             opener,
@@ -2082,20 +2056,20 @@ impl<O> MooncakeSessionTargetResolver<O> {
     }
 }
 
-impl<O> MooncakeTransferTargetResolver for MooncakeSessionTargetResolver<O>
+impl<O> KvTransferTargetResolver for SessionKvTargetResolver<O>
 where
-    O: MooncakeSegmentOpener,
+    O: KvSegmentOpener,
 {
     fn resolve_target(
         &mut self,
         span: &KvCacheTransferSpan,
-    ) -> Result<MooncakeTransferTarget, KvCacheTransferError> {
+    ) -> Result<KvTransferTarget, KvCacheTransferError> {
         let session_id = self
             .sessions_by_room
             .get(&span.bootstrap_room())
             .ok_or_else(|| {
                 KvCacheTransferError::Runtime(format!(
-                    "missing Mooncake session for bootstrap room {}",
+                    "missing session for bootstrap room {}",
                     span.bootstrap_room()
                 ))
             })?
@@ -2109,7 +2083,7 @@ where
             .opener
             .open_segment(&session_id)
             .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
-        let target = MooncakeTransferTarget { target_id };
+        let target = KvTransferTarget { target_id };
         self.targets_by_session.insert(session_id, target);
         Ok(target)
     }
@@ -2118,7 +2092,7 @@ where
         &mut self,
         _span: &KvCacheTransferSpan,
         session_id: &str,
-    ) -> Result<MooncakeTransferTarget, KvCacheTransferError> {
+    ) -> Result<KvTransferTarget, KvCacheTransferError> {
         if let Some(target) = self.targets_by_session.get(session_id) {
             return Ok(*target);
         }
@@ -2127,25 +2101,25 @@ where
             .opener
             .open_segment(session_id)
             .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
-        let target = MooncakeTransferTarget { target_id };
+        let target = KvTransferTarget { target_id };
         self.targets_by_session
             .insert(session_id.to_string(), target);
         Ok(target)
     }
 }
 
-pub fn build_mooncake_kv_transfer_requests(
+pub fn build_kv_transfer_requests(
     span: &KvCacheTransferSpan,
-    layout: MooncakeKvCacheLayout,
-    target: MooncakeTransferTarget,
-) -> Result<Vec<MooncakeTransferRequest>, MooncakeRequestBuildError> {
+    layout: KvTransferLayout,
+    target: KvTransferTarget,
+) -> Result<Vec<KvTransferRequest>, KvRequestBuildError> {
     if layout.page_size_bytes == 0 {
-        return Err(MooncakeRequestBuildError::ZeroPageSize);
+        return Err(KvRequestBuildError::ZeroPageSize);
     }
 
     let expected_page_count = span.token_count().div_ceil(span.page_size());
     if expected_page_count != span.page_indices().len() {
-        return Err(MooncakeRequestBuildError::SpanPageCountMismatch {
+        return Err(KvRequestBuildError::SpanPageCountMismatch {
             expected_page_count,
             source_page_index_count: span.page_indices().len(),
         });
@@ -2158,26 +2132,26 @@ pub fn build_mooncake_kv_transfer_requests(
         let source_offset = source_page_index
             .as_usize()
             .checked_mul(layout.page_size_bytes)
-            .ok_or(MooncakeRequestBuildError::AddressOverflow)?;
+            .ok_or(KvRequestBuildError::AddressOverflow)?;
         let source_addr = layout
             .source_base_addr
             .checked_add(source_offset)
-            .ok_or(MooncakeRequestBuildError::AddressOverflow)?;
+            .ok_or(KvRequestBuildError::AddressOverflow)?;
         let target_page_index = span
             .page_offset()
             .checked_add(page_index)
-            .ok_or(MooncakeRequestBuildError::OffsetOverflow)?;
+            .ok_or(KvRequestBuildError::OffsetOverflow)?;
         let target_offset = layout
             .target_base_offset
             .checked_add(
                 (target_page_index as u64)
                     .checked_mul(page_size_bytes)
-                    .ok_or(MooncakeRequestBuildError::OffsetOverflow)?,
+                    .ok_or(KvRequestBuildError::OffsetOverflow)?,
             )
-            .ok_or(MooncakeRequestBuildError::OffsetOverflow)?;
+            .ok_or(KvRequestBuildError::OffsetOverflow)?;
 
-        requests.push(MooncakeTransferRequest {
-            opcode: MooncakeOpcode::Write as c_int,
+        requests.push(KvTransferRequest {
+            opcode: KvOpcode::Write as c_int,
             source: source_addr as *mut c_void,
             target_id: target.target_id,
             target_offset,
@@ -2188,34 +2162,34 @@ pub fn build_mooncake_kv_transfer_requests(
     Ok(requests)
 }
 
-pub fn build_mooncake_remote_kv_transfer_requests(
+pub fn build_remote_kv_transfer_requests(
     span: &KvCacheTransferSpan,
-    layout: MooncakeKvCacheLayout,
-    target: MooncakeTransferTarget,
-    remote_layout: &MooncakeRemoteKvLayout,
-) -> Result<Vec<MooncakeTransferRequest>, MooncakeRequestBuildError> {
+    layout: KvTransferLayout,
+    target: KvTransferTarget,
+    remote_layout: &KvRemoteLayout,
+) -> Result<Vec<KvTransferRequest>, KvRequestBuildError> {
     if layout.page_size_bytes == 0 {
-        return Err(MooncakeRequestBuildError::ZeroPageSize);
+        return Err(KvRequestBuildError::ZeroPageSize);
     }
 
     if remote_layout.dst_kv_item_len == 0 {
-        return Err(MooncakeRequestBuildError::ZeroRemoteKvItemSize);
+        return Err(KvRequestBuildError::ZeroRemoteKvItemSize);
     }
 
     if remote_layout.dst_kv_ptrs.is_empty() {
-        return Err(MooncakeRequestBuildError::MissingRemoteKvPointers);
+        return Err(KvRequestBuildError::MissingRemoteKvPointers);
     }
 
     let expected_page_count = span.token_count().div_ceil(span.page_size());
     if expected_page_count != span.page_indices().len() {
-        return Err(MooncakeRequestBuildError::SpanPageCountMismatch {
+        return Err(KvRequestBuildError::SpanPageCountMismatch {
             expected_page_count,
             source_page_index_count: span.page_indices().len(),
         });
     }
 
     if span.page_indices().len() != remote_layout.dst_kv_indices.len() {
-        return Err(MooncakeRequestBuildError::RemoteKvIndexCountMismatch {
+        return Err(KvRequestBuildError::RemoteKvIndexCountMismatch {
             source_page_count: span.page_indices().len(),
             dst_kv_index_count: remote_layout.dst_kv_indices.len(),
         });
@@ -2224,9 +2198,9 @@ pub fn build_mooncake_remote_kv_transfer_requests(
     let item_len = remote_layout.dst_kv_item_len;
     let split_page_size = item_len
         .checked_mul(remote_layout.dst_kv_ptrs.len())
-        .ok_or(MooncakeRequestBuildError::AddressOverflow)?;
+        .ok_or(KvRequestBuildError::AddressOverflow)?;
     if split_page_size != layout.page_size_bytes {
-        return Err(MooncakeRequestBuildError::RemoteKvItemLayoutMismatch {
+        return Err(KvRequestBuildError::RemoteKvItemLayoutMismatch {
             page_size_bytes: layout.page_size_bytes,
             split_page_size,
         });
@@ -2238,38 +2212,36 @@ pub fn build_mooncake_remote_kv_transfer_requests(
     for (page_index, source_page_index) in span.page_indices().iter().enumerate() {
         let dst_kv_index = remote_layout.dst_kv_indices[page_index];
         if dst_kv_index < 0 {
-            return Err(MooncakeRequestBuildError::NegativeRemoteKvIndex(
-                dst_kv_index,
-            ));
+            return Err(KvRequestBuildError::NegativeRemoteKvIndex(dst_kv_index));
         }
 
         let source_offset = source_page_index
             .as_usize()
             .checked_mul(layout.page_size_bytes)
-            .ok_or(MooncakeRequestBuildError::AddressOverflow)?;
+            .ok_or(KvRequestBuildError::AddressOverflow)?;
         let source_page_addr = layout
             .source_base_addr
             .checked_add(source_offset)
-            .ok_or(MooncakeRequestBuildError::AddressOverflow)?;
+            .ok_or(KvRequestBuildError::AddressOverflow)?;
 
         for (ptr_index, dst_kv_ptr) in remote_layout.dst_kv_ptrs.iter().enumerate() {
             let source_addr = source_page_addr
                 .checked_add(
                     ptr_index
                         .checked_mul(item_len)
-                        .ok_or(MooncakeRequestBuildError::AddressOverflow)?,
+                        .ok_or(KvRequestBuildError::AddressOverflow)?,
                 )
-                .ok_or(MooncakeRequestBuildError::AddressOverflow)?;
+                .ok_or(KvRequestBuildError::AddressOverflow)?;
             let target_offset = dst_kv_ptr
                 .checked_add(
                     (dst_kv_index as u64)
                         .checked_mul(item_len as u64)
-                        .ok_or(MooncakeRequestBuildError::OffsetOverflow)?,
+                        .ok_or(KvRequestBuildError::OffsetOverflow)?,
                 )
-                .ok_or(MooncakeRequestBuildError::OffsetOverflow)?;
+                .ok_or(KvRequestBuildError::OffsetOverflow)?;
 
-            requests.push(MooncakeTransferRequest {
-                opcode: MooncakeOpcode::Write as c_int,
+            requests.push(KvTransferRequest {
+                opcode: KvOpcode::Write as c_int,
                 source: source_addr as *mut c_void,
                 target_id: target.target_id,
                 target_offset,
@@ -2282,7 +2254,7 @@ pub fn build_mooncake_remote_kv_transfer_requests(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MooncakeRequestBuildError {
+pub enum KvRequestBuildError {
     ZeroPageSize,
     ZeroRemoteKvItemSize,
     MissingRemoteKvPointers,
@@ -2303,15 +2275,15 @@ pub enum MooncakeRequestBuildError {
     OffsetOverflow,
 }
 
-impl fmt::Display for MooncakeRequestBuildError {
+impl fmt::Display for KvRequestBuildError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ZeroPageSize => formatter.write_str("Mooncake KV page size must be non-zero"),
+            Self::ZeroPageSize => formatter.write_str("KV page size must be non-zero"),
             Self::ZeroRemoteKvItemSize => {
-                formatter.write_str("Mooncake remote KV item size must be non-zero")
+                formatter.write_str("remote KV item size must be non-zero")
             }
             Self::MissingRemoteKvPointers => {
-                formatter.write_str("Mooncake remote KV pointers must not be empty")
+                formatter.write_str("remote KV pointers must not be empty")
             }
             Self::SpanPageCountMismatch {
                 expected_page_count,
@@ -2332,87 +2304,48 @@ impl fmt::Display for MooncakeRequestBuildError {
                 split_page_size,
             } => write!(
                 formatter,
-                "Mooncake remote KV item layout requires exactly {page_size_bytes} bytes but has {split_page_size} bytes"
+                "remote KV item layout requires exactly {page_size_bytes} bytes but has {split_page_size} bytes"
             ),
             Self::NegativeRemoteKvIndex(index) => {
-                write!(
-                    formatter,
-                    "Mooncake remote KV index must be non-negative: {index}"
-                )
+                write!(formatter, "remote KV index must be non-negative: {index}")
             }
-            Self::AddressOverflow => formatter.write_str("Mooncake source address overflow"),
-            Self::OffsetOverflow => formatter.write_str("Mooncake target offset overflow"),
+            Self::AddressOverflow => formatter.write_str("source address overflow"),
+            Self::OffsetOverflow => formatter.write_str("target offset overflow"),
         }
     }
 }
 
-impl std::error::Error for MooncakeRequestBuildError {}
+impl std::error::Error for KvRequestBuildError {}
 
-pub trait MooncakeTransferSubmitter {
+pub trait KvTransferSubmitter {
     fn submit_transfer(
         &mut self,
-        requests: &mut [MooncakeTransferRequest],
-    ) -> Result<MooncakeBatchId, MooncakeError>;
+        requests: &mut [KvTransferRequest],
+    ) -> Result<KvBatchId, KvTransportError>;
 }
 
-pub trait MooncakeTransferStatusReader {
+pub trait KvTransferStatusReader {
     fn transfer_status(
         &mut self,
-        batch_id: MooncakeBatchId,
+        batch_id: KvBatchId,
         task_id: usize,
-    ) -> Result<MooncakeTransferStatus, MooncakeError>;
+    ) -> Result<KvTransferStatus, KvTransportError>;
 }
 
-pub trait MooncakeBatchReleaser {
-    fn free_batch(&mut self, batch_id: MooncakeBatchId) -> Result<(), MooncakeError>;
-}
-
-#[cfg(not(feature = "mooncake-link"))]
-#[derive(Clone, Debug, Default)]
-pub struct UnlinkedMooncakeTransferEngine;
-
-#[cfg(not(feature = "mooncake-link"))]
-impl MooncakeTransferSubmitter for UnlinkedMooncakeTransferEngine {
-    fn submit_transfer(
-        &mut self,
-        _requests: &mut [MooncakeTransferRequest],
-    ) -> Result<MooncakeBatchId, MooncakeError> {
-        Err(MooncakeError::UnavailableWithoutLink)
-    }
-}
-
-#[cfg(not(feature = "mooncake-link"))]
-impl MooncakeTransferStatusReader for UnlinkedMooncakeTransferEngine {
-    fn transfer_status(
-        &mut self,
-        _batch_id: MooncakeBatchId,
-        _task_id: usize,
-    ) -> Result<MooncakeTransferStatus, MooncakeError> {
-        Err(MooncakeError::UnavailableWithoutLink)
-    }
-}
-
-#[cfg(not(feature = "mooncake-link"))]
-impl MooncakeBatchReleaser for UnlinkedMooncakeTransferEngine {
-    fn free_batch(&mut self, _batch_id: MooncakeBatchId) -> Result<(), MooncakeError> {
-        Err(MooncakeError::UnavailableWithoutLink)
-    }
+pub trait KvBatchReleaser {
+    fn free_batch(&mut self, batch_id: KvBatchId) -> Result<(), KvTransportError>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MooncakeSubmittedBatch {
+pub struct KvSubmittedBatch {
     bootstrap_room: BootstrapRoom,
-    batch_id: MooncakeBatchId,
+    batch_id: KvBatchId,
     task_count: usize,
     descriptor_checksum: String,
 }
 
-impl MooncakeSubmittedBatch {
-    pub fn new(
-        bootstrap_room: BootstrapRoom,
-        batch_id: MooncakeBatchId,
-        task_count: usize,
-    ) -> Self {
+impl KvSubmittedBatch {
+    pub fn new(bootstrap_room: BootstrapRoom, batch_id: KvBatchId, task_count: usize) -> Self {
         Self {
             bootstrap_room,
             batch_id,
@@ -2421,11 +2354,7 @@ impl MooncakeSubmittedBatch {
         }
     }
 
-    pub fn from_span(
-        span: &KvCacheTransferSpan,
-        batch_id: MooncakeBatchId,
-        task_count: usize,
-    ) -> Self {
+    pub fn from_span(span: &KvCacheTransferSpan, batch_id: KvBatchId, task_count: usize) -> Self {
         Self {
             bootstrap_room: span.bootstrap_room(),
             batch_id,
@@ -2438,7 +2367,7 @@ impl MooncakeSubmittedBatch {
         self.bootstrap_room
     }
 
-    pub fn batch_id(&self) -> MooncakeBatchId {
+    pub fn batch_id(&self) -> KvBatchId {
         self.batch_id
     }
 
@@ -2520,24 +2449,24 @@ pub fn apply_transfer_completion_events(
     Ok(summary)
 }
 
-pub fn poll_mooncake_transfer_batches<R>(
+pub fn poll_kv_transfer_batches<R>(
     reader: &mut R,
-    submitted_batches: &[MooncakeSubmittedBatch],
+    submitted_batches: &[KvSubmittedBatch],
 ) -> Result<KvTransferPoll, KvCacheTransferError>
 where
-    R: MooncakeTransferStatusReader,
+    R: KvTransferStatusReader,
 {
     let mut poll = KvTransferPoll::default();
     for batch in submitted_batches {
-        match poll_mooncake_submitted_batch(reader, batch)? {
-            MooncakePolledBatchState::Completed => {
+        match poll_kv_submitted_batch(reader, batch)? {
+            KvPolledBatchState::Completed => {
                 poll.events.push(KvTransferCompletionEvent::completed(
                     batch.bootstrap_room(),
                     batch.descriptor_checksum().to_string(),
                 ))
             }
-            MooncakePolledBatchState::Pending => poll.pending_transfers += 1,
-            MooncakePolledBatchState::Failed(message) => {
+            KvPolledBatchState::Pending => poll.pending_transfers += 1,
+            KvPolledBatchState::Failed(message) => {
                 poll.events.push(KvTransferCompletionEvent::failed(
                     batch.bootstrap_room(),
                     batch.descriptor_checksum().to_string(),
@@ -2550,18 +2479,18 @@ where
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum MooncakePolledBatchState {
+enum KvPolledBatchState {
     Completed,
     Pending,
     Failed(String),
 }
 
-fn poll_mooncake_submitted_batch<R>(
+fn poll_kv_submitted_batch<R>(
     reader: &mut R,
-    batch: &MooncakeSubmittedBatch,
-) -> Result<MooncakePolledBatchState, KvCacheTransferError>
+    batch: &KvSubmittedBatch,
+) -> Result<KvPolledBatchState, KvCacheTransferError>
 where
-    R: MooncakeTransferStatusReader,
+    R: KvTransferStatusReader,
 {
     let mut completed_tasks = 0;
     let mut failure = None;
@@ -2571,20 +2500,18 @@ where
         let status = reader
             .transfer_status(batch.batch_id(), task_id)
             .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
-        match MooncakeTransferStatusCode::try_from(status.status)? {
-            MooncakeTransferStatusCode::Completed => {
+        match KvTransferStatusCode::try_from(status.status)? {
+            KvTransferStatusCode::Completed => {
                 completed_tasks += 1;
             }
-            MooncakeTransferStatusCode::Waiting | MooncakeTransferStatusCode::Pending => {
-                pending = true
-            }
-            MooncakeTransferStatusCode::Invalid
-            | MooncakeTransferStatusCode::Canceled
-            | MooncakeTransferStatusCode::Timeout
-            | MooncakeTransferStatusCode::Failed => {
+            KvTransferStatusCode::Waiting | KvTransferStatusCode::Pending => pending = true,
+            KvTransferStatusCode::Invalid
+            | KvTransferStatusCode::Canceled
+            | KvTransferStatusCode::Timeout
+            | KvTransferStatusCode::Failed => {
                 failure.get_or_insert_with(|| {
                     format!(
-                        "Mooncake transfer batch {} task {task_id} failed with status {}",
+                        "KV transfer batch {} task {task_id} failed with status {}",
                         batch.batch_id(),
                         status.status
                     )
@@ -2594,65 +2521,59 @@ where
     }
 
     if pending {
-        Ok(MooncakePolledBatchState::Pending)
+        Ok(KvPolledBatchState::Pending)
     } else if let Some(message) = failure {
-        Ok(MooncakePolledBatchState::Failed(message))
+        Ok(KvPolledBatchState::Failed(message))
     } else if completed_tasks == batch.task_count() {
-        Ok(MooncakePolledBatchState::Completed)
+        Ok(KvPolledBatchState::Completed)
     } else {
-        Ok(MooncakePolledBatchState::Pending)
+        Ok(KvPolledBatchState::Pending)
     }
 }
 
-pub struct MooncakeKvCacheTransferExecutor<
-    S: MooncakeTransferStatusReader + MooncakeBatchReleaser,
-    R = FixedMooncakeTransferTargetResolver,
+pub struct KvCacheTransferExecutor<
+    S: KvTransferStatusReader + KvBatchReleaser,
+    R = FixedKvTransferTargetResolver,
 > {
-    local_memory_registration: Option<Box<dyn MooncakeMemoryRegistrationLease>>,
-    memory_registrar: Option<Box<dyn MooncakeMemoryRegistrar>>,
+    local_memory_registration: Option<Box<dyn KvMemoryRegistrationLease>>,
+    memory_registrar: Option<Box<dyn KvMemoryRegistrar>>,
     submitter: S,
-    layout: MooncakeKvCacheLayout,
+    layout: KvTransferLayout,
     target_resolver: R,
-    remote_kv_layouts_by_room: BTreeMap<BootstrapRoom, BTreeMap<String, MooncakeRemoteKvLayout>>,
-    submitted_batches: Vec<MooncakeBatchId>,
-    submitted_transfers: Vec<MooncakeSubmittedBatch>,
+    remote_kv_layouts_by_room: BTreeMap<BootstrapRoom, BTreeMap<String, KvRemoteLayout>>,
+    submitted_batches: Vec<KvBatchId>,
+    submitted_transfers: Vec<KvSubmittedBatch>,
     completion_events: Vec<KvTransferCompletionEvent>,
 }
 
-impl<S: MooncakeTransferStatusReader + MooncakeBatchReleaser> MooncakeKvCacheTransferExecutor<S> {
-    pub fn new(
-        submitter: S,
-        layout: MooncakeKvCacheLayout,
-        target: MooncakeTransferTarget,
-    ) -> Self {
+impl<S: KvTransferStatusReader + KvBatchReleaser> KvCacheTransferExecutor<S> {
+    pub fn new(submitter: S, layout: KvTransferLayout, target: KvTransferTarget) -> Self {
         Self::with_target_resolver(
             submitter,
             layout,
-            FixedMooncakeTransferTargetResolver::new(target),
+            FixedKvTransferTargetResolver::new(target),
         )
     }
 
     pub fn with_remote_kv_layouts(
         submitter: S,
-        layout: MooncakeKvCacheLayout,
-        target: MooncakeTransferTarget,
-        remote_kv_layouts: Vec<(BootstrapRoom, MooncakeRemoteKvLayout)>,
+        layout: KvTransferLayout,
+        target: KvTransferTarget,
+        remote_kv_layouts: Vec<(BootstrapRoom, KvRemoteLayout)>,
     ) -> Self {
         Self::with_target_resolver_and_remote_kv_layouts(
             submitter,
             layout,
-            FixedMooncakeTransferTargetResolver::new(target),
+            FixedKvTransferTargetResolver::new(target),
             remote_kv_layouts,
         )
     }
 }
 
-impl<S: MooncakeTransferStatusReader + MooncakeBatchReleaser, R>
-    MooncakeKvCacheTransferExecutor<S, R>
-{
+impl<S: KvTransferStatusReader + KvBatchReleaser, R> KvCacheTransferExecutor<S, R> {
     pub fn with_target_resolver(
         submitter: S,
-        layout: MooncakeKvCacheLayout,
+        layout: KvTransferLayout,
         target_resolver: R,
     ) -> Self {
         Self {
@@ -2670,9 +2591,9 @@ impl<S: MooncakeTransferStatusReader + MooncakeBatchReleaser, R>
 
     pub fn with_target_resolver_and_remote_kv_layouts(
         submitter: S,
-        layout: MooncakeKvCacheLayout,
+        layout: KvTransferLayout,
         target_resolver: R,
-        remote_kv_layouts: Vec<(BootstrapRoom, MooncakeRemoteKvLayout)>,
+        remote_kv_layouts: Vec<(BootstrapRoom, KvRemoteLayout)>,
     ) -> Self {
         let mut remote_kv_layouts_by_room = BTreeMap::new();
         for (room, layout) in remote_kv_layouts {
@@ -2697,9 +2618,9 @@ impl<S: MooncakeTransferStatusReader + MooncakeBatchReleaser, R>
 
     pub fn with_target_resolver_and_remote_kv_session_layouts(
         submitter: S,
-        layout: MooncakeKvCacheLayout,
+        layout: KvTransferLayout,
         target_resolver: R,
-        remote_kv_layouts: Vec<(BootstrapRoom, String, MooncakeRemoteKvLayout)>,
+        remote_kv_layouts: Vec<(BootstrapRoom, String, KvRemoteLayout)>,
     ) -> Self {
         let mut remote_kv_layouts_by_room = BTreeMap::new();
         for (room, session_id, layout) in remote_kv_layouts {
@@ -2731,11 +2652,11 @@ impl<S: MooncakeTransferStatusReader + MooncakeBatchReleaser, R>
         registration: L,
     ) -> Result<Self, KvCacheTransferError>
     where
-        L: MooncakeMemoryRegistrationLease + 'static,
+        L: KvMemoryRegistrationLease + 'static,
     {
         if self.local_memory_registration.is_some() {
             return Err(KvCacheTransferError::Runtime(
-                "Mooncake executor already owns a local memory registration".to_string(),
+                "KV executor already owns a local memory registration".to_string(),
             ));
         }
         let memory = registration.memory();
@@ -2743,7 +2664,7 @@ impl<S: MooncakeTransferStatusReader + MooncakeBatchReleaser, R>
             || memory.regions()[0].base_addr != self.layout.source_base_addr
         {
             return Err(KvCacheTransferError::Runtime(
-                "Mooncake memory registration does not match the executor KV layout".to_string(),
+                "KV memory registration does not match the executor KV layout".to_string(),
             ));
         }
 
@@ -2753,7 +2674,7 @@ impl<S: MooncakeTransferStatusReader + MooncakeBatchReleaser, R>
 
     pub fn with_memory_registrar<M>(mut self, registrar: M) -> Self
     where
-        M: MooncakeMemoryRegistrar,
+        M: KvMemoryRegistrar,
     {
         self.memory_registrar = Some(Box::new(registrar));
         self
@@ -2775,24 +2696,22 @@ impl<S: MooncakeTransferStatusReader + MooncakeBatchReleaser, R>
         &mut self.target_resolver
     }
 
-    pub fn submitted_batches(&self) -> &[MooncakeBatchId] {
+    pub fn submitted_batches(&self) -> &[KvBatchId] {
         &self.submitted_batches
     }
 
-    pub fn submitted_transfers(&self) -> &[MooncakeSubmittedBatch] {
+    pub fn submitted_transfers(&self) -> &[KvSubmittedBatch] {
         &self.submitted_transfers
     }
 
-    pub fn remote_kv_layouts(
-        &self,
-    ) -> &BTreeMap<BootstrapRoom, BTreeMap<String, MooncakeRemoteKvLayout>> {
+    pub fn remote_kv_layouts(&self) -> &BTreeMap<BootstrapRoom, BTreeMap<String, KvRemoteLayout>> {
         &self.remote_kv_layouts_by_room
     }
 
     pub fn insert_remote_kv_layout(
         &mut self,
         bootstrap_room: BootstrapRoom,
-        layout: MooncakeRemoteKvLayout,
+        layout: KvRemoteLayout,
     ) {
         self.insert_remote_kv_session_layout(bootstrap_room, String::new(), layout);
     }
@@ -2801,7 +2720,7 @@ impl<S: MooncakeTransferStatusReader + MooncakeBatchReleaser, R>
         &mut self,
         bootstrap_room: BootstrapRoom,
         session_id: impl Into<String>,
-        layout: MooncakeRemoteKvLayout,
+        layout: KvRemoteLayout,
     ) {
         self.remote_kv_layouts_by_room
             .entry(bootstrap_room)
@@ -2810,9 +2729,9 @@ impl<S: MooncakeTransferStatusReader + MooncakeBatchReleaser, R>
     }
 }
 
-impl<S, R> MooncakeKvCacheTransferExecutor<S, R>
+impl<S, R> KvCacheTransferExecutor<S, R>
 where
-    S: MooncakeTransferStatusReader + MooncakeBatchReleaser,
+    S: KvTransferStatusReader + KvBatchReleaser,
 {
     pub fn cancel_submitted_transfers_for_room(
         &mut self,
@@ -2825,8 +2744,8 @@ where
         {
             let transfer = &self.submitted_transfers[index];
             while matches!(
-                poll_mooncake_submitted_batch(&mut self.submitter, transfer)?,
-                MooncakePolledBatchState::Pending
+                poll_kv_submitted_batch(&mut self.submitter, transfer)?,
+                KvPolledBatchState::Pending
             ) {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
@@ -2846,8 +2765,8 @@ where
         let mut index = 0;
         while index < self.submitted_transfers.len() {
             let transfer = &self.submitted_transfers[index];
-            match poll_mooncake_submitted_batch(&mut self.submitter, transfer)? {
-                MooncakePolledBatchState::Completed => {
+            match poll_kv_submitted_batch(&mut self.submitter, transfer)? {
+                KvPolledBatchState::Completed => {
                     self.submitter
                         .free_batch(transfer.batch_id())
                         .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
@@ -2857,11 +2776,11 @@ where
                             transfer.descriptor_checksum().to_string(),
                         ));
                 }
-                MooncakePolledBatchState::Pending => {
+                KvPolledBatchState::Pending => {
                     index += 1;
                     continue;
                 }
-                MooncakePolledBatchState::Failed(message) => {
+                KvPolledBatchState::Failed(message) => {
                     self.submitter
                         .free_batch(transfer.batch_id())
                         .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
@@ -2883,15 +2802,15 @@ where
     }
 }
 
-impl<S, R> KvTransferBackend for MooncakeKvCacheTransferExecutor<S, R>
+impl<S, R> KvTransferBackend for KvCacheTransferExecutor<S, R>
 where
-    S: MooncakeTransferSubmitter + MooncakeTransferStatusReader + MooncakeBatchReleaser,
-    R: MooncakeTransferTargetResolver,
+    S: KvTransferSubmitter + KvTransferStatusReader + KvBatchReleaser,
+    R: KvTransferTargetResolver,
 {
     fn register(&mut self, memory: TransferableKvCacheMemory) -> Result<(), KvCacheTransferError> {
         if self.local_memory_registration.is_some() {
             return Err(KvCacheTransferError::Runtime(
-                "Mooncake KV memory is already registered".to_string(),
+                "KV memory is already registered".to_string(),
             ));
         }
         if memory.regions().len() != 1
@@ -2899,16 +2818,16 @@ where
             || memory.page_size_bytes() != self.layout.page_size_bytes
         {
             return Err(KvCacheTransferError::Runtime(
-                "NexusKV descriptor does not match the Mooncake executor source layout".to_string(),
+                "NexusKV descriptor does not match the KV executor source layout".to_string(),
             ));
         }
         let registrar = self.memory_registrar.take().ok_or_else(|| {
             KvCacheTransferError::Runtime(
-                "Mooncake backend has no memory registrar; construct it through the production transfer backend factory"
+                "KV backend has no memory registrar; construct it through the production transfer backend factory"
                     .to_string(),
             )
         })?;
-        let registration = RegisteredMooncakeKvCacheMemory::register(registrar, memory)
+        let registration = RegisteredKvCacheMemory::register(registrar, memory)
             .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
         self.local_memory_registration = Some(Box::new(registration));
         Ok(())
@@ -2917,7 +2836,7 @@ where
     fn submit(&mut self, span: &KvCacheTransferSpan) -> Result<(), KvCacheTransferError> {
         if self.local_memory_registration.is_none() {
             return Err(KvCacheTransferError::Runtime(
-                "Mooncake backend must register ModelRunner-owned NexusKV memory before submit"
+                "KV backend must register ModelRunner-owned NexusKV memory before submit"
                     .to_string(),
             ));
         }
@@ -2930,19 +2849,14 @@ where
                     .target_resolver
                     .resolve_session_target(span, session_id)?;
                 requests.extend(
-                    build_mooncake_remote_kv_transfer_requests(
-                        span,
-                        self.layout,
-                        target,
-                        remote_layout,
-                    )
-                    .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?,
+                    build_remote_kv_transfer_requests(span, self.layout, target, remote_layout)
+                        .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?,
                 );
             }
             requests
         } else {
             let target = self.target_resolver.resolve_target(span)?;
-            build_mooncake_kv_transfer_requests(span, self.layout, target)
+            build_kv_transfer_requests(span, self.layout, target)
                 .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?
         };
         if requests.is_empty() {
@@ -2961,9 +2875,7 @@ where
             .map_err(|error| KvCacheTransferError::Runtime(error.to_string()))?;
         self.submitted_batches.push(batch_id);
         self.submitted_transfers
-            .push(MooncakeSubmittedBatch::from_span(
-                span, batch_id, task_count,
-            ));
+            .push(KvSubmittedBatch::from_span(span, batch_id, task_count));
         Ok(())
     }
 
@@ -2979,7 +2891,7 @@ where
         let rooms = self
             .submitted_transfers
             .iter()
-            .map(MooncakeSubmittedBatch::bootstrap_room)
+            .map(KvSubmittedBatch::bootstrap_room)
             .collect::<Vec<_>>();
         for room in rooms {
             self.cancel_submitted_transfers_for_room(room)?;
@@ -2994,396 +2906,47 @@ where
     }
 }
 
-impl<S: MooncakeTransferStatusReader + MooncakeBatchReleaser, R> Drop
-    for MooncakeKvCacheTransferExecutor<S, R>
-{
+impl<S: KvTransferStatusReader + KvBatchReleaser, R> Drop for KvCacheTransferExecutor<S, R> {
     fn drop(&mut self) {
         while let Some(transfer) = self.submitted_transfers.first() {
             let room = transfer.bootstrap_room();
             if let Err(error) = self.cancel_submitted_transfers_for_room(room) {
                 // Releasing registered memory without proving DMA quiescence is unsafe.
-                eprintln!("fatal: cannot drain Mooncake KV memory before destruction: {error}");
+                eprintln!("fatal: cannot drain KV memory before destruction: {error}");
                 std::process::abort();
             }
         }
     }
 }
-#[cfg(feature = "mooncake-link")]
-pub struct LinkedMooncakeTransferEngine {
-    handle: MooncakeTransferEngineHandle,
-}
 
-// MooncakeTransferEngineHandle is an opaque C++ engine owner. Rust never dereferences
-// the pointer directly, and shared use goes through SharedLinkedMooncakeTransferEngine's Mutex.
-#[cfg(feature = "mooncake-link")]
-unsafe impl Send for LinkedMooncakeTransferEngine {}
-
-#[cfg(feature = "mooncake-link")]
-impl LinkedMooncakeTransferEngine {
-    pub fn new(config: &MooncakeTransferEngineConfig) -> Result<Self, MooncakeError> {
-        let metadata = CString::new(config.metadata_server.as_str())?;
-        let local_server = CString::new(config.session_id.as_str())?;
-        let host = CString::new(config.hostname.as_str())?;
-
-        let auto_discover = if config.protocol == "tcp" { 0 } else { 1 };
-        let handle = unsafe {
-            createTransferEngine(
-                metadata.as_ptr(),
-                local_server.as_ptr(),
-                host.as_ptr(),
-                u64::from(config.rpc_port),
-                auto_discover,
-            )
-        };
-        if handle.is_null() {
-            return Err(MooncakeError::EngineCreateFailed);
-        }
-
-        let engine = Self { handle };
-        engine.install_transport(config.protocol.as_str())?;
-        Ok(engine)
-    }
-
-    pub fn handle(&self) -> MooncakeTransferEngineHandle {
-        self.handle
-    }
-
-    pub fn local_endpoint(&self) -> Result<String, MooncakeError> {
-        let mut buffer = vec![0_u8; 256];
-        let code = unsafe {
-            getLocalIpAndPort(
-                self.handle,
-                buffer.as_mut_ptr().cast::<c_char>(),
-                buffer.len(),
-            )
-        };
-        if code != 0 {
-            return Err(MooncakeError::LocalEndpointQueryFailed(code));
-        }
-        let endpoint = CStr::from_bytes_until_nul(&buffer)
-            .map_err(|_| MooncakeError::LocalEndpointUtf8)?
-            .to_str()
-            .map_err(|_| MooncakeError::LocalEndpointUtf8)?;
-        Ok(endpoint.to_string())
-    }
-
-    pub fn install_transport(&self, protocol: &str) -> Result<(), MooncakeError> {
-        let protocol_c = CString::new(protocol)?;
-        let transport =
-            unsafe { installTransport(self.handle, protocol_c.as_ptr(), std::ptr::null_mut()) };
-        if transport.is_null() {
-            return Err(MooncakeError::TransportInstallFailed(protocol.to_string()));
-        }
-        Ok(())
-    }
-
-    pub fn register_memory_batch(
-        &self,
-        buffers: &mut [MooncakeBufferEntry],
-        location: &str,
-    ) -> Result<(), MooncakeError> {
-        let location_c = CString::new(location)?;
-        let code = unsafe {
-            registerLocalMemoryBatch(
-                self.handle,
-                buffers.as_mut_ptr(),
-                buffers.len(),
-                location_c.as_ptr(),
-            )
-        };
-        if code != 0 {
-            return Err(MooncakeError::RegisterMemoryFailed(code));
-        }
-        Ok(())
-    }
-
-    pub fn unregister_memory_batch(&self, addrs: &mut [*mut c_void]) -> Result<(), MooncakeError> {
-        let code =
-            unsafe { unregisterLocalMemoryBatch(self.handle, addrs.as_mut_ptr(), addrs.len()) };
-        if code != 0 {
-            return Err(MooncakeError::UnregisterMemoryFailed(code));
-        }
-        Ok(())
-    }
-
-    pub fn open_segment(&self, segment: &str) -> Result<MooncakeSegmentId, MooncakeError> {
-        let segment_c = CString::new(segment)?;
-        let segment_id = unsafe { openSegment(self.handle, segment_c.as_ptr()) };
-        if segment_id < 0 {
-            return Err(MooncakeError::OpenSegmentFailed(segment.to_string()));
-        }
-        Ok(segment_id)
-    }
-
-    pub fn submit_transfer(
-        &self,
-        requests: &mut [MooncakeTransferRequest],
-    ) -> Result<MooncakeBatchId, MooncakeError> {
-        let batch_id = unsafe { allocateBatchID(self.handle, requests.len()) };
-        let code =
-            unsafe { submitTransfer(self.handle, batch_id, requests.as_mut_ptr(), requests.len()) };
-        if code != 0 {
-            // Submission can fail after some tasks were queued. The caller may
-            // release source memory as soon as this error returns.
-            loop {
-                let mut pending = false;
-                for task in 0..requests.len() {
-                    let status = match self.transfer_status(batch_id, task) {
-                        Ok(status) => status,
-                        Err(error) => {
-                            eprintln!(
-                                "fatal: cannot establish Mooncake quiescence after partial submission: {error}"
-                            );
-                            std::process::abort();
-                        }
-                    };
-                    pending |= status.status == MooncakeTransferStatusCode::Waiting as c_int
-                        || status.status == MooncakeTransferStatusCode::Pending as c_int;
-                }
-                if !pending {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            self.free_batch(batch_id)?;
-            return Err(MooncakeError::SubmitTransferFailed(code));
-        }
-        Ok(batch_id)
-    }
-
-    pub fn transfer_status(
-        &self,
-        batch_id: MooncakeBatchId,
-        task_id: usize,
-    ) -> Result<MooncakeTransferStatus, MooncakeError> {
-        let mut status = MooncakeTransferStatus {
-            status: MooncakeTransferStatusCode::Waiting as c_int,
-            transferred_bytes: 0,
-        };
-        let code = unsafe { getTransferStatus(self.handle, batch_id, task_id, &mut status) };
-        if code != 0 {
-            return Err(MooncakeError::StatusQueryFailed(code));
-        }
-        Ok(status)
-    }
-
-    pub fn free_batch(&self, batch_id: MooncakeBatchId) -> Result<(), MooncakeError> {
-        let code = unsafe { freeBatchID(self.handle, batch_id) };
-        if code != 0 {
-            return Err(MooncakeError::FreeBatchFailed(code));
-        }
-        Ok(())
-    }
-}
-
-#[cfg(feature = "mooncake-link")]
-impl Drop for LinkedMooncakeTransferEngine {
-    fn drop(&mut self) {
-        unsafe { destroyTransferEngine(self.handle) };
-    }
-}
-
-#[cfg(feature = "mooncake-link")]
-impl MooncakeTransferSubmitter for LinkedMooncakeTransferEngine {
-    fn submit_transfer(
-        &mut self,
-        requests: &mut [MooncakeTransferRequest],
-    ) -> Result<MooncakeBatchId, MooncakeError> {
-        LinkedMooncakeTransferEngine::submit_transfer(self, requests)
-    }
-}
-
-#[cfg(feature = "mooncake-link")]
-impl MooncakeSegmentOpener for LinkedMooncakeTransferEngine {
-    fn open_segment(&mut self, segment: &str) -> Result<i32, MooncakeError> {
-        LinkedMooncakeTransferEngine::open_segment(self, segment)
-    }
-}
-
-#[cfg(feature = "mooncake-link")]
-impl MooncakeTransferStatusReader for LinkedMooncakeTransferEngine {
-    fn transfer_status(
-        &mut self,
-        batch_id: MooncakeBatchId,
-        task_id: usize,
-    ) -> Result<MooncakeTransferStatus, MooncakeError> {
-        LinkedMooncakeTransferEngine::transfer_status(self, batch_id, task_id)
-    }
-}
-
-#[cfg(feature = "mooncake-link")]
-impl MooncakeBatchReleaser for LinkedMooncakeTransferEngine {
-    fn free_batch(&mut self, batch_id: MooncakeBatchId) -> Result<(), MooncakeError> {
-        LinkedMooncakeTransferEngine::free_batch(self, batch_id)
-    }
-}
-
-#[cfg(feature = "mooncake-link")]
-#[derive(Clone)]
-pub struct SharedLinkedMooncakeTransferEngine {
-    inner: Arc<Mutex<LinkedMooncakeTransferEngine>>,
-}
-
-#[cfg(feature = "mooncake-link")]
-impl SharedLinkedMooncakeTransferEngine {
-    pub fn new(config: &MooncakeTransferEngineConfig) -> Result<Self, MooncakeError> {
-        Ok(Self {
-            inner: Arc::new(Mutex::new(LinkedMooncakeTransferEngine::new(config)?)),
-        })
-    }
-
-    pub fn local_endpoint(&self) -> Result<String, MooncakeError> {
-        self.inner
-            .lock()
-            .expect("linked Mooncake engine lock should be held")
-            .local_endpoint()
-    }
-
-    pub fn register_memory_batch(
-        &self,
-        buffers: &mut [MooncakeBufferEntry],
-        location: &str,
-    ) -> Result<(), MooncakeError> {
-        self.inner
-            .lock()
-            .expect("linked Mooncake engine lock should be held")
-            .register_memory_batch(buffers, location)
-    }
-
-    pub fn unregister_memory_batch(&self, addrs: &mut [*mut c_void]) -> Result<(), MooncakeError> {
-        self.inner
-            .lock()
-            .expect("linked Mooncake engine lock should be held")
-            .unregister_memory_batch(addrs)
-    }
-}
-
-#[cfg(feature = "mooncake-link")]
-impl MooncakeTransferSubmitter for SharedLinkedMooncakeTransferEngine {
-    fn submit_transfer(
-        &mut self,
-        requests: &mut [MooncakeTransferRequest],
-    ) -> Result<MooncakeBatchId, MooncakeError> {
-        self.inner
-            .lock()
-            .expect("linked Mooncake engine lock should be held")
-            .submit_transfer(requests)
-    }
-}
-
-#[cfg(feature = "mooncake-link")]
-impl MooncakeSegmentOpener for SharedLinkedMooncakeTransferEngine {
-    fn open_segment(&mut self, segment: &str) -> Result<i32, MooncakeError> {
-        self.inner
-            .lock()
-            .expect("linked Mooncake engine lock should be held")
-            .open_segment(segment)
-    }
-}
-
-#[cfg(feature = "mooncake-link")]
-impl MooncakeTransferStatusReader for SharedLinkedMooncakeTransferEngine {
-    fn transfer_status(
-        &mut self,
-        batch_id: MooncakeBatchId,
-        task_id: usize,
-    ) -> Result<MooncakeTransferStatus, MooncakeError> {
-        self.inner
-            .lock()
-            .expect("linked Mooncake engine lock should be held")
-            .transfer_status(batch_id, task_id)
-    }
-}
-
-#[cfg(feature = "mooncake-link")]
-impl MooncakeBatchReleaser for SharedLinkedMooncakeTransferEngine {
-    fn free_batch(&mut self, batch_id: MooncakeBatchId) -> Result<(), MooncakeError> {
-        self.inner
-            .lock()
-            .expect("linked Mooncake engine lock should be held")
-            .free_batch(batch_id)
-    }
-}
-
-#[cfg(feature = "mooncake-link")]
-impl MooncakeMemoryRegistrar for SharedLinkedMooncakeTransferEngine {
-    fn register_memory_batch(
-        &mut self,
-        buffers: &mut [MooncakeBufferEntry],
-        location: &str,
-    ) -> Result<(), MooncakeError> {
-        SharedLinkedMooncakeTransferEngine::register_memory_batch(self, buffers, location)
-    }
-
-    fn unregister_memory_batch(&mut self, addrs: &mut [*mut c_void]) -> Result<(), MooncakeError> {
-        SharedLinkedMooncakeTransferEngine::unregister_memory_batch(self, addrs)
-    }
-}
-
-unsafe extern "C" {
-    pub fn createTransferEngine(
-        metadata_conn_string: *const c_char,
-        local_server_name: *const c_char,
-        ip_or_host_name: *const c_char,
-        rpc_port: u64,
-        auto_discover: c_int,
-    ) -> MooncakeTransferEngineHandle;
-
-    pub fn destroyTransferEngine(engine: MooncakeTransferEngineHandle);
-
-    pub fn getLocalIpAndPort(
-        engine: MooncakeTransferEngineHandle,
-        buf_out: *mut c_char,
-        buf_len: usize,
-    ) -> c_int;
-
-    pub fn installTransport(
-        engine: MooncakeTransferEngineHandle,
-        proto: *const c_char,
-        args: *mut *mut c_void,
-    ) -> MooncakeTransportHandle;
-
-    pub fn registerLocalMemoryBatch(
-        engine: MooncakeTransferEngineHandle,
-        buffer_list: *mut MooncakeBufferEntry,
-        buffer_len: usize,
-        location: *const c_char,
-    ) -> c_int;
-
-    pub fn unregisterLocalMemoryBatch(
-        engine: MooncakeTransferEngineHandle,
-        addr_list: *mut *mut c_void,
-        addr_len: usize,
-    ) -> c_int;
-
-    pub fn openSegment(
-        engine: MooncakeTransferEngineHandle,
-        segment_name: *const c_char,
-    ) -> MooncakeSegmentId;
-
-    pub fn closeSegment(
-        engine: MooncakeTransferEngineHandle,
-        segment_id: MooncakeSegmentId,
-    ) -> c_int;
-
-    pub fn allocateBatchID(
-        engine: MooncakeTransferEngineHandle,
-        batch_size: usize,
-    ) -> MooncakeBatchId;
-
-    pub fn submitTransfer(
-        engine: MooncakeTransferEngineHandle,
-        batch_id: MooncakeBatchId,
-        entries: *mut MooncakeTransferRequest,
-        count: usize,
-    ) -> c_int;
-
-    pub fn getTransferStatus(
-        engine: MooncakeTransferEngineHandle,
-        batch_id: MooncakeBatchId,
-        task_id: usize,
-        status: *mut MooncakeTransferStatus,
-    ) -> c_int;
-
-    pub fn freeBatchID(engine: MooncakeTransferEngineHandle, batch_id: MooncakeBatchId) -> c_int;
-}
+// Backward compatibility re-exports
+pub use FixedKvTransferTargetResolver as FixedMooncakeTransferTargetResolver;
+pub use KvBatchId as MooncakeBatchId;
+pub use KvBatchReleaser as MooncakeBatchReleaser;
+pub use KvBufferEntry as MooncakeBufferEntry;
+pub use KvCacheMemoryExt as MooncakeKvCacheMemoryExt;
+pub use KvCacheTransferExecutor as MooncakeKvCacheTransferExecutor;
+pub use KvMemoryLocationExt as MooncakeMemoryLocationExt;
+pub use KvMemoryRegistrar as MooncakeMemoryRegistrar;
+pub use KvMemoryRegistrationLease as MooncakeMemoryRegistrationLease;
+pub use KvOpcode as MooncakeOpcode;
+pub use KvRemoteLayout as MooncakeRemoteKvLayout;
+pub use KvRequestBuildError as MooncakeRequestBuildError;
+pub use KvSegmentId as MooncakeSegmentId;
+pub use KvSegmentOpener as MooncakeSegmentOpener;
+pub use KvSubmittedBatch as MooncakeSubmittedBatch;
+pub use KvTransferEngineHandle as MooncakeTransferEngineHandle;
+pub use KvTransferLayout as MooncakeKvCacheLayout;
+pub use KvTransferRequest as MooncakeTransferRequest;
+pub use KvTransferStatus as MooncakeTransferStatus;
+pub use KvTransferStatusCode as MooncakeTransferStatusCode;
+pub use KvTransferStatusReader as MooncakeTransferStatusReader;
+pub use KvTransferSubmitter as MooncakeTransferSubmitter;
+pub use KvTransferTarget as MooncakeTransferTarget;
+pub use KvTransferTargetResolver as MooncakeTransferTargetResolver;
+pub use KvTransportHandle as MooncakeTransportHandle;
+pub use RegisteredKvCacheMemory as RegisteredMooncakeKvCacheMemory;
+pub use SessionKvTargetResolver as MooncakeSessionTargetResolver;
+pub use build_kv_transfer_requests as build_mooncake_kv_transfer_requests;
+pub use build_remote_kv_transfer_requests as build_mooncake_remote_kv_transfer_requests;
+pub use poll_kv_transfer_batches as poll_mooncake_transfer_batches;

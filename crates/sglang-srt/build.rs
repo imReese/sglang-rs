@@ -1,12 +1,8 @@
 use std::env;
 use std::path::PathBuf;
 
-#[path = "build_support/mooncake_link.rs"]
-mod mooncake_link;
-
 fn main() {
     compile_proto();
-    configure_mooncake_link();
 }
 
 fn compile_proto() {
@@ -30,33 +26,4 @@ fn compile_proto() {
         .file_descriptor_set_path(descriptor_path)
         .compile_with_config(prost_config, &[sglang_proto], &[proto_root])
         .expect("sglang runtime proto should compile");
-}
-
-fn configure_mooncake_link() {
-    println!("cargo:rerun-if-env-changed=MOONCAKE_HOME");
-    println!("cargo:rerun-if-env-changed=MOONCAKE_BUILD_DIR");
-
-    if env::var_os("CARGO_FEATURE_MOONCAKE_LINK").is_none() {
-        return;
-    }
-
-    let plan = mooncake_link::resolve_link_plan_from_env().unwrap_or_else(|error| {
-        panic!("mooncake-link feature requires built Mooncake native libraries:\n{error}")
-    });
-
-    for artifact in &plan.required_artifacts {
-        println!("cargo:rerun-if-changed={}", artifact.display());
-    }
-    for dir in &plan.link_search_dirs {
-        println!("cargo:rustc-link-search=native={}", dir.display());
-    }
-    for lib in &plan.static_libs {
-        println!("cargo:rustc-link-lib=static={lib}");
-    }
-    for lib in &plan.dynamic_libs {
-        println!("cargo:rustc-link-lib=dylib={lib}");
-    }
-    for lib in &plan.system_dynamic_libs {
-        println!("cargo:rustc-link-lib=dylib={lib}");
-    }
 }

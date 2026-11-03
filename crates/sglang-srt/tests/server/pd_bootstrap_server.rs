@@ -12,22 +12,20 @@ use sglang_srt::engine_info_bootstrap::{
     EngineInfoBootstrapService, serve_engine_info_bootstrap_with_shutdown,
 };
 use sglang_srt::pd_bootstrap::{
-    MooncakeBootstrapKvCacheTransferExecutor, MooncakeDecodeBootstrapPublisher,
-    MooncakeDecodeKvArgsRegistration, MooncakeDecodeTransferMetadata, PrefillBootstrapService,
-    query_prefill_route, send_mooncake_kv_args_registration, send_mooncake_transfer_metadata,
+    PdBootstrapKvCacheTransferExecutor, PdDecodeBootstrapPublisher, PdDecodeKvArgsRegistration,
+    PdDecodeTransferMetadata, PrefillBootstrapService, query_prefill_route,
+    send_kv_args_registration, send_transfer_metadata, serve_bootstrap_zmq_with_shutdown,
     serve_mooncake_bootstrap_zmq_endpoints_with_shutdown,
     serve_mooncake_bootstrap_zmq_with_shutdown, serve_prefill_bootstrap_with_shutdown,
 };
 use sglang_srt::recurrent_state::{RecurrentLayerStatePayload, RecurrentStatePayload};
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::transfer::{
-    DecodeBootstrapRegistry, FakeKvCacheTransferExecutor, KvCacheMemoryLocation, KvPoll,
-    KvTransferBackend, KvTransferModelWorker, MooncakeBatchId, MooncakeBatchReleaser,
-    MooncakeBufferEntry, MooncakeError, MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor,
-    MooncakeMemoryRegistrar, MooncakeRemoteKvLayout, MooncakeTransferRequest,
-    MooncakeTransferStatus, MooncakeTransferStatusCode, MooncakeTransferStatusReader,
-    MooncakeTransferSubmitter, MooncakeTransferTarget, TransferableKvCacheMemory,
-    TransferableKvCacheRegion,
+    DecodeBootstrapRegistry, FakeKvCacheTransferExecutor, KvBatchId, KvBatchReleaser,
+    KvBufferEntry, KvCacheMemoryLocation, KvCacheTransferExecutor, KvMemoryRegistrar, KvPoll,
+    KvRemoteLayout, KvTransferBackend, KvTransferLayout, KvTransferModelWorker, KvTransferRequest,
+    KvTransferStatus, KvTransferStatusCode, KvTransferStatusReader, KvTransferSubmitter,
+    KvTransferTarget, KvTransportError, TransferableKvCacheMemory, TransferableKvCacheRegion,
 };
 use sglang_srt::types::{BootstrapRoom, DisaggregatedParams, RequestId, SamplingParams};
 use sglang_srt::worker::{
@@ -247,16 +245,16 @@ async fn prefill_transfer_executor_registers_dp_rank_for_bootstrap_queries() {
             .expect("decode transfer metadata should parse");
     }
 
-    let mut inner = MooncakeKvCacheTransferExecutor::new(
-        RecordingMooncakeSubmitter::default(),
-        MooncakeKvCacheLayout {
+    let mut inner = KvCacheTransferExecutor::new(
+        RecordingKvSubmitter::default(),
+        KvTransferLayout {
             source_base_addr: 0x5000,
             page_size_bytes: 128,
             target_base_offset: 0,
         },
-        MooncakeTransferTarget { target_id: 7 },
+        KvTransferTarget { target_id: 7 },
     )
-    .with_memory_registrar(RecordingMooncakeSubmitter::default());
+    .with_memory_registrar(RecordingKvSubmitter::default());
     inner
         .register(
             TransferableKvCacheMemory::new(
@@ -270,8 +268,8 @@ async fn prefill_transfer_executor_registers_dp_rank_for_bootstrap_queries() {
             )
             .expect("test NexusKV descriptor should be valid"),
         )
-        .expect("test Mooncake executor should register active KV memory");
-    let transfer_executor = MooncakeBootstrapKvCacheTransferExecutor::new(service, inner)
+        .expect("test KV executor should register active KV memory");
+    let transfer_executor = PdBootstrapKvCacheTransferExecutor::new(service, inner)
         .with_metadata_wait_timeout(Duration::from_millis(50));
     let worker = KvTransferModelWorker::new(
         BootstrapMetadataWorker,
@@ -297,7 +295,7 @@ async fn prefill_transfer_executor_registers_dp_rank_for_bootstrap_queries() {
 
     scheduler
         .dispatch_prefill_batch(1)
-        .expect("prefill transfer should submit through Mooncake executor");
+        .expect("prefill transfer should submit through KV executor");
 
     let dp_ranks =
         post_json_value_with_retry(addr, "/query_dp_ranks", r#"{"bootstrap_rooms":[99]}"#).await;
@@ -413,8 +411,8 @@ fn prefill_bootstrap_ingests_mooncake_transfer_frames_and_marks_room_waiting() {
 
 #[test]
 fn decode_bootstrap_publisher_uses_live_session_id_and_nonzero_kv_layout() {
-    let publisher = MooncakeDecodeBootstrapPublisher::new("127.0.0.1", 41009, "127.0.0.1:41011")
-        .with_kv_cache_layout(MooncakeKvCacheLayout {
+    let publisher = PdDecodeBootstrapPublisher::new("127.0.0.1", 41009, "127.0.0.1:41011")
+        .with_kv_cache_layout(KvTransferLayout {
             source_base_addr: 0x7000,
             page_size_bytes: 256,
             target_base_offset: 0,
@@ -425,7 +423,7 @@ fn decode_bootstrap_publisher_uses_live_session_id_and_nonzero_kv_layout() {
 
     assert_eq!(registration.endpoint, "127.0.0.1");
     assert_eq!(registration.dst_port, 41009);
-    assert_eq!(registration.mooncake_session_id, "127.0.0.1:41011");
+    assert_eq!(registration.session_id, "127.0.0.1:41011");
     assert_eq!(registration.dst_kv_ptrs, vec![0x7000]);
     assert_eq!(registration.dst_kv_item_len, 256);
 }
@@ -473,7 +471,7 @@ fn prefill_bootstrap_builds_remote_kv_layouts_from_decode_metadata() {
         layouts,
         vec![(
             "session-a".to_string(),
-            MooncakeRemoteKvLayout {
+            KvRemoteLayout {
                 dst_kv_ptrs: vec![0x1000, 0x2000],
                 dst_kv_indices: vec![3, 4, 5],
                 dst_kv_item_len: 128,
@@ -729,13 +727,13 @@ async fn decode_bootstrap_client_queries_route_and_sends_transfer_metadata() {
     assert_eq!(rank.rank_ip, "127.0.0.1");
     assert_eq!(rank.rank_port, zmq_addr.port());
 
-    send_mooncake_transfer_metadata(
+    send_transfer_metadata(
         &rank.zmq_endpoint(),
-        &MooncakeDecodeTransferMetadata {
+        &PdDecodeTransferMetadata {
             room: 93,
             endpoint: "127.0.0.1".to_string(),
             dst_port: 41005,
-            mooncake_session_id: "decode-client-session".to_string(),
+            session_id: "decode-client-session".to_string(),
             dst_kv_indices: vec![9, 10, 11],
             dst_aux_index: Some(14),
             dst_state_indices: vec![vec![70, 71]],
@@ -788,18 +786,18 @@ async fn decode_bootstrap_client_sends_kv_args_registration() {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
     let server = tokio::spawn(async move {
-        serve_mooncake_bootstrap_zmq_with_shutdown(format!("tcp://{}", zmq_addr), service, async {
+        serve_bootstrap_zmq_with_shutdown(format!("tcp://{}", zmq_addr), service, async {
             let _ = shutdown_rx.await;
         })
         .await
     });
 
-    send_mooncake_kv_args_registration(
+    send_kv_args_registration(
         &format!("tcp://{}", zmq_addr),
-        &MooncakeDecodeKvArgsRegistration {
+        &PdDecodeKvArgsRegistration {
             endpoint: "127.0.0.1".to_string(),
             dst_port: 41006,
-            mooncake_session_id: "decode-kvargs-session".to_string(),
+            session_id: "decode-kvargs-session".to_string(),
             dst_kv_ptrs: vec![0x1000, 0x2000],
             dst_aux_ptrs: vec![0x3000],
             dst_state_data_ptrs: vec![vec![0x4000, 0x5000]],
@@ -905,7 +903,7 @@ async fn decode_worker_publishes_bootstrap_metadata_to_prefill_zmq_route() {
         DecodeBootstrapRegistry::default(),
         FakeKvCacheTransferExecutor::default(),
     )
-    .with_decode_bootstrap_publisher(MooncakeDecodeBootstrapPublisher::new(
+    .with_decode_bootstrap_publisher(PdDecodeBootstrapPublisher::new(
         "127.0.0.1",
         41007,
         "decode-worker-session",
@@ -1021,8 +1019,8 @@ async fn decode_worker_registers_kv_args_before_transfer_metadata() {
         FakeKvCacheTransferExecutor::default(),
     )
     .with_decode_bootstrap_publisher(
-        MooncakeDecodeBootstrapPublisher::new("127.0.0.1", 41008, "decode-kvargs-session")
-            .with_kv_cache_layout(MooncakeKvCacheLayout {
+        PdDecodeBootstrapPublisher::new("127.0.0.1", 41008, "decode-kvargs-session")
+            .with_kv_cache_layout(KvTransferLayout {
                 source_base_addr: 0x9000,
                 page_size_bytes: 128,
                 target_base_offset: 0,
@@ -1074,7 +1072,7 @@ async fn decode_worker_registers_kv_args_before_transfer_metadata() {
             layouts,
             vec![(
                 "decode-kvargs-session".to_string(),
-                MooncakeRemoteKvLayout {
+                KvRemoteLayout {
                     dst_kv_ptrs: vec![0x9000],
                     dst_kv_indices: vec![0, 1],
                     dst_kv_item_len: 128,
@@ -1150,8 +1148,8 @@ async fn decode_worker_reuses_kv_args_registration_for_multiple_rooms() {
         FakeKvCacheTransferExecutor::default(),
     )
     .with_decode_bootstrap_publisher(
-        MooncakeDecodeBootstrapPublisher::new("127.0.0.1", 41009, "decode-reuse-session")
-            .with_kv_cache_layout(MooncakeKvCacheLayout {
+        PdDecodeBootstrapPublisher::new("127.0.0.1", 41009, "decode-reuse-session")
+            .with_kv_cache_layout(KvTransferLayout {
                 source_base_addr: 0xa000,
                 page_size_bytes: 128,
                 target_base_offset: 0,
@@ -1245,51 +1243,54 @@ impl ModelWorker for BootstrapMetadataWorker {
 }
 
 #[derive(Default)]
-struct RecordingMooncakeSubmitter {
-    submitted_requests: Vec<Vec<MooncakeTransferRequest>>,
-    freed_batches: Vec<MooncakeBatchId>,
+struct RecordingKvSubmitter {
+    submitted_requests: Vec<Vec<KvTransferRequest>>,
+    freed_batches: Vec<KvBatchId>,
 }
 
-impl MooncakeTransferSubmitter for RecordingMooncakeSubmitter {
+impl KvTransferSubmitter for RecordingKvSubmitter {
     fn submit_transfer(
         &mut self,
-        requests: &mut [MooncakeTransferRequest],
-    ) -> Result<MooncakeBatchId, MooncakeError> {
+        requests: &mut [KvTransferRequest],
+    ) -> Result<KvBatchId, KvTransportError> {
         self.submitted_requests.push(requests.to_vec());
-        Ok(100 + self.submitted_requests.len() as MooncakeBatchId - 1)
+        Ok(100 + self.submitted_requests.len() as KvBatchId - 1)
     }
 }
 
-impl MooncakeTransferStatusReader for RecordingMooncakeSubmitter {
+impl KvTransferStatusReader for RecordingKvSubmitter {
     fn transfer_status(
         &mut self,
-        _batch_id: MooncakeBatchId,
+        _batch_id: KvBatchId,
         _task_id: usize,
-    ) -> Result<MooncakeTransferStatus, MooncakeError> {
-        Ok(MooncakeTransferStatus {
-            status: MooncakeTransferStatusCode::Completed as i32,
+    ) -> Result<KvTransferStatus, KvTransportError> {
+        Ok(KvTransferStatus {
+            status: KvTransferStatusCode::Completed as i32,
             transferred_bytes: 0,
         })
     }
 }
 
-impl MooncakeBatchReleaser for RecordingMooncakeSubmitter {
-    fn free_batch(&mut self, batch_id: MooncakeBatchId) -> Result<(), MooncakeError> {
+impl KvBatchReleaser for RecordingKvSubmitter {
+    fn free_batch(&mut self, batch_id: KvBatchId) -> Result<(), KvTransportError> {
         self.freed_batches.push(batch_id);
         Ok(())
     }
 }
 
-impl MooncakeMemoryRegistrar for RecordingMooncakeSubmitter {
+impl KvMemoryRegistrar for RecordingKvSubmitter {
     fn register_memory_batch(
         &mut self,
-        _buffers: &mut [MooncakeBufferEntry],
+        _buffers: &mut [KvBufferEntry],
         _location: &str,
-    ) -> Result<(), MooncakeError> {
+    ) -> Result<(), KvTransportError> {
         Ok(())
     }
 
-    fn unregister_memory_batch(&mut self, _addrs: &mut [*mut c_void]) -> Result<(), MooncakeError> {
+    fn unregister_memory_batch(
+        &mut self,
+        _addrs: &mut [*mut c_void],
+    ) -> Result<(), KvTransportError> {
         Ok(())
     }
 }
@@ -1512,7 +1513,7 @@ fn pack_list_of_buffers(buffers: &[Vec<u8>]) -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tcp_transfer_engine_transfers_kv_cache_across_prefill_and_decode() {
     use sglang_srt::tcp_transfer::SharedTcpTransferEngine;
-    use sglang_srt::transfer::MooncakeSessionTargetResolver;
+    use sglang_srt::transfer::SessionKvTargetResolver;
 
     // 1. Set up Decode side
     let mut decode_engine = SharedTcpTransferEngine::new("127.0.0.1", 0).expect("decode engine");
@@ -1522,7 +1523,7 @@ async fn tcp_transfer_engine_transfers_kv_cache_across_prefill_and_decode() {
 
     decode_engine
         .register_memory_batch(
-            &mut [MooncakeBufferEntry {
+            &mut [KvBufferEntry {
                 addr: decode_kv_cache.as_mut_ptr() as *mut c_void,
                 length: decode_kv_cache.len(),
             }],
@@ -1596,13 +1597,13 @@ async fn tcp_transfer_engine_transfers_kv_cache_across_prefill_and_decode() {
     let prefill_base_addr = prefill_kv_cache.as_mut_ptr() as usize;
 
     let prefill_engine = SharedTcpTransferEngine::new("127.0.0.1", 0).expect("prefill engine");
-    let layout = MooncakeKvCacheLayout {
+    let layout = KvTransferLayout {
         source_base_addr: prefill_base_addr,
         page_size_bytes: 128,
         target_base_offset: 0,
     };
-    let target_resolver = MooncakeSessionTargetResolver::new(prefill_engine.clone(), Vec::new());
-    let mut inner = MooncakeKvCacheTransferExecutor::with_target_resolver(
+    let target_resolver = SessionKvTargetResolver::new(prefill_engine.clone(), Vec::new());
+    let mut inner = KvCacheTransferExecutor::with_target_resolver(
         prefill_engine.clone(),
         layout,
         target_resolver,
@@ -1624,7 +1625,7 @@ async fn tcp_transfer_engine_transfers_kv_cache_across_prefill_and_decode() {
         )
         .expect("register prefill memory");
 
-    let transfer_executor = MooncakeBootstrapKvCacheTransferExecutor::new(service, inner)
+    let transfer_executor = PdBootstrapKvCacheTransferExecutor::new(service, inner)
         .with_metadata_wait_timeout(Duration::from_millis(100));
 
     let worker = KvTransferModelWorker::new(
@@ -1722,7 +1723,7 @@ async fn prefill_bootstrap_route_registers_and_queries_multi_rank_dp_and_tp() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tcp_transfer_engine_transfers_kv_cache_across_multi_rank_tp() {
     use sglang_srt::tcp_transfer::SharedTcpTransferEngine;
-    use sglang_srt::transfer::MooncakeSessionTargetResolver;
+    use sglang_srt::transfer::SessionKvTargetResolver;
 
     let service = PrefillBootstrapService::default();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -1752,7 +1753,7 @@ async fn tcp_transfer_engine_transfers_kv_cache_across_multi_rank_tp() {
 
         decode_engine
             .register_memory_batch(
-                &mut [MooncakeBufferEntry {
+                &mut [KvBufferEntry {
                     addr: decode_kv_cache.as_mut_ptr() as *mut c_void,
                     length: decode_kv_cache.len(),
                 }],
@@ -1812,14 +1813,13 @@ async fn tcp_transfer_engine_transfers_kv_cache_across_multi_rank_tp() {
         let prefill_base_addr = prefill_kv_cache.as_mut_ptr() as usize;
 
         let prefill_engine = SharedTcpTransferEngine::new("127.0.0.1", 0).expect("prefill engine");
-        let layout = MooncakeKvCacheLayout {
+        let layout = KvTransferLayout {
             source_base_addr: prefill_base_addr,
             page_size_bytes: 128,
             target_base_offset: 0,
         };
-        let target_resolver =
-            MooncakeSessionTargetResolver::new(prefill_engine.clone(), Vec::new());
-        let mut inner = MooncakeKvCacheTransferExecutor::with_target_resolver(
+        let target_resolver = SessionKvTargetResolver::new(prefill_engine.clone(), Vec::new());
+        let mut inner = KvCacheTransferExecutor::with_target_resolver(
             prefill_engine.clone(),
             layout,
             target_resolver,
@@ -1841,9 +1841,8 @@ async fn tcp_transfer_engine_transfers_kv_cache_across_multi_rank_tp() {
             )
             .expect("register prefill memory");
 
-        let transfer_executor =
-            MooncakeBootstrapKvCacheTransferExecutor::new(service.clone(), inner)
-                .with_metadata_wait_timeout(Duration::from_millis(100));
+        let transfer_executor = PdBootstrapKvCacheTransferExecutor::new(service.clone(), inner)
+            .with_metadata_wait_timeout(Duration::from_millis(100));
 
         let worker = KvTransferModelWorker::new(
             BootstrapMetadataWorker,
@@ -1917,7 +1916,7 @@ impl FallibleModelWorker for HybridStateTransferPrefillWorker {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tcp_transfer_engine_transfers_hybrid_recurrent_state_to_decode() {
     use sglang_srt::tcp_transfer::SharedTcpTransferEngine;
-    use sglang_srt::transfer::MooncakeSessionTargetResolver;
+    use sglang_srt::transfer::SessionKvTargetResolver;
 
     // 1. Set up Decode side
     let mut decode_engine = SharedTcpTransferEngine::new("127.0.0.1", 0).expect("decode engine");
@@ -1927,7 +1926,7 @@ async fn tcp_transfer_engine_transfers_hybrid_recurrent_state_to_decode() {
 
     decode_engine
         .register_memory_batch(
-            &mut [MooncakeBufferEntry {
+            &mut [KvBufferEntry {
                 addr: decode_kv_cache.as_mut_ptr() as *mut c_void,
                 length: decode_kv_cache.len(),
             }],
@@ -2017,13 +2016,13 @@ async fn tcp_transfer_engine_transfers_hybrid_recurrent_state_to_decode() {
     let prefill_base_addr = prefill_kv_cache.as_mut_ptr() as usize;
 
     let prefill_engine = SharedTcpTransferEngine::new("127.0.0.1", 0).expect("prefill engine");
-    let layout = MooncakeKvCacheLayout {
+    let layout = KvTransferLayout {
         source_base_addr: prefill_base_addr,
         page_size_bytes: 128,
         target_base_offset: 0,
     };
-    let target_resolver = MooncakeSessionTargetResolver::new(prefill_engine.clone(), Vec::new());
-    let mut inner = MooncakeKvCacheTransferExecutor::with_target_resolver(
+    let target_resolver = SessionKvTargetResolver::new(prefill_engine.clone(), Vec::new());
+    let mut inner = KvCacheTransferExecutor::with_target_resolver(
         prefill_engine.clone(),
         layout,
         target_resolver,
@@ -2045,7 +2044,7 @@ async fn tcp_transfer_engine_transfers_hybrid_recurrent_state_to_decode() {
         )
         .expect("register prefill memory");
 
-    let transfer_executor = MooncakeBootstrapKvCacheTransferExecutor::new(service, inner)
+    let transfer_executor = PdBootstrapKvCacheTransferExecutor::new(service, inner)
         .with_metadata_wait_timeout(Duration::from_millis(100));
 
     let expected_payload = RecurrentStatePayload {

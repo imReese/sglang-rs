@@ -1001,7 +1001,7 @@ mod pd_tests {
     use crate::cache::{CachePageAllocator, RadixCache};
     use crate::model_executor::{ForwardModel, KvCacheAllocationConfig, ModelRunner};
     use crate::model_registry::ModelRegistry;
-    use crate::mooncake_control::{MooncakeDecodeReceiver, completion_frames, send_frames};
+    use crate::pd_control::{PdDecodeReceiver, completion_frames, send_frames};
     use crate::scheduler::{ForwardMode, PrefixCachePolicy, ScheduledRequest, Scheduler};
     use crate::transfer::{
         DecodeBootstrapMetadataPublishSummary, DecodeBootstrapPublisher, DecodeBootstrapRegistry,
@@ -1073,7 +1073,7 @@ mod pd_tests {
     type Rendezvous = Arc<(Mutex<Option<Destination>>, Condvar)>;
 
     // A test-only host payload copy exercises the real reference decoder. It does
-    // not implement or claim Mooncake's CUDA/RDMA data plane.
+    // not implement or claim hardware RDMA acceleration.
     struct ReferencePageCopy {
         source: Resources,
         destination: Resources,
@@ -1138,7 +1138,7 @@ mod pd_tests {
     }
 
     struct ReferenceReceive {
-        receiver: MooncakeDecodeReceiver,
+        receiver: PdDecodeReceiver,
         rendezvous: Rendezvous,
     }
 
@@ -1232,7 +1232,7 @@ mod pd_tests {
             assert_eq!(sender.available_cache_pages(), Some(64));
         });
         let receive = ReferenceReceive {
-            receiver: MooncakeDecodeReceiver::start("127.0.0.1").expect("receiver"),
+            receiver: PdDecodeReceiver::start("127.0.0.1").expect("receiver"),
             rendezvous,
         };
         let decode =

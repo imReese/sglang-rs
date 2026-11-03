@@ -32,7 +32,7 @@ Full [Qwen3.5-0.8B](https://huggingface.co/Qwen/Qwen3.5-0.8B) on macOS CPU: 18 G
 
 ## Quick Start
 
-Requires `rustup` and the Hugging Face `hf` CLI. Use an existing local checkpoint to skip the download. The pinned revision matches the demo; weights are about 1.75 GB. The default Rust build needs neither a CUDA SDK nor native Mooncake.
+Requires `rustup` and the Hugging Face `hf` CLI. Use an existing local checkpoint to skip the download. The pinned revision matches the demo; weights are about 1.75 GB. The default Rust build needs neither a CUDA SDK nor external C++ transfer libraries.
 
 ```bash
 git clone https://github.com/imReese/sglang-rs.git
@@ -80,7 +80,7 @@ Use `"stream": false` for a single JSON response. CPU execution is an FP32 corre
 | Text serving | OpenAI-compatible chat/completions and SSE; native gRPC |
 | CPU reference | Dense and hybrid execution; full Qwen3.5-0.8B validated |
 | CUDA | BF16 executors and single-node dense TP; hardware acceptance required |
-| P/D transfer | Native Mooncake FFI, single rank; network acceptance required |
+| P/D transfer | Pure Rust native TCP KV transport, single rank; cross-platform |
 | Metal / ROCm / MUSA | Not implemented; explicit startup errors |
 | NexusKV | Memory descriptor contract only; no store/offload or network executor integration |
 
@@ -93,7 +93,7 @@ P/D currently transfers full prompts without prefix reuse. Recurrent-state trans
 | Guide | Contents |
 | --- | --- |
 | [Models and backends](docs/support.md) | Adapter coverage, capabilities, runtime architecture, and KV capacity |
-| [P/D disaggregation](docs/disaggregation.md) | Mooncake build, restrictions, shutdown, and NexusKV boundaries |
+| [P/D disaggregation](docs/disaggregation.md) | Native TCP transfer, restrictions, shutdown, and NexusKV boundaries |
 | [Validation](docs/validation.md) | Local checks, numerical oracles, CUDA acceptance, and demo timings |
 | [Router](crates/sglang-router/README.md) | HTTP/gRPC routing and control-plane surface |
 

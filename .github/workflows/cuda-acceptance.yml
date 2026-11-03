@@ -6,8 +6,8 @@ on:
       - main
   workflow_dispatch:
     inputs:
-      mooncake:
-        description: Run native Mooncake CUDA registration and linked P/D network tests
+      pd_network:
+        description: Run CUDA P/D network acceptance tests
         required: false
         default: false
         type: boolean
@@ -121,36 +121,14 @@ jobs:
           cargo test -p sglang-srt --locked --test core cuda_inference:: --
           --ignored --nocapture --test-threads=1
 
-      - name: Run linked Mooncake CUDA registration acceptance
-        if: ${{ (github.event_name == 'workflow_dispatch' && inputs.mooncake) || vars.ENABLE_MOONCAKE_CI == 'true' }}
-        env:
-          MOONCAKE_BUILD_DIR: ${{ vars.MOONCAKE_BUILD_DIR }}
+      - name: Run CUDA P/D network acceptance
+        if: ${{ (github.event_name == 'workflow_dispatch' && inputs.pd_network) || vars.ENABLE_PD_NETWORK_CI == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -z "${MOONCAKE_BUILD_DIR}" ]]; then
-            echo "::error::Set the MOONCAKE_BUILD_DIR repository variable to the native Mooncake build directory on the runner."
-            exit 1
-          fi
-          cargo test -p sglang-srt --locked --features mooncake-link \
-            --test core \
-            cuda_backend::cuda_mooncake_registers_real_cuda_kv_memory -- \
-            --ignored --nocapture --test-threads=1
-
-      - name: Run linked Mooncake CUDA P/D network acceptance
-        if: ${{ (github.event_name == 'workflow_dispatch' && inputs.mooncake) || vars.ENABLE_MOONCAKE_CI == 'true' }}
-        env:
-          MOONCAKE_BUILD_DIR: ${{ vars.MOONCAKE_BUILD_DIR }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -z "${MOONCAKE_BUILD_DIR}" ]]; then
-            echo "::error::Set the MOONCAKE_BUILD_DIR repository variable to the native Mooncake build directory on the runner."
-            exit 1
-          fi
-          cargo test -p sglang-router --locked --features mooncake-link \
+          cargo test -p sglang-router --locked \
             --test proxy \
-            real_srt_pd::router_pd_chat_completes_with_real_cuda_qwen_mooncake_workers -- \
+            real_srt_pd::router_pd_chat_completes_with_real_cuda_qwen_workers -- \
             --ignored --nocapture --test-threads=1
 
       - name: Remove CUDA build artifacts

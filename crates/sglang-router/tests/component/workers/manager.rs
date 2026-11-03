@@ -203,18 +203,10 @@ async fn manager_does_not_register_unstartable_dummy_mooncake_srt_worker() {
         .await
         .expect("gRPC server task should join")
         .expect_err("dummy Mooncake SRT worker should fail before serving");
-    #[cfg(not(feature = "mooncake-link"))]
     assert!(
         error
             .to_string()
-            .contains("requires building sglang-srt with the mooncake-link feature"),
-        "{error}"
-    );
-    #[cfg(feature = "mooncake-link")]
-    assert!(
-        error
-            .to_string()
-            .contains("production serving cannot use the Space reference model"),
+            .contains("invalid disaggregation transfer backend: mooncake"),
         "{error}"
     );
     drop(shutdown_tx);

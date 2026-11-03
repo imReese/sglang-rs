@@ -4,64 +4,39 @@
 //! further: it starts actual `sglang-srt` prefill/decode HTTP workers
 //! and drives the router's PD fan-out through reqwest into those workers.
 
-#[cfg(feature = "mooncake-link")]
-use std::io::{Read, Write};
-#[cfg(feature = "mooncake-link")]
+use std::fs;
+use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::net::{SocketAddr, TcpListener};
-#[cfg(feature = "mooncake-link")]
 use std::path::Path;
-#[cfg(feature = "mooncake-link")]
 use std::sync::Arc;
-#[cfg(feature = "mooncake-link")]
 use std::time::Duration;
-#[cfg(feature = "mooncake-link")]
-use std::{fs, io};
 
-#[cfg(feature = "mooncake-link")]
 use axum::body::Body;
-#[cfg(feature = "mooncake-link")]
 use axum::http::{Request, StatusCode};
-#[cfg(feature = "mooncake-link")]
 use http_body_util::BodyExt;
-#[cfg(feature = "mooncake-link")]
 use serde_json::json;
-#[cfg(feature = "mooncake-link")]
 use sglang_router::config::{
     ActiveLoadConfig, Config, DiscoveryBackend, DiscoveryConfig, ModelConfig, ObservabilityConfig,
     PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
-#[cfg(feature = "mooncake-link")]
 use sglang_router::discovery::ModelId;
-#[cfg(feature = "mooncake-link")]
 use sglang_router::discovery::{DiscoveryEvent, WorkerId, WorkerMode, WorkerSpec};
-#[cfg(feature = "mooncake-link")]
 use sglang_router::policies::factory::build_registry_with_defaults;
-#[cfg(feature = "mooncake-link")]
 use sglang_router::proxy::Proxy;
-#[cfg(feature = "mooncake-link")]
 use sglang_router::server::app::build_router;
-#[cfg(feature = "mooncake-link")]
 use sglang_router::server::app_context::AppContext;
-#[cfg(feature = "mooncake-link")]
 use sglang_router::tokenizer::TokenizerRegistry;
-#[cfg(feature = "mooncake-link")]
 use sglang_router::workers::{manager, WorkerRegistry};
 use sglang_srt::cli::ServerArgs;
 use sglang_srt::server::launch_http_server_with_shutdown;
-#[cfg(feature = "mooncake-link")]
 use sglang_srt::server::ServerLaunchError;
-#[cfg(feature = "mooncake-link")]
 use tempfile::TempDir;
-#[cfg(feature = "mooncake-link")]
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
-#[cfg(feature = "mooncake-link")]
 use tokio::task::JoinHandle;
-#[cfg(feature = "mooncake-link")]
 use tower::ServiceExt;
 
-#[cfg(feature = "mooncake-link")]
 fn config() -> Config {
     Config {
         server: ServerConfig {
@@ -86,7 +61,6 @@ fn config() -> Config {
     }
 }
 
-#[cfg(feature = "mooncake-link")]
 async fn build_ctx(prefill_addr: SocketAddr, decode_addr: SocketAddr) -> Arc<AppContext> {
     let cfg = config();
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
@@ -114,7 +88,6 @@ async fn build_ctx(prefill_addr: SocketAddr, decode_addr: SocketAddr) -> Arc<App
     Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))
 }
 
-#[cfg(feature = "mooncake-link")]
 async fn register_real_srt_workers_with_manager(
     prefill_addr: SocketAddr,
     decode_addr: SocketAddr,
@@ -123,28 +96,33 @@ async fn register_real_srt_workers_with_manager(
     let (tx, rx) = mpsc::channel(8);
     let manager = tokio::spawn(manager::run(rx, Arc::clone(&registry)));
 
-    for (id, addr) in [("srt-prefill", prefill_addr), ("srt-decode", decode_addr)] {
-        tx.send(DiscoveryEvent::Added(WorkerSpec {
-            id: WorkerId(id.into()),
-            url: format!("http://{addr}"),
-            // Static discovery seeds a plain/empty worker; the manager
-            // must resolve the real mode and model from /server_info.
-            mode: WorkerMode::Plain,
-            model_ids: Vec::new(),
-            bootstrap_port: None,
-        }))
-        .await
-        .expect("worker discovery event should send");
-    }
+    tx.send(DiscoveryEvent::Added(WorkerSpec {
+        id: WorkerId("prefill-real".into()),
+        url: format!("http://{prefill_addr}"),
+        mode: WorkerMode::Prefill,
+        model_ids: Vec::new(),
+        bootstrap_port: None,
+    }))
+    .await
+    .expect("prefill registration event should send");
+    tx.send(DiscoveryEvent::Added(WorkerSpec {
+        id: WorkerId("decode-real".into()),
+        url: format!("http://{decode_addr}"),
+        mode: WorkerMode::Decode,
+        model_ids: Vec::new(),
+        bootstrap_port: None,
+    }))
+    .await
+    .expect("decode registration event should send");
     drop(tx);
+
     manager
         .await
         .expect("worker manager task should join after discovery sender closes");
 }
 
-#[cfg(not(feature = "mooncake-link"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_rust_srt_mooncake_workers_reject_unlinked_transfer_backend() {
+async fn real_rust_srt_workers_reject_retired_mooncake_backend() {
     let prefill_addr = unused_local_addr();
     let bootstrap_addr = unused_local_addr();
     let prefill_zmq_addr = unused_local_addr();
@@ -218,23 +196,22 @@ async fn real_rust_srt_mooncake_workers_reject_unlinked_transfer_backend() {
     assert!(
         prefill_error
             .to_string()
-            .contains("requires building sglang-srt with the mooncake-link feature"),
+            .contains("invalid disaggregation transfer backend: mooncake_tcp"),
         "{prefill_error}"
     );
     assert!(
         decode_error
             .to_string()
-            .contains("requires building sglang-srt with the mooncake-link feature"),
+            .contains("invalid disaggregation transfer backend: mooncake_tcp"),
         "{decode_error}"
     );
     drop(prefill_shutdown_tx);
     drop(decode_shutdown_tx);
 }
 
-#[cfg(feature = "mooncake-link")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires linked Mooncake, CUDA, and a TCP-capable local environment"]
-async fn router_pd_chat_completes_with_real_cuda_qwen_mooncake_workers() {
+#[ignore = "requires CUDA and a TCP-capable local environment"]
+async fn router_pd_chat_completes_with_real_cuda_qwen_workers() {
     let model_dir = write_linked_qwen3_fixture_model("router-linked-cuda-qwen-pd-chat");
     let (prefill_addr, bootstrap_addr, prefill_zmq_addr, decode_addr) = test_addrs();
     let (mut prefill_server, prefill_shutdown_tx) = spawn_prefill_worker(
@@ -332,7 +309,6 @@ async fn router_pd_chat_completes_with_real_cuda_qwen_mooncake_workers() {
         .expect("central server stops");
 }
 
-#[cfg(feature = "mooncake-link")]
 async fn wait_for_worker_health(
     addr: SocketAddr,
     worker_name: &'static str,
@@ -357,7 +333,6 @@ async fn wait_for_worker_health(
     );
 }
 
-#[cfg(feature = "mooncake-link")]
 fn test_addrs() -> (SocketAddr, SocketAddr, SocketAddr, SocketAddr) {
     (
         unused_local_addr(),
@@ -367,7 +342,6 @@ fn test_addrs() -> (SocketAddr, SocketAddr, SocketAddr, SocketAddr) {
     )
 }
 
-#[cfg(feature = "mooncake-link")]
 fn cuda_test_device_ordinal() -> usize {
     let ordinal = std::env::var("SGLANG_CUDA_TEST_DEVICE")
         .expect("SGLANG_CUDA_TEST_DEVICE must select a nonzero CUDA ordinal")
@@ -380,7 +354,6 @@ fn cuda_test_device_ordinal() -> usize {
     ordinal
 }
 
-#[cfg(feature = "mooncake-link")]
 async fn spawn_prefill_worker(
     prefill_addr: SocketAddr,
     bootstrap_addr: SocketAddr,
@@ -408,7 +381,7 @@ async fn spawn_prefill_worker(
         "--disaggregation-mode",
         "prefill",
         "--disaggregation-transfer-backend",
-        "mooncake_tcp",
+        "tcp",
         "--disaggregation-bootstrap-port",
         &bootstrap_addr.port().to_string(),
         "--disaggregation-zmq-ports",
@@ -422,7 +395,6 @@ async fn spawn_prefill_worker(
     spawn_worker(args)
 }
 
-#[cfg(feature = "mooncake-link")]
 async fn spawn_decode_worker(
     decode_addr: SocketAddr,
     model_path: &Path,
@@ -448,7 +420,7 @@ async fn spawn_decode_worker(
         "--disaggregation-mode",
         "decode",
         "--disaggregation-transfer-backend",
-        "mooncake_tcp",
+        "tcp",
         "--kv-cache-dtype",
         "bfloat16",
         "--max-total-tokens",
@@ -458,7 +430,6 @@ async fn spawn_decode_worker(
     spawn_worker(args)
 }
 
-#[cfg(feature = "mooncake-link")]
 fn spawn_worker(
     args: ServerArgs,
 ) -> (
@@ -475,7 +446,6 @@ fn spawn_worker(
     (server, shutdown_tx)
 }
 
-#[cfg(feature = "mooncake-link")]
 fn chat_request(model: &str, content: &str, max_tokens: u32) -> Request<Body> {
     Request::builder()
         .method("POST")
@@ -493,7 +463,6 @@ fn chat_request(model: &str, content: &str, max_tokens: u32) -> Request<Body> {
         .expect("chat request should build")
 }
 
-#[cfg(feature = "mooncake-link")]
 fn write_linked_qwen3_fixture_model(name: &str) -> TempDir {
     let model_dir = tempfile::Builder::new()
         .prefix(&format!("sglang-rs-{name}-"))
@@ -513,7 +482,6 @@ fn write_linked_qwen3_fixture_model(name: &str) -> TempDir {
     model_dir
 }
 
-#[cfg(feature = "mooncake-link")]
 fn write_qwen3_dense_fixture(model_dir: &Path) {
     fs::write(
         model_dir.join("config.json"),
@@ -621,7 +589,6 @@ fn write_qwen3_dense_fixture(model_dir: &Path) {
         .expect("safetensors shard should be written");
 }
 
-#[cfg(feature = "mooncake-link")]
 fn write_safetensors_file(
     path: &Path,
     tensors: &[(&str, &str, Vec<usize>, [usize; 2])],
@@ -647,7 +614,6 @@ fn write_safetensors_file(
     fs::write(path, bytes)
 }
 
-#[cfg(feature = "mooncake-link")]
 fn word_level_tokenizer_json() -> &'static str {
     r#"{
   "version": "1.0",
@@ -680,7 +646,6 @@ fn unused_local_addr() -> SocketAddr {
         .expect("ephemeral listener should have local addr")
 }
 
-#[cfg(feature = "mooncake-link")]
 async fn request_raw(
     addr: SocketAddr,
     method: &'static str,

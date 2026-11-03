@@ -1915,9 +1915,8 @@ async fn router_generate_accepts_tokenized_input_ids_for_real_rust_srt_grpc_work
         .expect("gRPC server should stop cleanly");
 }
 
-#[cfg(not(feature = "mooncake-link"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_rust_srt_grpc_mooncake_workers_reject_unlinked_transfer_backend() {
+async fn real_rust_srt_grpc_workers_reject_retired_mooncake_backend() {
     let prefill_addr = unused_local_addr();
     let bootstrap_addr = unused_local_addr();
     let prefill_zmq_addr = unused_local_addr();
@@ -1993,13 +1992,13 @@ async fn real_rust_srt_grpc_mooncake_workers_reject_unlinked_transfer_backend() 
     assert!(
         prefill_error
             .to_string()
-            .contains("requires building sglang-srt with the mooncake-link feature"),
+            .contains("invalid disaggregation transfer backend: mooncake"),
         "{prefill_error}"
     );
     assert!(
         decode_error
             .to_string()
-            .contains("requires building sglang-srt with the mooncake-link feature"),
+            .contains("invalid disaggregation transfer backend: mooncake"),
         "{decode_error}"
     );
     drop(prefill_shutdown_tx);

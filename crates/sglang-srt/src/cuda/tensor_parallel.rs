@@ -128,7 +128,7 @@ impl CudaTensorParallelDenseRuntime {
         capability.attention_backends = vec!["cuda-paged-bf16"];
         capability.tensor_parallel = CapabilityStatus::Supported;
         capability.kv_cache_memory_registration = CapabilityStatus::Unsupported;
-        capability.mooncake = CapabilityStatus::Unsupported;
+        capability.kv_transfer = CapabilityStatus::Unsupported;
         capability.rdma = CapabilityStatus::Unsupported;
 
         let nccl_library =

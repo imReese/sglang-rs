@@ -28,11 +28,11 @@ use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::tokenizer::ByteTokenizer;
 use sglang_srt::transfer::{
     DecodeBootstrapRegistry, DecodeBootstrapSession, KvCacheMemoryLocation, KvTransferBackend,
-    KvTransferModelWorker, MooncakeBatchId, MooncakeBatchReleaser, MooncakeBufferEntry,
-    MooncakeError, MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeMemoryRegistrar,
-    MooncakeTransferRequest, MooncakeTransferStatus, MooncakeTransferStatusCode,
-    MooncakeTransferStatusReader, MooncakeTransferSubmitter, MooncakeTransferTarget,
-    TransferableKvCacheMemory, TransferableKvCacheRegion,
+    KvTransferModelWorker, KvTransportError, MooncakeBatchId, MooncakeBatchReleaser,
+    MooncakeBufferEntry, MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor,
+    MooncakeMemoryRegistrar, MooncakeTransferRequest, MooncakeTransferStatus,
+    MooncakeTransferStatusCode, MooncakeTransferStatusReader, MooncakeTransferSubmitter,
+    MooncakeTransferTarget, TransferableKvCacheMemory, TransferableKvCacheRegion,
 };
 use sglang_srt::types::{
     BootstrapRoom, DisaggregatedParams as RuntimeDisaggregatedParams, RequestId,
@@ -2104,7 +2104,7 @@ impl MooncakeTransferSubmitter for RecordingMooncakeBackend {
     fn submit_transfer(
         &mut self,
         requests: &mut [MooncakeTransferRequest],
-    ) -> Result<MooncakeBatchId, MooncakeError> {
+    ) -> Result<MooncakeBatchId, KvTransportError> {
         assert!(!requests.is_empty());
         self.submitted_batches += 1;
         Ok(500 + self.submitted_batches as MooncakeBatchId - 1)
@@ -2116,7 +2116,7 @@ impl MooncakeTransferStatusReader for RecordingMooncakeBackend {
         &mut self,
         _batch_id: MooncakeBatchId,
         task_id: usize,
-    ) -> Result<MooncakeTransferStatus, MooncakeError> {
+    ) -> Result<MooncakeTransferStatus, KvTransportError> {
         let status = self
             .statuses
             .get(task_id)
@@ -2131,7 +2131,7 @@ impl MooncakeTransferStatusReader for RecordingMooncakeBackend {
 }
 
 impl MooncakeBatchReleaser for RecordingMooncakeBackend {
-    fn free_batch(&mut self, batch_id: MooncakeBatchId) -> Result<(), MooncakeError> {
+    fn free_batch(&mut self, batch_id: MooncakeBatchId) -> Result<(), KvTransportError> {
         self.freed_batches.push(batch_id);
         Ok(())
     }
@@ -2142,11 +2142,14 @@ impl MooncakeMemoryRegistrar for RecordingMooncakeBackend {
         &mut self,
         _buffers: &mut [MooncakeBufferEntry],
         _location: &str,
-    ) -> Result<(), MooncakeError> {
+    ) -> Result<(), KvTransportError> {
         Ok(())
     }
 
-    fn unregister_memory_batch(&mut self, _addrs: &mut [*mut c_void]) -> Result<(), MooncakeError> {
+    fn unregister_memory_batch(
+        &mut self,
+        _addrs: &mut [*mut c_void],
+    ) -> Result<(), KvTransportError> {
         Ok(())
     }
 }

@@ -117,7 +117,7 @@ pub struct RuntimeRequirements<'a> {
     pub attention_backend: Option<&'a str>,
     pub tensor_parallel_size: usize,
     pub requires_kv_cache_registration: bool,
-    pub requires_mooncake: bool,
+    pub requires_kv_transfer: bool,
 }
 
 impl Default for RuntimeRequirements<'_> {
@@ -128,7 +128,7 @@ impl Default for RuntimeRequirements<'_> {
             attention_backend: None,
             tensor_parallel_size: 1,
             requires_kv_cache_registration: false,
-            requires_mooncake: false,
+            requires_kv_transfer: false,
         }
     }
 }
@@ -261,7 +261,7 @@ pub struct RuntimeCapability {
     pub attention_backends: Vec<&'static str>,
     pub tensor_parallel: CapabilityStatus,
     pub kv_cache_memory_registration: CapabilityStatus,
-    pub mooncake: CapabilityStatus,
+    pub kv_transfer: CapabilityStatus,
     pub rdma: CapabilityStatus,
     pub nvlink: CapabilityStatus,
 }
@@ -282,7 +282,7 @@ impl RuntimeCapability {
             } else {
                 CapabilityStatus::Unsupported
             },
-            mooncake: if supports_transferable_kv && cfg!(feature = "mooncake-link") {
+            kv_transfer: if supports_transferable_kv {
                 CapabilityStatus::Supported
             } else {
                 CapabilityStatus::Unsupported
@@ -303,7 +303,7 @@ impl RuntimeCapability {
             attention_backends: Vec::new(),
             tensor_parallel: CapabilityStatus::Unknown,
             kv_cache_memory_registration: CapabilityStatus::Unknown,
-            mooncake: CapabilityStatus::Unknown,
+            kv_transfer: CapabilityStatus::Unknown,
             rdma: CapabilityStatus::Unknown,
             nvlink: CapabilityStatus::Unknown,
         }
@@ -320,7 +320,7 @@ impl RuntimeCapability {
             attention_backends: Vec::new(),
             tensor_parallel: CapabilityStatus::Unsupported,
             kv_cache_memory_registration: CapabilityStatus::Unsupported,
-            mooncake: CapabilityStatus::Unsupported,
+            kv_transfer: CapabilityStatus::Unsupported,
             rdma: CapabilityStatus::Unsupported,
             nvlink: CapabilityStatus::Unsupported,
         }
@@ -346,7 +346,7 @@ impl RuntimeCapability {
             } else {
                 CapabilityStatus::Unsupported
             },
-            mooncake: CapabilityStatus::Unknown,
+            kv_transfer: CapabilityStatus::Unknown,
             rdma: CapabilityStatus::Unknown,
             nvlink: CapabilityStatus::Unknown,
         }
@@ -379,7 +379,7 @@ impl RuntimeCapability {
             } else {
                 CapabilityStatus::Unsupported
             },
-            mooncake: if cfg!(feature = "mooncake-link") {
+            kv_transfer: if device.unified_addressing {
                 CapabilityStatus::Supported
             } else {
                 CapabilityStatus::Unsupported
@@ -423,8 +423,8 @@ impl RuntimeCapability {
         {
             missing.push("KV cache memory registration".to_string());
         }
-        if requirements.requires_mooncake && !self.mooncake.is_supported() {
-            missing.push("Mooncake transport".to_string());
+        if requirements.requires_kv_transfer && !self.kv_transfer.is_supported() {
+            missing.push("KV transfer transport".to_string());
         }
 
         if missing.is_empty() {
@@ -509,11 +509,6 @@ pub struct TransferBackendCapability {
 impl TransferBackendCapability {
     pub fn from_backend(backend: TransferBackend) -> Self {
         match backend {
-            TransferBackend::Mooncake => Self {
-                backend,
-                class: TransferBackendClass::Production,
-                linked_transport: cfg!(feature = "mooncake-link"),
-            },
             TransferBackend::Tcp => Self {
                 backend,
                 class: TransferBackendClass::Production,

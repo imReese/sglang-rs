@@ -12,7 +12,6 @@ crate-type = ["rlib"]
 
 [features]
 default = []
-mooncake-link = ["sglang-srt/mooncake-link"]
 
 [[bin]]
 name = "sgl-router"

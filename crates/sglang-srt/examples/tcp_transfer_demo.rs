@@ -3,9 +3,8 @@
 
 use sglang_srt::tcp_transfer::SharedTcpTransferEngine;
 use sglang_srt::transfer::{
-    MooncakeBatchReleaser, MooncakeBufferEntry, MooncakeMemoryRegistrar, MooncakeSegmentOpener,
-    MooncakeTransferRequest, MooncakeTransferStatusCode, MooncakeTransferStatusReader,
-    MooncakeTransferSubmitter,
+    KvBatchReleaser, KvBufferEntry, KvMemoryRegistrar, KvSegmentOpener, KvTransferRequest,
+    KvTransferStatusCode, KvTransferStatusReader, KvTransferSubmitter,
 };
 use std::ffi::c_void;
 
@@ -22,7 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let mut decode_kv_buffer = vec![0u8; 1024];
-    let mut decode_entries = [MooncakeBufferEntry {
+    let mut decode_entries = [KvBufferEntry {
         addr: decode_kv_buffer.as_mut_ptr() as *mut c_void,
         length: decode_kv_buffer.len(),
     }];
@@ -52,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         target_offset
     );
 
-    let mut requests = [MooncakeTransferRequest {
+    let mut requests = [KvTransferRequest {
         opcode: 0,
         source: payload.as_ptr() as *mut c_void,
         target_id,
@@ -66,7 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "[Prefill] Transfer finished: batch_id={}, status={}, transferred_bytes={}",
         batch_id,
-        if status.status == MooncakeTransferStatusCode::Completed as i32 {
+        if status.status == KvTransferStatusCode::Completed as i32 {
             "COMPLETED"
         } else {
             "FAILED"

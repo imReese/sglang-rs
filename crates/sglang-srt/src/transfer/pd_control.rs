@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
+// SPDX-License-Identifier: Apache-2.0
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -21,22 +24,22 @@ struct Inbox {
     failure: Option<String>,
 }
 
-pub(crate) struct MooncakeDecodeReceiver {
+pub(crate) struct PdDecodeReceiver {
     port: u16,
     inbox: Arc<(Mutex<Inbox>, Condvar)>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
 
-impl std::fmt::Debug for MooncakeDecodeReceiver {
+impl std::fmt::Debug for PdDecodeReceiver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MooncakeDecodeReceiver")
+        f.debug_struct("PdDecodeReceiver")
             .field("port", &self.port)
             .finish_non_exhaustive()
     }
 }
 
-impl MooncakeDecodeReceiver {
+impl PdDecodeReceiver {
     pub(crate) fn start(host: &str) -> Result<Self, String> {
         let endpoint = format!("tcp://{host}:0");
         let inbox = Arc::new((Mutex::new(Inbox::default()), Condvar::new()));
@@ -164,7 +167,7 @@ impl MooncakeDecodeReceiver {
         room: BootstrapRoom,
         cancel: bool,
     ) -> Result<(Option<u32>, Option<Vec<u8>>), String> {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(300);
         let (lock, changed) = &*self.inbox;
         let mut state = lock.lock().map_err(|e| e.to_string())?;
         loop {
@@ -188,7 +191,7 @@ impl MooncakeDecodeReceiver {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(format!(
-                    "timed out waiting for Mooncake room {room}; KV memory remains reserved until sender drain acknowledgement"
+                    "timed out waiting for PD control room {room}; KV memory remains reserved until sender drain acknowledgement"
                 ));
             }
             state = changed
@@ -205,7 +208,7 @@ impl MooncakeDecodeReceiver {
     }
 }
 
-impl Drop for MooncakeDecodeReceiver {
+impl Drop for PdDecodeReceiver {
     fn drop(&mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
@@ -217,14 +220,14 @@ impl Drop for MooncakeDecodeReceiver {
 }
 
 fn ascii<T: std::str::FromStr>(frame: Option<&Vec<u8>>) -> Result<T, String> {
-    std::str::from_utf8(frame.ok_or("missing Mooncake control field")?)
+    std::str::from_utf8(frame.ok_or("missing PD control field")?)
         .map_err(|e| e.to_string())?
         .parse()
-        .map_err(|_| "invalid Mooncake control field".into())
+        .map_err(|_| "invalid PD control field".into())
 }
 
 fn ingest(state: &mut Inbox, frames: &[Vec<u8>]) -> Result<(), String> {
-    let header = frames.first().ok_or("empty Mooncake control frame")?;
+    let header = frames.first().ok_or("empty PD control frame")?;
     let aux = header == b"AUX_DATA";
     let ack = header == b"ABORT_ACK";
     let room_id = ascii::<u64>(frames.get(usize::from(aux || ack)))?;
@@ -275,7 +278,7 @@ fn ingest(state: &mut Inbox, frames: &[Vec<u8>]) -> Result<(), String> {
                 .get(3)
                 .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
                 .unwrap_or_else(|| "prefill transfer failed".into())),
-            _ => return Err(format!("unexpected nonterminal Mooncake status {status}")),
+            _ => return Err(format!("unexpected nonterminal PD control status {status}")),
         });
     }
     Ok(())
@@ -338,7 +341,7 @@ pub(crate) fn send_frames(endpoint: String, frames: Vec<Vec<Vec<u8>>>) -> Result
             let mut socket = PushSocket::new();
             tokio::time::timeout(Duration::from_secs(5), socket.connect(&endpoint))
                 .await
-                .map_err(|_| "Mooncake control connect timed out")?
+                .map_err(|_| "PD control connect timed out")?
                 .map_err(|e| e.to_string())?;
             for frame in frames {
                 let mut parts = frame.into_iter();
@@ -348,14 +351,14 @@ pub(crate) fn send_frames(endpoint: String, frames: Vec<Vec<Vec<u8>>>) -> Result
                 }
                 tokio::time::timeout(Duration::from_secs(5), socket.send(message))
                     .await
-                    .map_err(|_| "Mooncake control send timed out")?
+                    .map_err(|_| "PD control send timed out")?
                     .map_err(|e| e.to_string())?;
             }
             Ok(())
         })
     })
     .join()
-    .map_err(|_| "Mooncake control sender panicked".to_string())?
+    .map_err(|_| "PD control sender panicked".to_string())?
 }
 
 #[cfg(test)]
@@ -364,7 +367,7 @@ mod tests {
 
     #[test]
     fn decode_waits_for_both_success_and_first_token_over_real_control_socket() {
-        let receiver = MooncakeDecodeReceiver::start("127.0.0.1").expect("receiver");
+        let receiver = PdDecodeReceiver::start("127.0.0.1").expect("receiver");
         receiver.register(7).expect("room");
         let endpoint = format!("tcp://127.0.0.1:{}", receiver.port());
         let mut frames = completion_frames(7, Some(3), None, None, 0).expect("frames");
@@ -388,7 +391,7 @@ mod tests {
 
     #[test]
     fn decode_receives_token_and_recurrent_state_over_real_control_socket() {
-        let receiver = MooncakeDecodeReceiver::start("127.0.0.1").expect("receiver");
+        let receiver = PdDecodeReceiver::start("127.0.0.1").expect("receiver");
         receiver.register(8).expect("room");
         let endpoint = format!("tcp://127.0.0.1:{}", receiver.port());
         let state_bytes = b"sample_recurrent_state_payload";

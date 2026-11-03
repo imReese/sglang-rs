@@ -898,7 +898,7 @@ impl ModelDefinition {
             attention_backend: requested_attention_backend,
             tensor_parallel_size,
             requires_kv_cache_registration: false,
-            requires_mooncake: false,
+            requires_kv_transfer: false,
         }
     }
 

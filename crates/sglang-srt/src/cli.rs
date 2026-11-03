@@ -46,7 +46,7 @@ pub struct ServerArgs {
     pub disaggregation_mode: String,
     pub disaggregation_transfer_backend: String,
     pub disaggregation_bootstrap_port: u16,
-    pub disaggregation_mooncake_rpc_port: Option<u16>,
+    pub disaggregation_transfer_rpc_port: Option<u16>,
     pub disaggregation_ib_device: Option<String>,
     pub disaggregation_zmq_ports: Option<ZmqPortRange>,
     pub disaggregation_decode_enable_radix_cache: bool,
@@ -70,6 +70,8 @@ pub struct ServerArgs {
     pub allow_auto_truncate: bool,
     pub collect_tokens_histogram: bool,
     pub enable_cache_report: bool,
+    pub kv_events_port: Option<u16>,
+    pub kv_events_config: Option<serde_json::Value>,
     pub enable_metrics: bool,
     pub disable_radix_cache: bool,
     pub tool_call_parser: Option<String>,
@@ -331,9 +333,9 @@ impl ArgParser {
                         .parse::<u16>()
                         .map_err(|_| CliParseError::InvalidPort(value))?;
                 }
-                "--disaggregation-mooncake-rpc-port" => {
-                    let value = self.take_value("--disaggregation-mooncake-rpc-port")?;
-                    self.parsed.disaggregation_mooncake_rpc_port = Some(
+                "--disaggregation-transfer-rpc-port" | "--disaggregation-mooncake-rpc-port" => {
+                    let value = self.take_value("--disaggregation-transfer-rpc-port")?;
+                    self.parsed.disaggregation_transfer_rpc_port = Some(
                         value
                             .parse::<u16>()
                             .map_err(|_| CliParseError::InvalidPort(value))?,
@@ -441,6 +443,25 @@ impl ArgParser {
                 "--enable-cache-report" => {
                     self.parsed.enable_cache_report = true;
                 }
+                "--kv-events-port" | "--kv-event-port" => {
+                    let value = self.take_value("--kv-events-port")?;
+                    self.parsed.kv_events_port = Some(
+                        value
+                            .parse::<u16>()
+                            .map_err(|_| CliParseError::InvalidPort(value))?,
+                    );
+                }
+                "--kv-events-config" => {
+                    let raw = self.take_value("--kv-events-config")?;
+                    let val = parse_json_value("--kv-events-config", raw)?;
+                    if let Some(endpoint) = val.get("endpoint").and_then(|v| v.as_str())
+                        && let Some(port_str) = endpoint.rsplit(':').next()
+                        && let Ok(p) = port_str.parse::<u16>()
+                    {
+                        self.parsed.kv_events_port = Some(p);
+                    }
+                    self.parsed.kv_events_config = Some(val);
+                }
                 "--enable-metrics" => {
                     self.parsed.enable_metrics = true;
                 }
@@ -497,7 +518,7 @@ impl ArgParser {
             disaggregation_mode: self.parsed.disaggregation_mode.clone(),
             disaggregation_transfer_backend: self.parsed.disaggregation_transfer_backend.clone(),
             disaggregation_bootstrap_port: self.parsed.disaggregation_bootstrap_port,
-            disaggregation_mooncake_rpc_port: self.parsed.disaggregation_mooncake_rpc_port,
+            disaggregation_transfer_rpc_port: self.parsed.disaggregation_transfer_rpc_port,
             disaggregation_ib_device: self.parsed.disaggregation_ib_device.clone(),
             disaggregation_zmq_ports: self.parsed.disaggregation_zmq_ports,
             disaggregation_decode_enable_radix_cache: self
@@ -527,6 +548,8 @@ impl ArgParser {
             allow_auto_truncate: self.parsed.allow_auto_truncate,
             collect_tokens_histogram: self.parsed.collect_tokens_histogram,
             enable_cache_report: self.parsed.enable_cache_report,
+            kv_events_port: self.parsed.kv_events_port,
+            kv_events_config: self.parsed.kv_events_config.clone(),
             enable_metrics: self.parsed.enable_metrics,
             disable_radix_cache: self.parsed.disable_radix_cache,
             tool_call_parser: self.parsed.tool_call_parser.clone(),
@@ -605,7 +628,7 @@ struct PartialServerArgs {
     disaggregation_mode: String,
     disaggregation_transfer_backend: String,
     disaggregation_bootstrap_port: u16,
-    disaggregation_mooncake_rpc_port: Option<u16>,
+    disaggregation_transfer_rpc_port: Option<u16>,
     disaggregation_ib_device: Option<String>,
     disaggregation_zmq_ports: Option<ZmqPortRange>,
     disaggregation_decode_enable_radix_cache: bool,
@@ -629,6 +652,8 @@ struct PartialServerArgs {
     allow_auto_truncate: bool,
     collect_tokens_histogram: bool,
     enable_cache_report: bool,
+    kv_events_port: Option<u16>,
+    kv_events_config: Option<serde_json::Value>,
     enable_metrics: bool,
     disable_radix_cache: bool,
     tool_call_parser: Option<String>,
@@ -668,9 +693,9 @@ impl Default for PartialServerArgs {
             served_model_name: None,
             tokenizer_path: None,
             disaggregation_mode: "null".to_string(),
-            disaggregation_transfer_backend: "mooncake".to_string(),
+            disaggregation_transfer_backend: "tcp".to_string(),
             disaggregation_bootstrap_port: 8998,
-            disaggregation_mooncake_rpc_port: None,
+            disaggregation_transfer_rpc_port: None,
             disaggregation_ib_device: None,
             disaggregation_zmq_ports: None,
             disaggregation_decode_enable_radix_cache: false,
@@ -694,6 +719,8 @@ impl Default for PartialServerArgs {
             allow_auto_truncate: false,
             collect_tokens_histogram: false,
             enable_cache_report: false,
+            kv_events_port: None,
+            kv_events_config: None,
             enable_metrics: false,
             disable_radix_cache: false,
             tool_call_parser: None,

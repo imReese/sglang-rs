@@ -20,8 +20,6 @@ mod kv_block_hash;
 mod kv_cache;
 mod model_artifacts;
 mod model_worker_batch;
-mod mooncake_lifecycle;
-mod mooncake_link_build;
 mod pd_config;
 mod pd_separation;
 mod pd_transfer_plan;
@@ -31,6 +29,7 @@ mod scheduler_batch;
 mod scheduler_cache_allocation;
 mod sglang_command;
 mod tokenizer_loader;
+mod transfer_lifecycle;
 
 #[path = "../support/compressed_kimi_k25.rs"]
 mod compressed_kimi_k25;

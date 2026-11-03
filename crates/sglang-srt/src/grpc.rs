@@ -1937,16 +1937,17 @@ pub(crate) fn server_info_attributes_from_args(args: &ServerArgs) -> HashMap<Str
         );
     }
 
-    if let Some(ports) = args.disaggregation_zmq_ports {
+    let kv_events_port = args
+        .kv_events_port
+        .or_else(|| args.disaggregation_zmq_ports.map(|ports| ports.start));
+
+    if let Some(port) = kv_events_port {
         attributes.insert("kv_events.publisher".to_string(), "zmq".to_string());
         attributes.insert(
             "kv_events.endpoint_host".to_string(),
             grpc_kv_events_endpoint_host(args).to_string(),
         );
-        attributes.insert(
-            "kv_events.endpoint_port_base".to_string(),
-            ports.start.to_string(),
-        );
+        attributes.insert("kv_events.endpoint_port_base".to_string(), port.to_string());
         attributes.insert("kv_events.topic".to_string(), String::new());
         attributes.insert(
             "kv_events.block_size".to_string(),

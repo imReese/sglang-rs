@@ -13,14 +13,10 @@ use sglang_srt::kv_cache::PagedKvCacheLayout;
 use sglang_srt::model_executor::ModelWorkerBatch;
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::transfer::{
-    KvCacheDtype, KvCacheMemoryLocation, KvCacheMemoryProvider, KvCacheRuntimeLayout,
-    MooncakeKvCacheMemoryExt,
+    KvCacheDtype, KvCacheMemoryExt, KvCacheMemoryLocation, KvCacheMemoryProvider,
+    KvCacheRuntimeLayout,
 };
-#[cfg(feature = "mooncake-link")]
-use sglang_srt::transfer::{
-    MooncakeTransferEngineConfig, RegisteredMooncakeKvCacheMemory,
-    SharedLinkedMooncakeTransferEngine,
-};
+
 use sglang_srt::types::{RequestId, SamplingParams};
 use sglang_srt::worker::{BatchGeneratedTokens, GeneratedToken, ModelWorker};
 
@@ -289,7 +285,7 @@ fn cuda_backend_round_trips_page_major_device_kv_memory() {
     );
     let transferable = kv_cache
         .transferable_kv_cache_memory()
-        .expect("CUDA KV cache should expose Mooncake memory");
+        .expect("CUDA KV cache should expose transferable memory");
 
     assert_eq!(transferable.regions().len(), 1);
     assert_eq!(transferable.page_size_bytes(), 131_072);
@@ -538,7 +534,7 @@ fn cuda_kv_kernels_scatter_and_gather_batched_physical_slots() {
     let transferable_before = kv_cache
         .storage()
         .transferable_kv_cache_memory()
-        .expect("KV pool should expose its Mooncake memory before model writes");
+        .expect("KV pool should expose its transferable memory before model writes");
     kv_cache
         .storage_mut()
         .write_kv_slots_from_device(
@@ -559,7 +555,7 @@ fn cuda_kv_kernels_scatter_and_gather_batched_physical_slots() {
     assert_eq!(
         transferable_before.regions()[0].base_addr,
         kv_cache.storage().allocation().device_ptr() as usize,
-        "attention writes and Mooncake registration must use the same allocation"
+        "attention writes and transferable registration must use the same allocation"
     );
 
     let gathered_key_stride = row_bytes + 11;
@@ -638,7 +634,7 @@ fn cuda_kv_kernels_scatter_and_gather_batched_physical_slots() {
 
 #[test]
 #[ignore = "requires a BF16-capable CUDA device, NVIDIA driver, and NVRTC"]
-fn cuda_bf16_paged_attention_reads_mooncake_registered_physical_kv_slots() {
+fn cuda_bf16_paged_attention_reads_registered_physical_kv_slots() {
     let backend = CudaBackend::initialize(cuda_test_device_ordinal())
         .expect("CUDA backend should initialize");
     let capability = backend.capabilities();
@@ -738,11 +734,11 @@ fn cuda_bf16_paged_attention_reads_mooncake_registered_physical_kv_slots() {
     let transferable = kv_cache
         .storage()
         .transferable_kv_cache_memory()
-        .expect("attention KV pool should expose Mooncake memory");
+        .expect("attention KV pool should expose transferable memory");
     assert_eq!(
         transferable.regions()[0].base_addr,
         kv_cache.storage().allocation().device_ptr() as usize,
-        "attention and Mooncake must read and register the same CUDA allocation"
+        "attention and transport must read and register the same CUDA allocation"
     );
     let scale = (runtime.head_dim as f32).sqrt().recip();
     attention
@@ -879,34 +875,4 @@ fn cuda_bf16_paged_attention_executes_asymmetric_compressed_mla_kv() {
         ],
         0.05,
     );
-}
-
-#[cfg(feature = "mooncake-link")]
-#[test]
-#[ignore = "requires a CUDA device, NVIDIA driver, and linked native Mooncake"]
-fn cuda_mooncake_registers_real_cuda_kv_memory() {
-    let device_ordinal = cuda_test_device_ordinal();
-    let backend = CudaBackend::initialize(device_ordinal).expect("CUDA backend should initialize");
-    let kv_cache = allocate_cuda_kv_cache(backend.context(), cuda_test_layout(), 16)
-        .expect("CUDA KV cache should allocate a page-major device pool");
-    let transferable = kv_cache
-        .transferable_kv_cache_memory()
-        .expect("CUDA KV cache should expose Mooncake memory");
-    let engine = SharedLinkedMooncakeTransferEngine::new(&MooncakeTransferEngineConfig {
-        metadata_server: "P2PHANDSHAKE".to_string(),
-        session_id: "127.0.0.1:0".to_string(),
-        hostname: "127.0.0.1".to_string(),
-        rpc_port: 0,
-        protocol: "tcp".to_string(),
-        device_name: String::new(),
-        gpu_id: device_ordinal,
-    })
-    .expect("linked Mooncake engine should initialize");
-    let mut registration = RegisteredMooncakeKvCacheMemory::register(engine, transferable)
-        .expect("Mooncake should register CUDA KV regions");
-
-    assert_eq!(registration.memory().regions().len(), 1);
-    registration
-        .unregister()
-        .expect("Mooncake should unregister CUDA KV regions");
 }

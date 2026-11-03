@@ -15,12 +15,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use zeromq::{PullSocket, PushSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
-use crate::mooncake_control::{MooncakeDecodeReceiver, completion_frames, send_frames};
+use crate::pd_control::{PdDecodeReceiver, completion_frames, send_frames};
 use crate::transfer::{
-    DecodeBootstrapMetadataPublishSummary, DecodeBootstrapPublisher, KvCacheTransferError,
-    KvCacheTransferPlan, KvCacheTransferSpan, KvPoll, KvTransferBackend, KvTransferPoll,
-    MooncakeBatchReleaser, MooncakeKvCacheTransferExecutor, MooncakeRemoteKvLayout,
-    MooncakeTransferStatusReader, MooncakeTransferSubmitter, MooncakeTransferTargetResolver,
+    DecodeBootstrapMetadataPublishSummary, DecodeBootstrapPublisher, KvBatchReleaser,
+    KvCacheTransferError, KvCacheTransferExecutor, KvCacheTransferPlan, KvCacheTransferSpan,
+    KvPoll, KvRemoteLayout, KvTransferBackend, KvTransferLayout, KvTransferPoll,
+    KvTransferStatusReader, KvTransferSubmitter, KvTransferTargetResolver,
     TransferableKvCacheMemory,
 };
 use crate::types::BootstrapRoom;
@@ -47,7 +47,7 @@ impl PrefillBootstrapService {
     }
 }
 
-pub struct MooncakeBootstrapKvCacheTransferExecutor<E> {
+pub struct PdBootstrapKvCacheTransferExecutor<E> {
     bootstrap_service: PrefillBootstrapService,
     inner: E,
     metadata_wait_timeout: Duration,
@@ -56,7 +56,9 @@ pub struct MooncakeBootstrapKvCacheTransferExecutor<E> {
     pending_states: BTreeMap<BootstrapRoom, Vec<u8>>,
 }
 
-impl<E> MooncakeBootstrapKvCacheTransferExecutor<E> {
+pub type MooncakeBootstrapKvCacheTransferExecutor<E> = PdBootstrapKvCacheTransferExecutor<E>;
+
+impl<E> PdBootstrapKvCacheTransferExecutor<E> {
     const DEFAULT_METADATA_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
     const DEFAULT_METADATA_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
@@ -91,7 +93,7 @@ impl<E> MooncakeBootstrapKvCacheTransferExecutor<E> {
     fn remote_kv_layouts_for_room(
         &self,
         room: BootstrapRoom,
-    ) -> Result<Vec<(String, MooncakeRemoteKvLayout)>, KvCacheTransferError> {
+    ) -> Result<Vec<(String, KvRemoteLayout)>, KvCacheTransferError> {
         let deadline = Instant::now() + self.metadata_wait_timeout;
         loop {
             let result = {
@@ -122,11 +124,10 @@ impl<E> MooncakeBootstrapKvCacheTransferExecutor<E> {
     }
 }
 
-impl<S, R> KvTransferBackend
-    for MooncakeBootstrapKvCacheTransferExecutor<MooncakeKvCacheTransferExecutor<S, R>>
+impl<S, R> KvTransferBackend for PdBootstrapKvCacheTransferExecutor<KvCacheTransferExecutor<S, R>>
 where
-    S: MooncakeTransferSubmitter + MooncakeTransferStatusReader + MooncakeBatchReleaser,
-    R: MooncakeTransferTargetResolver,
+    S: KvTransferSubmitter + KvTransferStatusReader + KvBatchReleaser,
+    R: KvTransferTargetResolver,
 {
     fn register(&mut self, memory: TransferableKvCacheMemory) -> Result<(), KvCacheTransferError> {
         self.inner.register(memory)
@@ -221,9 +222,9 @@ where
     }
 }
 
-impl<S, R> MooncakeBootstrapKvCacheTransferExecutor<MooncakeKvCacheTransferExecutor<S, R>>
+impl<S, R> PdBootstrapKvCacheTransferExecutor<KvCacheTransferExecutor<S, R>>
 where
-    S: MooncakeTransferStatusReader + MooncakeBatchReleaser,
+    S: KvTransferStatusReader + KvBatchReleaser,
 {
     fn notify_room(
         &mut self,
@@ -312,9 +313,9 @@ pub struct PrefillBootstrapState {
     registered_count: usize,
     prefill_port_table: PrefillPortTable,
     room_to_dp_rank: BTreeMap<BootstrapRoom, RegisteredDpRank>,
-    decode_kv_args_table: BTreeMap<String, MooncakeKvArgsRegisterInfo>,
+    decode_kv_args_table: BTreeMap<String, PdKvArgsRegisterInfo>,
     decode_kv_args_registration_count: usize,
-    transfer_rooms: BTreeMap<BootstrapRoom, MooncakeTransferRoom>,
+    transfer_rooms: BTreeMap<BootstrapRoom, PdTransferRoom>,
     active_rooms: BTreeSet<BootstrapRoom>,
     aborted_rooms: BTreeSet<BootstrapRoom>,
     abort_targets: BTreeMap<BootstrapRoom, Vec<String>>,
@@ -326,30 +327,30 @@ type PrefillCpRankTable = BTreeMap<usize, PrefillTpRankTable>;
 type PrefillPortTable = BTreeMap<usize, PrefillCpRankTable>;
 
 impl PrefillBootstrapState {
-    pub fn ingest_mooncake_bootstrap_frame(
+    pub fn ingest_bootstrap_frame(
         &mut self,
         frame: &[Vec<u8>],
-    ) -> Result<(), MooncakeBootstrapFrameError> {
+    ) -> Result<(), PdBootstrapFrameError> {
         let room = ascii_field(frame, 0, "room")?;
         match room {
             "WATERMARK" | "STAGING_RSP" => Ok(()),
             "None" => {
-                let register = MooncakeKvArgsRegisterInfo::from_frame(frame)?;
+                let register = PdKvArgsRegisterInfo::from_frame(frame)?;
                 self.decode_kv_args_table
-                    .insert(register.mooncake_session_id.clone(), register);
+                    .insert(register.session_id.clone(), register);
                 self.decode_kv_args_registration_count += 1;
                 Ok(())
             }
             _ => {
-                let transfer = MooncakeTransferInfo::from_frame(frame)?;
+                let transfer = PdTransferInfo::from_frame(frame)?;
                 let room = transfer.room;
-                let session = transfer.mooncake_session_id.clone();
+                let session = transfer.session_id.clone();
                 let required_dst_info_num = transfer.required_dst_info_num;
                 let decode_prefix_len = transfer.decode_prefix_len;
                 let room_state =
                     self.transfer_rooms
                         .entry(room)
-                        .or_insert_with(|| MooncakeTransferRoom {
+                        .or_insert_with(|| PdTransferRoom {
                             required_dst_info_num,
                             status: KvPoll::Bootstrapping,
                             decode_prefix_len: None,
@@ -372,7 +373,14 @@ impl PrefillBootstrapState {
         }
     }
 
-    pub fn decode_kv_args(&self, session_id: &str) -> Option<&MooncakeKvArgsRegisterInfo> {
+    pub fn ingest_mooncake_bootstrap_frame(
+        &mut self,
+        frame: &[Vec<u8>],
+    ) -> Result<(), PdBootstrapFrameError> {
+        self.ingest_bootstrap_frame(frame)
+    }
+
+    pub fn decode_kv_args(&self, session_id: &str) -> Option<&PdKvArgsRegisterInfo> {
         self.decode_kv_args_table.get(session_id)
     }
 
@@ -380,7 +388,7 @@ impl PrefillBootstrapState {
         self.decode_kv_args_registration_count
     }
 
-    pub fn transfer_room(&self, room: BootstrapRoom) -> Option<&MooncakeTransferRoom> {
+    pub fn transfer_room(&self, room: BootstrapRoom) -> Option<&PdTransferRoom> {
         self.transfer_rooms.get(&room)
     }
 
@@ -391,11 +399,11 @@ impl PrefillBootstrapState {
     pub fn remote_kv_layouts_for_room(
         &self,
         room: BootstrapRoom,
-    ) -> Result<Vec<(String, MooncakeRemoteKvLayout)>, MooncakeRemoteKvLayoutError> {
+    ) -> Result<Vec<(String, KvRemoteLayout)>, PdRemoteKvLayoutError> {
         let room_state = self
             .transfer_rooms
             .get(&room)
-            .ok_or(MooncakeRemoteKvLayoutError::MissingTransferRoom(room))?;
+            .ok_or(PdRemoteKvLayoutError::MissingTransferRoom(room))?;
         let mut layouts = Vec::with_capacity(room_state.transfers.len());
 
         for transfer in room_state.transfers.values() {
@@ -405,15 +413,15 @@ impl PrefillBootstrapState {
 
             let kv_args = self
                 .decode_kv_args_table
-                .get(&transfer.mooncake_session_id)
-                .ok_or_else(|| MooncakeRemoteKvLayoutError::MissingKvArgsRegistration {
+                .get(&transfer.session_id)
+                .ok_or_else(|| PdRemoteKvLayoutError::MissingKvArgsRegistration {
                     room,
-                    mooncake_session_id: transfer.mooncake_session_id.clone(),
+                    session_id: transfer.session_id.clone(),
                 })?;
 
             layouts.push((
-                transfer.mooncake_session_id.clone(),
-                MooncakeRemoteKvLayout {
+                transfer.session_id.clone(),
+                KvRemoteLayout {
                     dst_kv_ptrs: kv_args.dst_kv_ptrs.clone(),
                     dst_kv_indices: transfer.dst_kv_indices.clone(),
                     dst_kv_item_len: kv_args.dst_kv_item_len,
@@ -567,11 +575,11 @@ impl PrefillRankInfo {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MooncakeKvArgsRegisterInfo {
+pub struct PdKvArgsRegisterInfo {
     pub room: String,
     pub endpoint: String,
     pub dst_port: u16,
-    pub mooncake_session_id: String,
+    pub session_id: String,
     pub dst_kv_ptrs: Vec<u64>,
     pub dst_aux_ptrs: Vec<u64>,
     pub dst_state_data_ptrs: Vec<Vec<u64>>,
@@ -582,14 +590,16 @@ pub struct MooncakeKvArgsRegisterInfo {
     pub dst_state_dim_per_tensor: Vec<Vec<u32>>,
 }
 
-impl MooncakeKvArgsRegisterInfo {
-    fn from_frame(frame: &[Vec<u8>]) -> Result<Self, MooncakeBootstrapFrameError> {
-        require_min_fields(frame, 10, "Mooncake KVArgs registration")?;
+pub type MooncakeKvArgsRegisterInfo = PdKvArgsRegisterInfo;
+
+impl PdKvArgsRegisterInfo {
+    fn from_frame(frame: &[Vec<u8>]) -> Result<Self, PdBootstrapFrameError> {
+        require_min_fields(frame, 10, "KVArgs registration")?;
         Ok(Self {
             room: ascii_field(frame, 0, "room")?.to_string(),
             endpoint: ascii_field(frame, 1, "endpoint")?.to_string(),
             dst_port: parse_u16(frame, 2, "dst_port")?,
-            mooncake_session_id: ascii_field(frame, 3, "mooncake_session_id")?.to_string(),
+            session_id: ascii_field(frame, 3, "session_id")?.to_string(),
             dst_kv_ptrs: unpack_u64s(field(frame, 4, "dst_kv_ptrs")?)?,
             dst_aux_ptrs: unpack_u64s(field(frame, 5, "dst_aux_ptrs")?)?,
             dst_state_data_ptrs: unpack_u64_lists(field(frame, 6, "dst_state_data_ptrs")?)?,
@@ -603,11 +613,11 @@ impl MooncakeKvArgsRegisterInfo {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MooncakeTransferInfo {
+pub struct PdTransferInfo {
     pub room: BootstrapRoom,
     pub endpoint: String,
     pub dst_port: u16,
-    pub mooncake_session_id: String,
+    pub session_id: String,
     pub dst_kv_indices: Vec<i32>,
     pub dst_aux_index: Option<i32>,
     pub dst_state_indices: Vec<Vec<i32>>,
@@ -616,9 +626,11 @@ pub struct MooncakeTransferInfo {
     pub decode_prefix_len: Option<usize>,
 }
 
-impl MooncakeTransferInfo {
-    fn from_frame(frame: &[Vec<u8>]) -> Result<Self, MooncakeBootstrapFrameError> {
-        require_min_fields(frame, 8, "Mooncake transfer metadata")?;
+pub type MooncakeTransferInfo = PdTransferInfo;
+
+impl PdTransferInfo {
+    fn from_frame(frame: &[Vec<u8>]) -> Result<Self, PdBootstrapFrameError> {
+        require_min_fields(frame, 8, "transfer metadata")?;
         let is_dummy = field(frame, 4, "dst_kv_indices")?.is_empty()
             && field(frame, 5, "dst_aux_index")?.is_empty();
         let (dst_kv_indices, dst_aux_index, dst_state_indices) = if is_dummy {
@@ -635,7 +647,7 @@ impl MooncakeTransferInfo {
             room: parse_bootstrap_room(frame, 0, "room")?,
             endpoint: ascii_field(frame, 1, "endpoint")?.to_string(),
             dst_port: parse_u16(frame, 2, "dst_port")?,
-            mooncake_session_id: ascii_field(frame, 3, "mooncake_session_id")?.to_string(),
+            session_id: ascii_field(frame, 3, "session_id")?.to_string(),
             dst_kv_indices,
             dst_aux_index,
             dst_state_indices,
@@ -647,40 +659,41 @@ impl MooncakeTransferInfo {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MooncakeTransferRoom {
+pub struct PdTransferRoom {
     pub required_dst_info_num: usize,
     pub status: KvPoll,
     pub decode_prefix_len: Option<usize>,
-    pub transfers: BTreeMap<String, MooncakeTransferInfo>,
+    pub transfers: BTreeMap<String, PdTransferInfo>,
 }
 
+pub type MooncakeTransferRoom = PdTransferRoom;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MooncakeRemoteKvLayoutError {
+pub enum PdRemoteKvLayoutError {
     MissingTransferRoom(BootstrapRoom),
     MissingKvArgsRegistration {
         room: BootstrapRoom,
-        mooncake_session_id: String,
+        session_id: String,
     },
 }
 
-impl fmt::Display for MooncakeRemoteKvLayoutError {
+pub type MooncakeRemoteKvLayoutError = PdRemoteKvLayoutError;
+
+impl fmt::Display for PdRemoteKvLayoutError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingTransferRoom(room) => {
-                write!(formatter, "missing Mooncake transfer room: {room}")
+                write!(formatter, "missing transfer room: {room}")
             }
-            Self::MissingKvArgsRegistration {
-                room,
-                mooncake_session_id,
-            } => write!(
+            Self::MissingKvArgsRegistration { room, session_id } => write!(
                 formatter,
-                "missing Mooncake KVArgs registration for room {room} session {mooncake_session_id}"
+                "missing KVArgs registration for room {room} session {session_id}"
             ),
         }
     }
 }
 
-impl std::error::Error for MooncakeRemoteKvLayoutError {}
+impl std::error::Error for PdRemoteKvLayoutError {}
 
 #[derive(Clone, Debug)]
 struct RegisteredDpRank {
@@ -727,7 +740,7 @@ struct QueryDpRanksRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MooncakeBootstrapFrameError {
+pub enum PdBootstrapFrameError {
     MissingField {
         frame: &'static str,
         expected: usize,
@@ -753,7 +766,9 @@ pub enum MooncakeBootstrapFrameError {
     },
 }
 
-impl fmt::Display for MooncakeBootstrapFrameError {
+pub type MooncakeBootstrapFrameError = PdBootstrapFrameError;
+
+impl fmt::Display for PdBootstrapFrameError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingField {
@@ -786,12 +801,12 @@ impl fmt::Display for MooncakeBootstrapFrameError {
     }
 }
 
-impl std::error::Error for MooncakeBootstrapFrameError {}
+impl std::error::Error for PdBootstrapFrameError {}
 
 #[derive(Debug)]
 pub enum PrefillBootstrapServeError {
     Io(std::io::Error),
-    MooncakeFrame(MooncakeBootstrapFrameError),
+    BootstrapFrame(PdBootstrapFrameError),
     Zmq(String),
 }
 
@@ -799,8 +814,8 @@ impl fmt::Display for PrefillBootstrapServeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "prefill bootstrap server error: {error}"),
-            Self::MooncakeFrame(error) => {
-                write!(formatter, "prefill bootstrap Mooncake frame error: {error}")
+            Self::BootstrapFrame(error) => {
+                write!(formatter, "prefill bootstrap frame error: {error}")
             }
             Self::Zmq(error) => write!(formatter, "prefill bootstrap ZMQ error: {error}"),
         }
@@ -815,17 +830,17 @@ impl From<std::io::Error> for PrefillBootstrapServeError {
     }
 }
 
-impl From<MooncakeBootstrapFrameError> for PrefillBootstrapServeError {
-    fn from(value: MooncakeBootstrapFrameError) -> Self {
-        Self::MooncakeFrame(value)
+impl From<PdBootstrapFrameError> for PrefillBootstrapServeError {
+    fn from(value: PdBootstrapFrameError) -> Self {
+        Self::BootstrapFrame(value)
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MooncakeDecodeKvArgsRegistration {
+pub struct PdDecodeKvArgsRegistration {
     pub endpoint: String,
     pub dst_port: u16,
-    pub mooncake_session_id: String,
+    pub session_id: String,
     pub dst_kv_ptrs: Vec<u64>,
     pub dst_aux_ptrs: Vec<u64>,
     pub dst_state_data_ptrs: Vec<Vec<u64>>,
@@ -836,13 +851,15 @@ pub struct MooncakeDecodeKvArgsRegistration {
     pub dst_state_dim_per_tensor: Vec<Vec<u32>>,
 }
 
-impl MooncakeDecodeKvArgsRegistration {
+pub type MooncakeDecodeKvArgsRegistration = PdDecodeKvArgsRegistration;
+
+impl PdDecodeKvArgsRegistration {
     fn to_frame(&self) -> Vec<Vec<u8>> {
         vec![
             b"None".to_vec(),
             self.endpoint.as_bytes().to_vec(),
             self.dst_port.to_string().into_bytes(),
-            self.mooncake_session_id.as_bytes().to_vec(),
+            self.session_id.as_bytes().to_vec(),
             pack_u64s(&self.dst_kv_ptrs),
             pack_u64s(&self.dst_aux_ptrs),
             pack_u64_lists(&self.dst_state_data_ptrs),
@@ -858,11 +875,11 @@ impl MooncakeDecodeKvArgsRegistration {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MooncakeDecodeTransferMetadata {
+pub struct PdDecodeTransferMetadata {
     pub room: BootstrapRoom,
     pub endpoint: String,
     pub dst_port: u16,
-    pub mooncake_session_id: String,
+    pub session_id: String,
     pub dst_kv_indices: Vec<i32>,
     pub dst_aux_index: Option<i32>,
     pub dst_state_indices: Vec<Vec<i32>>,
@@ -871,15 +888,17 @@ pub struct MooncakeDecodeTransferMetadata {
     pub is_dummy: bool,
 }
 
-impl MooncakeDecodeTransferMetadata {
-    fn to_frame(&self) -> Result<Vec<Vec<u8>>, MooncakeDecodeBootstrapError> {
+pub type MooncakeDecodeTransferMetadata = PdDecodeTransferMetadata;
+
+impl PdDecodeTransferMetadata {
+    fn to_frame(&self) -> Result<Vec<Vec<u8>>, PdDecodeBootstrapError> {
         let (dst_kv_indices, dst_aux_index, dst_state_indices) = if self.is_dummy {
             (Vec::new(), Vec::new(), Vec::new())
         } else {
             let dst_aux_index =
                 self.dst_aux_index
-                    .ok_or(MooncakeDecodeBootstrapError::MissingAuxIndex {
-                        session_id: self.mooncake_session_id.clone(),
+                    .ok_or(PdDecodeBootstrapError::MissingAuxIndex {
+                        session_id: self.session_id.clone(),
                     })?;
             (
                 pack_i32s(&self.dst_kv_indices),
@@ -892,7 +911,7 @@ impl MooncakeDecodeTransferMetadata {
             self.room.to_string().into_bytes(),
             self.endpoint.as_bytes().to_vec(),
             self.dst_port.to_string().into_bytes(),
-            self.mooncake_session_id.as_bytes().to_vec(),
+            self.session_id.as_bytes().to_vec(),
             dst_kv_indices,
             dst_aux_index,
             dst_state_indices,
@@ -903,30 +922,28 @@ impl MooncakeDecodeTransferMetadata {
 }
 
 #[derive(Debug)]
-pub struct MooncakeDecodeBootstrapPublisher {
+pub struct PdDecodeBootstrapPublisher {
     endpoint: String,
     dst_port: u16,
-    mooncake_session_id: String,
-    kv_cache_layout: Option<crate::transfer::MooncakeKvCacheLayout>,
+    session_id: String,
+    kv_cache_layout: Option<KvTransferLayout>,
     target_tp_rank: i32,
     target_pp_rank: i32,
     dst_aux_index: Option<i32>,
     required_dst_info_num: usize,
     registered_kv_args_endpoints: BTreeSet<String>,
-    receiver: Option<MooncakeDecodeReceiver>,
+    receiver: Option<PdDecodeReceiver>,
     receive_targets: BTreeMap<BootstrapRoom, String>,
 }
 
-impl MooncakeDecodeBootstrapPublisher {
-    pub fn new(
-        endpoint: impl Into<String>,
-        dst_port: u16,
-        mooncake_session_id: impl Into<String>,
-    ) -> Self {
+pub type MooncakeDecodeBootstrapPublisher = PdDecodeBootstrapPublisher;
+
+impl PdDecodeBootstrapPublisher {
+    pub fn new(endpoint: impl Into<String>, dst_port: u16, session_id: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
             dst_port,
-            mooncake_session_id: mooncake_session_id.into(),
+            session_id: session_id.into(),
             kv_cache_layout: None,
             target_tp_rank: 0,
             target_pp_rank: 0,
@@ -938,16 +955,13 @@ impl MooncakeDecodeBootstrapPublisher {
         }
     }
 
-    pub fn with_kv_cache_layout(
-        mut self,
-        kv_cache_layout: crate::transfer::MooncakeKvCacheLayout,
-    ) -> Self {
+    pub fn with_kv_cache_layout(mut self, kv_cache_layout: KvTransferLayout) -> Self {
         self.kv_cache_layout = Some(kv_cache_layout);
         self
     }
 
     pub fn with_receiver(mut self) -> Result<Self, String> {
-        let receiver = MooncakeDecodeReceiver::start(&self.endpoint)?;
+        let receiver = PdDecodeReceiver::start(&self.endpoint)?;
         self.dst_port = receiver.port();
         self.receiver = Some(receiver);
         Ok(self)
@@ -972,19 +986,19 @@ impl MooncakeDecodeBootstrapPublisher {
     fn metadata_for_span(
         &self,
         span: &KvCacheTransferSpan,
-    ) -> Result<MooncakeDecodeTransferMetadata, String> {
-        Ok(MooncakeDecodeTransferMetadata {
+    ) -> Result<PdDecodeTransferMetadata, String> {
+        Ok(PdDecodeTransferMetadata {
             room: span.bootstrap_room(),
             endpoint: self.endpoint.clone(),
             dst_port: self.dst_port,
-            mooncake_session_id: self.mooncake_session_id.clone(),
+            session_id: self.session_id.clone(),
             dst_kv_indices: span
                 .page_indices()
                 .iter()
                 .map(|page| {
                     i32::try_from(page.as_usize()).map_err(|_| {
                         format!(
-                            "physical KV page {} cannot fit into Mooncake metadata i32 index",
+                            "physical KV page {} cannot fit into metadata i32 index",
                             page.as_usize()
                         )
                     })
@@ -998,15 +1012,15 @@ impl MooncakeDecodeBootstrapPublisher {
         })
     }
 
-    fn kv_args_registration(&self) -> Option<MooncakeDecodeKvArgsRegistration> {
+    fn kv_args_registration(&self) -> Option<PdDecodeKvArgsRegistration> {
         let layout = self.kv_cache_layout?;
         if layout.source_base_addr == 0 {
             return None;
         }
-        Some(MooncakeDecodeKvArgsRegistration {
+        Some(PdDecodeKvArgsRegistration {
             endpoint: self.endpoint.clone(),
             dst_port: self.dst_port,
-            mooncake_session_id: self.mooncake_session_id.clone(),
+            session_id: self.session_id.clone(),
             dst_kv_ptrs: vec![layout.source_base_addr as u64],
             dst_aux_ptrs: Vec::new(),
             dst_state_data_ptrs: Vec::new(),
@@ -1019,12 +1033,12 @@ impl MooncakeDecodeBootstrapPublisher {
     }
 
     #[doc(hidden)]
-    pub fn kv_args_registration_for_test(&self) -> Option<MooncakeDecodeKvArgsRegistration> {
+    pub fn kv_args_registration_for_test(&self) -> Option<PdDecodeKvArgsRegistration> {
         self.kv_args_registration()
     }
 }
 
-impl DecodeBootstrapPublisher for MooncakeDecodeBootstrapPublisher {
+impl DecodeBootstrapPublisher for PdDecodeBootstrapPublisher {
     fn publish_decode_bootstrap_metadata(
         &mut self,
         plan: &KvCacheTransferPlan,
@@ -1042,11 +1056,7 @@ impl DecodeBootstrapPublisher for MooncakeDecodeBootstrapPublisher {
             let target_pp_rank = self.target_pp_rank;
             let kv_args_registration_key = format!(
                 "{}|{}|{}|{}|{}",
-                bootstrap_addr,
-                prefill_dp_rank,
-                target_tp_rank,
-                target_pp_rank,
-                self.mooncake_session_id
+                bootstrap_addr, prefill_dp_rank, target_tp_rank, target_pp_rank, self.session_id
             );
             let kv_args_registration = if self
                 .registered_kv_args_endpoints
@@ -1062,7 +1072,7 @@ impl DecodeBootstrapPublisher for MooncakeDecodeBootstrapPublisher {
             }
             self.receive_targets
                 .insert(span.bootstrap_room(), bootstrap_addr.clone());
-            publish_mooncake_decode_metadata_blocking(
+            publish_decode_metadata_blocking(
                 bootstrap_addr,
                 prefill_dp_rank,
                 target_tp_rank,
@@ -1092,7 +1102,7 @@ impl DecodeBootstrapPublisher for MooncakeDecodeBootstrapPublisher {
         let receiver = self
             .receiver
             .as_ref()
-            .ok_or("Mooncake decode receiver was not started")?;
+            .ok_or("decode receiver was not started")?;
         let (token, state) = receiver.receive_token_and_state(room)?;
         receiver.remove(room);
         self.receive_targets.remove(&room);
@@ -1106,13 +1116,13 @@ impl DecodeBootstrapPublisher for MooncakeDecodeBootstrapPublisher {
         let receiver = self
             .receiver
             .as_ref()
-            .ok_or("Mooncake decode receiver was not started")?;
+            .ok_or("decode receiver was not started")?;
         if receiver.is_drained(room) {
             receiver.remove(room);
             self.receive_targets.remove(&room);
             return Ok(());
         }
-        let target = query_mooncake_control_target(bootstrap_addr)?;
+        let target = query_control_target(bootstrap_addr)?;
         send_frames(
             target,
             vec![vec![
@@ -1129,7 +1139,7 @@ impl DecodeBootstrapPublisher for MooncakeDecodeBootstrapPublisher {
     }
 }
 
-impl Drop for MooncakeDecodeBootstrapPublisher {
+impl Drop for PdDecodeBootstrapPublisher {
     fn drop(&mut self) {
         for room in self.receive_targets.keys().copied().collect::<Vec<_>>() {
             if self.receiver.is_some()
@@ -1144,7 +1154,7 @@ impl Drop for MooncakeDecodeBootstrapPublisher {
     }
 }
 
-fn query_mooncake_control_target(bootstrap_addr: String) -> Result<String, String> {
+pub fn query_control_target(bootstrap_addr: String) -> Result<String, String> {
     std::thread::spawn(move || {
         let response = http_get(
             &bootstrap_addr,
@@ -1156,11 +1166,15 @@ fn query_mooncake_control_target(bootstrap_addr: String) -> Result<String, Strin
         Ok(rank.zmq_endpoint())
     })
     .join()
-    .map_err(|_| "Mooncake route lookup panicked".to_string())?
+    .map_err(|_| "control route lookup panicked".to_string())?
+}
+
+pub fn query_mooncake_control_target(bootstrap_addr: String) -> Result<String, String> {
+    query_control_target(bootstrap_addr)
 }
 
 #[derive(Debug)]
-pub enum MooncakeDecodeBootstrapError {
+pub enum PdDecodeBootstrapError {
     HttpStatus { status: u16, body: String },
     InvalidHttpResponse,
     Io(std::io::Error),
@@ -1170,7 +1184,9 @@ pub enum MooncakeDecodeBootstrapError {
     Zmq(String),
 }
 
-impl fmt::Display for MooncakeDecodeBootstrapError {
+pub type MooncakeDecodeBootstrapError = PdDecodeBootstrapError;
+
+impl fmt::Display for PdDecodeBootstrapError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::HttpStatus { status, body } => {
@@ -1185,7 +1201,7 @@ impl fmt::Display for MooncakeDecodeBootstrapError {
             Self::MissingAuxIndex { session_id } => {
                 write!(
                     formatter,
-                    "Mooncake transfer metadata for {session_id} needs aux index"
+                    "transfer metadata for {session_id} needs aux index"
                 )
             }
             Self::TaskJoin(error) => write!(formatter, "bootstrap client task join error: {error}"),
@@ -1194,15 +1210,15 @@ impl fmt::Display for MooncakeDecodeBootstrapError {
     }
 }
 
-impl std::error::Error for MooncakeDecodeBootstrapError {}
+impl std::error::Error for PdDecodeBootstrapError {}
 
-impl From<std::io::Error> for MooncakeDecodeBootstrapError {
+impl From<std::io::Error> for PdDecodeBootstrapError {
     fn from(value: std::io::Error) -> Self {
         Self::Io(value)
     }
 }
 
-impl From<serde_json::Error> for MooncakeDecodeBootstrapError {
+impl From<serde_json::Error> for PdDecodeBootstrapError {
     fn from(value: serde_json::Error) -> Self {
         Self::Json(value)
     }
@@ -1230,7 +1246,7 @@ where
     Ok(())
 }
 
-pub async fn serve_mooncake_bootstrap_zmq_with_shutdown<F>(
+pub async fn serve_bootstrap_zmq_with_shutdown<F>(
     endpoint: impl Into<String>,
     service: PrefillBootstrapService,
     shutdown: F,
@@ -1271,7 +1287,7 @@ where
                         } else { true }
                     };
                     if quiescent {
-                        send_mooncake_bootstrap_frame(&endpoint, vec![b"ABORT_ACK".to_vec(), room.to_string().into_bytes(), b"0".to_vec()]).await.map_err(|e| PrefillBootstrapServeError::Zmq(e.to_string()))?;
+                        send_bootstrap_frame(&endpoint, vec![b"ABORT_ACK".to_vec(), room.to_string().into_bytes(), b"0".to_vec()]).await.map_err(|e| PrefillBootstrapServeError::Zmq(e.to_string()))?;
                     }
                     continue;
                 }
@@ -1279,13 +1295,24 @@ where
                     .state
                     .lock()
                     .expect("prefill bootstrap state lock should be held")
-                    .ingest_mooncake_bootstrap_frame(&frames)?;
+                    .ingest_bootstrap_frame(&frames)?;
             }
         }
     }
 }
 
-pub async fn serve_mooncake_bootstrap_zmq_endpoints_with_shutdown<F>(
+pub async fn serve_mooncake_bootstrap_zmq_with_shutdown<F>(
+    endpoint: impl Into<String>,
+    service: PrefillBootstrapService,
+    shutdown: F,
+) -> Result<(), PrefillBootstrapServeError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    serve_bootstrap_zmq_with_shutdown(endpoint, service, shutdown).await
+}
+
+pub async fn serve_bootstrap_zmq_endpoints_with_shutdown<F>(
     endpoints: Vec<String>,
     service: PrefillBootstrapService,
     shutdown: F,
@@ -1303,7 +1330,7 @@ where
     for endpoint in endpoints {
         let service = service.clone();
         let shutdown_rx = shutdown_rx.clone();
-        tasks.spawn(serve_mooncake_bootstrap_zmq_with_shutdown(
+        tasks.spawn(serve_bootstrap_zmq_with_shutdown(
             endpoint,
             service,
             watch_bootstrap_shutdown(shutdown_rx),
@@ -1314,12 +1341,12 @@ where
     tokio::select! {
         _ = &mut shutdown => {
             let _ = shutdown_tx.send(true);
-            join_mooncake_zmq_tasks(tasks).await?;
+            join_bootstrap_zmq_tasks(tasks).await?;
             Ok(())
         }
         result = tasks.join_next(), if !tasks.is_empty() => {
             let _ = shutdown_tx.send(true);
-            join_mooncake_zmq_tasks(tasks).await?;
+            join_bootstrap_zmq_tasks(tasks).await?;
             match result {
                 Some(Ok(Ok(()))) => Ok(()),
                 Some(Ok(Err(error))) => Err(error),
@@ -1332,13 +1359,24 @@ where
     }
 }
 
+pub async fn serve_mooncake_bootstrap_zmq_endpoints_with_shutdown<F>(
+    endpoints: Vec<String>,
+    service: PrefillBootstrapService,
+    shutdown: F,
+) -> Result<(), PrefillBootstrapServeError>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    serve_bootstrap_zmq_endpoints_with_shutdown(endpoints, service, shutdown).await
+}
+
 pub async fn query_prefill_route(
     bootstrap_addr: &str,
     prefill_dp_rank: i32,
     prefill_cp_rank: i32,
     target_tp_rank: i32,
     target_pp_rank: i32,
-) -> Result<PrefillRankInfo, MooncakeDecodeBootstrapError> {
+) -> Result<PrefillRankInfo, PdDecodeBootstrapError> {
     let bootstrap_addr = bootstrap_addr.to_string();
     tokio::task::spawn_blocking(move || {
         let path = format!(
@@ -1349,30 +1387,44 @@ pub async fn query_prefill_route(
         Ok(serde_json::from_str(&body)?)
     })
     .await
-    .map_err(|error| MooncakeDecodeBootstrapError::TaskJoin(error.to_string()))?
+    .map_err(|error| PdDecodeBootstrapError::TaskJoin(error.to_string()))?
+}
+
+pub async fn send_transfer_metadata(
+    endpoint: &str,
+    metadata: &PdDecodeTransferMetadata,
+) -> Result<(), PdDecodeBootstrapError> {
+    send_bootstrap_frame(endpoint, metadata.to_frame()?).await
 }
 
 pub async fn send_mooncake_transfer_metadata(
     endpoint: &str,
-    metadata: &MooncakeDecodeTransferMetadata,
-) -> Result<(), MooncakeDecodeBootstrapError> {
-    send_mooncake_bootstrap_frame(endpoint, metadata.to_frame()?).await
+    metadata: &PdDecodeTransferMetadata,
+) -> Result<(), PdDecodeBootstrapError> {
+    send_transfer_metadata(endpoint, metadata).await
+}
+
+pub async fn send_kv_args_registration(
+    endpoint: &str,
+    registration: &PdDecodeKvArgsRegistration,
+) -> Result<(), PdDecodeBootstrapError> {
+    send_bootstrap_frame(endpoint, registration.to_frame()).await
 }
 
 pub async fn send_mooncake_kv_args_registration(
     endpoint: &str,
-    registration: &MooncakeDecodeKvArgsRegistration,
-) -> Result<(), MooncakeDecodeBootstrapError> {
-    send_mooncake_bootstrap_frame(endpoint, registration.to_frame()).await
+    registration: &PdDecodeKvArgsRegistration,
+) -> Result<(), PdDecodeBootstrapError> {
+    send_kv_args_registration(endpoint, registration).await
 }
 
-fn publish_mooncake_decode_metadata_blocking(
+fn publish_decode_metadata_blocking(
     bootstrap_addr: String,
     prefill_dp_rank: i32,
     target_tp_rank: i32,
     target_pp_rank: i32,
-    kv_args_registration: Option<MooncakeDecodeKvArgsRegistration>,
-    metadata: MooncakeDecodeTransferMetadata,
+    kv_args_registration: Option<PdDecodeKvArgsRegistration>,
+    metadata: PdDecodeTransferMetadata,
 ) -> Result<(), String> {
     let run_client = move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1390,11 +1442,11 @@ fn publish_mooncake_decode_metadata_blocking(
             .await
             .map_err(|error| error.to_string())?;
             if let Some(kv_args_registration) = kv_args_registration.as_ref() {
-                send_mooncake_kv_args_registration(&rank.zmq_endpoint(), kv_args_registration)
+                send_kv_args_registration(&rank.zmq_endpoint(), kv_args_registration)
                     .await
                     .map_err(|error| error.to_string())?;
             }
-            send_mooncake_transfer_metadata(&rank.zmq_endpoint(), &metadata)
+            send_transfer_metadata(&rank.zmq_endpoint(), &metadata)
                 .await
                 .map_err(|error| error.to_string())
         })
@@ -1407,10 +1459,28 @@ fn publish_mooncake_decode_metadata_blocking(
     }
 }
 
-async fn send_mooncake_bootstrap_frame(
+pub fn publish_mooncake_decode_metadata_blocking(
+    bootstrap_addr: String,
+    prefill_dp_rank: i32,
+    target_tp_rank: i32,
+    target_pp_rank: i32,
+    kv_args_registration: Option<PdDecodeKvArgsRegistration>,
+    metadata: PdDecodeTransferMetadata,
+) -> Result<(), String> {
+    publish_decode_metadata_blocking(
+        bootstrap_addr,
+        prefill_dp_rank,
+        target_tp_rank,
+        target_pp_rank,
+        kv_args_registration,
+        metadata,
+    )
+}
+
+async fn send_bootstrap_frame(
     endpoint: &str,
     frame: Vec<Vec<u8>>,
-) -> Result<(), MooncakeDecodeBootstrapError> {
+) -> Result<(), PdDecodeBootstrapError> {
     let mut last_error = None;
     for _ in 0..20 {
         let mut socket = PushSocket::new();
@@ -1427,12 +1497,19 @@ async fn send_mooncake_bootstrap_frame(
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 
-    Err(MooncakeDecodeBootstrapError::Zmq(
+    Err(PdDecodeBootstrapError::Zmq(
         last_error.unwrap_or_else(|| "no ZMQ send attempts ran".to_string()),
     ))
 }
 
-fn http_get(addr: &str, path: &str) -> Result<String, MooncakeDecodeBootstrapError> {
+pub async fn send_mooncake_bootstrap_frame(
+    endpoint: &str,
+    frame: Vec<Vec<u8>>,
+) -> Result<(), PdDecodeBootstrapError> {
+    send_bootstrap_frame(endpoint, frame).await
+}
+
+fn http_get(addr: &str, path: &str) -> Result<String, PdDecodeBootstrapError> {
     let mut stream = std::net::TcpStream::connect(addr)?;
     let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes())?;
@@ -1441,18 +1518,18 @@ fn http_get(addr: &str, path: &str) -> Result<String, MooncakeDecodeBootstrapErr
     Ok(response)
 }
 
-fn http_success_body(response: String) -> Result<String, MooncakeDecodeBootstrapError> {
+fn http_success_body(response: String) -> Result<String, PdDecodeBootstrapError> {
     let (headers, body) = response
         .split_once("\r\n\r\n")
-        .ok_or(MooncakeDecodeBootstrapError::InvalidHttpResponse)?;
+        .ok_or(PdDecodeBootstrapError::InvalidHttpResponse)?;
     let status = headers
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|status| status.parse::<u16>().ok())
-        .ok_or(MooncakeDecodeBootstrapError::InvalidHttpResponse)?;
+        .ok_or(PdDecodeBootstrapError::InvalidHttpResponse)?;
     if status != 200 {
-        return Err(MooncakeDecodeBootstrapError::HttpStatus {
+        return Err(PdDecodeBootstrapError::HttpStatus {
             status,
             body: body.to_string(),
         });
@@ -1464,12 +1541,31 @@ fn zmq_message(frames: Vec<Vec<u8>>) -> ZmqMessage {
     let mut frames = frames.into_iter();
     let first = frames
         .next()
-        .expect("Mooncake bootstrap message should have at least one frame");
+        .expect("bootstrap message should have at least one frame");
     let mut message = ZmqMessage::from(first);
     for frame in frames {
         message.push_back(frame.into());
     }
     message
+}
+
+async fn join_bootstrap_zmq_tasks(
+    mut tasks: tokio::task::JoinSet<Result<(), PrefillBootstrapServeError>>,
+) -> Result<(), PrefillBootstrapServeError> {
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error),
+            Err(error) => return Err(PrefillBootstrapServeError::Zmq(error.to_string())),
+        }
+    }
+    Ok(())
+}
+
+pub async fn join_mooncake_zmq_tasks(
+    tasks: tokio::task::JoinSet<Result<(), PrefillBootstrapServeError>>,
+) -> Result<(), PrefillBootstrapServeError> {
+    join_bootstrap_zmq_tasks(tasks).await
 }
 
 fn pack_i32s(values: &[i32]) -> Vec<u8> {
@@ -1543,19 +1639,6 @@ async fn watch_bootstrap_shutdown(mut shutdown_rx: tokio::sync::watch::Receiver<
             break;
         }
     }
-}
-
-async fn join_mooncake_zmq_tasks(
-    mut tasks: tokio::task::JoinSet<Result<(), PrefillBootstrapServeError>>,
-) -> Result<(), PrefillBootstrapServeError> {
-    while let Some(result) = tasks.join_next().await {
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => return Err(error),
-            Err(error) => return Err(PrefillBootstrapServeError::Zmq(error.to_string())),
-        }
-    }
-    Ok(())
 }
 
 async fn health() -> &'static str {
@@ -1688,9 +1771,9 @@ fn require_min_fields(
     frame: &[Vec<u8>],
     expected: usize,
     frame_name: &'static str,
-) -> Result<(), MooncakeBootstrapFrameError> {
+) -> Result<(), PdBootstrapFrameError> {
     if frame.len() < expected {
-        return Err(MooncakeBootstrapFrameError::MissingField {
+        return Err(PdBootstrapFrameError::MissingField {
             frame: frame_name,
             expected,
             actual: frame.len(),
@@ -1703,11 +1786,11 @@ fn field<'a>(
     frame: &'a [Vec<u8>],
     index: usize,
     field: &'static str,
-) -> Result<&'a [u8], MooncakeBootstrapFrameError> {
+) -> Result<&'a [u8], PdBootstrapFrameError> {
     frame
         .get(index)
         .map(Vec::as_slice)
-        .ok_or(MooncakeBootstrapFrameError::MissingField {
+        .ok_or(PdBootstrapFrameError::MissingField {
             frame: field,
             expected: index + 1,
             actual: frame.len(),
@@ -1718,20 +1801,20 @@ fn ascii_field<'a>(
     frame: &'a [Vec<u8>],
     index: usize,
     name: &'static str,
-) -> Result<&'a str, MooncakeBootstrapFrameError> {
+) -> Result<&'a str, PdBootstrapFrameError> {
     std::str::from_utf8(field(frame, index, name)?)
-        .map_err(|_| MooncakeBootstrapFrameError::Utf8Field { field: name })
+        .map_err(|_| PdBootstrapFrameError::Utf8Field { field: name })
 }
 
 fn parse_i32(
     frame: &[Vec<u8>],
     index: usize,
     name: &'static str,
-) -> Result<i32, MooncakeBootstrapFrameError> {
+) -> Result<i32, PdBootstrapFrameError> {
     let value = ascii_field(frame, index, name)?;
     value
         .parse()
-        .map_err(|_| MooncakeBootstrapFrameError::IntegerField {
+        .map_err(|_| PdBootstrapFrameError::IntegerField {
             field: name,
             value: value.to_string(),
         })
@@ -1741,17 +1824,16 @@ fn parse_bootstrap_room(
     frame: &[Vec<u8>],
     index: usize,
     name: &'static str,
-) -> Result<BootstrapRoom, MooncakeBootstrapFrameError> {
+) -> Result<BootstrapRoom, PdBootstrapFrameError> {
     let value = ascii_field(frame, index, name)?;
-    let room =
-        value
-            .parse::<BootstrapRoom>()
-            .map_err(|_| MooncakeBootstrapFrameError::IntegerField {
-                field: name,
-                value: value.to_string(),
-            })?;
+    let room = value
+        .parse::<BootstrapRoom>()
+        .map_err(|_| PdBootstrapFrameError::IntegerField {
+            field: name,
+            value: value.to_string(),
+        })?;
     if room > i64::MAX as u64 {
-        return Err(MooncakeBootstrapFrameError::IntegerField {
+        return Err(PdBootstrapFrameError::IntegerField {
             field: name,
             value: value.to_string(),
         });
@@ -1764,11 +1846,11 @@ fn parse_u16(
     frame: &[Vec<u8>],
     index: usize,
     name: &'static str,
-) -> Result<u16, MooncakeBootstrapFrameError> {
+) -> Result<u16, PdBootstrapFrameError> {
     let value = ascii_field(frame, index, name)?;
     value
         .parse()
-        .map_err(|_| MooncakeBootstrapFrameError::IntegerField {
+        .map_err(|_| PdBootstrapFrameError::IntegerField {
             field: name,
             value: value.to_string(),
         })
@@ -1778,11 +1860,11 @@ fn parse_usize(
     frame: &[Vec<u8>],
     index: usize,
     name: &'static str,
-) -> Result<usize, MooncakeBootstrapFrameError> {
+) -> Result<usize, PdBootstrapFrameError> {
     let value = ascii_field(frame, index, name)?;
     value
         .parse()
-        .map_err(|_| MooncakeBootstrapFrameError::IntegerField {
+        .map_err(|_| PdBootstrapFrameError::IntegerField {
             field: name,
             value: value.to_string(),
         })
@@ -1792,7 +1874,7 @@ fn optional_usize(
     frame: &[Vec<u8>],
     index: usize,
     name: &'static str,
-) -> Result<Option<usize>, MooncakeBootstrapFrameError> {
+) -> Result<Option<usize>, PdBootstrapFrameError> {
     let Some(value) = frame.get(index) else {
         return Ok(None);
     };
@@ -1805,33 +1887,33 @@ fn optional_usize(
 fn optional_u32_lists(
     frame: &[Vec<u8>],
     index: usize,
-) -> Result<Vec<Vec<u32>>, MooncakeBootstrapFrameError> {
+) -> Result<Vec<Vec<u32>>, PdBootstrapFrameError> {
     let Some(value) = frame.get(index) else {
         return Ok(Vec::new());
     };
     unpack_u32_lists(value)
 }
 
-fn unpack_u64s(bytes: &[u8]) -> Result<Vec<u64>, MooncakeBootstrapFrameError> {
+fn unpack_u64s(bytes: &[u8]) -> Result<Vec<u64>, PdBootstrapFrameError> {
     unpack_fixed_width(bytes, 8, "u64 values", |chunk| {
         u64::from_le_bytes(chunk.try_into().expect("chunk width is checked"))
     })
 }
 
-fn unpack_i32s(bytes: &[u8]) -> Result<Vec<i32>, MooncakeBootstrapFrameError> {
+fn unpack_i32s(bytes: &[u8]) -> Result<Vec<i32>, PdBootstrapFrameError> {
     unpack_fixed_width(bytes, 4, "i32 values", |chunk| {
         i32::from_le_bytes(chunk.try_into().expect("chunk width is checked"))
     })
 }
 
-fn unpack_u64_lists(bytes: &[u8]) -> Result<Vec<Vec<u64>>, MooncakeBootstrapFrameError> {
+fn unpack_u64_lists(bytes: &[u8]) -> Result<Vec<Vec<u64>>, PdBootstrapFrameError> {
     unpack_list_of_buffers(bytes, "u64 lists")?
         .into_iter()
         .map(unpack_u64s)
         .collect()
 }
 
-fn unpack_u32_lists(bytes: &[u8]) -> Result<Vec<Vec<u32>>, MooncakeBootstrapFrameError> {
+fn unpack_u32_lists(bytes: &[u8]) -> Result<Vec<Vec<u32>>, PdBootstrapFrameError> {
     unpack_list_of_buffers(bytes, "u32 lists")?
         .into_iter()
         .map(|bytes| {
@@ -1842,7 +1924,7 @@ fn unpack_u32_lists(bytes: &[u8]) -> Result<Vec<Vec<u32>>, MooncakeBootstrapFram
         .collect()
 }
 
-fn unpack_i32_lists(bytes: &[u8]) -> Result<Vec<Vec<i32>>, MooncakeBootstrapFrameError> {
+fn unpack_i32_lists(bytes: &[u8]) -> Result<Vec<Vec<i32>>, PdBootstrapFrameError> {
     unpack_list_of_buffers(bytes, "i32 lists")?
         .into_iter()
         .map(unpack_i32s)
@@ -1854,12 +1936,12 @@ fn unpack_fixed_width<T, F>(
     width: usize,
     field: &'static str,
     decode: F,
-) -> Result<Vec<T>, MooncakeBootstrapFrameError>
+) -> Result<Vec<T>, PdBootstrapFrameError>
 where
     F: Fn(&[u8]) -> T,
 {
     if !bytes.len().is_multiple_of(width) {
-        return Err(MooncakeBootstrapFrameError::BinaryLength {
+        return Err(PdBootstrapFrameError::BinaryLength {
             field,
             width,
             actual: bytes.len(),
@@ -1871,17 +1953,17 @@ where
 fn unpack_list_of_buffers<'a>(
     bytes: &'a [u8],
     field: &'static str,
-) -> Result<Vec<&'a [u8]>, MooncakeBootstrapFrameError> {
+) -> Result<Vec<&'a [u8]>, PdBootstrapFrameError> {
     if bytes.is_empty() {
         return Ok(Vec::new());
     }
     if bytes.len() < 4 {
-        return Err(MooncakeBootstrapFrameError::PackedListHeader { field });
+        return Err(PdBootstrapFrameError::PackedListHeader { field });
     }
     let count = u32::from_le_bytes(bytes[0..4].try_into().expect("slice has length 4")) as usize;
     let header_len = 4 + count * 4;
     if bytes.len() < header_len {
-        return Err(MooncakeBootstrapFrameError::PackedListHeader { field });
+        return Err(PdBootstrapFrameError::PackedListHeader { field });
     }
 
     let mut lengths = Vec::with_capacity(count);
@@ -1899,7 +1981,7 @@ fn unpack_list_of_buffers<'a>(
     for length in lengths {
         let end = offset + length;
         if bytes.len() < end {
-            return Err(MooncakeBootstrapFrameError::PackedListLength { field });
+            return Err(PdBootstrapFrameError::PackedListLength { field });
         }
         buffers.push(&bytes[offset..end]);
         offset = end;

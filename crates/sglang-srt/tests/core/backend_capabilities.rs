@@ -13,7 +13,7 @@ fn cpu_reference_reports_missing_production_requirements_together() {
             attention_backend: Some("flashinfer"),
             tensor_parallel_size: 2,
             requires_kv_cache_registration: true,
-            requires_mooncake: true,
+            requires_kv_transfer: true,
         })
         .expect_err("CPU reference must not satisfy production requirements");
 
@@ -24,7 +24,7 @@ fn cpu_reference_reports_missing_production_requirements_together() {
             "attention backend flashinfer",
             "tensor parallel size 2",
             "KV cache memory registration",
-            "Mooncake transport",
+            "KV transfer transport",
         ]
     );
 }

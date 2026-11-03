@@ -48,7 +48,7 @@ the full-model demo and is not a network transfer test.
 cargo test -p sglang-srt --locked --lib nonzero_qwen_pd
 cargo test -p sglang-srt --locked --lib pd_shutdown_tests
 cargo test -p sglang-srt --locked --features test-support \
-  --test core mooncake_lifecycle --test server pd_bootstrap_server
+  --test core transfer_lifecycle --test server pd_bootstrap_server
 ```
 
 The numerical oracle runs a complete nonzero-weight Qwen3 Transformer for four
@@ -57,7 +57,7 @@ deliberately corrupted KV. Its host payload copy is test-only. Local ZMQ
 control tests cover completion and cancellation, but do not validate CUDA
 memory registration, RDMA, or NVLink.
 
-## CUDA and Native Mooncake
+## CUDA and P/D Acceptance
 
 The [CUDA Acceptance workflow](../.github/workflows/cuda-acceptance.yml) uses
 a Linux self-hosted runner labeled `cuda`, without a GPU product-model label.
@@ -65,9 +65,8 @@ It exercises nonzero device placement, allocation, kernels, inference, and
 two-rank NCCL execution. Its full matrix requires two visible CUDA devices;
 this is an acceptance-test requirement, not a single-rank serving requirement.
 
-Start it manually, or set `ENABLE_CUDA_CI=true` for pushes to `main`. Native
-registration and linked P/D tests additionally require `MOONCAKE_BUILD_DIR`
-and the `mooncake` manual input or `ENABLE_MOONCAKE_CI=true`.
+Start it manually, or set `ENABLE_CUDA_CI=true` for pushes to `main`. P/D network
+tests can be enabled with the `pd_network` manual input or `ENABLE_PD_NETWORK_CI=true`.
 
 For a single-device allocation and kernel check:
 
@@ -76,12 +75,12 @@ SGLANG_CUDA_TEST_DEVICE=0 cargo test -p sglang-srt --locked \
   --test core cuda_backend:: -- --ignored --nocapture --test-threads=1
 ```
 
-For linked P/D acceptance, using a nonzero CUDA ordinal:
+For P/D network acceptance, using a nonzero CUDA ordinal:
 
 ```bash
-MOONCAKE_BUILD_DIR=/path/to/Mooncake/build SGLANG_CUDA_TEST_DEVICE=1 \
-  cargo test -p sglang-router --locked --features mooncake-link --test proxy \
-  real_srt_pd::router_pd_chat_completes_with_real_cuda_qwen_mooncake_workers \
+SGLANG_CUDA_TEST_DEVICE=1 \
+  cargo test -p sglang-router --locked --test proxy \
+  real_srt_pd::router_pd_chat_completes_with_real_cuda_qwen_workers \
   -- --ignored --nocapture --test-threads=1
 ```
 

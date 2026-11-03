@@ -27,17 +27,15 @@ use sglang_srt::server::test_support::{
 };
 use sglang_srt::server::{
     ServerLaunchError, grpc_http_sidecar_listen_addr, grpc_listen_addr, launch_grpc_server,
-    launch_grpc_server_with_shutdown, prefill_mooncake_zmq_endpoints,
-    register_prefill_mooncake_routes_from_args, try_build_bootstrap_grpc_router_service,
-    try_build_bootstrap_prefill_http_router_service,
+    launch_grpc_server_with_shutdown, prefill_zmq_endpoints, register_prefill_routes_from_args,
+    try_build_bootstrap_grpc_router_service, try_build_bootstrap_prefill_http_router_service,
 };
 use sglang_srt::tokenizer::TokenizerError;
 use sglang_srt::transfer::{
-    DecodeBootstrapRegistry, DisaggregationMode, KvCacheMemoryLocation, KvTransferBackend,
-    MooncakeBatchId, MooncakeBatchReleaser, MooncakeBufferEntry, MooncakeError,
-    MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeMemoryRegistrar,
-    MooncakeTransferRequest, MooncakeTransferStatus, MooncakeTransferStatusCode,
-    MooncakeTransferStatusReader, MooncakeTransferSubmitter, MooncakeTransferTarget,
+    DecodeBootstrapRegistry, DisaggregationMode, KvBatchId, KvBatchReleaser, KvBufferEntry,
+    KvCacheMemoryLocation, KvCacheTransferExecutor, KvMemoryRegistrar, KvTransferBackend,
+    KvTransferLayout, KvTransferRequest, KvTransferStatus, KvTransferStatusCode,
+    KvTransferStatusReader, KvTransferSubmitter, KvTransferTarget, KvTransportError,
     TransferBackend, TransferableKvCacheMemory, TransferableKvCacheRegion,
 };
 
@@ -1155,16 +1153,16 @@ async fn bootstrap_pd_grpc_router_service_polls_transfer_before_decode() {
         "8",
     ])
     .expect("args should parse");
-    let mut transfer_executor = MooncakeKvCacheTransferExecutor::new(
-        RecordingMooncakeBackend::completed(),
-        MooncakeKvCacheLayout {
+    let mut transfer_executor = KvCacheTransferExecutor::new(
+        RecordingKvBackend::completed(),
+        KvTransferLayout {
             source_base_addr: 0x3000,
             page_size_bytes: 64,
             target_base_offset: 0,
         },
-        MooncakeTransferTarget { target_id: 17 },
+        KvTransferTarget { target_id: 17 },
     )
-    .with_memory_registrar(RecordingMooncakeBackend::default());
+    .with_memory_registrar(RecordingKvBackend::default());
     transfer_executor
         .register(
             TransferableKvCacheMemory::new(
@@ -1178,7 +1176,7 @@ async fn bootstrap_pd_grpc_router_service_polls_transfer_before_decode() {
             )
             .expect("test NexusKV descriptor should be valid"),
         )
-        .expect("test Mooncake executor should register active KV memory");
+        .expect("test KV executor should register active KV memory");
     let service = build_reference_pd_grpc_router_service(
         &args,
         DecodeBootstrapRegistry::default(),
@@ -1352,9 +1350,8 @@ async fn launch_grpc_server_rejects_unsupported_nixl_pd_backend() {
     );
 }
 
-#[cfg(not(feature = "mooncake-link"))]
 #[tokio::test]
-async fn launch_grpc_server_rejects_unlinked_mooncake_before_serving() {
+async fn launch_grpc_server_rejects_retired_mooncake_backend() {
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
@@ -1369,13 +1366,12 @@ async fn launch_grpc_server_rejects_unlinked_mooncake_before_serving() {
 
     let error = launch_grpc_server(args)
         .await
-        .expect_err("unlinked Mooncake must fail before serving");
+        .expect_err("retired Mooncake must fail before serving");
 
     assert!(
-        matches!(
-            error,
-            ServerLaunchError::MooncakeTransfer(MooncakeError::UnavailableWithoutLink)
-        ),
+        error
+            .to_string()
+            .contains("invalid disaggregation transfer backend: mooncake"),
         "unexpected error: {error:?}"
     );
 }
@@ -1398,7 +1394,7 @@ fn prefill_mooncake_zmq_endpoints_follow_launch_host_and_port_range() {
     .expect("args should parse");
 
     assert_eq!(
-        prefill_mooncake_zmq_endpoints(&args),
+        prefill_zmq_endpoints(&args),
         vec![
             "tcp://0.0.0.0:7000".to_string(),
             "tcp://0.0.0.0:7001".to_string(),
@@ -1408,7 +1404,7 @@ fn prefill_mooncake_zmq_endpoints_follow_launch_host_and_port_range() {
 }
 
 #[test]
-fn prefill_mooncake_route_registration_maps_tp_ranks_to_zmq_ports() {
+fn prefill_route_registration_maps_tp_ranks_to_zmq_ports() {
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
@@ -1426,15 +1422,14 @@ fn prefill_mooncake_route_registration_maps_tp_ranks_to_zmq_ports() {
         "--disaggregation-mode",
         "prefill",
         "--disaggregation-transfer-backend",
-        "mooncake",
+        "tcp",
         "--disaggregation-zmq-ports",
         "7000-7001",
     ])
     .expect("args should parse");
     let service = PrefillBootstrapService::default();
 
-    register_prefill_mooncake_routes_from_args(&service, &args)
-        .expect("prefill ZMQ routes should register");
+    register_prefill_routes_from_args(&service, &args).expect("prefill ZMQ routes should register");
 
     let state = service.state().lock().expect("state lock should be held");
     let topology = state
@@ -1461,7 +1456,7 @@ fn prefill_mooncake_route_registration_maps_tp_ranks_to_zmq_ports() {
 }
 
 #[test]
-fn prefill_mooncake_route_registration_uses_dist_init_host_for_wildcard_bind_host() {
+fn prefill_route_registration_uses_dist_init_host_for_wildcard_bind_host() {
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
@@ -1475,15 +1470,14 @@ fn prefill_mooncake_route_registration_uses_dist_init_host_for_wildcard_bind_hos
         "--disaggregation-mode",
         "prefill",
         "--disaggregation-transfer-backend",
-        "mooncake",
+        "tcp",
         "--disaggregation-zmq-ports",
         "7000-7000",
     ])
     .expect("args should parse");
     let service = PrefillBootstrapService::default();
 
-    register_prefill_mooncake_routes_from_args(&service, &args)
-        .expect("prefill ZMQ routes should register");
+    register_prefill_routes_from_args(&service, &args).expect("prefill ZMQ routes should register");
 
     let state = service.state().lock().expect("state lock should be held");
     assert_eq!(
@@ -1496,7 +1490,7 @@ fn prefill_mooncake_route_registration_uses_dist_init_host_for_wildcard_bind_hos
 }
 
 #[test]
-fn prefill_mooncake_route_registration_rejects_incomplete_zmq_port_range() {
+fn prefill_route_registration_rejects_incomplete_zmq_port_range() {
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
@@ -1506,14 +1500,14 @@ fn prefill_mooncake_route_registration_rejects_incomplete_zmq_port_range() {
         "--disaggregation-mode",
         "prefill",
         "--disaggregation-transfer-backend",
-        "mooncake",
+        "tcp",
         "--disaggregation-zmq-ports",
         "7000-7000",
     ])
     .expect("args should parse");
     let service = PrefillBootstrapService::default();
 
-    let error = register_prefill_mooncake_routes_from_args(&service, &args)
+    let error = register_prefill_routes_from_args(&service, &args)
         .expect_err("incomplete ZMQ port range should fail route registration");
 
     assert_eq!(
@@ -1526,69 +1520,72 @@ fn prefill_mooncake_route_registration_rejects_incomplete_zmq_port_range() {
 }
 
 #[derive(Default)]
-struct RecordingMooncakeBackend {
+struct RecordingKvBackend {
     submitted_batches: usize,
-    statuses: Vec<MooncakeTransferStatusCode>,
-    freed_batches: Vec<MooncakeBatchId>,
+    statuses: Vec<KvTransferStatusCode>,
+    freed_batches: Vec<KvBatchId>,
 }
 
-impl RecordingMooncakeBackend {
+impl RecordingKvBackend {
     fn completed() -> Self {
         Self {
             submitted_batches: 0,
-            statuses: vec![MooncakeTransferStatusCode::Completed],
+            statuses: vec![KvTransferStatusCode::Completed],
             freed_batches: Vec::new(),
         }
     }
 }
 
-impl MooncakeTransferSubmitter for RecordingMooncakeBackend {
+impl KvTransferSubmitter for RecordingKvBackend {
     fn submit_transfer(
         &mut self,
-        requests: &mut [MooncakeTransferRequest],
-    ) -> Result<MooncakeBatchId, MooncakeError> {
+        requests: &mut [KvTransferRequest],
+    ) -> Result<KvBatchId, KvTransportError> {
         assert!(!requests.is_empty());
         self.submitted_batches += 1;
-        Ok(700 + self.submitted_batches as MooncakeBatchId - 1)
+        Ok(700 + self.submitted_batches as KvBatchId - 1)
     }
 }
 
-impl MooncakeTransferStatusReader for RecordingMooncakeBackend {
+impl KvTransferStatusReader for RecordingKvBackend {
     fn transfer_status(
         &mut self,
-        _batch_id: MooncakeBatchId,
+        _batch_id: KvBatchId,
         task_id: usize,
-    ) -> Result<MooncakeTransferStatus, MooncakeError> {
+    ) -> Result<KvTransferStatus, KvTransportError> {
         let status = self
             .statuses
             .get(task_id)
             .or_else(|| self.statuses.last())
             .copied()
-            .expect("recording Mooncake backend needs at least one status");
-        Ok(MooncakeTransferStatus {
+            .expect("recording KV backend needs at least one status");
+        Ok(KvTransferStatus {
             status: status as i32,
             transferred_bytes: 0,
         })
     }
 }
 
-impl MooncakeBatchReleaser for RecordingMooncakeBackend {
-    fn free_batch(&mut self, batch_id: MooncakeBatchId) -> Result<(), MooncakeError> {
+impl KvBatchReleaser for RecordingKvBackend {
+    fn free_batch(&mut self, batch_id: KvBatchId) -> Result<(), KvTransportError> {
         self.freed_batches.push(batch_id);
         Ok(())
     }
 }
 
-impl MooncakeMemoryRegistrar for RecordingMooncakeBackend {
+impl KvMemoryRegistrar for RecordingKvBackend {
     fn register_memory_batch(
         &mut self,
-        _buffers: &mut [MooncakeBufferEntry],
+        _buffers: &mut [KvBufferEntry],
         _location: &str,
-    ) -> Result<(), MooncakeError> {
+    ) -> Result<(), KvTransportError> {
         Ok(())
     }
 
-    fn unregister_memory_batch(&mut self, _addrs: &mut [*mut c_void]) -> Result<(), MooncakeError> {
+    fn unregister_memory_batch(
+        &mut self,
+        _addrs: &mut [*mut c_void],
+    ) -> Result<(), KvTransportError> {
         Ok(())
     }
 }

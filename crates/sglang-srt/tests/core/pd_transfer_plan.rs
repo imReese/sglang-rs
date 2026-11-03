@@ -5,12 +5,11 @@ use sglang_srt::cache::{CachePageAllocator, CachePageId, RadixCache};
 use sglang_srt::model_executor::ModelWorkerBatch;
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::transfer::{
-    DecodeBootstrapRegistry, DecodeBootstrapSession, KvCacheMemoryLocation, KvCacheTransferError,
-    KvCacheTransferPlan, KvPoll, KvTransferBackend, KvTransferCompletionEvent, KvTransferPoll,
-    MooncakeBatchId, MooncakeBatchReleaser, MooncakeBufferEntry, MooncakeError,
-    MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeMemoryRegistrar,
-    MooncakeTransferRequest, MooncakeTransferStatus, MooncakeTransferStatusCode,
-    MooncakeTransferStatusReader, MooncakeTransferSubmitter, MooncakeTransferTarget,
+    DecodeBootstrapRegistry, DecodeBootstrapSession, KvBatchId, KvBatchReleaser, KvBufferEntry,
+    KvCacheMemoryLocation, KvCacheTransferError, KvCacheTransferExecutor, KvCacheTransferPlan,
+    KvMemoryRegistrar, KvPoll, KvTransferBackend, KvTransferCompletionEvent, KvTransferLayout,
+    KvTransferPoll, KvTransferRequest, KvTransferStatus, KvTransferStatusCode,
+    KvTransferStatusReader, KvTransferSubmitter, KvTransferTarget, KvTransportError,
     TransferableKvCacheMemory, TransferableKvCacheRegion, apply_transfer_completion_events,
     execute_kv_cache_transfer_plan,
 };
@@ -161,35 +160,32 @@ fn transfer_worker_shutdown_clears_sessions_and_stops_backend() {
 }
 
 #[test]
-fn mooncake_registers_nexus_descriptor_and_unregisters_on_shutdown() {
-    let state = Arc::new(Mutex::new(MooncakeState::default()));
-    let io = RecordingMooncakeIo {
+fn kv_executor_registers_nexus_descriptor_and_unregisters_on_shutdown() {
+    let state = Arc::new(Mutex::new(KvTransferExecutorState::default()));
+    let io = RecordingKvIo {
         state: state.clone(),
     };
     let memory = transferable_memory();
-    let layout = MooncakeKvCacheLayout {
+    let layout = KvTransferLayout {
         source_base_addr: memory.regions()[0].base_addr,
         page_size_bytes: memory.page_size_bytes(),
         target_base_offset: 0,
     };
-    let mut backend = MooncakeKvCacheTransferExecutor::new(
-        io.clone(),
-        layout,
-        MooncakeTransferTarget { target_id: 3 },
-    )
-    .with_memory_registrar(io);
+    let mut backend =
+        KvCacheTransferExecutor::new(io.clone(), layout, KvTransferTarget { target_id: 3 })
+            .with_memory_registrar(io);
     backend
         .register(memory)
         .expect("descriptor should register");
 
     let mut registry = registry_with_session(10);
     execute_kv_cache_transfer_plan(&mut registry, &mut backend, &simple_plan(10))
-        .expect("Mooncake submit should succeed");
-    let poll = backend.poll().expect("Mooncake poll should succeed");
+        .expect("KV transfer submit should succeed");
+    let poll = backend.poll().expect("KV transfer poll should succeed");
     apply_transfer_completion_events(&mut registry, poll).expect("completion event should apply");
     backend
         .shutdown()
-        .expect("Mooncake shutdown should succeed");
+        .expect("KV transfer shutdown should succeed");
 
     let state = state.lock().expect("state lock");
     assert_eq!(state.registered, 1);
@@ -200,33 +196,30 @@ fn mooncake_registers_nexus_descriptor_and_unregisters_on_shutdown() {
 }
 
 #[test]
-fn mooncake_shutdown_frees_pending_batch_before_memory_unregister() {
-    let state = Arc::new(Mutex::new(MooncakeState::default()));
-    let io = RecordingMooncakeIo {
+fn kv_executor_shutdown_frees_pending_batch_before_memory_unregister() {
+    let state = Arc::new(Mutex::new(KvTransferExecutorState::default()));
+    let io = RecordingKvIo {
         state: state.clone(),
     };
     let memory = transferable_memory();
-    let layout = MooncakeKvCacheLayout {
+    let layout = KvTransferLayout {
         source_base_addr: memory.regions()[0].base_addr,
         page_size_bytes: memory.page_size_bytes(),
         target_base_offset: 0,
     };
-    let mut backend = MooncakeKvCacheTransferExecutor::new(
-        io.clone(),
-        layout,
-        MooncakeTransferTarget { target_id: 3 },
-    )
-    .with_memory_registrar(io);
+    let mut backend =
+        KvCacheTransferExecutor::new(io.clone(), layout, KvTransferTarget { target_id: 3 })
+            .with_memory_registrar(io);
     backend
         .register(memory)
         .expect("descriptor should register");
 
     let mut registry = registry_with_session(11);
     execute_kv_cache_transfer_plan(&mut registry, &mut backend, &simple_plan(11))
-        .expect("Mooncake submit should succeed");
+        .expect("KV transfer submit should succeed");
     backend
         .shutdown()
-        .expect("Mooncake shutdown should cancel pending transfer");
+        .expect("KV transfer shutdown should cancel pending transfer");
 
     let state = state.lock().expect("state lock");
     assert_eq!(state.submitted, 1);
@@ -290,7 +283,7 @@ fn transferable_memory() -> TransferableKvCacheMemory {
 }
 
 #[derive(Default)]
-struct MooncakeState {
+struct KvTransferExecutorState {
     registered: usize,
     unregistered: usize,
     submitted: usize,
@@ -298,52 +291,55 @@ struct MooncakeState {
 }
 
 #[derive(Clone)]
-struct RecordingMooncakeIo {
-    state: Arc<Mutex<MooncakeState>>,
+struct RecordingKvIo {
+    state: Arc<Mutex<KvTransferExecutorState>>,
 }
 
-impl MooncakeMemoryRegistrar for RecordingMooncakeIo {
+impl KvMemoryRegistrar for RecordingKvIo {
     fn register_memory_batch(
         &mut self,
-        _buffers: &mut [MooncakeBufferEntry],
+        _buffers: &mut [KvBufferEntry],
         _location: &str,
-    ) -> Result<(), MooncakeError> {
+    ) -> Result<(), KvTransportError> {
         self.state.lock().expect("state lock").registered += 1;
         Ok(())
     }
 
-    fn unregister_memory_batch(&mut self, _addrs: &mut [*mut c_void]) -> Result<(), MooncakeError> {
+    fn unregister_memory_batch(
+        &mut self,
+        _addrs: &mut [*mut c_void],
+    ) -> Result<(), KvTransportError> {
         self.state.lock().expect("state lock").unregistered += 1;
         Ok(())
     }
 }
 
-impl MooncakeTransferSubmitter for RecordingMooncakeIo {
+impl KvTransferSubmitter for RecordingKvIo {
     fn submit_transfer(
         &mut self,
-        requests: &mut [MooncakeTransferRequest],
-    ) -> Result<MooncakeBatchId, MooncakeError> {
+        requests: &mut [KvTransferRequest],
+    ) -> Result<KvBatchId, KvTransportError> {
         assert!(!requests.is_empty());
         self.state.lock().expect("state lock").submitted += 1;
         Ok(42)
     }
 }
 
-impl MooncakeTransferStatusReader for RecordingMooncakeIo {
+impl KvTransferStatusReader for RecordingKvIo {
     fn transfer_status(
         &mut self,
-        _batch_id: MooncakeBatchId,
+        _batch_id: KvBatchId,
         _task_id: usize,
-    ) -> Result<MooncakeTransferStatus, MooncakeError> {
-        Ok(MooncakeTransferStatus {
-            status: MooncakeTransferStatusCode::Completed as i32,
+    ) -> Result<KvTransferStatus, KvTransportError> {
+        Ok(KvTransferStatus {
+            status: KvTransferStatusCode::Completed as i32,
             transferred_bytes: 32,
         })
     }
 }
 
-impl MooncakeBatchReleaser for RecordingMooncakeIo {
-    fn free_batch(&mut self, _batch_id: MooncakeBatchId) -> Result<(), MooncakeError> {
+impl KvBatchReleaser for RecordingKvIo {
+    fn free_batch(&mut self, _batch_id: KvBatchId) -> Result<(), KvTransportError> {
         self.state.lock().expect("state lock").freed += 1;
         Ok(())
     }

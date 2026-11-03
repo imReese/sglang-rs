@@ -286,15 +286,6 @@ impl BootstrapForwardModel {
         self.registered.definition.cache_architecture()
     }
 
-    #[cfg(feature = "mooncake-link")]
-    pub(crate) fn runtime_device_ordinal(&self) -> Result<usize, String> {
-        self.registered
-            .runtime
-            .config()
-            .device_placement
-            .device_ordinal()
-    }
-
     fn reload_backend(&self) -> RuntimeBackend {
         self.registered.runtime_backend()
     }

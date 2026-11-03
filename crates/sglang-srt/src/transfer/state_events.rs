@@ -188,3 +188,276 @@ impl KvStateEventPublisher for BroadcastKvStateEventPublisher {
 
     fn publish_all_blocks_cleared(&self) {}
 }
+
+/// Composite publisher that broadcasts to multiple inner publishers.
+#[derive(Clone, Default)]
+pub struct CompositeKvStateEventPublisher {
+    publishers: Vec<Arc<dyn KvStateEventPublisher>>,
+}
+
+impl CompositeKvStateEventPublisher {
+    pub fn new(publishers: Vec<Arc<dyn KvStateEventPublisher>>) -> Self {
+        Self { publishers }
+    }
+
+    pub fn push(&mut self, publisher: Arc<dyn KvStateEventPublisher>) {
+        self.publishers.push(publisher);
+    }
+}
+
+impl KvStateEventPublisher for CompositeKvStateEventPublisher {
+    fn publish_block_stored(&self, event: &BlockStoredEvent) {
+        for p in &self.publishers {
+            p.publish_block_stored(event);
+        }
+    }
+
+    fn publish_block_removed(&self, event: &BlockRemovedEvent) {
+        for p in &self.publishers {
+            p.publish_block_removed(event);
+        }
+    }
+
+    fn publish_all_blocks_cleared(&self) {
+        for p in &self.publishers {
+            p.publish_all_blocks_cleared();
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ZmqPublishCommand {
+    BlockStored(BlockStoredEvent),
+    BlockRemoved(BlockRemovedEvent),
+    AllBlocksCleared,
+}
+
+/// ZMQ-based KV cache state event publisher that broadcasts events to subscribers
+/// (such as SGLang router Locus `HashTree`) over a ZeroMQ PUB socket.
+pub struct ZmqKvStateEventPublisher {
+    sender: tokio::sync::mpsc::UnboundedSender<ZmqPublishCommand>,
+    endpoint: String,
+    port: u16,
+    topic: String,
+}
+
+impl ZmqKvStateEventPublisher {
+    pub async fn bind(host: &str, port: u16, topic: impl Into<String>) -> Result<Self, String> {
+        use zeromq::{Endpoint, PubSocket, Socket, SocketSend, ZmqMessage};
+
+        let mut socket = PubSocket::new();
+        let bind_addr = format!("tcp://{host}:{port}");
+        let endpoint = socket
+            .bind(&bind_addr)
+            .await
+            .map_err(|e| format!("failed to bind ZMQ PUB socket on {bind_addr}: {e}"))?;
+        let bound_port = match endpoint {
+            Endpoint::Tcp(_, p) => p,
+            _ => port,
+        };
+        let topic = topic.into();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ZmqPublishCommand>();
+        let task_topic = topic.clone();
+
+        tokio::spawn(async move {
+            let mut seq: i64 = 1;
+            while let Some(cmd) = rx.recv().await {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                let payload = match cmd {
+                    ZmqPublishCommand::BlockStored(ev) => {
+                        let dp = if ev.data_parallel_rank >= 0 {
+                            Some(ev.data_parallel_rank as u32)
+                        } else {
+                            None
+                        };
+                        encode_single_event_batch(ts, &encode_block_stored(&ev), dp)
+                    }
+                    ZmqPublishCommand::BlockRemoved(ev) => {
+                        let dp = if ev.data_parallel_rank >= 0 {
+                            Some(ev.data_parallel_rank as u32)
+                        } else {
+                            None
+                        };
+                        encode_single_event_batch(ts, &encode_block_removed(&ev), dp)
+                    }
+                    ZmqPublishCommand::AllBlocksCleared => {
+                        encode_single_event_batch(ts, &encode_all_blocks_cleared(), None)
+                    }
+                };
+                let mut msg = ZmqMessage::from(task_topic.as_bytes().to_vec());
+                msg.push_back(seq.to_be_bytes().to_vec().into());
+                msg.push_back(payload.into());
+                if socket.send(msg).await.is_err() {
+                    break;
+                }
+                seq = seq.wrapping_add(1);
+            }
+            // Send shutdown sentinel END_SEQ (-1)
+            let mut msg = ZmqMessage::from(task_topic.as_bytes().to_vec());
+            msg.push_back((-1_i64).to_be_bytes().to_vec().into());
+            msg.push_back(Vec::new().into());
+            let _ = socket.send(msg).await;
+        });
+
+        Ok(Self {
+            sender: tx,
+            endpoint: format!("tcp://{host}:{bound_port}"),
+            port: bound_port,
+            topic,
+        })
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+}
+
+impl KvStateEventPublisher for ZmqKvStateEventPublisher {
+    fn publish_block_stored(&self, event: &BlockStoredEvent) {
+        let _ = self
+            .sender
+            .send(ZmqPublishCommand::BlockStored(event.clone()));
+    }
+
+    fn publish_block_removed(&self, event: &BlockRemovedEvent) {
+        let _ = self
+            .sender
+            .send(ZmqPublishCommand::BlockRemoved(event.clone()));
+    }
+
+    fn publish_all_blocks_cleared(&self) {
+        let _ = self.sender.send(ZmqPublishCommand::AllBlocksCleared);
+    }
+}
+
+fn encode_block_stored(event: &BlockStoredEvent) -> Vec<u8> {
+    use rmp::encode as mp;
+
+    let mut buf = Vec::new();
+    mp::write_array_len(&mut buf, 7).expect("rmp write");
+    mp::write_str(&mut buf, "BlockStored").expect("rmp write");
+    mp::write_array_len(&mut buf, event.block_hashes.len() as u32).expect("rmp write");
+    for hash in &event.block_hashes {
+        mp::write_sint(&mut buf, *hash).expect("rmp write");
+    }
+    match event.parent_block_hash {
+        Some(h) => {
+            let _ = mp::write_sint(&mut buf, h).expect("rmp write");
+        }
+        None => {
+            mp::write_nil(&mut buf).expect("rmp write");
+        }
+    }
+    mp::write_array_len(&mut buf, event.token_ids.len() as u32).expect("rmp write");
+    for id in &event.token_ids {
+        mp::write_uint(&mut buf, *id as u64).expect("rmp write");
+    }
+    mp::write_uint(&mut buf, event.block_size as u64).expect("rmp write");
+    mp::write_nil(&mut buf).expect("rmp write");
+    let medium = if event.boundary.tier.is_empty() {
+        "GPU"
+    } else {
+        &event.boundary.tier
+    };
+    mp::write_str(&mut buf, medium).expect("rmp write");
+    buf
+}
+
+fn encode_block_removed(event: &BlockRemovedEvent) -> Vec<u8> {
+    use rmp::encode as mp;
+
+    let mut buf = Vec::new();
+    mp::write_array_len(&mut buf, 3).expect("rmp write");
+    mp::write_str(&mut buf, "BlockRemoved").expect("rmp write");
+    mp::write_array_len(&mut buf, event.block_hashes.len() as u32).expect("rmp write");
+    for hash in &event.block_hashes {
+        mp::write_sint(&mut buf, *hash).expect("rmp write");
+    }
+    mp::write_nil(&mut buf).expect("rmp write");
+    buf
+}
+
+fn encode_all_blocks_cleared() -> Vec<u8> {
+    use rmp::encode as mp;
+
+    let mut buf = Vec::new();
+    mp::write_array_len(&mut buf, 1).expect("rmp write");
+    mp::write_str(&mut buf, "AllBlocksCleared").expect("rmp write");
+    buf
+}
+
+fn encode_single_event_batch(ts: f64, event_bytes: &[u8], attn_dp_rank: Option<u32>) -> Vec<u8> {
+    use rmp::encode as mp;
+
+    let mut buf = Vec::new();
+    let total_len = if attn_dp_rank.is_some() { 3 } else { 2 };
+    mp::write_array_len(&mut buf, total_len).expect("rmp write");
+    mp::write_f64(&mut buf, ts).expect("rmp write");
+    mp::write_array_len(&mut buf, 1).expect("rmp write");
+    buf.extend_from_slice(event_bytes);
+    if let Some(rank) = attn_dp_rank {
+        mp::write_uint(&mut buf, rank as u64).expect("rmp write");
+    }
+    buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeromq::{Socket, SocketRecv, SubSocket};
+
+    #[tokio::test]
+    async fn zmq_publisher_broadcasts_block_stored_events_to_subscriber() {
+        let publisher = ZmqKvStateEventPublisher::bind("127.0.0.1", 0, "kv")
+            .await
+            .expect("bind zmq publisher");
+        let port = publisher.port();
+        assert!(port > 0);
+
+        let mut sub = SubSocket::new();
+        sub.connect(&format!("tcp://127.0.0.1:{port}"))
+            .await
+            .expect("connect subscriber");
+        sub.subscribe("kv").await.expect("subscribe to topic");
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let event = BlockStoredEvent {
+            request_id: RequestId::from("test-req"),
+            block_hashes: vec![12345, 67890],
+            parent_block_hash: Some(11111),
+            token_ids: vec![10, 20, 30],
+            block_size: 16,
+            data_parallel_rank: 0,
+            prompt_tokens_processed: 3,
+            total_prompt_tokens: 3,
+            is_final_chunk: true,
+            boundary: ReusableBoundary::new(0, 3, "GPU"),
+        };
+
+        publisher.publish_block_stored(&event);
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), sub.recv())
+            .await
+            .expect("recv timeout")
+            .expect("recv msg");
+
+        assert_eq!(msg.len(), 3);
+        assert_eq!(msg.get(0).unwrap().as_ref(), b"kv");
+        let seq_bytes: [u8; 8] = msg.get(1).unwrap().as_ref().try_into().unwrap();
+        assert_eq!(i64::from_be_bytes(seq_bytes), 1);
+        let payload = msg.get(2).unwrap();
+        assert!(!payload.is_empty());
+    }
+}

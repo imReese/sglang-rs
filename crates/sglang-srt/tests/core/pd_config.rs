@@ -1,18 +1,18 @@
 use sglang_srt::backend::{TransferBackendCapability, TransferBackendClass};
 use sglang_srt::cli::{CliParseError, ServerArgs};
 use sglang_srt::transfer::{
-    DisaggregationMode, MooncakeTransferEngineConfig, PdConfig, PdConfigError, TransferBackend,
+    DisaggregationMode, PdConfig, PdConfigError, PdTransferEngineConfig, TransferBackend,
 };
 
 #[test]
-fn pd_config_defaults_to_unified_mooncake_backend() {
+fn pd_config_defaults_to_tcp_backend() {
     let args =
         ServerArgs::parse_from(["serve", "--model-path", "dummy"]).expect("args should parse");
     let config = PdConfig::from_server_args(&args).expect("PD config should parse");
 
     assert_eq!(config.mode, DisaggregationMode::Null);
-    assert_eq!(config.transfer_backend, TransferBackend::Mooncake);
-    assert!(!config.force_tcp_transport);
+    assert_eq!(config.transfer_backend, TransferBackend::Tcp);
+    assert!(config.force_tcp_transport);
 }
 
 #[test]
@@ -70,29 +70,7 @@ fn noncommunity_kv_geometry_flags_are_rejected_by_cli() {
 }
 
 #[test]
-fn mooncake_tcp_normalization_drops_rdma_device() {
-    let args = ServerArgs::parse_from([
-        "serve",
-        "--model-path",
-        "dummy",
-        "--disaggregation-transfer-backend",
-        "mooncake_tcp",
-        "--disaggregation-ib-device",
-        "mlx5_0",
-    ])
-    .expect("args should parse");
-    let config = PdConfig::from_server_args(&args).expect("PD config should parse");
-
-    assert!(config.force_tcp_transport);
-    assert!(config.ib_device.is_none());
-    assert_eq!(
-        MooncakeTransferEngineConfig::from_pd_config("127.0.0.1", 0, &config).protocol,
-        "tcp"
-    );
-}
-
-#[test]
-fn mooncake_engine_config_consumes_runtime_device_ordinal() {
+fn pd_transfer_engine_config_consumes_runtime_device_ordinal() {
     let args = ServerArgs::parse_from([
         "serve",
         "--model-path",
@@ -105,23 +83,20 @@ fn mooncake_engine_config_consumes_runtime_device_ordinal() {
     .expect("args should parse");
     let config = PdConfig::from_server_args(&args).expect("PD config should parse");
 
-    let engine = MooncakeTransferEngineConfig::from_pd_config("127.0.0.1", 5, &config);
+    let engine = PdTransferEngineConfig::from_pd_config("127.0.0.1", 5, &config);
     assert_eq!(engine.gpu_id, 5);
 }
 
 #[test]
 fn transfer_capabilities_distinguish_production_and_planned_backends() {
-    let mooncake = TransferBackendCapability::from_backend(TransferBackend::Mooncake);
-    let nixl = TransferBackendCapability::from_backend(TransferBackend::Nixl);
     let tcp = TransferBackendCapability::from_backend(TransferBackend::Tcp);
+    let nixl = TransferBackendCapability::from_backend(TransferBackend::Nixl);
 
-    assert_eq!(mooncake.class, TransferBackendClass::Production);
-    assert!(mooncake.is_production());
-    assert_eq!(nixl.class, TransferBackendClass::Planned);
-    assert!(!nixl.is_production());
     assert_eq!(tcp.class, TransferBackendClass::Production);
     assert!(tcp.is_production());
     assert!(tcp.linked_transport);
+    assert_eq!(nixl.class, TransferBackendClass::Planned);
+    assert!(!nixl.is_production());
 }
 
 #[test]

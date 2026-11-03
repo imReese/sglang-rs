@@ -666,3 +666,143 @@ async fn plain_mode_chat_response_omits_decode_affinity_header() {
         res.headers(),
     );
 }
+
+/// Verify end-to-end integration of Locus cache-aware routing policy (CacheAwareZmq)
+/// combined with P/D disaggregated execution.
+///
+/// When multiple prefill workers are registered, the Locus HashTree is queried
+/// with the request prompt's block hashes. The prefill worker holding the cached
+/// prefix MUST be selected, while cold prefill workers receive zero traffic.
+/// The router then pairs the chosen prefill worker with a decode worker and performs
+/// the dual P/D dispatch.
+#[tokio::test]
+async fn pd_mode_chat_dispatch_selects_prefill_worker_via_locus_cache_aware_policy() {
+    use sglang_router::config::CacheAwareConfig;
+    use sglang_router::policies::cache_aware_zmq::CacheAwareZmqPolicy;
+    use sglang_router::policies::kv_events::{
+        compute_block_hashes, tree::KvWorkerId, BlockSizeOracle, HashTree,
+    };
+    use sglang_router::policies::PolicyRegistry;
+
+    let prefill_1 = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let prefill_2 = crate::common::mock_worker::MockWorker::start(vec![]).await;
+    let decode = crate::common::mock_worker::MockWorker::start(vec![]).await;
+
+    let cfg = Config {
+        server: ServerConfig {
+            host: "0".into(),
+            port: 0,
+        },
+        observability: ObservabilityConfig::default(),
+        models: vec![ModelConfig {
+            id: "tiny".into(),
+            tokenizer_path: "tests/fixtures/tiny_tokenizer.json".into(),
+            policy: PolicyKind::CacheAwareZmq,
+            circuit_breaker: None,
+            cache_aware: Some(CacheAwareConfig {
+                cache_threshold: 0.0,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+            }),
+        }],
+        discovery: DiscoveryConfig {
+            backend: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
+                urls: vec!["http://placeholder:0".into()],
+            }),
+        },
+        proxy: ProxyConfig::default(),
+        active_load: ActiveLoadConfig::default(),
+    };
+
+    let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
+    let tree = Arc::new(HashTree::new());
+    let block_size_oracle = BlockSizeOracle::new();
+    let block_size = 1usize;
+    block_size_oracle.try_set(block_size as u32).unwrap();
+
+    // Populate HashTree as if Locus received kv_events indicating prefill_1 has cached "hi"
+    let tok = tokenizers.get("tiny").unwrap();
+    let token_ids = sglang_router::tokenizer::adapter::encode(&tok, "hi").unwrap();
+    let hashes = compute_block_hashes(&token_ids, block_size);
+    assert!(!hashes.is_empty());
+    tree.insert(&KvWorkerId::new(prefill_1.url.clone(), 0), None, &hashes);
+
+    let registry = Arc::new(WorkerRegistry::default());
+    let _ = registry.add(WorkerSpec {
+        id: WorkerId("p1".into()),
+        url: prefill_1.url.clone(),
+        mode: WorkerMode::Prefill,
+        model_ids: vec![ModelId("tiny".into())],
+        bootstrap_port: Some(8997),
+    });
+    let _ = registry.add(WorkerSpec {
+        id: WorkerId("p2".into()),
+        url: prefill_2.url.clone(),
+        mode: WorkerMode::Prefill,
+        model_ids: vec![ModelId("tiny".into())],
+        bootstrap_port: Some(8998),
+    });
+    let _ = registry.add(WorkerSpec {
+        id: WorkerId("d1".into()),
+        url: decode.url.clone(),
+        mode: WorkerMode::Decode,
+        model_ids: vec![ModelId("tiny".into())],
+        bootstrap_port: None,
+    });
+
+    let policies = PolicyRegistry::default();
+    policies.insert(
+        ModelId("tiny".into()),
+        Arc::new(CacheAwareZmqPolicy::new(
+            CacheAwareConfig {
+                cache_threshold: 0.0,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+            },
+            Arc::clone(&tree),
+            Arc::clone(&tokenizers),
+            block_size_oracle,
+        )),
+    );
+
+    let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
+    let ctx = Arc::new(AppContext::new(
+        cfg,
+        tokenizers,
+        proxy,
+        registry,
+        Arc::new(policies),
+    ));
+    let app = build_router(ctx);
+
+    let res = app.oneshot(chat_request()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Verify p1 was selected because Locus matched its cached prefix!
+    let prefill_1_body = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let captured = prefill_1.captured.lock().unwrap().last_body.clone();
+            if let Some(b) = captured {
+                return b;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("prefill_1 (with cached prefix in Locus) must receive the dispatched request");
+    assert!(!prefill_1_body.is_empty());
+
+    // p2 was cold and must NOT have received the request
+    let p2_seen = prefill_2.captured.lock().unwrap().last_body.clone();
+    assert!(
+        p2_seen.is_none(),
+        "prefill_2 without cache hit must not receive the request"
+    );
+
+    // d1 (decode worker) must have received the request with matching bootstrap info
+    let d1_seen = decode.captured.lock().unwrap().last_body.clone();
+    assert!(
+        d1_seen.is_some(),
+        "decode worker must receive the bootstrap request body"
+    );
+}

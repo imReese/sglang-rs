@@ -32,17 +32,17 @@ use sglang_srt::server::test_support::{
     build_reference_pd_http_router_service, build_reference_prefill_http_router_service,
 };
 use sglang_srt::server::{
-    ServerLaunchError, launch_http_server_with_shutdown,
-    register_prefill_mooncake_routes_from_args, try_build_bootstrap_http_router_service,
+    launch_http_server_with_shutdown, register_prefill_mooncake_routes_from_args,
+    try_build_bootstrap_http_router_service,
 };
 use sglang_srt::tokenizer::ByteTokenizer;
 use sglang_srt::transfer::{
     DecodeBootstrapRegistry, KvCacheMemoryLocation, KvCacheTransferError, KvCacheTransferSpan,
-    KvTransferBackend, KvTransferPoll, MooncakeBatchId, MooncakeBatchReleaser, MooncakeBufferEntry,
-    MooncakeError, MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeMemoryRegistrar,
-    MooncakeTransferRequest, MooncakeTransferStatus, MooncakeTransferStatusCode,
-    MooncakeTransferStatusReader, MooncakeTransferSubmitter, MooncakeTransferTarget,
-    TransferableKvCacheMemory, TransferableKvCacheRegion,
+    KvTransferBackend, KvTransferPoll, KvTransportError, MooncakeBatchId, MooncakeBatchReleaser,
+    MooncakeBufferEntry, MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor,
+    MooncakeMemoryRegistrar, MooncakeTransferRequest, MooncakeTransferStatus,
+    MooncakeTransferStatusCode, MooncakeTransferStatusReader, MooncakeTransferSubmitter,
+    MooncakeTransferTarget, TransferableKvCacheMemory, TransferableKvCacheRegion,
 };
 use sglang_srt::types::{BootstrapRoom, RequestId, SamplingParams as RuntimeSamplingParams};
 use sglang_srt::worker::{
@@ -3006,7 +3006,12 @@ async fn prefill_http_launch_rejects_unstartable_dummy_mooncake_runtime() {
     let error = launch_http_server_with_shutdown(args, async {}).await;
     let error = error.expect_err("dummy prefill worker should reject Mooncake PD startup");
 
-    assert_dummy_mooncake_startup_error(&error);
+    assert!(
+        error
+            .to_string()
+            .contains("invalid disaggregation transfer backend: mooncake"),
+        "{error}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3095,11 +3100,16 @@ async fn prefill_http_launch_routes_reject_unstartable_dummy_mooncake_runtime() 
     let error = launch_http_server_with_shutdown(args, async {}).await;
     let error = error.expect_err("dummy prefill worker should reject Mooncake PD startup");
 
-    assert_dummy_mooncake_startup_error(&error);
+    assert!(
+        error
+            .to_string()
+            .contains("invalid disaggregation transfer backend: mooncake"),
+        "{error}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn decode_http_launch_rejects_unstartable_dummy_mooncake_runtime() {
+async fn decode_http_launch_rejects_retired_mooncake_backend() {
     let http_addr = unused_local_addr();
     let args = ServerArgs::parse_from([
         "serve",
@@ -3123,22 +3133,12 @@ async fn decode_http_launch_rejects_unstartable_dummy_mooncake_runtime() {
     .expect("args should parse");
 
     let error = launch_http_server_with_shutdown(args, async {}).await;
-    let error = error.expect_err("dummy decode worker should reject Mooncake PD startup");
+    let error = error.expect_err("dummy decode worker should reject retired Mooncake backend");
 
-    assert_dummy_mooncake_startup_error(&error);
-}
-
-fn assert_dummy_mooncake_startup_error(error: &ServerLaunchError) {
-    #[cfg(not(feature = "mooncake-link"))]
     assert!(
         error
             .to_string()
-            .contains("requires building sglang-srt with the mooncake-link feature"),
-        "{error}"
-    );
-    #[cfg(feature = "mooncake-link")]
-    assert!(
-        error.to_string().contains("not a local directory"),
+            .contains("invalid disaggregation transfer backend: mooncake"),
         "{error}"
     );
 }
@@ -3656,7 +3656,7 @@ impl MooncakeTransferSubmitter for RecordingMooncakeBackend {
     fn submit_transfer(
         &mut self,
         requests: &mut [MooncakeTransferRequest],
-    ) -> Result<MooncakeBatchId, MooncakeError> {
+    ) -> Result<MooncakeBatchId, KvTransportError> {
         self.submitted_requests.push(requests.to_vec());
         Ok(500 + self.submitted_requests.len() as MooncakeBatchId - 1)
     }
@@ -3667,7 +3667,7 @@ impl MooncakeTransferStatusReader for RecordingMooncakeBackend {
         &mut self,
         _batch_id: MooncakeBatchId,
         _task_id: usize,
-    ) -> Result<MooncakeTransferStatus, MooncakeError> {
+    ) -> Result<MooncakeTransferStatus, KvTransportError> {
         Ok(MooncakeTransferStatus {
             status: self.status as i32,
             transferred_bytes: 0,
@@ -3676,7 +3676,7 @@ impl MooncakeTransferStatusReader for RecordingMooncakeBackend {
 }
 
 impl MooncakeBatchReleaser for RecordingMooncakeBackend {
-    fn free_batch(&mut self, batch_id: MooncakeBatchId) -> Result<(), MooncakeError> {
+    fn free_batch(&mut self, batch_id: MooncakeBatchId) -> Result<(), KvTransportError> {
         self.freed_batches.push(batch_id);
         Ok(())
     }
@@ -3687,11 +3687,14 @@ impl MooncakeMemoryRegistrar for RecordingMooncakeBackend {
         &mut self,
         _buffers: &mut [MooncakeBufferEntry],
         _location: &str,
-    ) -> Result<(), MooncakeError> {
+    ) -> Result<(), KvTransportError> {
         Ok(())
     }
 
-    fn unregister_memory_batch(&mut self, _addrs: &mut [*mut c_void]) -> Result<(), MooncakeError> {
+    fn unregister_memory_batch(
+        &mut self,
+        _addrs: &mut [*mut c_void],
+    ) -> Result<(), KvTransportError> {
         Ok(())
     }
 }

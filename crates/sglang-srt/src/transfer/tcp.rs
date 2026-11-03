@@ -11,10 +11,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::transfer::{
-    MooncakeBatchId, MooncakeBatchReleaser, MooncakeBufferEntry, MooncakeError,
-    MooncakeMemoryRegistrar, MooncakeSegmentId, MooncakeSegmentOpener, MooncakeTransferRequest,
-    MooncakeTransferStatus, MooncakeTransferStatusCode, MooncakeTransferStatusReader,
-    MooncakeTransferSubmitter,
+    KvBatchId, KvBatchReleaser, KvBufferEntry, KvMemoryRegistrar, KvSegmentId, KvSegmentOpener,
+    KvTransferRequest, KvTransferStatus, KvTransferStatusCode, KvTransferStatusReader,
+    KvTransferSubmitter, KvTransportError,
 };
 
 pub const TCP_TRANSFER_MAGIC: &[u8; 8] = b"SG_TCPKV";
@@ -37,7 +36,7 @@ pub struct TcpTransferEngine {
     streams: BTreeMap<i32, TcpStream>,
     next_target_id: i32,
     next_batch_id: u64,
-    batches: BTreeMap<u64, Vec<MooncakeTransferStatus>>,
+    batches: BTreeMap<u64, Vec<KvTransferStatus>>,
 }
 
 impl TcpTransferEngine {
@@ -234,11 +233,11 @@ impl SharedTcpTransferEngine {
         })
     }
 
-    pub fn local_endpoint(&self) -> Result<String, MooncakeError> {
+    pub fn local_endpoint(&self) -> Result<String, KvTransportError> {
         let engine = self
             .inner
             .lock()
-            .map_err(|_| MooncakeError::StatusQueryFailed(-3))?;
+            .map_err(|_| KvTransportError::StatusQueryFailed("lock poisoned".to_string()))?;
         Ok(engine.local_endpoint().to_string())
     }
 
@@ -263,20 +262,19 @@ impl SharedTcpTransferEngine {
     }
 }
 
-impl MooncakeMemoryRegistrar for SharedTcpTransferEngine {
+impl KvMemoryRegistrar for SharedTcpTransferEngine {
     fn register_memory_batch(
         &mut self,
-        buffers: &mut [MooncakeBufferEntry],
+        buffers: &mut [KvBufferEntry],
         _location: &str,
-    ) -> Result<(), MooncakeError> {
+    ) -> Result<(), KvTransportError> {
         let engine = self
             .inner
             .lock()
-            .map_err(|_| MooncakeError::RegisterMemoryFailed(-1))?;
-        let mut bufs = engine
-            .registered_buffers
-            .lock()
-            .map_err(|_| MooncakeError::RegisterMemoryFailed(-1))?;
+            .map_err(|_| KvTransportError::RegisterMemoryFailed("lock poisoned".to_string()))?;
+        let mut bufs = engine.registered_buffers.lock().map_err(|_| {
+            KvTransportError::RegisterMemoryFailed("buffers lock poisoned".to_string())
+        })?;
         bufs.clear();
         for buffer in buffers.iter() {
             bufs.push(RegisteredBuffer {
@@ -287,26 +285,28 @@ impl MooncakeMemoryRegistrar for SharedTcpTransferEngine {
         Ok(())
     }
 
-    fn unregister_memory_batch(&mut self, _addrs: &mut [*mut c_void]) -> Result<(), MooncakeError> {
+    fn unregister_memory_batch(
+        &mut self,
+        _addrs: &mut [*mut c_void],
+    ) -> Result<(), KvTransportError> {
         let engine = self
             .inner
             .lock()
-            .map_err(|_| MooncakeError::UnregisterMemoryFailed(-1))?;
-        let mut bufs = engine
-            .registered_buffers
-            .lock()
-            .map_err(|_| MooncakeError::UnregisterMemoryFailed(-1))?;
+            .map_err(|_| KvTransportError::UnregisterMemoryFailed("lock poisoned".to_string()))?;
+        let mut bufs = engine.registered_buffers.lock().map_err(|_| {
+            KvTransportError::UnregisterMemoryFailed("buffers lock poisoned".to_string())
+        })?;
         bufs.clear();
         Ok(())
     }
 }
 
-impl MooncakeSegmentOpener for SharedTcpTransferEngine {
-    fn open_segment(&mut self, segment: &str) -> Result<MooncakeSegmentId, MooncakeError> {
+impl KvSegmentOpener for SharedTcpTransferEngine {
+    fn open_segment(&mut self, segment: &str) -> Result<KvSegmentId, KvTransportError> {
         let mut engine = self
             .inner
             .lock()
-            .map_err(|e| MooncakeError::OpenSegmentFailed(e.to_string()))?;
+            .map_err(|e| KvTransportError::OpenSegmentFailed(e.to_string()))?;
         let target_id = engine.next_target_id;
         engine.next_target_id += 1;
         engine.targets.insert(target_id, segment.to_string());
@@ -314,15 +314,15 @@ impl MooncakeSegmentOpener for SharedTcpTransferEngine {
     }
 }
 
-impl MooncakeTransferSubmitter for SharedTcpTransferEngine {
+impl KvTransferSubmitter for SharedTcpTransferEngine {
     fn submit_transfer(
         &mut self,
-        requests: &mut [MooncakeTransferRequest],
-    ) -> Result<MooncakeBatchId, MooncakeError> {
+        requests: &mut [KvTransferRequest],
+    ) -> Result<KvBatchId, KvTransportError> {
         let mut engine = self
             .inner
             .lock()
-            .map_err(|_| MooncakeError::SubmitTransferFailed(-1))?;
+            .map_err(|_| KvTransportError::SubmitTransferFailed("lock poisoned".to_string()))?;
 
         let batch_id = engine.next_batch_id;
         engine.next_batch_id += 1;
@@ -336,7 +336,7 @@ impl MooncakeTransferSubmitter for SharedTcpTransferEngine {
                 .get(&request.target_id)
                 .cloned()
                 .ok_or_else(|| {
-                    MooncakeError::OpenSegmentFailed(format!(
+                    KvTransportError::OpenSegmentFailed(format!(
                         "target ID {} not opened",
                         request.target_id
                     ))
@@ -353,7 +353,7 @@ impl MooncakeTransferSubmitter for SharedTcpTransferEngine {
                 {
                     let addrs = target_addr
                         .to_socket_addrs()
-                        .map_err(|_| MooncakeError::EngineCreateFailed)?
+                        .map_err(|e| KvTransportError::ConnectionFailed(e.to_string()))?
                         .collect::<Vec<SocketAddr>>();
                     let socket_addr = match addrs.first() {
                         Some(a) => *a,
@@ -391,13 +391,13 @@ impl MooncakeTransferSubmitter for SharedTcpTransferEngine {
             }
 
             if success {
-                statuses.push(MooncakeTransferStatus {
-                    status: MooncakeTransferStatusCode::Completed as i32,
+                statuses.push(KvTransferStatus {
+                    status: KvTransferStatusCode::Completed as i32,
                     transferred_bytes: request.length,
                 });
             } else {
-                statuses.push(MooncakeTransferStatus {
-                    status: MooncakeTransferStatusCode::Failed as i32,
+                statuses.push(KvTransferStatus {
+                    status: KvTransferStatusCode::Failed as i32,
                     transferred_bytes: 0,
                 });
             }
@@ -408,34 +408,34 @@ impl MooncakeTransferSubmitter for SharedTcpTransferEngine {
     }
 }
 
-impl MooncakeTransferStatusReader for SharedTcpTransferEngine {
+impl KvTransferStatusReader for SharedTcpTransferEngine {
     fn transfer_status(
         &mut self,
-        batch_id: MooncakeBatchId,
+        batch_id: KvBatchId,
         task_id: usize,
-    ) -> Result<MooncakeTransferStatus, MooncakeError> {
+    ) -> Result<KvTransferStatus, KvTransportError> {
         let engine = self
             .inner
             .lock()
-            .map_err(|_| MooncakeError::StatusQueryFailed(-3))?;
-        let batch = engine
-            .batches
-            .get(&batch_id)
-            .ok_or(MooncakeError::StatusQueryFailed(-1))?;
-        let status = batch
-            .get(task_id)
-            .copied()
-            .ok_or(MooncakeError::StatusQueryFailed(-2))?;
+            .map_err(|_| KvTransportError::StatusQueryFailed("lock poisoned".to_string()))?;
+        let batch = engine.batches.get(&batch_id).ok_or_else(|| {
+            KvTransportError::StatusQueryFailed(format!("batch {batch_id} not found"))
+        })?;
+        let status = batch.get(task_id).copied().ok_or_else(|| {
+            KvTransportError::StatusQueryFailed(format!(
+                "task {task_id} not found in batch {batch_id}"
+            ))
+        })?;
         Ok(status)
     }
 }
 
-impl MooncakeBatchReleaser for SharedTcpTransferEngine {
-    fn free_batch(&mut self, batch_id: MooncakeBatchId) -> Result<(), MooncakeError> {
+impl KvBatchReleaser for SharedTcpTransferEngine {
+    fn free_batch(&mut self, batch_id: KvBatchId) -> Result<(), KvTransportError> {
         let mut engine = self
             .inner
             .lock()
-            .map_err(|_| MooncakeError::FreeBatchFailed(-1))?;
+            .map_err(|_| KvTransportError::FreeBatchFailed("lock poisoned".to_string()))?;
         engine.batches.remove(&batch_id);
         Ok(())
     }
@@ -476,7 +476,7 @@ mod tests {
         }
         let mut rx = SharedTcpTransferEngine::new("127.0.0.1", 0).expect("rx");
         let mut rx_buf = vec![0u8; 1024];
-        let mut entries = [MooncakeBufferEntry {
+        let mut entries = [KvBufferEntry {
             addr: rx_buf.as_mut_ptr() as *mut c_void,
             length: rx_buf.len(),
         }];
@@ -488,7 +488,7 @@ mod tests {
         let target_id = tx.open_segment(&endpoint).expect("open segment");
 
         let message = b"Hello from SGLang TCP KV Cache transfer!";
-        let mut requests = [MooncakeTransferRequest {
+        let mut requests = [KvTransferRequest {
             opcode: 0,
             source: message.as_ptr() as *mut c_void,
             target_id,
@@ -498,7 +498,7 @@ mod tests {
 
         let batch_id = tx.submit_transfer(&mut requests).expect("submit");
         let status = tx.transfer_status(batch_id, 0).expect("status");
-        assert_eq!(status.status, MooncakeTransferStatusCode::Completed as i32);
+        assert_eq!(status.status, KvTransferStatusCode::Completed as i32);
         assert_eq!(status.transferred_bytes, message.len() as u64);
 
         assert_eq!(&rx_buf[64..64 + message.len()], message);
@@ -515,7 +515,7 @@ mod tests {
         let mut rx = SharedTcpTransferEngine::new("127.0.0.1", 0).expect("rx");
         let mut rx_buf = vec![0u8; 2048];
         let base_addr = rx_buf.as_mut_ptr() as usize;
-        let mut entries = [MooncakeBufferEntry {
+        let mut entries = [KvBufferEntry {
             addr: rx_buf.as_mut_ptr() as *mut c_void,
             length: rx_buf.len(),
         }];
@@ -528,7 +528,7 @@ mod tests {
 
         let payload = b"Direct virtual address resolution test";
         let target_offset = (base_addr + 128) as u64;
-        let mut requests = [MooncakeTransferRequest {
+        let mut requests = [KvTransferRequest {
             opcode: 0,
             source: payload.as_ptr() as *mut c_void,
             target_id,
@@ -538,7 +538,7 @@ mod tests {
 
         let batch_id = tx.submit_transfer(&mut requests).expect("submit");
         let status = tx.transfer_status(batch_id, 0).expect("status");
-        assert_eq!(status.status, MooncakeTransferStatusCode::Completed as i32);
+        assert_eq!(status.status, KvTransferStatusCode::Completed as i32);
         assert_eq!(status.transferred_bytes, payload.len() as u64);
 
         assert_eq!(&rx_buf[128..128 + payload.len()], payload);
@@ -552,7 +552,7 @@ mod tests {
         }
         let mut rx = SharedTcpTransferEngine::new("127.0.0.1", 0).expect("rx");
         let mut rx_buf = vec![0u8; 4096];
-        let mut entries = [MooncakeBufferEntry {
+        let mut entries = [KvBufferEntry {
             addr: rx_buf.as_mut_ptr() as *mut c_void,
             length: rx_buf.len(),
         }];
@@ -568,21 +568,21 @@ mod tests {
         let page3 = [0xCCu8; 128];
 
         let mut requests = [
-            MooncakeTransferRequest {
+            KvTransferRequest {
                 opcode: 0,
                 source: page1.as_ptr() as *mut c_void,
                 target_id,
                 target_offset: 0,
                 length: 128,
             },
-            MooncakeTransferRequest {
+            KvTransferRequest {
                 opcode: 0,
                 source: page2.as_ptr() as *mut c_void,
                 target_id,
                 target_offset: 256,
                 length: 128,
             },
-            MooncakeTransferRequest {
+            KvTransferRequest {
                 opcode: 0,
                 source: page3.as_ptr() as *mut c_void,
                 target_id,
@@ -594,7 +594,7 @@ mod tests {
         let batch_id = tx.submit_transfer(&mut requests).expect("submit");
         for task_id in 0..3 {
             let status = tx.transfer_status(batch_id, task_id).expect("status");
-            assert_eq!(status.status, MooncakeTransferStatusCode::Completed as i32);
+            assert_eq!(status.status, KvTransferStatusCode::Completed as i32);
             assert_eq!(status.transferred_bytes, 128);
         }
 
@@ -609,7 +609,7 @@ mod tests {
     fn test_tcp_transfer_out_of_bounds_fails() {
         let mut rx = SharedTcpTransferEngine::new("127.0.0.1", 0).expect("rx");
         let mut rx_buf = vec![0u8; 256];
-        let mut entries = [MooncakeBufferEntry {
+        let mut entries = [KvBufferEntry {
             addr: rx_buf.as_mut_ptr() as *mut c_void,
             length: rx_buf.len(),
         }];
@@ -621,7 +621,7 @@ mod tests {
         let target_id = tx.open_segment(&endpoint).expect("open segment");
 
         let payload = [1u8; 128];
-        let mut requests = [MooncakeTransferRequest {
+        let mut requests = [KvTransferRequest {
             opcode: 0,
             source: payload.as_ptr() as *mut c_void,
             target_id,
@@ -631,6 +631,6 @@ mod tests {
 
         let batch_id = tx.submit_transfer(&mut requests).expect("submit");
         let status = tx.transfer_status(batch_id, 0).expect("status");
-        assert_eq!(status.status, MooncakeTransferStatusCode::Failed as i32);
+        assert_eq!(status.status, KvTransferStatusCode::Failed as i32);
     }
 }

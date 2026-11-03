@@ -110,7 +110,7 @@ The transfer executor consumes transfer descriptions from the CPU control plane 
 TransferPlan
      │
      ├── local H2D/D2H
-     ├── Mooncake
+     ├── Native TCP transport
      ├── NIXL (future)
      └── other transport backends
 ```

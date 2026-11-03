@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
+// SPDX-License-Identifier: Apache-2.0
+
 use std::ffi::c_void;
 use std::sync::{
     Arc, Mutex,
@@ -70,11 +73,11 @@ impl MooncakeMemoryRegistrar for StrictNative {
         &mut self,
         _: &mut [MooncakeBufferEntry],
         _: &str,
-    ) -> Result<(), MooncakeError> {
+    ) -> Result<(), KvTransportError> {
         self.0.lock().expect("state").events.push("register");
         Ok(())
     }
-    fn unregister_memory_batch(&mut self, _: &mut [*mut c_void]) -> Result<(), MooncakeError> {
+    fn unregister_memory_batch(&mut self, _: &mut [*mut c_void]) -> Result<(), KvTransportError> {
         let mut state = self.0.lock().expect("state");
         assert_eq!(
             state.freed.len(),
@@ -83,7 +86,9 @@ impl MooncakeMemoryRegistrar for StrictNative {
         );
         if state.unregister_error_once {
             state.unregister_error_once = false;
-            return Err(MooncakeError::UnregisterMemoryFailed(-1));
+            return Err(KvTransportError::UnregisterMemoryFailed(
+                "test unregister error".into(),
+            ));
         }
         state.events.push("unregister");
         Ok(())
@@ -93,7 +98,7 @@ impl MooncakeTransferSubmitter for StrictNative {
     fn submit_transfer(
         &mut self,
         requests: &mut [MooncakeTransferRequest],
-    ) -> Result<MooncakeBatchId, MooncakeError> {
+    ) -> Result<MooncakeBatchId, KvTransportError> {
         assert_eq!(requests.len(), 2);
         let mut state = self.0.lock().expect("state");
         state.batches += 1;
@@ -106,11 +111,13 @@ impl MooncakeTransferStatusReader for StrictNative {
         &mut self,
         batch: MooncakeBatchId,
         task: usize,
-    ) -> Result<MooncakeTransferStatus, MooncakeError> {
+    ) -> Result<MooncakeTransferStatus, KvTransportError> {
         let mut state = self.0.lock().expect("state");
         if batch == 2 && state.query_error_once {
             state.query_error_once = false;
-            return Err(MooncakeError::StatusQueryFailed(-1));
+            return Err(KvTransportError::StatusQueryFailed(
+                "test status error".into(),
+            ));
         }
         let status = if state.busy && task == 0 {
             MooncakeTransferStatusCode::Failed
@@ -132,7 +139,7 @@ impl MooncakeTransferStatusReader for StrictNative {
     }
 }
 impl MooncakeBatchReleaser for StrictNative {
-    fn free_batch(&mut self, batch: MooncakeBatchId) -> Result<(), MooncakeError> {
+    fn free_batch(&mut self, batch: MooncakeBatchId) -> Result<(), KvTransportError> {
         let mut state = self.0.lock().expect("state");
         assert!(
             !state.busy || state.tail_polls >= 3,

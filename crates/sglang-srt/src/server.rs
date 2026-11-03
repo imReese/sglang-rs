@@ -3,6 +3,7 @@ use std::fmt;
 use std::future::Future;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::backend::{RuntimeBackend, validate_runtime_backend};
 use crate::cache::{CachePageAllocator, RadixCache};
@@ -27,9 +28,9 @@ pub use crate::model_registry::BootstrapForwardModel;
 use crate::model_registry::{ModelRegistry, ModelRegistryError};
 use crate::parallel_topology::{Parallel4DConfig, Parallel4DTopology};
 use crate::pd_bootstrap::{
-    MooncakeBootstrapKvCacheTransferExecutor, MooncakeDecodeBootstrapPublisher,
-    PrefillBootstrapServeError, PrefillBootstrapService, PrefillRouteRegistration,
-    serve_mooncake_bootstrap_zmq_endpoints_with_shutdown, serve_prefill_bootstrap_with_shutdown,
+    PdBootstrapKvCacheTransferExecutor, PdDecodeBootstrapPublisher, PrefillBootstrapServeError,
+    PrefillBootstrapService, PrefillRouteRegistration, serve_bootstrap_zmq_endpoints_with_shutdown,
+    serve_prefill_bootstrap_with_shutdown,
 };
 use crate::router::{RouterGetModelInfoResponse, RouterRuntime};
 use crate::runtime_kv_cache::RuntimeKvCacheMetadata;
@@ -38,10 +39,10 @@ use crate::tokenizer::{RuntimeTokenizer, Tokenizer, TokenizerError};
 #[cfg(any(test, feature = "test-support"))]
 use crate::transfer::FakeKvCacheTransferExecutor;
 use crate::transfer::{
-    DecodeBootstrapPublisher, DecodeBootstrapRegistry, DisaggregationMode, KvTransferBackend,
-    KvTransferModelWorker, MooncakeBatchReleaser, MooncakeError, MooncakeKvCacheLayout,
-    MooncakeKvCacheTransferExecutor, MooncakeTransferStatusReader, MooncakeTransferSubmitter,
-    MooncakeTransferTargetResolver, PdConfig, PdConfigError, TransferBackend,
+    DecodeBootstrapPublisher, DecodeBootstrapRegistry, DisaggregationMode, KvBatchReleaser,
+    KvCacheTransferExecutor, KvStateEventPublisher, KvTransferBackend, KvTransferLayout,
+    KvTransferModelWorker, KvTransferStatusReader, KvTransferSubmitter, KvTransferTargetResolver,
+    PdConfig, PdConfigError, TransferBackend, ZmqKvStateEventPublisher,
 };
 use crate::transfer_backend_factory::{
     ProductionTransferBackend, TransferBackendBuildContext, TransferBackendFactory,
@@ -181,18 +182,18 @@ pub mod test_support {
     pub fn build_reference_mooncake_prefill_http_router_service<S, R>(
         args: &ServerArgs,
         bootstrap_service: PrefillBootstrapService,
-        transfer_executor: MooncakeKvCacheTransferExecutor<S, R>,
+        transfer_executor: KvCacheTransferExecutor<S, R>,
     ) -> ReferencePdHttpRouterService<
-        MooncakeBootstrapKvCacheTransferExecutor<MooncakeKvCacheTransferExecutor<S, R>>,
+        PdBootstrapKvCacheTransferExecutor<KvCacheTransferExecutor<S, R>>,
     >
     where
-        S: MooncakeTransferSubmitter + MooncakeTransferStatusReader + MooncakeBatchReleaser,
-        R: MooncakeTransferTargetResolver,
+        S: KvTransferSubmitter + KvTransferStatusReader + KvBatchReleaser,
+        R: KvTransferTargetResolver,
     {
         build_reference_pd_http_router_service(
             args,
             DecodeBootstrapRegistry::default(),
-            MooncakeBootstrapKvCacheTransferExecutor::new(bootstrap_service, transfer_executor),
+            PdBootstrapKvCacheTransferExecutor::new(bootstrap_service, transfer_executor),
         )
     }
 
@@ -306,6 +307,23 @@ fn model_prefix_cache_policy(model: &BootstrapForwardModel) -> PrefixCachePolicy
     }
 }
 
+fn resolve_prefix_cache_policy(
+    args: &ServerArgs,
+    model: &BootstrapForwardModel,
+) -> PrefixCachePolicy {
+    if args.disable_radix_cache {
+        PrefixCachePolicy::Disabled
+    } else if args.disaggregation_mode == "decode" {
+        if args.disaggregation_decode_enable_radix_cache {
+            model_prefix_cache_policy(model)
+        } else {
+            PrefixCachePolicy::Disabled
+        }
+    } else {
+        model_prefix_cache_policy(model)
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 fn validate_kv_only_transfer_model(model: &BootstrapForwardModel) -> Result<(), ServerLaunchError> {
     if model.cache_architecture().supports_kv_only_transfer() {
@@ -373,7 +391,7 @@ pub type BootstrapPdGrpcRouterService<E, P = crate::transfer::NoopDecodeBootstra
 
 enum ProductionDecodeBootstrapPublisher {
     Noop(crate::transfer::NoopDecodeBootstrapPublisher),
-    Mooncake(Box<MooncakeDecodeBootstrapPublisher>),
+    Pd(Box<PdDecodeBootstrapPublisher>),
 }
 
 impl DecodeBootstrapPublisher for ProductionDecodeBootstrapPublisher {
@@ -383,13 +401,13 @@ impl DecodeBootstrapPublisher for ProductionDecodeBootstrapPublisher {
     ) -> Result<crate::transfer::DecodeBootstrapMetadataPublishSummary, String> {
         match self {
             Self::Noop(publisher) => publisher.publish_decode_bootstrap_metadata(plan),
-            Self::Mooncake(publisher) => publisher.publish_decode_bootstrap_metadata(plan),
+            Self::Pd(publisher) => publisher.publish_decode_bootstrap_metadata(plan),
         }
     }
 
     fn receive_prefill_token(&mut self, room: crate::types::BootstrapRoom) -> Result<u32, String> {
         match self {
-            Self::Mooncake(publisher) => publisher.receive_prefill_token(room),
+            Self::Pd(publisher) => publisher.receive_prefill_token(room),
             Self::Noop(_) => Err("prefill role does not receive remote KV".into()),
         }
     }
@@ -399,14 +417,14 @@ impl DecodeBootstrapPublisher for ProductionDecodeBootstrapPublisher {
         room: crate::types::BootstrapRoom,
     ) -> Result<(u32, Option<Vec<u8>>), String> {
         match self {
-            Self::Mooncake(publisher) => publisher.receive_prefill_token_and_state(room),
+            Self::Pd(publisher) => publisher.receive_prefill_token_and_state(room),
             Self::Noop(_) => Err("prefill role does not receive remote KV".into()),
         }
     }
 
     fn cancel_receive(&mut self, room: crate::types::BootstrapRoom) -> Result<(), String> {
         match self {
-            Self::Mooncake(publisher) => publisher.cancel_receive(room),
+            Self::Pd(publisher) => publisher.cancel_receive(room),
             Self::Noop(_) => Err("prefill role does not own a decode receive".into()),
         }
     }
@@ -442,10 +460,9 @@ pub enum ServerLaunchError {
     Grpc(GrpcServeError),
     Http(HttpServeError),
     PrefillBootstrap(PrefillBootstrapServeError),
-    MooncakeTransfer(MooncakeError),
     TransferBackendFactory(String),
     KvCacheTransfer(String),
-    UnsupportedMooncakeKvMemory {
+    UnsupportedKvMemory {
         model_path: String,
         model_type: Option<String>,
     },
@@ -508,11 +525,11 @@ impl PartialEq for ServerLaunchError {
             }
             (Self::KvCacheTransfer(left), Self::KvCacheTransfer(right)) => left == right,
             (
-                Self::UnsupportedMooncakeKvMemory {
+                Self::UnsupportedKvMemory {
                     model_path: left_model_path,
                     model_type: left_model_type,
                 },
-                Self::UnsupportedMooncakeKvMemory {
+                Self::UnsupportedKvMemory {
                     model_path: right_model_path,
                     model_type: right_model_type,
                 },
@@ -596,17 +613,16 @@ impl fmt::Display for ServerLaunchError {
             Self::Grpc(error) => write!(formatter, "{error}"),
             Self::Http(error) => write!(formatter, "{error}"),
             Self::PrefillBootstrap(error) => write!(formatter, "{error}"),
-            Self::MooncakeTransfer(error) => write!(formatter, "{error}"),
             Self::TransferBackendFactory(error) => {
                 write!(formatter, "transfer backend initialization error: {error}")
             }
             Self::KvCacheTransfer(error) => write!(formatter, "KV cache transfer error: {error}"),
-            Self::UnsupportedMooncakeKvMemory {
+            Self::UnsupportedKvMemory {
                 model_path,
                 model_type,
             } => write!(
                 formatter,
-                "model {model_path} type {} does not expose transferable Mooncake KV memory",
+                "model {model_path} type {} does not expose transferable KV memory",
                 model_type.as_deref().unwrap_or("<unknown>")
             ),
             Self::InvalidDevice(value) => {
@@ -632,7 +648,7 @@ impl fmt::Display for ServerLaunchError {
             Self::ServerTaskJoin(error) => write!(formatter, "server task failed to join: {error}"),
             Self::ZmqRoutePortCountMismatch { expected, actual } => write!(
                 formatter,
-                "prefill Mooncake ZMQ route port count mismatch: expected {expected}, got {actual}"
+                "prefill ZMQ route port count mismatch: expected {expected}, got {actual}"
             ),
             Self::DpCoordinator(error) => {
                 write!(formatter, "DP coordinator launch error: {error}")
@@ -658,12 +674,6 @@ impl From<HttpServeError> for ServerLaunchError {
 impl From<PrefillBootstrapServeError> for ServerLaunchError {
     fn from(value: PrefillBootstrapServeError) -> Self {
         Self::PrefillBootstrap(value)
-    }
-}
-
-impl From<MooncakeError> for ServerLaunchError {
-    fn from(value: MooncakeError) -> Self {
-        Self::MooncakeTransfer(value)
     }
 }
 
@@ -696,7 +706,9 @@ impl From<TransferBackendFactoryError> for ServerLaunchError {
             TransferBackendFactoryError::KvCache(error) => {
                 Self::KvCacheTransfer(error.to_string())
             }
-            TransferBackendFactoryError::Mooncake(error) => Self::MooncakeTransfer(error),
+            TransferBackendFactoryError::Transport(error) => {
+                Self::KvCacheTransfer(error.to_string())
+            }
         }
     }
 }
@@ -782,7 +794,7 @@ pub fn prefill_bootstrap_listen_addr(args: &ServerArgs) -> Result<SocketAddr, Se
         })
 }
 
-pub fn prefill_mooncake_zmq_endpoints(args: &ServerArgs) -> Vec<String> {
+pub fn prefill_zmq_endpoints(args: &ServerArgs) -> Vec<String> {
     let Some(ports) = args.disaggregation_zmq_ports else {
         return Vec::new();
     };
@@ -790,6 +802,10 @@ pub fn prefill_mooncake_zmq_endpoints(args: &ServerArgs) -> Vec<String> {
     (ports.start..=ports.end)
         .map(|port| format!("tcp://{}:{port}", args.host))
         .collect()
+}
+
+pub fn prefill_mooncake_zmq_endpoints(args: &ServerArgs) -> Vec<String> {
+    prefill_zmq_endpoints(args)
 }
 
 fn http_server_info_from_args(args: &ServerArgs) -> HttpServerInfo {
@@ -811,14 +827,18 @@ fn http_server_info_from_args(args: &ServerArgs) -> HttpServerInfo {
         kv_cache: None,
     };
 
-    if let Some(ports) = args.disaggregation_zmq_ports
+    let kv_events_port = args
+        .kv_events_port
+        .or_else(|| args.disaggregation_zmq_ports.map(|ports| ports.start));
+
+    if let Some(port) = kv_events_port
         && let (Ok(block_size), Ok(dp_size)) =
             (u32::try_from(args.page_size), u32::try_from(args.dp_size))
     {
         server_info.kv_events = Some(HttpKvEventsInfo {
             publisher: "zmq".to_string(),
-            endpoint_host: prefill_mooncake_route_rank_ip(args),
-            endpoint_port_base: ports.start,
+            endpoint_host: prefill_route_rank_ip(args),
+            endpoint_port_base: port,
             topic: String::new(),
             block_size,
             dp_size,
@@ -901,7 +921,7 @@ where
     attributes
 }
 
-pub fn register_prefill_mooncake_routes_from_args(
+pub fn register_prefill_routes_from_args(
     service: &PrefillBootstrapService,
     args: &ServerArgs,
 ) -> Result<(), ServerLaunchError> {
@@ -923,7 +943,7 @@ pub fn register_prefill_mooncake_routes_from_args(
     } else {
         args.dp_size
     };
-    let rank_ip = prefill_mooncake_route_rank_ip(args);
+    let rank_ip = prefill_route_rank_ip(args);
     let mut state = service
         .state()
         .lock()
@@ -953,7 +973,14 @@ pub fn register_prefill_mooncake_routes_from_args(
     Ok(())
 }
 
-fn prefill_mooncake_route_rank_ip(args: &ServerArgs) -> String {
+pub fn register_prefill_mooncake_routes_from_args(
+    service: &PrefillBootstrapService,
+    args: &ServerArgs,
+) -> Result<(), ServerLaunchError> {
+    register_prefill_routes_from_args(service, args)
+}
+
+fn prefill_route_rank_ip(args: &ServerArgs) -> String {
     if is_wildcard_host(&args.host)
         && let Some(dist_init_host) = args.dist_init_addr.as_deref().and_then(host_from_addr)
     {
@@ -1043,7 +1070,7 @@ fn try_build_bootstrap_grpc_router_service_from_model(
     args: &ServerArgs,
     model: BootstrapForwardModel,
 ) -> Result<BootstrapGrpcRouterService, ServerLaunchError> {
-    let prefix_cache_policy = model_prefix_cache_policy(&model);
+    let prefix_cache_policy = resolve_prefix_cache_policy(args, &model);
     let model_runner = bootstrap_model_runner(model)?;
     let server_info_attributes = grpc_server_info_from_model_runner(args, &model_runner);
     let scheduler = Scheduler::with_cache_resources_and_policy(
@@ -1092,7 +1119,7 @@ fn try_build_bootstrap_http_router_service_from_model(
     args: &ServerArgs,
     model: BootstrapForwardModel,
 ) -> Result<BootstrapHttpRouterService, ServerLaunchError> {
-    let prefix_cache_policy = model_prefix_cache_policy(&model);
+    let prefix_cache_policy = resolve_prefix_cache_policy(args, &model);
     let model_runner = bootstrap_model_runner(model)?;
     let server_info = http_server_info_from_model_runner(args, &model_runner);
     let scheduler = Scheduler::with_cache_resources_and_policy(
@@ -1235,6 +1262,7 @@ where
         transfer_executor,
         decode_bootstrap_publisher,
         decode_side_bootstrap_only,
+        None,
     )
 }
 
@@ -1245,12 +1273,14 @@ fn try_build_bootstrap_pd_http_router_service_from_runner_with_decode_publisher<
     transfer_executor: E,
     decode_bootstrap_publisher: P,
     decode_side_bootstrap_only: bool,
+    event_publisher: Option<Arc<dyn KvStateEventPublisher>>,
 ) -> Result<BootstrapPdHttpRouterService<E, P>, ServerLaunchError>
 where
     E: KvTransferBackend,
     P: DecodeBootstrapPublisher,
 {
     let server_info = http_server_info_from_model_runner(args, &model_runner);
+    let prefix_cache_policy = resolve_prefix_cache_policy(args, model_runner.model());
     let mut worker = KvTransferModelWorker::new(model_runner, registry, transfer_executor)
         .with_decode_bootstrap_publisher(decode_bootstrap_publisher)
         .with_kv_page_size(args.page_size);
@@ -1259,14 +1289,17 @@ where
     } else if args.disaggregation_mode == "prefill" {
         worker = worker.with_prefill_only();
     }
-    let scheduler = Scheduler::with_cache_resources_and_policy(
+    let mut scheduler = Scheduler::with_cache_resources_and_policy(
         worker,
         RadixCache::default(),
         cache_page_allocator_from_server_args(args)?,
-        PrefixCachePolicy::Disabled,
+        prefix_cache_policy,
     )
     .with_max_running_requests(args.max_running_requests)
     .with_chunked_prefill_size(args.chunked_prefill_size);
+    if let Some(publisher) = event_publisher {
+        scheduler = scheduler.with_event_publisher(publisher);
+    }
     let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
         &args.model_path,
         args.tokenizer_path.as_deref(),
@@ -1282,12 +1315,12 @@ where
     )
 }
 
-fn launch_mooncake_decode_bootstrap_publisher(
+fn launch_decode_bootstrap_publisher(
     args: &ServerArgs,
-    kv_cache_layout: MooncakeKvCacheLayout,
-    mooncake_session_id: impl Into<String>,
-) -> Result<MooncakeDecodeBootstrapPublisher, ServerLaunchError> {
-    let endpoint = prefill_mooncake_route_rank_ip(args);
+    kv_cache_layout: KvTransferLayout,
+    session_id: impl Into<String>,
+) -> Result<PdDecodeBootstrapPublisher, ServerLaunchError> {
+    let endpoint = prefill_route_rank_ip(args);
     let ranks_per_node = args.tp_size.checked_div(args.nnodes.max(1)).unwrap_or(1);
     let target_tp_rank = i32::try_from(args.node_rank * ranks_per_node).unwrap_or(0);
     let dst_port = args
@@ -1305,7 +1338,7 @@ fn launch_mooncake_decode_bootstrap_publisher(
             }
         })
         .unwrap_or(args.port);
-    MooncakeDecodeBootstrapPublisher::new(endpoint, dst_port, mooncake_session_id)
+    PdDecodeBootstrapPublisher::new(endpoint, dst_port, session_id)
         .with_kv_cache_layout(kv_cache_layout)
         .with_target_ranks(target_tp_rank, 0)
         .with_receiver()
@@ -1315,13 +1348,11 @@ fn launch_mooncake_decode_bootstrap_publisher(
 pub fn build_bootstrap_mooncake_prefill_http_router_service<S, R>(
     args: &ServerArgs,
     bootstrap_service: PrefillBootstrapService,
-    transfer_executor: MooncakeKvCacheTransferExecutor<S, R>,
-) -> BootstrapPdHttpRouterService<
-    MooncakeBootstrapKvCacheTransferExecutor<MooncakeKvCacheTransferExecutor<S, R>>,
->
+    transfer_executor: KvCacheTransferExecutor<S, R>,
+) -> BootstrapPdHttpRouterService<PdBootstrapKvCacheTransferExecutor<KvCacheTransferExecutor<S, R>>>
 where
-    S: MooncakeTransferSubmitter + MooncakeTransferStatusReader + MooncakeBatchReleaser,
-    R: MooncakeTransferTargetResolver,
+    S: KvTransferSubmitter + KvTransferStatusReader + KvBatchReleaser,
+    R: KvTransferTargetResolver,
 {
     try_build_bootstrap_mooncake_prefill_http_router_service(
         args,
@@ -1334,42 +1365,38 @@ where
 pub fn try_build_bootstrap_mooncake_prefill_http_router_service<S, R>(
     args: &ServerArgs,
     bootstrap_service: PrefillBootstrapService,
-    transfer_executor: MooncakeKvCacheTransferExecutor<S, R>,
+    transfer_executor: KvCacheTransferExecutor<S, R>,
 ) -> Result<
-    BootstrapPdHttpRouterService<
-        MooncakeBootstrapKvCacheTransferExecutor<MooncakeKvCacheTransferExecutor<S, R>>,
-    >,
+    BootstrapPdHttpRouterService<PdBootstrapKvCacheTransferExecutor<KvCacheTransferExecutor<S, R>>>,
     ServerLaunchError,
 >
 where
-    S: MooncakeTransferSubmitter + MooncakeTransferStatusReader + MooncakeBatchReleaser,
-    R: MooncakeTransferTargetResolver,
+    S: KvTransferSubmitter + KvTransferStatusReader + KvBatchReleaser,
+    R: KvTransferTargetResolver,
 {
     try_build_bootstrap_pd_http_router_service(
         args,
         DecodeBootstrapRegistry::default(),
-        MooncakeBootstrapKvCacheTransferExecutor::new(bootstrap_service, transfer_executor),
+        PdBootstrapKvCacheTransferExecutor::new(bootstrap_service, transfer_executor),
     )
 }
 
 pub fn try_build_bootstrap_mooncake_prefill_grpc_router_service<S, R>(
     args: &ServerArgs,
     bootstrap_service: PrefillBootstrapService,
-    transfer_executor: MooncakeKvCacheTransferExecutor<S, R>,
+    transfer_executor: KvCacheTransferExecutor<S, R>,
 ) -> Result<
-    BootstrapPdGrpcRouterService<
-        MooncakeBootstrapKvCacheTransferExecutor<MooncakeKvCacheTransferExecutor<S, R>>,
-    >,
+    BootstrapPdGrpcRouterService<PdBootstrapKvCacheTransferExecutor<KvCacheTransferExecutor<S, R>>>,
     ServerLaunchError,
 >
 where
-    S: MooncakeTransferSubmitter + MooncakeTransferStatusReader + MooncakeBatchReleaser,
-    R: MooncakeTransferTargetResolver,
+    S: KvTransferSubmitter + KvTransferStatusReader + KvBatchReleaser,
+    R: KvTransferTargetResolver,
 {
     try_build_bootstrap_pd_grpc_router_service(
         args,
         DecodeBootstrapRegistry::default(),
-        MooncakeBootstrapKvCacheTransferExecutor::new(bootstrap_service, transfer_executor),
+        PdBootstrapKvCacheTransferExecutor::new(bootstrap_service, transfer_executor),
     )
 }
 
@@ -1378,6 +1405,14 @@ struct ProductionPdRuntimeBundle {
     transfer_backend: ProductionTransferBackend,
     decode_bootstrap_publisher: ProductionDecodeBootstrapPublisher,
     decode_side_bootstrap_only: bool,
+    event_publisher: Option<Arc<dyn KvStateEventPublisher>>,
+}
+
+impl ProductionPdRuntimeBundle {
+    fn with_event_publisher(mut self, publisher: Arc<dyn KvStateEventPublisher>) -> Self {
+        self.event_publisher = Some(publisher);
+        self
+    }
 }
 
 fn try_build_launch_pd_runtime_bundle(
@@ -1389,7 +1424,7 @@ fn try_build_launch_pd_runtime_bundle(
     let mut context = TransferBackendBuildContext::new(
         &mut model_runner,
         pd_config,
-        prefill_mooncake_route_rank_ip(args),
+        prefill_route_rank_ip(args),
         crate::cli::resolve_max_total_tokens(args),
         args.page_size,
     );
@@ -1403,13 +1438,11 @@ fn try_build_launch_pd_runtime_bundle(
             false,
         ),
         DisaggregationMode::Decode => (
-            ProductionDecodeBootstrapPublisher::Mooncake(Box::new(
-                launch_mooncake_decode_bootstrap_publisher(
-                    args,
-                    transfer_backend.layout,
-                    transfer_backend.local_endpoint,
-                )?,
-            )),
+            ProductionDecodeBootstrapPublisher::Pd(Box::new(launch_decode_bootstrap_publisher(
+                args,
+                transfer_backend.layout,
+                transfer_backend.local_endpoint,
+            )?)),
             true,
         ),
         DisaggregationMode::Null => {
@@ -1425,6 +1458,7 @@ fn try_build_launch_pd_runtime_bundle(
         transfer_backend: transfer_backend.backend,
         decode_bootstrap_publisher,
         decode_side_bootstrap_only,
+        event_publisher: None,
     })
 }
 
@@ -1439,6 +1473,7 @@ fn try_build_launch_pd_http_router_service(
         bundle.transfer_backend,
         bundle.decode_bootstrap_publisher,
         bundle.decode_side_bootstrap_only,
+        bundle.event_publisher,
     )
 }
 
@@ -1453,6 +1488,7 @@ fn try_build_launch_pd_grpc_router_service(
         bundle.transfer_backend,
         bundle.decode_bootstrap_publisher,
         bundle.decode_side_bootstrap_only,
+        bundle.event_publisher,
     )
 }
 
@@ -1527,6 +1563,7 @@ where
         transfer_executor,
         decode_bootstrap_publisher,
         decode_side_bootstrap_only,
+        None,
     )
 }
 
@@ -1537,12 +1574,14 @@ fn try_build_bootstrap_pd_grpc_router_service_from_runner_with_decode_publisher<
     transfer_executor: E,
     decode_bootstrap_publisher: P,
     decode_side_bootstrap_only: bool,
+    event_publisher: Option<Arc<dyn KvStateEventPublisher>>,
 ) -> Result<BootstrapPdGrpcRouterService<E, P>, ServerLaunchError>
 where
     E: KvTransferBackend,
     P: DecodeBootstrapPublisher,
 {
     let server_info_attributes = grpc_server_info_from_model_runner(args, &model_runner);
+    let prefix_cache_policy = resolve_prefix_cache_policy(args, model_runner.model());
     let mut worker = KvTransferModelWorker::new(model_runner, registry, transfer_executor)
         .with_decode_bootstrap_publisher(decode_bootstrap_publisher)
         .with_kv_page_size(args.page_size);
@@ -1551,14 +1590,17 @@ where
     } else if args.disaggregation_mode == "prefill" {
         worker = worker.with_prefill_only();
     }
-    let scheduler = Scheduler::with_cache_resources_and_policy(
+    let mut scheduler = Scheduler::with_cache_resources_and_policy(
         worker,
         RadixCache::default(),
         cache_page_allocator_from_server_args(args)?,
-        PrefixCachePolicy::Disabled,
+        prefix_cache_policy,
     )
     .with_max_running_requests(args.max_running_requests)
     .with_chunked_prefill_size(args.chunked_prefill_size);
+    if let Some(publisher) = event_publisher {
+        scheduler = scheduler.with_event_publisher(publisher);
+    }
     let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
         &args.model_path,
         args.tokenizer_path.as_deref(),
@@ -1636,8 +1678,6 @@ fn validate_launch_transfer_backend(pd_config: &PdConfig) -> Result<(), ServerLa
     }
 
     match pd_config.transfer_backend {
-        TransferBackend::Mooncake if cfg!(feature = "mooncake-link") => Ok(()),
-        TransferBackend::Mooncake => Err(MooncakeError::UnavailableWithoutLink.into()),
         TransferBackend::Tcp => Ok(()),
         backend @ (TransferBackend::Nixl | TransferBackend::Ascend | TransferBackend::Mori) => {
             Err(ServerLaunchError::UnsupportedBootstrapPdRuntime {
@@ -1685,19 +1725,24 @@ where
             serve_grpc_and_sidecar(addr, service, sidecar_addr, args.enable_metrics, shutdown)
                 .await?;
         }
-        DisaggregationMode::Prefill
-            if pd_config.transfer_backend == TransferBackend::Mooncake
-                || pd_config.transfer_backend == TransferBackend::Tcp =>
-        {
+        DisaggregationMode::Prefill if pd_config.transfer_backend == TransferBackend::Tcp => {
+            let mut args = args;
             let bootstrap_addr = prefill_bootstrap_listen_addr(&args)?;
-            let zmq_endpoints = prefill_mooncake_zmq_endpoints(&args);
+            let zmq_endpoints = prefill_zmq_endpoints(&args);
             let bootstrap_service = PrefillBootstrapService::default();
-            register_prefill_mooncake_routes_from_args(&bootstrap_service, &args)?;
-            let runtime_bundle = try_build_launch_pd_runtime_bundle(
+            register_prefill_routes_from_args(&bootstrap_service, &args)?;
+            let mut runtime_bundle = try_build_launch_pd_runtime_bundle(
                 &args,
                 &pd_config,
                 Some(bootstrap_service.clone()),
             )?;
+            if let Some(port) = args.kv_events_port {
+                let publisher = ZmqKvStateEventPublisher::bind(&args.host, port, "")
+                    .await
+                    .map_err(ServerLaunchError::KvCacheTransfer)?;
+                args.kv_events_port = Some(publisher.port());
+                runtime_bundle = runtime_bundle.with_event_publisher(Arc::new(publisher));
+            }
             let service = try_build_launch_pd_grpc_router_service(&args, runtime_bundle)?;
             serve_prefill_grpc_and_bootstrap(
                 addr,
@@ -1713,11 +1758,16 @@ where
             )
             .await?;
         }
-        DisaggregationMode::Decode
-            if pd_config.transfer_backend == TransferBackend::Mooncake
-                || pd_config.transfer_backend == TransferBackend::Tcp =>
-        {
-            let runtime_bundle = try_build_launch_pd_runtime_bundle(&args, &pd_config, None)?;
+        DisaggregationMode::Decode if pd_config.transfer_backend == TransferBackend::Tcp => {
+            let mut args = args;
+            let mut runtime_bundle = try_build_launch_pd_runtime_bundle(&args, &pd_config, None)?;
+            if let Some(port) = args.kv_events_port {
+                let publisher = ZmqKvStateEventPublisher::bind(&args.host, port, "")
+                    .await
+                    .map_err(ServerLaunchError::KvCacheTransfer)?;
+                args.kv_events_port = Some(publisher.port());
+                runtime_bundle = runtime_bundle.with_event_publisher(Arc::new(publisher));
+            }
             let service = try_build_launch_pd_grpc_router_service(&args, runtime_bundle)?;
             serve_grpc_and_sidecar(addr, service, sidecar_addr, args.enable_metrics, shutdown)
                 .await?;
@@ -1778,19 +1828,24 @@ where
                 .with_engine_info_bootstrap_service(engine_info_service);
             serve_http_router_with_shutdown(addr, service, shutdown).await?;
         }
-        DisaggregationMode::Prefill
-            if pd_config.transfer_backend == TransferBackend::Mooncake
-                || pd_config.transfer_backend == TransferBackend::Tcp =>
-        {
+        DisaggregationMode::Prefill if pd_config.transfer_backend == TransferBackend::Tcp => {
+            let mut args = args;
             let bootstrap_addr = prefill_bootstrap_listen_addr(&args)?;
-            let zmq_endpoints = prefill_mooncake_zmq_endpoints(&args);
+            let zmq_endpoints = prefill_zmq_endpoints(&args);
             let bootstrap_service = PrefillBootstrapService::default();
-            register_prefill_mooncake_routes_from_args(&bootstrap_service, &args)?;
-            let runtime_bundle = try_build_launch_pd_runtime_bundle(
+            register_prefill_routes_from_args(&bootstrap_service, &args)?;
+            let mut runtime_bundle = try_build_launch_pd_runtime_bundle(
                 &args,
                 &pd_config,
                 Some(bootstrap_service.clone()),
             )?;
+            if let Some(port) = args.kv_events_port {
+                let publisher = ZmqKvStateEventPublisher::bind(&args.host, port, "")
+                    .await
+                    .map_err(ServerLaunchError::KvCacheTransfer)?;
+                args.kv_events_port = Some(publisher.port());
+                runtime_bundle = runtime_bundle.with_event_publisher(Arc::new(publisher));
+            }
             let service = try_build_launch_pd_http_router_service(&args, runtime_bundle)?
                 .with_engine_info_bootstrap_service(engine_info_service);
             serve_prefill_http_and_bootstrap(
@@ -1805,11 +1860,16 @@ where
             )
             .await?;
         }
-        DisaggregationMode::Decode
-            if pd_config.transfer_backend == TransferBackend::Mooncake
-                || pd_config.transfer_backend == TransferBackend::Tcp =>
-        {
-            let runtime_bundle = try_build_launch_pd_runtime_bundle(&args, &pd_config, None)?;
+        DisaggregationMode::Decode if pd_config.transfer_backend == TransferBackend::Tcp => {
+            let mut args = args;
+            let mut runtime_bundle = try_build_launch_pd_runtime_bundle(&args, &pd_config, None)?;
+            if let Some(port) = args.kv_events_port {
+                let publisher = ZmqKvStateEventPublisher::bind(&args.host, port, "")
+                    .await
+                    .map_err(ServerLaunchError::KvCacheTransfer)?;
+                args.kv_events_port = Some(publisher.port());
+                runtime_bundle = runtime_bundle.with_event_publisher(Arc::new(publisher));
+            }
             let service = try_build_launch_pd_http_router_service(&args, runtime_bundle)?
                 .with_engine_info_bootstrap_service(engine_info_service);
             serve_http_router_with_shutdown(addr, service, shutdown).await?;
@@ -1862,7 +1922,7 @@ where
     });
     if !bootstrap.zmq_endpoints.is_empty() {
         bootstrap_tasks.spawn(async move {
-            serve_mooncake_bootstrap_zmq_endpoints_with_shutdown(
+            serve_bootstrap_zmq_endpoints_with_shutdown(
                 bootstrap.zmq_endpoints,
                 bootstrap.prefill_service,
                 watch_shutdown(bootstrap_shutdown_rx),
@@ -1996,7 +2056,7 @@ where
         watch_shutdown(bootstrap_shutdown_rx.clone()),
     ));
     if !bootstrap.zmq_endpoints.is_empty() {
-        bootstrap_tasks.spawn(serve_mooncake_bootstrap_zmq_endpoints_with_shutdown(
+        bootstrap_tasks.spawn(serve_bootstrap_zmq_endpoints_with_shutdown(
             bootstrap.zmq_endpoints,
             bootstrap.prefill_service,
             watch_shutdown(bootstrap_shutdown_rx),
@@ -2101,7 +2161,7 @@ async fn watch_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
 #[cfg(test)]
 mod pd_shutdown_tests {
     use super::*;
-    use crate::mooncake_control::send_frames;
+    use crate::pd_control::send_frames;
     use crate::scheduler::ScheduleBatch;
     use crate::tokenizer::ByteTokenizer;
     use crate::worker::{BatchGeneratedTokens, FallibleModelWorker, WorkerExecutionError};

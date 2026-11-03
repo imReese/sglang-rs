@@ -4326,6 +4326,7 @@ dependencies = [
  "prost",
  "protoc-bin-vendored",
  "rand 0.10.1",
+ "rmp",
  "serde",
  "serde_json",
  "serde_path_to_error",
