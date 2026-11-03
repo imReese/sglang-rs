@@ -49,7 +49,7 @@ hf download Qwen/Qwen3.5-0.8B \
   --served-model-name Qwen3.5-0.8B \
   --device cpu \
   --host 127.0.0.1 --port 30000 \
-  --max-total-tokens 4096 \
+  --max-total-tokens 32768 \
   --max-running-requests 1
 ```
 
@@ -71,7 +71,7 @@ curl --fail-with-body --no-buffer \
   }'
 ```
 
-Use `"stream": false` for a single JSON response. CPU execution is an FP32 correctness reference; keep prompts short. This example reserves 256 KV token slots, not the model's full context capacity. For a download-free Transformer smoke, run [`./scripts/run_cpu_reference_smoke.sh`](scripts/run_cpu_reference_smoke.sh).
+Use `"stream": false` for a single JSON response. CPU execution is an FP32 correctness reference; keep prompts short. This example reserves 32K (32,768) KV token slots, not the model's full context capacity. For a download-free Transformer smoke, run [`./scripts/run_cpu_reference_smoke.sh`](scripts/run_cpu_reference_smoke.sh).
 
 ## Capabilities
 
