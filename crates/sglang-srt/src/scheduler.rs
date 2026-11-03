@@ -147,35 +147,39 @@ impl ScheduledRequest {
         self.prefix_match.matched_token_count
     }
 
-    fn apply_prefix_match(&mut self, prefix_match: PrefixMatch) {
+    pub(crate) fn set_data_parallel_rank(&mut self, rank: i32) {
+        self.data_parallel_rank = rank;
+    }
+
+    pub(crate) fn apply_prefix_match(&mut self, prefix_match: PrefixMatch) {
         self.prefix_match = prefix_match;
     }
 
-    fn set_stage(&mut self, stage: RequestStage) {
+    pub(crate) fn set_stage(&mut self, stage: RequestStage) {
         self.stage = stage;
     }
 
-    fn set_allocated_cache_pages(&mut self, cache_pages: Vec<CachePageId>) {
+    pub(crate) fn set_allocated_cache_pages(&mut self, cache_pages: Vec<CachePageId>) {
         self.allocated_cache_pages = cache_pages;
     }
 
-    fn set_forward_cache_pages(&mut self, cache_pages: Vec<CachePageId>) {
+    pub(crate) fn set_forward_cache_pages(&mut self, cache_pages: Vec<CachePageId>) {
         self.forward_cache_pages = cache_pages;
     }
 
-    fn set_cache_hit_token_count(&mut self, token_count: usize) {
+    pub(crate) fn set_cache_hit_token_count(&mut self, token_count: usize) {
         self.cache_hit_token_count = token_count;
     }
 
-    fn set_sequence_cache_pages(&mut self, cache_pages: Vec<CachePageId>) {
+    pub(crate) fn set_sequence_cache_pages(&mut self, cache_pages: Vec<CachePageId>) {
         self.sequence_cache_pages = cache_pages;
     }
 
-    fn append_sequence_cache_pages(&mut self, cache_pages: &[CachePageId]) {
+    pub(crate) fn append_sequence_cache_pages(&mut self, cache_pages: &[CachePageId]) {
         self.sequence_cache_pages.extend_from_slice(cache_pages);
     }
 
-    fn clear_forward_cache_allocation(&mut self) {
+    pub(crate) fn clear_forward_cache_allocation(&mut self) {
         let allocated_page_count = self.allocated_cache_pages.len();
         if allocated_page_count > 0 {
             self.sequence_cache_pages.truncate(
@@ -188,11 +192,11 @@ impl ScheduledRequest {
         self.forward_cache_pages.clear();
     }
 
-    fn append_output_ids(&mut self, output_ids: &[u32]) {
+    pub(crate) fn append_output_ids(&mut self, output_ids: &[u32]) {
         self.output_ids.extend_from_slice(output_ids);
     }
 
-    fn reached_max_new_tokens(&self) -> bool {
+    pub(crate) fn reached_max_new_tokens(&self) -> bool {
         self.output_ids.len() >= self.sampling.max_new_tokens
     }
 }
