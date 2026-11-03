@@ -11,8 +11,7 @@ use sglang_srt::http::serve_http_router_with_shutdown;
 use sglang_srt::server::build_bootstrap_http_router_service;
 use tokio::sync::oneshot;
 
-#[path = "support/compressed_kimi_k25.rs"]
-mod compressed_kimi_k25;
+use crate::support::compressed_kimi_k25;
 
 fn cuda_test_device_ordinal() -> usize {
     std::env::var("SGLANG_CUDA_TEST_DEVICE")

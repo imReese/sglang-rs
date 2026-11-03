@@ -1,5 +1,3 @@
-#![cfg(feature = "test-support")]
-
 use std::ffi::c_void;
 use std::sync::{
     Arc, Mutex,

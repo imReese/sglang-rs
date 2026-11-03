@@ -41,3 +41,13 @@ tower = { version = "0.5.3", features = ["util"] }
 [build-dependencies]
 protoc-bin-vendored = "3.2.0"
 tonic-prost-build = "0.14.6"
+
+[[test]]
+name = "core"
+path = "tests/core/main.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "server"
+path = "tests/server/main.rs"
+required-features = ["test-support"]

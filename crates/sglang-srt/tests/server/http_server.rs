@@ -1,5 +1,3 @@
-#![cfg(feature = "test-support")]
-
 use std::ffi::c_void;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -52,9 +50,7 @@ use sglang_srt::worker::{
     WorkerWeightUpdateRequest,
 };
 
-mod support {
-    pub mod qwen3_nonzero;
-}
+use crate::support;
 
 #[derive(Default)]
 struct HttpTwoStepWorker;

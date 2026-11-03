@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[path = "../build_support/mooncake_link.rs"]
+#[path = "../../build_support/mooncake_link.rs"]
 mod mooncake_link;
 
 #[test]

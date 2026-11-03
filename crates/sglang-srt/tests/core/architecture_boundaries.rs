@@ -1,8 +1,8 @@
 #[test]
 fn common_runtime_does_not_depend_on_cuda_storage() {
     for source in [
-        include_str!("../src/model_runtime.rs"),
-        include_str!("../src/runtime_kv_cache.rs"),
+        include_str!("../../src/model_runtime.rs"),
+        include_str!("../../src/runtime_kv_cache.rs"),
     ] {
         assert!(!source.contains("CudaKvStorage"));
         assert!(!source.contains("allocate_cuda_kv_cache"));
@@ -12,7 +12,7 @@ fn common_runtime_does_not_depend_on_cuda_storage() {
 
 #[test]
 fn server_reuses_transfer_factory_without_constructing_mooncake_infrastructure() {
-    let source = include_str!("../src/server.rs");
+    let source = include_str!("../../src/server.rs");
 
     for forbidden in [
         "SharedLinkedMooncakeTransferEngine::new",
@@ -30,8 +30,8 @@ fn server_reuses_transfer_factory_without_constructing_mooncake_infrastructure()
 
 #[test]
 fn transfer_and_artifact_primitives_do_not_rederive_model_specific_layouts() {
-    let transfer = include_str!("../src/transfer/mod.rs");
-    let artifacts = include_str!("../src/model_artifacts.rs");
+    let transfer = include_str!("../../src/transfer/mod.rs");
+    let artifacts = include_str!("../../src/model_artifacts.rs");
 
     assert!(!transfer.contains("HfModelConfig"));
     assert!(!transfer.contains("kv_cache_num_layers"));
@@ -60,8 +60,8 @@ fn transfer_and_artifact_primitives_do_not_rederive_model_specific_layouts() {
 
 #[test]
 fn production_launch_has_no_fake_transfer_backend() {
-    let transfer = include_str!("../src/transfer/mod.rs");
-    let server = include_str!("../src/server.rs");
+    let transfer = include_str!("../../src/transfer/mod.rs");
+    let server = include_str!("../../src/server.rs");
 
     assert!(!transfer.contains("\"fake\" =>"));
     assert!(!server.contains("TransferBackend::Fake"));
@@ -69,10 +69,10 @@ fn production_launch_has_no_fake_transfer_backend() {
 
 #[test]
 fn backend_execution_bundle_prevents_runtime_kv_type_erasure() {
-    let runtime = include_str!("../src/model_runtime.rs");
-    let runtime_kv = include_str!("../src/runtime_kv_cache.rs");
-    let server = include_str!("../src/server.rs");
-    let runner = include_str!("../src/model_executor.rs");
+    let runtime = include_str!("../../src/model_runtime.rs");
+    let runtime_kv = include_str!("../../src/runtime_kv_cache.rs");
+    let server = include_str!("../../src/server.rs");
+    let runner = include_str!("../../src/model_executor.rs");
 
     for source in [runtime, runtime_kv] {
         assert!(!source.contains("std::any::Any"));
@@ -86,11 +86,11 @@ fn backend_execution_bundle_prevents_runtime_kv_type_erasure() {
 #[test]
 fn model_adapters_do_not_select_runtime_backend_providers() {
     for adapter in [
-        include_str!("../src/models/qwen.rs"),
-        include_str!("../src/models/qwen3_5.rs"),
-        include_str!("../src/models/kimi_linear.rs"),
-        include_str!("../src/models/deepseek.rs"),
-        include_str!("../src/models/glm.rs"),
+        include_str!("../../src/models/qwen.rs"),
+        include_str!("../../src/models/qwen3_5.rs"),
+        include_str!("../../src/models/kimi_linear.rs"),
+        include_str!("../../src/models/deepseek.rs"),
+        include_str!("../../src/models/glm.rs"),
     ] {
         assert!(!adapter.contains("BackendProviderRegistry"));
         assert!(!adapter.contains("CudaBackend"));
@@ -100,17 +100,17 @@ fn model_adapters_do_not_select_runtime_backend_providers() {
 
 #[test]
 fn cuda_backend_components_do_not_branch_on_model_names() {
-    let dense = include_str!("../src/cuda/dense_decoder.rs");
-    let hybrid = include_str!("../src/cuda/hybrid_decoder.rs");
-    let mla = include_str!("../src/cuda/mla.rs");
-    let moe = include_str!("../src/cuda/moe.rs");
+    let dense = include_str!("../../src/cuda/dense_decoder.rs");
+    let hybrid = include_str!("../../src/cuda/hybrid_decoder.rs");
+    let mla = include_str!("../../src/cuda/mla.rs");
+    let moe = include_str!("../../src/cuda/moe.rs");
     for source in [
-        include_str!("../src/backend_model.rs"),
-        include_str!("../src/cuda/execution_resources.rs"),
-        include_str!("../src/cuda/tensor_parallel.rs"),
-        include_str!("../src/cuda/transformer.rs"),
-        include_str!("../src/distributed/transformer_parallel.rs"),
-        include_str!("../src/moe.rs"),
+        include_str!("../../src/backend_model.rs"),
+        include_str!("../../src/cuda/execution_resources.rs"),
+        include_str!("../../src/cuda/tensor_parallel.rs"),
+        include_str!("../../src/cuda/transformer.rs"),
+        include_str!("../../src/distributed/transformer_parallel.rs"),
+        include_str!("../../src/moe.rs"),
         hybrid,
         mla,
         moe,

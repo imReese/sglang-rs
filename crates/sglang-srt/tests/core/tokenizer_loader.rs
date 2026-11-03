@@ -168,6 +168,14 @@ fn runtime_tokenizer_downloads_repo_id_tokenizer_when_cache_is_missing() {
     let _hf_home = EnvVarRestore::set("HF_HOME", &hf_home);
     let _hf_hub_cache = EnvVarRestore::set("HUGGINGFACE_HUB_CACHE", hf_home.join("hub"));
     let _hf_endpoint = EnvVarRestore::set("HF_ENDPOINT", endpoint);
+    let _http_proxy = EnvVarRestore::remove("http_proxy");
+    let _http_proxy_upper = EnvVarRestore::remove("HTTP_PROXY");
+    let _https_proxy = EnvVarRestore::remove("https_proxy");
+    let _https_proxy_upper = EnvVarRestore::remove("HTTPS_PROXY");
+    let _all_proxy = EnvVarRestore::remove("all_proxy");
+    let _all_proxy_upper = EnvVarRestore::remove("ALL_PROXY");
+    let _no_proxy = EnvVarRestore::set("no_proxy", "127.0.0.1,localhost");
+    let _no_proxy_upper = EnvVarRestore::set("NO_PROXY", "127.0.0.1,localhost");
 
     let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path("zai-org/GLM-5-FP8", None)
         .expect("runtime tokenizer should download repo tokenizer metadata");
@@ -211,6 +219,14 @@ impl EnvVarRestore {
         let previous = std::env::var_os(name);
         unsafe {
             std::env::set_var(name, value);
+        }
+        Self { name, previous }
+    }
+
+    fn remove(name: &'static str) -> Self {
+        let previous = std::env::var_os(name);
+        unsafe {
+            std::env::remove_var(name);
         }
         Self { name, previous }
     }

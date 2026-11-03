@@ -1,5 +1,3 @@
-#![cfg(feature = "test-support")]
-
 use std::fs;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
