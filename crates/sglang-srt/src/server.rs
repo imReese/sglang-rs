@@ -104,7 +104,8 @@ pub mod test_support {
         args: &ServerArgs,
     ) -> Result<ReferenceGrpcRouterService, ServerLaunchError> {
         let scheduler = Scheduler::new(ModelRunner::new(CpuReferenceModel))
-            .with_max_running_requests(args.max_running_requests);
+            .with_max_running_requests(args.max_running_requests)
+            .with_chunked_prefill_size(args.chunked_prefill_size);
         let tokenizer = reference_tokenizer_from_args(args)?;
         let runtime = RouterRuntime::new(Engine::new(tokenizer, scheduler))
             .with_default_stop_token_ids(model_config_eos_token_ids(&args.model_path));
@@ -113,7 +114,8 @@ pub mod test_support {
 
     pub fn build_reference_http_router_service(args: &ServerArgs) -> ReferenceHttpRouterService {
         let scheduler = Scheduler::new(ModelRunner::new(CpuReferenceModel))
-            .with_max_running_requests(args.max_running_requests);
+            .with_max_running_requests(args.max_running_requests)
+            .with_chunked_prefill_size(args.chunked_prefill_size);
         let tokenizer =
             reference_tokenizer_from_args(args).expect("reference tokenizer should load");
         let runtime = RouterRuntime::new(Engine::new(tokenizer, scheduler))
@@ -143,7 +145,8 @@ pub mod test_support {
             RadixCache::default(),
             cache_page_allocator_from_server_args(args)?,
         )
-        .with_max_running_requests(args.max_running_requests);
+        .with_max_running_requests(args.max_running_requests)
+        .with_chunked_prefill_size(args.chunked_prefill_size);
         Ok(reference_http_service(args, scheduler).with_disaggregated_requests())
     }
 
@@ -168,7 +171,8 @@ pub mod test_support {
             cache_page_allocator_from_server_args(args)
                 .expect("reference KV cache arguments should be valid"),
         )
-        .with_max_running_requests(args.max_running_requests);
+        .with_max_running_requests(args.max_running_requests)
+        .with_chunked_prefill_size(args.chunked_prefill_size);
         reference_http_service(args, scheduler)
             .with_disaggregated_requests()
             .with_max_transfer_polls(args.disaggregation_decode_polling_interval)
@@ -213,7 +217,8 @@ pub mod test_support {
             cache_page_allocator_from_server_args(args)
                 .expect("reference KV cache arguments should be valid"),
         )
-        .with_max_running_requests(args.max_running_requests);
+        .with_max_running_requests(args.max_running_requests)
+        .with_chunked_prefill_size(args.chunked_prefill_size);
         let tokenizer =
             reference_tokenizer_from_args(args).expect("reference tokenizer should load");
         let runtime = RouterRuntime::new(Engine::new(tokenizer, scheduler))
@@ -995,7 +1000,8 @@ pub fn try_build_bootstrap_dp_coordinator(
     let scheduler = DpScheduler::new(worker_pool, allocators, max_batch_size, args.page_size)
         .map_err(|e| {
             ServerLaunchError::DpCoordinator(format!("failed to initialize DP scheduler: {e}"))
-        })?;
+        })?
+        .with_chunked_prefill_size(args.chunked_prefill_size);
 
     let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
         &args.model_path,
@@ -1035,7 +1041,8 @@ fn try_build_bootstrap_grpc_router_service_from_model(
         cache_page_allocator_from_server_args(args)?,
         prefix_cache_policy,
     )
-    .with_max_running_requests(args.max_running_requests);
+    .with_max_running_requests(args.max_running_requests)
+    .with_chunked_prefill_size(args.chunked_prefill_size);
     let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
         &args.model_path,
         args.tokenizer_path.as_deref(),
@@ -1083,7 +1090,8 @@ fn try_build_bootstrap_http_router_service_from_model(
         cache_page_allocator_from_server_args(args)?,
         prefix_cache_policy,
     )
-    .with_max_running_requests(args.max_running_requests);
+    .with_max_running_requests(args.max_running_requests)
+    .with_chunked_prefill_size(args.chunked_prefill_size);
     let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
         &args.model_path,
         args.tokenizer_path.as_deref(),
@@ -1129,7 +1137,8 @@ pub fn try_build_bootstrap_prefill_http_router_service(
         RadixCache::default(),
         cache_page_allocator_from_server_args(args)?,
     )
-    .with_max_running_requests(args.max_running_requests);
+    .with_max_running_requests(args.max_running_requests)
+    .with_chunked_prefill_size(args.chunked_prefill_size);
     let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
         &args.model_path,
         args.tokenizer_path.as_deref(),
@@ -1246,7 +1255,8 @@ where
         cache_page_allocator_from_server_args(args)?,
         PrefixCachePolicy::Disabled,
     )
-    .with_max_running_requests(args.max_running_requests);
+    .with_max_running_requests(args.max_running_requests)
+    .with_chunked_prefill_size(args.chunked_prefill_size);
     let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
         &args.model_path,
         args.tokenizer_path.as_deref(),
@@ -1538,7 +1548,8 @@ where
         cache_page_allocator_from_server_args(args)?,
         PrefixCachePolicy::Disabled,
     )
-    .with_max_running_requests(args.max_running_requests);
+    .with_max_running_requests(args.max_running_requests)
+    .with_chunked_prefill_size(args.chunked_prefill_size);
     let tokenizer = RuntimeTokenizer::from_model_or_tokenizer_path(
         &args.model_path,
         args.tokenizer_path.as_deref(),

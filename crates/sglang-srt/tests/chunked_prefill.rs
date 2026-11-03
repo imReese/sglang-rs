@@ -358,3 +358,105 @@ fn hash_chain_parity_with_locus_router() {
     assert_eq!(events[1].block_hashes, expected_hashes[4..8]);
     assert_eq!(events[1].parent_block_hash, Some(expected_hashes[3]));
 }
+
+#[tokio::test]
+async fn real_qwen35_0_8b_chunked_prefill_execution() {
+    use sglang_srt::cli::ServerArgs;
+    use sglang_srt::proto::sglang::runtime::v1::sglang_service_server::SglangService;
+    use sglang_srt::proto::sglang::runtime::v1::{
+        RequestOptions, SamplingParams, TextGenerateRequest,
+    };
+    use sglang_srt::server::try_build_bootstrap_grpc_router_service;
+    use std::path::Path;
+    use tonic::Request;
+
+    let model_path = Path::new("/Users/reese/.cache/sglang-rs/Qwen3.5-0.8B");
+    if !model_path.exists() {
+        eprintln!("Qwen3.5-0.8B weights not present, skipping real model run");
+        return;
+    }
+
+    let chunk_size: usize = 4;
+    let args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_path.to_str().unwrap(),
+        "--device",
+        "cpu",
+        "--grpc-mode",
+        "--max-total-tokens",
+        "512",
+        "--chunked-prefill-size",
+        &chunk_size.to_string(),
+    ])
+    .expect("server args parse successfully");
+
+    let service = try_build_bootstrap_grpc_router_service(&args)
+        .expect("bootstrap grpc router service should build with Qwen3.5 on CPU");
+
+    // Prompt with ~18 tokens (> chunk_size 4)
+    let prompt =
+        "Artificial intelligence has evolved rapidly over recent years, transforming computing.";
+    let mut stream = service
+        .text_generate(Request::new(TextGenerateRequest {
+            text: prompt.to_string(),
+            sampling_params: Some(SamplingParams {
+                max_new_tokens: Some(3),
+                top_k: Some(1),
+                ..Default::default()
+            }),
+            options: Some(RequestOptions {
+                request_id: Some("real-qwen35-chunked-test".to_string()),
+                stream: true,
+                data_parallel_rank: 0,
+                trace_headers: Default::default(),
+            }),
+            disaggregated_params: None,
+        }))
+        .await
+        .expect("text generate request should succeed")
+        .into_inner();
+
+    let mut generated_tokens = Vec::new();
+    let mut generated_text = String::new();
+    let mut prompt_tokens_reported = 0;
+    while let Some(resp) = tonic::codegen::tokio_stream::StreamExt::next(&mut stream).await {
+        let resp = resp.expect("stream response ok");
+        if let Some(body) = resp.body {
+            match body {
+                sglang_srt::proto::sglang::runtime::v1::generate_response::Body::Chunk(chunk) => {
+                    generated_tokens.extend(chunk.token_ids);
+                    generated_text.push_str(&chunk.text);
+                }
+                sglang_srt::proto::sglang::runtime::v1::generate_response::Body::Complete(
+                    complete,
+                ) => {
+                    prompt_tokens_reported = complete.prompt_tokens;
+                    if generated_tokens.is_empty() {
+                        generated_tokens.extend(complete.output_ids);
+                    }
+                    if generated_text.is_empty() {
+                        generated_text = complete.text;
+                    }
+                    break;
+                }
+                sglang_srt::proto::sglang::runtime::v1::generate_response::Body::Error(err) => {
+                    panic!("Generation stream error: {err:?}");
+                }
+            }
+        }
+    }
+
+    assert!(
+        prompt_tokens_reported as usize > chunk_size,
+        "Prompt tokens ({prompt_tokens_reported}) must exceed chunk size ({chunk_size})"
+    );
+    assert!(
+        !generated_tokens.is_empty(),
+        "Should generate at least one token from Qwen3.5"
+    );
+    println!(
+        "Successfully ran real Qwen3.5-0.8B with chunked prefill!\n  Prompt tokens: {}\n  Chunk size: {}\n  Generated tokens: {:?}\n  Generated text: {:?}",
+        prompt_tokens_reported, chunk_size, generated_tokens, generated_text
+    );
+}
