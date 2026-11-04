@@ -37,6 +37,13 @@ impl PrefillBootstrapService {
         &self.state
     }
 
+    pub fn register_route(&self, registration: PrefillRouteRegistration) {
+        self.state
+            .lock()
+            .expect("prefill bootstrap state lock should be held")
+            .register_route(registration);
+    }
+
     fn into_router(self) -> Router {
         Router::new()
             .route("/health", get(health))
@@ -432,7 +439,7 @@ impl PrefillBootstrapState {
         Ok(layouts)
     }
 
-    pub(crate) fn register_route(&mut self, registration: PrefillRouteRegistration) {
+    pub fn register_route(&mut self, registration: PrefillRouteRegistration) {
         self.attn_tp_size.get_or_insert(registration.attn_tp_size);
         self.attn_cp_size.get_or_insert(registration.attn_cp_size);
         self.dp_size

@@ -151,21 +151,34 @@ pub mod test_support {
         Ok(reference_http_service(args, scheduler).with_disaggregated_requests())
     }
 
-    pub fn build_reference_pd_http_router_service<E>(
+    pub fn build_reference_pd_http_router_service_with_publisher<E, P>(
         args: &ServerArgs,
         registry: DecodeBootstrapRegistry,
         transfer_executor: E,
-    ) -> ReferencePdHttpRouterService<E>
+        decode_bootstrap_publisher: P,
+        decode_side_only: bool,
+        prefill_only: bool,
+    ) -> HttpRouterService<
+        RuntimeTokenizer,
+        KvTransferModelWorker<ModelRunner<CpuReferenceModel>, E, P>,
+    >
     where
         E: KvTransferBackend,
+        P: DecodeBootstrapPublisher,
     {
-        let worker = KvTransferModelWorker::new(
+        let mut worker = KvTransferModelWorker::new(
             ModelRunner::new(CpuReferenceModel),
             registry,
             transfer_executor,
         )
-        .with_decode_bootstrap_publisher(NoopDecodeBootstrapPublisher)
+        .with_decode_bootstrap_publisher(decode_bootstrap_publisher)
         .with_kv_page_size(args.page_size);
+        if decode_side_only {
+            worker = worker.with_decode_side_bootstrap_only();
+        }
+        if prefill_only {
+            worker = worker.with_prefill_only();
+        }
         let scheduler = Scheduler::with_cache_resources(
             worker,
             RadixCache::default(),
@@ -179,7 +192,25 @@ pub mod test_support {
             .with_max_transfer_polls(args.disaggregation_decode_polling_interval)
     }
 
-    pub fn build_reference_mooncake_prefill_http_router_service<S, R>(
+    pub fn build_reference_pd_http_router_service<E>(
+        args: &ServerArgs,
+        registry: DecodeBootstrapRegistry,
+        transfer_executor: E,
+    ) -> ReferencePdHttpRouterService<E>
+    where
+        E: KvTransferBackend,
+    {
+        build_reference_pd_http_router_service_with_publisher(
+            args,
+            registry,
+            transfer_executor,
+            NoopDecodeBootstrapPublisher,
+            false,
+            false,
+        )
+    }
+
+    pub fn build_reference_pd_prefill_http_router_service<S, R>(
         args: &ServerArgs,
         bootstrap_service: PrefillBootstrapService,
         transfer_executor: KvCacheTransferExecutor<S, R>,
@@ -195,6 +226,20 @@ pub mod test_support {
             DecodeBootstrapRegistry::default(),
             PdBootstrapKvCacheTransferExecutor::new(bootstrap_service, transfer_executor),
         )
+    }
+
+    pub fn build_reference_mooncake_prefill_http_router_service<S, R>(
+        args: &ServerArgs,
+        bootstrap_service: PrefillBootstrapService,
+        transfer_executor: KvCacheTransferExecutor<S, R>,
+    ) -> ReferencePdHttpRouterService<
+        PdBootstrapKvCacheTransferExecutor<KvCacheTransferExecutor<S, R>>,
+    >
+    where
+        S: KvTransferSubmitter + KvTransferStatusReader + KvBatchReleaser,
+        R: KvTransferTargetResolver,
+    {
+        build_reference_pd_prefill_http_router_service(args, bootstrap_service, transfer_executor)
     }
 
     pub fn build_reference_pd_grpc_router_service<E>(

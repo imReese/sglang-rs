@@ -24,25 +24,33 @@ use sglang_srt::engine_info_bootstrap::{
     EngineInfoBootstrapService, TransferEngineInfo, TransferEngineInfoRegistration,
 };
 use sglang_srt::http::{HttpRouterService, HttpServerInfo, serve_http_router_with_shutdown};
-use sglang_srt::pd_bootstrap::{PrefillBootstrapService, serve_prefill_bootstrap_with_shutdown};
+use sglang_srt::pd_bootstrap::{
+    PdBootstrapKvCacheTransferExecutor, PdDecodeBootstrapPublisher, PrefillBootstrapService,
+    PrefillRouteRegistration, serve_bootstrap_zmq_with_shutdown,
+    serve_prefill_bootstrap_with_shutdown,
+};
 use sglang_srt::router::{RouterGetModelInfoResponse, RouterRuntime};
 use sglang_srt::scheduler::{ScheduleBatch, ScheduledRequest, Scheduler};
 use sglang_srt::server::test_support::{
     build_reference_http_router_service, build_reference_mooncake_prefill_http_router_service,
-    build_reference_pd_http_router_service, build_reference_prefill_http_router_service,
+    build_reference_pd_http_router_service, build_reference_pd_http_router_service_with_publisher,
+    build_reference_prefill_http_router_service,
 };
 use sglang_srt::server::{
     launch_http_server_with_shutdown, register_prefill_mooncake_routes_from_args,
     try_build_bootstrap_http_router_service,
 };
+use sglang_srt::tcp_transfer::SharedTcpTransferEngine;
 use sglang_srt::tokenizer::ByteTokenizer;
 use sglang_srt::transfer::{
-    DecodeBootstrapRegistry, KvCacheMemoryLocation, KvCacheTransferError, KvCacheTransferSpan,
-    KvTransferBackend, KvTransferPoll, KvTransportError, MooncakeBatchId, MooncakeBatchReleaser,
-    MooncakeBufferEntry, MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor,
-    MooncakeMemoryRegistrar, MooncakeTransferRequest, MooncakeTransferStatus,
-    MooncakeTransferStatusCode, MooncakeTransferStatusReader, MooncakeTransferSubmitter,
-    MooncakeTransferTarget, TransferableKvCacheMemory, TransferableKvCacheRegion,
+    DecodeBootstrapRegistry, KvBufferEntry, KvCacheMemoryLocation, KvCacheTransferError,
+    KvCacheTransferExecutor, KvCacheTransferSpan, KvTransferBackend, KvTransferLayout,
+    KvTransferPoll, KvTransportError, MooncakeBatchId, MooncakeBatchReleaser, MooncakeBufferEntry,
+    MooncakeKvCacheLayout, MooncakeKvCacheTransferExecutor, MooncakeMemoryRegistrar,
+    MooncakeTransferRequest, MooncakeTransferStatus, MooncakeTransferStatusCode,
+    MooncakeTransferStatusReader, MooncakeTransferSubmitter, MooncakeTransferTarget,
+    NoopDecodeBootstrapPublisher, SessionKvTargetResolver, TransferableKvCacheMemory,
+    TransferableKvCacheRegion,
 };
 use sglang_srt::types::{BootstrapRoom, RequestId, SamplingParams as RuntimeSamplingParams};
 use sglang_srt::worker::{
@@ -3926,4 +3934,643 @@ fn parse_sse_data(raw_response: &str) -> Vec<String> {
         .filter_map(|line| line.strip_prefix("data: "))
         .map(ToString::to_string)
         .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_pd_tcp_transfer() {
+    let prefill_http_addr = unused_local_addr();
+    let prefill_boot_addr = unused_local_addr();
+    let prefill_zmq_addr = unused_local_addr();
+
+    // 1. Prefill bootstrap service and ZMQ endpoint
+    let prefill_bootstrap_service = PrefillBootstrapService::default();
+    {
+        let mut state = prefill_bootstrap_service
+            .state()
+            .lock()
+            .expect("prefill bootstrap state lock");
+        state.register_route(PrefillRouteRegistration {
+            attn_tp_size: 1,
+            attn_tp_rank: 0,
+            attn_cp_size: 1,
+            attn_cp_rank: 0,
+            attn_dp_size: 1,
+            attn_dp_rank: 0,
+            pp_size: 1,
+            pp_rank: 0,
+            system_dp_size: 1,
+            system_dp_rank: 0,
+            rank_ip: "127.0.0.1".to_string(),
+            rank_port: prefill_zmq_addr.port(),
+            page_size: Some(1),
+            kv_cache_dtype: Some("auto".to_string()),
+            load_balance_method: None,
+        });
+    }
+
+    let (boot_shutdown_tx, boot_shutdown_rx) = oneshot::channel();
+    let boot_svc = prefill_bootstrap_service.clone();
+    let boot_server = tokio::spawn(async move {
+        serve_prefill_bootstrap_with_shutdown(prefill_boot_addr, boot_svc, async move {
+            let _ = boot_shutdown_rx.await;
+        })
+        .await
+    });
+
+    let (zmq_shutdown_tx, zmq_shutdown_rx) = oneshot::channel();
+    let zmq_svc = prefill_bootstrap_service.clone();
+    let zmq_endpoint = format!("tcp://{}", prefill_zmq_addr);
+    let zmq_server = tokio::spawn(async move {
+        serve_bootstrap_zmq_with_shutdown(zmq_endpoint, zmq_svc, async move {
+            let _ = zmq_shutdown_rx.await;
+        })
+        .await
+    });
+
+    // 2. Prefill TCP transfer engine with pattern memory
+    let prefill_engine = SharedTcpTransferEngine::new("127.0.0.1", 0).expect("prefill engine");
+    let mut prefill_kv_cache = vec![0x7C_u8; 128 * 16];
+    let prefill_base_addr = prefill_kv_cache.as_mut_ptr() as usize;
+
+    let prefill_layout = KvTransferLayout {
+        source_base_addr: prefill_base_addr,
+        page_size_bytes: 128,
+        target_base_offset: 0,
+    };
+    let prefill_target_resolver = SessionKvTargetResolver::new(prefill_engine.clone(), Vec::new());
+    let mut prefill_inner = KvCacheTransferExecutor::with_target_resolver(
+        prefill_engine.clone(),
+        prefill_layout,
+        prefill_target_resolver,
+    )
+    .with_memory_registrar(prefill_engine);
+
+    prefill_inner
+        .register(
+            TransferableKvCacheMemory::new(
+                vec![TransferableKvCacheRegion {
+                    base_addr: prefill_base_addr,
+                    byte_len: 128 * 16,
+                    page_size_bytes: 128,
+                }],
+                128,
+                KvCacheMemoryLocation::Cpu { numa_node: 0 },
+            )
+            .expect("prefill transferable memory"),
+        )
+        .expect("register prefill memory");
+
+    let prefill_transfer_executor =
+        PdBootstrapKvCacheTransferExecutor::new(prefill_bootstrap_service, prefill_inner)
+            .with_metadata_wait_timeout(Duration::from_secs(5));
+
+    let prefill_args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "glm-pd",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--disaggregation-mode",
+        "prefill",
+        "--page-size",
+        "1",
+        "--max-total-tokens",
+        "16",
+    ])
+    .expect("prefill args");
+
+    let prefill_service = build_reference_pd_http_router_service_with_publisher(
+        &prefill_args,
+        DecodeBootstrapRegistry::default(),
+        prefill_transfer_executor,
+        NoopDecodeBootstrapPublisher,
+        false,
+        true,
+    );
+
+    let (prefill_shutdown_tx, prefill_shutdown_rx) = oneshot::channel();
+    let prefill_server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(prefill_http_addr, prefill_service, async move {
+            let _ = prefill_shutdown_rx.await;
+        })
+        .await
+    });
+
+    // 3. Decode TCP transfer engine with zeroed memory
+    let decode_http_addr = unused_local_addr();
+    let mut decode_kv_cache = vec![0u8; 128 * 16];
+    let decode_base_addr = decode_kv_cache.as_mut_ptr() as usize;
+
+    let mut decode_engine = SharedTcpTransferEngine::new("127.0.0.1", 0).expect("decode engine");
+    let decode_tcp_endpoint = decode_engine.local_endpoint().expect("decode endpoint");
+
+    decode_engine
+        .register_memory_batch(
+            &mut [KvBufferEntry {
+                addr: decode_kv_cache.as_mut_ptr() as *mut c_void,
+                length: decode_kv_cache.len(),
+            }],
+            "cpu",
+        )
+        .expect("register decode memory");
+
+    let decode_layout = KvTransferLayout {
+        source_base_addr: decode_base_addr,
+        page_size_bytes: 128,
+        target_base_offset: 0,
+    };
+
+    let decode_publisher =
+        PdDecodeBootstrapPublisher::new("127.0.0.1", 0, decode_tcp_endpoint.clone())
+            .with_kv_cache_layout(decode_layout)
+            .with_receiver()
+            .expect("decode receiver");
+
+    let decode_target_resolver = SessionKvTargetResolver::new(decode_engine.clone(), Vec::new());
+    let decode_executor = KvCacheTransferExecutor::with_target_resolver(
+        decode_engine.clone(),
+        decode_layout,
+        decode_target_resolver,
+    );
+
+    let decode_args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "glm-pd",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--disaggregation-mode",
+        "decode",
+        "--page-size",
+        "1",
+        "--max-total-tokens",
+        "16",
+    ])
+    .expect("decode args");
+
+    let decode_service = build_reference_pd_http_router_service_with_publisher(
+        &decode_args,
+        DecodeBootstrapRegistry::default(),
+        decode_executor,
+        decode_publisher,
+        true,
+        false,
+    );
+
+    let (decode_shutdown_tx, decode_shutdown_rx) = oneshot::channel();
+    let decode_server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(decode_http_addr, decode_service, async move {
+            let _ = decode_shutdown_rx.await;
+        })
+        .await
+    });
+
+    // 4. Client dual-dispatch request (matching Locus payload)
+    let room: u64 = 901;
+    let request_body = serde_json::json!({
+        "model": "glm-pd",
+        "prompt": "hi",
+        "max_tokens": 2,
+        "bootstrap_host": "127.0.0.1",
+        "bootstrap_port": prefill_boot_addr.port(),
+        "bootstrap_room": room,
+    })
+    .to_string();
+
+    let (prefill_res, decode_res) = tokio::join!(
+        request_raw_dynamic_with_retry(
+            prefill_http_addr,
+            "POST",
+            "/v1/completions",
+            request_body.clone(),
+        ),
+        request_raw_dynamic_with_retry(decode_http_addr, "POST", "/v1/completions", request_body,),
+    );
+
+    // 5. Verify HTTP responses
+    assert!(
+        prefill_res.starts_with("HTTP/1.1 200"),
+        "prefill should succeed: {prefill_res}"
+    );
+    assert!(
+        decode_res.starts_with("HTTP/1.1 200"),
+        "decode should succeed: {decode_res}"
+    );
+
+    let (_, decode_json_str) = decode_res
+        .split_once("\r\n\r\n")
+        .expect("decode response headers");
+    let decode_json: Value = serde_json::from_str(decode_json_str).expect("decode JSON response");
+    assert_eq!(decode_json["object"], "text_completion");
+    assert_eq!(decode_json["choices"][0]["index"], 0);
+    assert!(decode_json["choices"][0]["text"].as_str().is_some());
+
+    // 6. Verify native TCP KV cache transfer: decode memory received prefill bytes
+    assert_eq!(&decode_kv_cache[0..128], &[0x7C_u8; 128]);
+
+    // 7. Clean shutdown
+    prefill_shutdown_tx.send(()).expect("prefill stop");
+    decode_shutdown_tx.send(()).expect("decode stop");
+    zmq_shutdown_tx.send(()).expect("zmq stop");
+    boot_shutdown_tx.send(()).expect("boot stop");
+
+    prefill_server
+        .await
+        .expect("prefill join")
+        .expect("prefill clean");
+    decode_server
+        .await
+        .expect("decode join")
+        .expect("decode clean");
+    zmq_server.await.expect("zmq join").expect("zmq clean");
+    boot_server.await.expect("boot join").expect("boot clean");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_pd_streaming_tcp_transfer() {
+    let prefill_http_addr = unused_local_addr();
+    let prefill_boot_addr = unused_local_addr();
+    let prefill_zmq_addr = unused_local_addr();
+
+    // 1. Prefill bootstrap service and ZMQ endpoint
+    let prefill_bootstrap_service = PrefillBootstrapService::default();
+    {
+        let mut state = prefill_bootstrap_service
+            .state()
+            .lock()
+            .expect("prefill bootstrap state lock");
+        state.register_route(PrefillRouteRegistration {
+            attn_tp_size: 1,
+            attn_tp_rank: 0,
+            attn_cp_size: 1,
+            attn_cp_rank: 0,
+            attn_dp_size: 1,
+            attn_dp_rank: 0,
+            pp_size: 1,
+            pp_rank: 0,
+            system_dp_size: 1,
+            system_dp_rank: 0,
+            rank_ip: "127.0.0.1".to_string(),
+            rank_port: prefill_zmq_addr.port(),
+            page_size: Some(1),
+            kv_cache_dtype: Some("auto".to_string()),
+            load_balance_method: None,
+        });
+    }
+
+    let (boot_shutdown_tx, boot_shutdown_rx) = oneshot::channel();
+    let boot_svc = prefill_bootstrap_service.clone();
+    let boot_server = tokio::spawn(async move {
+        serve_prefill_bootstrap_with_shutdown(prefill_boot_addr, boot_svc, async move {
+            let _ = boot_shutdown_rx.await;
+        })
+        .await
+    });
+
+    let (zmq_shutdown_tx, zmq_shutdown_rx) = oneshot::channel();
+    let zmq_svc = prefill_bootstrap_service.clone();
+    let zmq_endpoint = format!("tcp://{}", prefill_zmq_addr);
+    let zmq_server = tokio::spawn(async move {
+        serve_bootstrap_zmq_with_shutdown(zmq_endpoint, zmq_svc, async move {
+            let _ = zmq_shutdown_rx.await;
+        })
+        .await
+    });
+
+    // 2. Prefill TCP transfer engine
+    let prefill_engine = SharedTcpTransferEngine::new("127.0.0.1", 0).expect("prefill engine");
+    let mut prefill_kv_cache = vec![0x9E_u8; 128 * 16];
+    let prefill_base_addr = prefill_kv_cache.as_mut_ptr() as usize;
+
+    let prefill_layout = KvTransferLayout {
+        source_base_addr: prefill_base_addr,
+        page_size_bytes: 128,
+        target_base_offset: 0,
+    };
+    let prefill_target_resolver = SessionKvTargetResolver::new(prefill_engine.clone(), Vec::new());
+    let mut prefill_inner = KvCacheTransferExecutor::with_target_resolver(
+        prefill_engine.clone(),
+        prefill_layout,
+        prefill_target_resolver,
+    )
+    .with_memory_registrar(prefill_engine);
+
+    prefill_inner
+        .register(
+            TransferableKvCacheMemory::new(
+                vec![TransferableKvCacheRegion {
+                    base_addr: prefill_base_addr,
+                    byte_len: 128 * 16,
+                    page_size_bytes: 128,
+                }],
+                128,
+                KvCacheMemoryLocation::Cpu { numa_node: 0 },
+            )
+            .expect("prefill transferable memory"),
+        )
+        .expect("register prefill memory");
+
+    let prefill_transfer_executor =
+        PdBootstrapKvCacheTransferExecutor::new(prefill_bootstrap_service, prefill_inner)
+            .with_metadata_wait_timeout(Duration::from_secs(5));
+
+    let prefill_args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "glm-pd",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--disaggregation-mode",
+        "prefill",
+        "--page-size",
+        "1",
+        "--max-total-tokens",
+        "16",
+    ])
+    .expect("prefill args");
+
+    let prefill_service = build_reference_pd_http_router_service_with_publisher(
+        &prefill_args,
+        DecodeBootstrapRegistry::default(),
+        prefill_transfer_executor,
+        NoopDecodeBootstrapPublisher,
+        false,
+        true,
+    );
+
+    let (prefill_shutdown_tx, prefill_shutdown_rx) = oneshot::channel();
+    let prefill_server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(prefill_http_addr, prefill_service, async move {
+            let _ = prefill_shutdown_rx.await;
+        })
+        .await
+    });
+
+    // 3. Decode TCP transfer engine
+    let decode_http_addr = unused_local_addr();
+    let mut decode_kv_cache = vec![0u8; 128 * 16];
+    let decode_base_addr = decode_kv_cache.as_mut_ptr() as usize;
+
+    let mut decode_engine = SharedTcpTransferEngine::new("127.0.0.1", 0).expect("decode engine");
+    let decode_tcp_endpoint = decode_engine.local_endpoint().expect("decode endpoint");
+
+    decode_engine
+        .register_memory_batch(
+            &mut [KvBufferEntry {
+                addr: decode_kv_cache.as_mut_ptr() as *mut c_void,
+                length: decode_kv_cache.len(),
+            }],
+            "cpu",
+        )
+        .expect("register decode memory");
+
+    let decode_layout = KvTransferLayout {
+        source_base_addr: decode_base_addr,
+        page_size_bytes: 128,
+        target_base_offset: 0,
+    };
+
+    let decode_publisher =
+        PdDecodeBootstrapPublisher::new("127.0.0.1", 0, decode_tcp_endpoint.clone())
+            .with_kv_cache_layout(decode_layout)
+            .with_receiver()
+            .expect("decode receiver");
+
+    let decode_target_resolver = SessionKvTargetResolver::new(decode_engine.clone(), Vec::new());
+    let decode_executor = KvCacheTransferExecutor::with_target_resolver(
+        decode_engine.clone(),
+        decode_layout,
+        decode_target_resolver,
+    );
+
+    let decode_args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        "dummy",
+        "--served-model-name",
+        "glm-pd",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--disaggregation-mode",
+        "decode",
+        "--page-size",
+        "1",
+        "--max-total-tokens",
+        "16",
+    ])
+    .expect("decode args");
+
+    let decode_service = build_reference_pd_http_router_service_with_publisher(
+        &decode_args,
+        DecodeBootstrapRegistry::default(),
+        decode_executor,
+        decode_publisher,
+        true,
+        false,
+    );
+
+    let (decode_shutdown_tx, decode_shutdown_rx) = oneshot::channel();
+    let decode_server = tokio::spawn(async move {
+        serve_http_router_with_shutdown(decode_http_addr, decode_service, async move {
+            let _ = decode_shutdown_rx.await;
+        })
+        .await
+    });
+
+    // 4. Client streaming dual-dispatch request
+    let room: u64 = 902;
+    let request_body = serde_json::json!({
+        "model": "glm-pd",
+        "prompt": "hi",
+        "max_tokens": 2,
+        "stream": true,
+        "bootstrap_host": "127.0.0.1",
+        "bootstrap_port": prefill_boot_addr.port(),
+        "bootstrap_room": room,
+    })
+    .to_string();
+
+    let (prefill_res, decode_res) = tokio::join!(
+        request_raw_dynamic_with_retry(
+            prefill_http_addr,
+            "POST",
+            "/v1/completions",
+            request_body.clone(),
+        ),
+        request_raw_dynamic_with_retry(decode_http_addr, "POST", "/v1/completions", request_body,),
+    );
+
+    // 5. Verify HTTP responses and SSE streams
+    assert!(
+        prefill_res.starts_with("HTTP/1.1 200"),
+        "prefill streaming should succeed: {prefill_res}"
+    );
+    assert!(
+        decode_res.starts_with("HTTP/1.1 200"),
+        "decode streaming should succeed: {decode_res}"
+    );
+
+    let decode_events = parse_sse_data(&decode_res);
+    assert_eq!(
+        decode_events.last().map(String::as_str),
+        Some("[DONE]"),
+        "decode SSE should end with [DONE]: {decode_events:?}"
+    );
+
+    // 6. Verify native TCP KV cache transfer: decode memory received prefill bytes
+    assert_eq!(&decode_kv_cache[0..128], &[0x9E_u8; 128]);
+
+    // 7. Clean shutdown
+    prefill_shutdown_tx.send(()).expect("prefill stop");
+    decode_shutdown_tx.send(()).expect("decode stop");
+    zmq_shutdown_tx.send(()).expect("zmq stop");
+    boot_shutdown_tx.send(()).expect("boot stop");
+
+    prefill_server
+        .await
+        .expect("prefill join")
+        .expect("prefill clean");
+    decode_server
+        .await
+        .expect("decode join")
+        .expect("decode clean");
+    zmq_server.await.expect("zmq join").expect("zmq clean");
+    boot_server.await.expect("boot join").expect("boot clean");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_pd_serves_real_model() {
+    let model_dir = temp_model_dir("http-pd-qwen3-real-model");
+    support::qwen3_nonzero::write_model(&model_dir);
+
+    let prefill_http_addr = unused_local_addr();
+    let prefill_boot_addr = unused_local_addr();
+    let prefill_zmq_addr = unused_local_addr();
+    let decode_http_addr = unused_local_addr();
+
+    let prefill_args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_dir.to_str().expect("model dir"),
+        "--served-model-name",
+        "qwen3",
+        "--device",
+        "cpu",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &prefill_http_addr.port().to_string(),
+        "--disaggregation-mode",
+        "prefill",
+        "--disaggregation-transfer-backend",
+        "tcp",
+        "--disaggregation-bootstrap-port",
+        &prefill_boot_addr.port().to_string(),
+        "--disaggregation-zmq-ports",
+        &format!("{}-{}", prefill_zmq_addr.port(), prefill_zmq_addr.port()),
+        "--page-size",
+        "1",
+        "--max-total-tokens",
+        "16",
+    ])
+    .expect("prefill args");
+
+    let decode_args = ServerArgs::parse_from([
+        "serve",
+        "--model-path",
+        model_dir.to_str().expect("model dir"),
+        "--served-model-name",
+        "qwen3",
+        "--device",
+        "cpu",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &decode_http_addr.port().to_string(),
+        "--disaggregation-mode",
+        "decode",
+        "--disaggregation-transfer-backend",
+        "tcp",
+        "--page-size",
+        "1",
+        "--max-total-tokens",
+        "16",
+    ])
+    .expect("decode args");
+
+    let (prefill_shutdown_tx, prefill_shutdown_rx) = oneshot::channel();
+    let prefill_server = tokio::spawn(launch_http_server_with_shutdown(prefill_args, async move {
+        let _ = prefill_shutdown_rx.await;
+    }));
+
+    let (decode_shutdown_tx, decode_shutdown_rx) = oneshot::channel();
+    let decode_server = tokio::spawn(launch_http_server_with_shutdown(decode_args, async move {
+        let _ = decode_shutdown_rx.await;
+    }));
+
+    let room: u64 = 903;
+    let request_body = serde_json::json!({
+        "model": "qwen3",
+        "prompt": "hello",
+        "max_tokens": 2,
+        "bootstrap_host": "127.0.0.1",
+        "bootstrap_port": prefill_boot_addr.port(),
+        "bootstrap_room": room,
+    })
+    .to_string();
+
+    let (prefill_res, decode_res) = tokio::join!(
+        request_raw_dynamic_with_retry(
+            prefill_http_addr,
+            "POST",
+            "/v1/completions",
+            request_body.clone(),
+        ),
+        request_raw_dynamic_with_retry(decode_http_addr, "POST", "/v1/completions", request_body,),
+    );
+
+    assert!(
+        prefill_res.starts_with("HTTP/1.1 200"),
+        "prefill should succeed with real qwen3: {prefill_res}"
+    );
+    assert!(
+        decode_res.starts_with("HTTP/1.1 200"),
+        "decode should succeed with real qwen3: {decode_res}"
+    );
+
+    let (_, decode_json_str) = decode_res
+        .split_once("\r\n\r\n")
+        .expect("decode response headers");
+    let decode_json: Value = serde_json::from_str(decode_json_str).expect("decode JSON response");
+    assert_eq!(decode_json["object"], "text_completion");
+    assert_eq!(decode_json["choices"][0]["index"], 0);
+    assert!(decode_json["choices"][0]["text"].as_str().is_some());
+
+    prefill_shutdown_tx.send(()).expect("prefill stop");
+    decode_shutdown_tx.send(()).expect("decode stop");
+
+    prefill_server
+        .await
+        .expect("prefill join")
+        .expect("prefill clean");
+    decode_server
+        .await
+        .expect("decode join")
+        .expect("decode clean");
+
+    let _ = fs::remove_dir_all(model_dir);
 }
